@@ -2045,7 +2045,7 @@ fn the_map_carries_the_pcie_identity_only_when_there_is_one() {
 fn a_short_target_name_is_recorded_in_full() {
     let dir = fixture(&veryl_toml(), HARNESS_TOML);
     let out = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
-        .args(["gen", "--target", "d"])
+        .args(["gen", "--target", "digilent/arty-a7-3"])
         .current_dir(dir.path())
         .output()
         .unwrap();

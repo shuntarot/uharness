@@ -54,7 +54,7 @@ hio (HostIO) works over JTAG (an FTDI cable) or PCIe, and needs no Vivado.
 
 ## Boards
 
-Arty A7-35, VCU118, KCU105, KC705. Adding one is a TOML file.
+Arty A7-35 and A7-100, VCU118, KCU105, KC705. Adding one is a TOML file.
 
 ## Build
 

@@ -331,7 +331,7 @@ veryl harness targets             # what ships with this build
 
 | option | `check` | `gen` | |
 |---|---|---|---|
-| `--target <provider>/<board>[:<config>]` | ✓ | ✓ | required for `gen`; the start of the name is enough while only one board starts that way (`--target d`) |
+| `--target <provider>/<board>[:<config>]` | ✓ | ✓ | required for `gen`; the start of the name is enough while only one board starts that way (`--target xilinx/vcu`) |
 | `--target-file <path>` | ✓ | ✓ | your own description; reported as unverified |
 | `--target-patch <path>` | ✓ | ✓ | a TOML patch over it, repeatable |
 | `--transport <name>` | ✓ | ✓ | `jtag` (default) or `pcie`; a board without `jtag` defaults to its only transport |
@@ -352,6 +352,7 @@ to fix it.
 | `--target` | transports | `dram` |
 |---|---|---|
 | `digilent/arty-a7-35` | `jtag` | DDR3L, 256 MB |
+| `digilent/arty-a7-100` | `jtag` | DDR3L, 256 MB |
 | `xilinx/vcu118` | `jtag`, `pcie` | DDR4 |
 | `xilinx/kcu105` | `jtag`, `pcie` | DDR4, 2 GB, with `:dr` or `:062` |
 | `xilinx/kc705` | `jtag` | DDR3, 1 GB |
