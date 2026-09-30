@@ -1,0 +1,134 @@
+# Digilent Arty A7-100T
+#
+# The same board as the A7-35T with a larger FPGA. Pins, clock, reset, DDR3L and
+# the USB-JTAG circuit are the same (the board files differ only in the part),
+# so the board-side values are the A7-35T's. The device values come from the
+# XC7A100T BSDL and datasheet.
+#
+# **Not yet run on the board** (2026-09-30). The JTAG probe values below were
+# measured on an A7-35T, and the IDCODE is the expected one, not a reading.
+
+[board]
+provider    = "digilent"
+name        = "arty-a7-100"
+description = "Digilent Arty A7-100T"
+url         = "https://digilent.com/reference/programmable-logic/arty-a7/start"
+untested    = true
+
+[device]
+vendor = "xilinx"
+family = "artix7"
+part   = "xc7a100tcsg324-1"
+
+# Regex matched against the device names hw_manager lists, to pick one when
+# several FPGAs are attached.
+hw_pattern = "xc7a100t"
+
+# The MIG is generated from `mig.prj` beside this file, a copy of the board
+# file (see README.md). No Vivado board files are needed, and so no
+# `board_part`: the pins are in `mig.prj`.
+[vivado]
+mig_prj = "mig.prj"
+
+[provides]
+# JTAG only; this board has no PCIe.
+transport = ["jtag"]
+
+# 36Kb x 135 = 4,860 Kbit on the XC7A100T. From the datasheet.
+bram_kb = 607
+
+# What the MIG needs and what it presents, read out of `mig.prj` (the same
+# memory settings as the A7-35T). Both `sys_clk` and `ref_clk` are "No Buffer",
+# so the harness MMCM makes them.
+dram = {kind = "ddr3l", device = "MT41K128M16XX-15E", channels = 1, mb = 256, width = 16, controller = "mig", sys_clk_mhz = 166.666, ref_clk_mhz = 200.0, ui_clk_mhz = 83.333, axi_data_bits = 128, axi_addr_bits = 28, axi_id_bits = 4, row_bits = 14, bank_bits = 3, sys_rst_active = "low"}
+
+# The board's clock source. Frequency and pin are fixed by the board.
+[clocks.sys]
+freq_mhz = 100
+diff     = false
+pin      = "E3"
+standard = "LVCMOS33"
+
+# ck_rst. A push button, **active low**.
+[resets.sys]
+pin      = "C2"
+standard = "LVCMOS33"
+active   = "low"
+
+# Signals the board brings out. **Facts about the board only** — which port is
+# connected to which is decided in the manifest's `[pin]`, by resource name.
+#
+# From the board files, `arty-a7-100/E.0/{part0_pins.xml,
+# board.xml}`. **Directions are as the FPGA sees them**, taken from
+# `<port_map logical_port="TxD" ... dir="out">`: the pin names
+# (`usb_uart_txd` / `rxd`) are named from the USB chip's side and read backwards
+# here.
+[pins.uart_tx]
+pin       = "D10"
+standard  = "LVCMOS33"
+direction = "output"
+
+[pins.uart_rx]
+pin       = "A9"
+standard  = "LVCMOS33"
+direction = "input"
+
+[jtag]
+# How Vivado reaches the device. `hio` does not use this; it drives the FTDI
+# directly with the values below.
+via = "vivado_hw_server"
+
+# The ceiling constrained on the bridge's TCK. A choice, not a measurement.
+max_tck_mhz = 30
+
+# The on-board FT2232H: channel A (interface 0) is JTAG, B (interface 1) is the
+# UART. Measured on an A7-35T, which has the same USB-JTAG circuit.
+vid       = 0x0403
+pid       = 0x6010
+interface = 0
+product   = "Digilent USB Device"
+
+# MPSSE GPIO values that enable the level shifters (data, direction). Without
+# them TDO never comes back. Measured on an A7-35T.
+layout_init = [0x0088, 0x008b]
+
+# What the host may clock, set by the cable and level-shifter delay. Measured on
+# an A7-35T: 30 MHz corrupted reads, 20 MHz was clean.
+host_tck_mhz = 20
+
+# IR length, from the XC7A100T BSDL (`INSTRUCTION_LENGTH` 6).
+ir_length = 6
+
+# The device IDCODE. The BSDL leaves the 4 version bits open (`XXXX`), and
+# Vivado's SVF masks them off; version 0 is assumed, as on the A7-35T. Not read
+# from this board yet.
+idcode = 0x03631093
+
+# USER1 and the configuration IRs are the same for all 7-series devices
+# (UG470 Table 6-3). They were confirmed on an A7-35T, and the configuration
+# IRs match Vivado 2021.2's SVF for this part.
+user1_ir    = 0x02
+jprogram_ir = 0x0b
+cfg_in_ir   = 0x05
+jstart_ir   = 0x0c
+bypass_ir   = 0x3f
+
+# Read back after JPROGRAM and JSTART, copied from Vivado 2021.2's SVF for this
+# part as they are.
+[jtag.ready]
+ir     = 0x14   # ISC_NOOP
+expect = 0x11
+mask   = 0x31
+
+[jtag.done]
+ir     = 0x09   # IDCODE
+expect = 0x31
+mask   = 0x11
+
+# One SLR, so no `[[jtag.slr]]`.
+
+# Written with the same schema a multi-device board would use. Branching on
+# "just one" leaves the multi-device path to rot.
+[topology]
+nodes = 1
+links = []

@@ -17,7 +17,7 @@
 //! - A name in both directories is an error. The two are equals, so there is
 //!   no precedence.
 //! - Paths and names use separate flags, so no rule has to tell a path from
-//!   a name in one argument. A name may be cut short (`--target d`).
+//!   a name in one argument. A name may be cut short (`--target xilinx/vcu`).
 //!
 //! The descriptions are embedded with `rust-embed`, as veryl-std does. A
 //! binary on PATH must work without knowing where the repository is.
@@ -225,7 +225,7 @@ pub enum TargetError {
     #[diagnostic(
         code(harness::target::malformed_name),
         help(
-            "A target is named <provider>/<board>, optionally with a config:\n\n    --target digilent/arty-a7-35\n    --target digilent/arty-a7-35:some-config\n\nThe start of the name is enough when only one target starts that way:\n\n    --target d\n\nTo use a description that does not ship with the tool, pass the file instead:\n\n    --target-file ./my-board.toml"
+            "A target is named <provider>/<board>, optionally with a config:\n\n    --target digilent/arty-a7-35\n    --target digilent/arty-a7-35:some-config\n\nThe start of the name is enough when only one target starts that way:\n\n    --target xilinx/vcu\n\nTo use a description that does not ship with the tool, pass the file instead:\n\n    --target-file ./my-board.toml"
         )
     )]
     MalformedName { name: String },
@@ -1338,12 +1338,24 @@ mod tests {
 
     #[test]
     fn the_start_of_a_name_is_enough() {
-        for given in ["d", "digilent/arty", "digilent/arty-a7-35"] {
+        for given in ["digilent/arty-a7-3", "digilent/arty-a7-35"] {
             let target = resolve(given, &[]).unwrap();
             assert_eq!(target.name, "digilent/arty-a7-35", "{given}");
         }
-        let err = resolve("d:nope", &[]).unwrap_err();
+        assert_eq!(resolve("xilinx/v", &[]).unwrap().name, "xilinx/vcu118");
+        let err = resolve("xilinx/v:nope", &[]).unwrap_err();
         assert!(matches!(err, TargetError::ConfigNotFound { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn the_two_artys_need_their_size() {
+        let err = resolve("digilent/arty", &[]).unwrap_err();
+        assert!(
+            matches!(err, TargetError::AmbiguousPrefix { .. }),
+            "{err:?}"
+        );
+        let target = resolve("digilent/arty-a7-1", &[]).unwrap();
+        assert_eq!(target.name, "digilent/arty-a7-100");
     }
 
     #[test]
