@@ -1,0 +1,172 @@
+/// A memory the DUT reads on a fixed schedule; the host reaches it through
+/// the CSR (an address register and a data register).
+///
+/// One entry is as wide as the write channel. A read returns one WIDTH-bit
+/// slice of it, picked by the address bits below SHIFT -- a cache that drains a
+/// whole line writes one entry, and the loads that follow read its words.
+///
+/// Port A is the DUT, port B is the host. The read latency is built to the
+/// number the manifest states.
+pub module mem #(
+    param WIDTH   : u32   = 8    ,
+    param SLICES  : u32   = 1    ,
+    param DEPTH   : u32   = 1024 ,
+    param LATENCY : u32   = 1    ,
+    param ADDR_W  : u32   = 10   ,
+    param SHIFT   : u32   = 0    ,
+    param STRB_W  : u32   = 1    ,
+    param HAS_STRB: bbool = false,
+    /// Host-side byte strobe. The window is 32 bits, so a write to a wide entry
+    /// covers only part of it. An indirect port can hold words until the entry
+    /// is complete, but a region has nowhere to hold them.
+    param HSTRB_W  : u32   = 1    ,
+    param HAS_HSTRB: bbool = false,
+    param HAS_EN  : bbool = false,
+) (
+    i_clk   : input  clock                ,
+    i_rst   : input  reset                ,
+    i_addr  : input  logic<ADDR_W>        ,
+    o_rdata : output logic<WIDTH>         ,
+    i_wdata : input  logic<WIDTH * SLICES>,
+    i_wstrb : input  logic<STRB_W>        ,
+    i_we    : input  logic                ,
+    i_en    : input  logic                ,
+    o_oor   : output logic<32>            ,
+    i_haddr : input  logic<$clog2(DEPTH)> ,
+    i_hwdata: input  logic<WIDTH * SLICES>,
+    i_hwstrb: input  logic<HSTRB_W>       ,
+    i_hwe   : input  logic                ,
+    o_hrdata: output logic<WIDTH * SLICES>,
+) {
+    const ENTRY  : u32                  = WIDTH * SLICES;
+    const INDEX_W: u32                  = $clog2(DEPTH);
+    const LANE_W : u32                  = $clog2(SLICES);
+    var   mem    : logic<ENTRY> [DEPTH];
+
+    // The DUT's address is not folded into range. SHIFT drops the bits that
+    // pick a byte or a word inside an entry; what is left either names an
+    // entry or is outside the memory.
+    let entry_index: logic<ADDR_W>  = i_addr >> SHIFT;
+    let in_range   : logic          = entry_index <: DEPTH;
+    let index      : logic<INDEX_W> = entry_index[INDEX_W - 1:0];
+
+    // Which slice of the entry a read returns. SLICES == 1 means the entry is
+    // the word, and the whole thing is read.
+    // This needs `SHIFT >= LANE_W`, or the unsigned subtraction wraps.
+    // The generator passes only such values: `word` gives `SHIFT == LANE_W`,
+    // and `byte` gives `SHIFT = log2(entry bytes)`, where
+    // `byte_address_needs_whole_bytes` requires a power-of-two entry size.
+    // A smaller SHIFT happens only for words narrower than 8 bits, and the
+    // same check rejects those.
+    let lane: logic<ADDR_W> = if SLICES == 1 ? 0 : (i_addr >> (SHIFT - LANE_W)) & (SLICES - 1);
+
+    // Port A: the DUT.
+    //
+    // The shape here is the vendor's RAM template, not a preference. The read
+    // is a bare `mem[index]` and the write sits directly under its enable: a
+    // conditional read (`in_range ? mem[index] : 0`) or a static `if` nested
+    // inside the block makes Vivado refuse to infer a BRAM at all. Out of range
+    // is applied to the output instead, one cycle later.
+    var raw       : logic<ENTRY> ;
+    var lane_q    : logic<ADDR_W>;
+    var in_range_q: logic        ;
+
+    // A read happens every cycle unless the port carries an enable, in which
+    // case the data holds between reads -- what a DUT that gates its reads
+    // expects to see.
+    let reading: logic = if HAS_EN ? i_en : 1'b1;
+
+    if HAS_STRB :g_bytes {
+        always_ff {
+            // A byte the strobe does not name keeps its old value.
+            if i_we && in_range {
+                for b in 0..STRB_W {
+                    if i_wstrb[b] {
+                        mem[index][b * 8+:8] = i_wdata[b * 8+:8];
+                    }
+                }
+            }
+            if reading {
+                raw = mem[index];
+            }
+        }
+    } else :g_whole {
+        always_ff {
+            if i_we && in_range {
+                mem[index] = i_wdata;
+            }
+            if reading {
+                raw = mem[index];
+            }
+        }
+    }
+
+    always_ff {
+        if reading {
+            lane_q     = lane;
+            in_range_q = in_range;
+        }
+    }
+
+    // Accesses the DUT made outside the memory, or -- when the port carries no
+    // read enable and an access cannot be told from an idle cycle -- the cycles
+    // it held such an address. Saturating: a nonzero value means it happened,
+    // and those reads returned 0 while the writes were dropped.
+    let missed: logic     = if HAS_EN ? (i_en || i_we) && !in_range : !in_range;
+    var oor   : logic<32>;
+    always_ff {
+        if_reset {
+            oor = 0;
+        } else {
+            if missed && oor != 32'hffff_ffff {
+                oor = oor + 1;
+            }
+        }
+    }
+    assign o_oor = oor;
+
+    // Port B: the host, always one cycle. JTAG transactions are milliseconds
+    // apart, so the data is long ready by the time the host reads it back.
+    //
+    // A whole entry unless the host says otherwise. The indirect ports hold the
+    // words until the entry is complete and then write all of it; a region has
+    // nowhere to hold them, so it names the bytes it is writing.
+    var hrdata: logic<ENTRY>;
+    if HAS_HSTRB :g_hbytes {
+        always_ff {
+            // A byte the strobe does not name keeps its old value.
+            if i_hwe {
+                for b in 0..HSTRB_W {
+                    if i_hwstrb[b] {
+                        mem[i_haddr][b * 8+:8] = i_hwdata[b * 8+:8];
+                    }
+                }
+            }
+            hrdata = mem[i_haddr];
+        }
+    } else :g_hwhole {
+        always_ff {
+            if i_hwe {
+                mem[i_haddr] = i_hwdata;
+            }
+            hrdata = mem[i_haddr];
+        }
+    }
+    assign o_hrdata = hrdata;
+
+    // The read latency the manifest declared, built as declared.
+    if LATENCY == 0 :g_async {
+        assign o_rdata = if in_range ? mem[index][lane * WIDTH+:WIDTH] : 0;
+    } else if LATENCY == 1 :g_lat1 {
+        assign o_rdata = if in_range_q ? raw[lane_q * WIDTH+:WIDTH] : 0;
+    } else :g_latn {
+        var pipe: logic<WIDTH> [LATENCY - 1];
+        always_ff {
+            pipe[0] = if in_range_q ? raw[lane_q * WIDTH+:WIDTH] : 0;
+            for i in 1..LATENCY - 1 {
+                pipe[i] = pipe[i - 1];
+            }
+        }
+        assign o_rdata = pipe[LATENCY - 2];
+    }
+}

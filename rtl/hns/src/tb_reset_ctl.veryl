@@ -1,0 +1,74 @@
+/// The order in `hns::reset_ctl`: no reset until the fence is closed, and no
+/// release until the slave is idle and the minimum width has passed.
+#[test(reset_ctl_waits_for_the_fence)]
+module test_reset_ctl {
+    const MIN: u32 = 8;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen (
+        clk: clk,
+    );
+
+    var hold  : logic;
+    var pulse : logic;
+    var closed: logic;
+    var idle  : logic;
+    var fence : logic;
+    var drst  : logic;
+    var busy  : logic;
+
+    inst u_ctl: reset_ctl #(
+        MIN_CYCLES: MIN,
+    ) (
+        i_clk   : clk   ,
+        i_rst   : rst   ,
+        i_hold  : hold  ,
+        i_pulse : pulse ,
+        i_closed: closed,
+        i_idle  : idle  ,
+        o_fence : fence ,
+        o_rst   : drst  ,
+        o_busy  : busy  ,
+    );
+
+    initial {
+        hold   = 0;
+        pulse  = 0;
+        closed = 0;
+        idle   = 1;
+        rst.assert(4);
+        clk.next(2);
+        $assert(!fence && !drst && !busy, "quiet out of reset");
+
+        // Hold: no reset until the fence is closed.
+        hold = 1;
+        clk.next(1);
+        $assert(fence && busy, "the fence goes up first");
+        clk.next(5);
+        $assert(!drst, "reset before the fence closed");
+        closed = 1;
+        idle   = 0;
+        clk.next(2);
+        $assert(drst, "no reset after the fence closed");
+
+        // Release: not before the slave is idle.
+        hold = 0;
+        clk.next(MIN + 4);
+        $assert(drst, "released while the slave was still busy");
+        idle = 1;
+        clk.next(2);
+        $assert(!drst && !fence && !busy, "not released once idle");
+
+        // Pulse: held for at least the minimum width.
+        pulse = 1;
+        clk.next(1);
+        pulse = 0;
+        clk.next(2);
+        $assert(drst, "a pulse did not reset");
+        clk.next(MIN - 4);
+        $assert(drst, "released before the minimum width");
+        clk.next(6);
+        $assert(!drst && !busy, "a pulse did not release");
+        $finish();
+    }
+}

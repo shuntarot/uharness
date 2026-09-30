@@ -1,0 +1,187 @@
+/// A DUT that reaches memory over **AXI4**.
+///
+/// `backing` says where the data lives; the port shape is a fact about the
+/// DUT. This one is terminated by FPGA memory today (`backing = "bram"`) and
+/// will take a real controller (`backing = "dram"`) without changing a line.
+///
+/// The point of this example is not the DUT -- it is that **the host and the
+/// DUT reach the same memory**, and that they do so through the same AXI4 bus
+/// with an arbiter between them. There is no backdoor: a real memory
+/// controller does not have one, so the harness does not use one either.
+///
+/// Everything is driven from a CSR, so on hardware each step is one register
+/// write and one register read:
+///
+///   - write `i_addr` / `i_wdata`, pulse `i_start_wr`  -- the DUT writes one word
+///   - write `i_addr`, pulse `i_start_rd`, read `o_rdata` -- the DUT reads one word
+///   - set `i_sweep` -- the DUT reads continuously, so host traffic has to
+///     share the bus with it. `o_reads` shows it is really running.
+///
+/// **Board-independent.** Which board it is built for is decided by
+/// `gen --target`.
+module dut_top (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    // --- driven by the host (reg) ---
+    i_addr    : input logic<32>, // byte address of the next transaction
+    i_wdata   : input logic<32>, // the word to write
+    i_start_wr: input logic    , // 0 -> 1 starts one write
+    i_start_rd: input logic    , // 0 -> 1 starts one read
+    i_sweep   : input logic    , // while 1, read the whole memory over and over
+
+    // --- observed by the host (reg) ---
+    o_rdata : output logic<32>, // the word the last host-asked read returned
+    o_busy  : output logic    ,
+    o_reads : output logic<32>, // completed reads (sweep included)
+    o_writes: output logic<32>, // completed writes
+    o_resp  : output logic<2> , // the last RRESP / BRESP
+
+    // --- memory (dram) ---
+    axi: modport $std::axi4_if::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>>::master,
+) {
+    /// How much of the memory the sweep walks, in 32-bit words.
+    const SWEEP_WORDS: u32 = 256;
+
+    const IDLE : logic<2> = 2'd0;
+    const WRITE: logic<2> = 2'd1;
+    const READ : logic<2> = 2'd2;
+
+    var phase   : logic<2> ;
+    var aw_done : logic    ;
+    var wd_done : logic    ;
+    var ar_done : logic    ;
+    var addr_q  : logic<32>;
+    var data_q  : logic<32>;
+    var sweeping: logic    ;
+
+    var sweep_at: logic<$clog2(SWEEP_WORDS)>;
+
+    // **Start on an edge, not on a level.** A level would fire again the moment
+    // the transaction finished, so how many transactions one `hio write` costs
+    // would depend on how long the host took to write the clearing 0.
+    var wr_seen: logic;
+    var rd_seen: logic;
+
+    let wr_edge: logic = i_start_wr & ~wr_seen;
+    let rd_edge: logic = i_start_rd & ~rd_seen;
+
+    always_comb {
+        axi.awvalid  = (phase == WRITE) & ~aw_done;
+        axi.awaddr   = addr_q;
+        axi.awlen    = 0;
+        axi.awsize   = 3'd2;
+        axi.awburst  = 2'b01;
+        axi.awcache  = 0;
+        axi.awprot   = 0;
+        axi.awid     = 0;
+        axi.awlock   = 0;
+        axi.awqos    = 0;
+        axi.awregion = 0;
+        axi.awuser   = 0;
+
+        axi.wvalid = (phase == WRITE) & ~wd_done;
+        axi.wdata  = data_q;
+        axi.wstrb  = 4'hf;
+        axi.wlast  = 1;
+        axi.wuser  = 0;
+
+        axi.bready = 1;
+
+        axi.arvalid  = (phase == READ) & ~ar_done;
+        axi.araddr   = addr_q;
+        axi.arlen    = 0;
+        axi.arsize   = 3'd2;
+        axi.arburst  = 2'b01;
+        axi.arcache  = 0;
+        axi.arprot   = 0;
+        axi.arid     = 0;
+        axi.arlock   = 0;
+        axi.arqos    = 0;
+        axi.arregion = 0;
+        axi.aruser   = 0;
+
+        axi.rready = 1;
+    }
+
+    always_ff {
+        if_reset {
+            phase    = IDLE;
+            aw_done  = 0;
+            wd_done  = 0;
+            ar_done  = 0;
+            addr_q   = 0;
+            data_q   = 0;
+            sweeping = 0;
+            sweep_at = 0;
+            wr_seen  = 0;
+            rd_seen  = 0;
+            o_rdata  = 0;
+            o_reads  = 0;
+            o_writes = 0;
+            o_resp   = 0;
+        } else {
+            wr_seen = i_start_wr;
+            rd_seen = i_start_rd;
+
+            case phase {
+                IDLE: {
+                    if wr_edge {
+                        addr_q   = i_addr;
+                        data_q   = i_wdata;
+                        aw_done  = 0;
+                        wd_done  = 0;
+                        sweeping = 0;
+                        phase    = WRITE;
+                    } else if rd_edge {
+                        addr_q   = i_addr;
+                        ar_done  = 0;
+                        sweeping = 0;
+                        phase    = READ;
+                    } else if i_sweep {
+                        // The sweep exists to put traffic on the bus while the
+                        // host is using it. It walks the whole memory so it
+                        // cannot sit on one address the host never touches.
+                        addr_q   = {22'b0, sweep_at, 2'b00};
+                        ar_done  = 0;
+                        sweeping = 1;
+                        sweep_at = sweep_at + 1;
+                        phase    = READ;
+                    }
+                }
+                WRITE: {
+                    if axi.awvalid && axi.awready {
+                        aw_done = 1;
+                    }
+                    if axi.wvalid && axi.wready {
+                        wd_done = 1;
+                    }
+                    if axi.bvalid && axi.bready {
+                        o_writes = o_writes + 1;
+                        o_resp   = axi.bresp;
+                        phase    = IDLE;
+                    }
+                }
+                READ: {
+                    if axi.arvalid && axi.arready {
+                        ar_done = 1;
+                    }
+                    if axi.rvalid && axi.rready {
+                        o_reads = o_reads + 1;
+                        o_resp  = axi.rresp;
+                        // **The sweep does not touch `o_rdata`.** Otherwise the
+                        // value the host asked for would be gone before it
+                        // could be read back.
+                        if !sweeping {
+                            o_rdata = axi.rdata;
+                        }
+                        phase = IDLE;
+                    }
+                }
+                default: {}
+            }
+        }
+    }
+
+    assign o_busy = phase != IDLE;
+}

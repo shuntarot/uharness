@@ -1,0 +1,27 @@
+# DDR4: EDY4016AABG-DR-F, the part on older boards (board interface
+# ddr4_sdram_DR). Layered over default.toml.
+#
+# **Read out of the generated IP** (Vivado 2021.2, 2026-09-30): naming the
+# board interface fills in the part, the timing and the pins. The IP reports
+# 833 ps / 4:1, AXI 512 bits / address 31 / id 8 (the id width is ours), and
+# DM without DBI. The address width means 2 GB, although the board files call
+# the component "4GB". The user clock is 3.332 ns in the timing report of a
+# full build (300.12 MHz). The reset polarity is the one the VCU118's DDR4 IP
+# has.
+[provides]
+dram = {kind = "ddr4", device = "EDY4016AABG-DR-F", channels = 1, gb = 2, width = 64, controller = "ddr4", board_interface = "ddr4_sdram_DR", sys_clk = "ddr", axi_data_bits = 512, axi_addr_bits = 31, axi_id_bits = 8, ui_clk_mhz = 300.12, row_bits = 17, bank_bits = 2, bank_group_bits = 1, sys_rst_active = "high"}
+
+# The clock the DDR4 controller takes, straight from the board
+# (default_sysclk_300, the clock the board files bind to the DDR4 IP). It is
+# here, not in default.toml: without `dram` nothing claims it, and the harness
+# takes only one board clock.
+#
+# **The board files say LVDS; this says DIFF_SSTL12.** The pins sit in the
+# DDR4 bank, which runs at 1.2 V, and taxi's KCU105 XDC uses DIFF_SSTL12 too,
+# as the VCU118 does for its DDR4 clock.
+[clocks.ddr]
+freq_mhz = 300
+diff     = true
+pin_p    = "AK17"
+pin_n    = "AK16"
+standard = "DIFF_SSTL12"

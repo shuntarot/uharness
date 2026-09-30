@@ -1,0 +1,170 @@
+/// `hns::axi_aw` connects a 28-bit master to a 31-bit bus.
+///
+/// It checks two things. The upper bits are filled with 0 (no sign extension,
+/// no garbage). The top address of the narrow side passes through unchanged;
+/// address folding happens there. On real hardware the address was truncated
+/// to 28 bits, and a word written at 768 MB was read back at address 0.
+#[test(axi_aw_widens_without_folding)]
+module test_axi_aw {
+    const DEPTH: u32 = 16;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk: clk );
+
+    inst nar: $std::axi4_if::<$std::axi4_pkg::<28, 4, 4, 1, 1, 1, 1, 1>>;
+    inst wid: $std::axi4_if::<$std::axi4_pkg::<31, 4, 4, 1, 1, 1, 1, 1>>;
+
+    inst u_aw: axi_aw::<
+        $std::axi4_pkg::<28, 4, 4, 1, 1, 1, 1, 1>,
+        $std::axi4_pkg::<31, 4, 4, 1, 1, 1, 1, 1>,
+    > (
+        s_axi: nar,
+        m_axi: wid,
+    );
+
+    inst u_mem: axi_mem::<$std::axi4_pkg::<31, 4, 4, 1, 1, 1, 1, 1>> #(
+        DEPTH: DEPTH,
+    ) (
+        i_clk   : clk,
+        i_rst   : rst,
+        axi     : wid,
+        i_haddr : '0 ,
+        i_hwdata: '0 ,
+        i_hwstrb: '0 ,
+        i_hwe   : '0 ,
+        o_hrdata: _  ,
+    );
+
+    always_comb {
+        nar.awsize   = 3'd2;
+        nar.awburst  = 2'b01;
+        nar.awcache  = 0;
+        nar.awprot   = 0;
+        nar.awlock   = 0;
+        nar.awqos    = 0;
+        nar.awregion = 0;
+        nar.awuser   = 0;
+        nar.awlen    = 0;
+        nar.wuser    = 0;
+        nar.arsize   = 3'd2;
+        nar.arburst  = 2'b01;
+        nar.arcache  = 0;
+        nar.arprot   = 0;
+        nar.arlock   = 0;
+        nar.arqos    = 0;
+        nar.arregion = 0;
+        nar.aruser   = 0;
+        nar.arlen    = 0;
+    }
+
+    /// Writes one word and waits for the response.
+    function put (
+        addr: input logic<28>,
+        data: input logic<32>,
+    ) {
+        nar.awaddr  = addr;
+        nar.awid    = 3;
+        nar.awvalid = 1;
+        for _i in 0..64 {
+            if nar.awready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        nar.awvalid = 0;
+
+        nar.wdata  = data;
+        nar.wstrb  = 4'hf;
+        nar.wlast  = 1;
+        nar.wvalid = 1;
+        for _i in 0..64 {
+            if nar.wready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        nar.wvalid = 0;
+
+        for _i in 0..64 {
+            if nar.bvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $assert(nar.bvalid);
+        $assert(nar.bid == 3);
+        nar.bready = 1;
+        clk.next(1);
+        nar.bready = 0;
+    }
+
+    /// Reads one word and checks its value.
+    function get (
+        addr: input logic<28>,
+        want: input logic<32>,
+    ) {
+        nar.araddr  = addr;
+        nar.arid    = 4;
+        nar.arvalid = 1;
+        for _i in 0..64 {
+            if nar.arready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        nar.arvalid = 0;
+
+        nar.rready = 1;
+        for _i in 0..64 {
+            if nar.rvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $assert(nar.rvalid);
+        $assert(nar.rid == 4);
+        $assert(nar.rlast);
+        $assert(nar.rdata == want);
+        clk.next(1);
+        nar.rready = 0;
+    }
+
+    initial {
+        nar.awvalid = 0;
+        nar.wvalid  = 0;
+        nar.bready  = 0;
+        nar.arvalid = 0;
+        nar.rready  = 0;
+        nar.araddr  = 0;
+        nar.awaddr  = 0;
+        clk.next(4);
+
+        // The upper bits are 0. With sign extension, the top address would
+        // point into the highest 1 GB.
+        nar.araddr = 28'h0ff_fffc;
+        clk.next(1);
+        $assert(wid.araddr == 31'h0ff_fffc);
+        nar.awaddr = 28'h0ff_fffc;
+        clk.next(1);
+        $assert(wid.awaddr == 31'h0ff_fffc);
+
+        // 0 stays 0.
+        nar.araddr = 0;
+        clk.next(1);
+        $assert(wid.araddr == 0);
+
+        // Run traffic through it. The part is only wiring, so this is enough.
+        put(28'h00_0000, 32'hdead_beef);
+        put(28'h00_0004, 32'h00c0_ffee);
+        get(28'h00_0000, 32'hdead_beef);
+        get(28'h00_0004, 32'h00c0_ffee);
+
+        // The write did not land anywhere else.
+        put(28'h00_003c, 32'h5a5a_0001);
+        get(28'h00_003c, 32'h5a5a_0001);
+        get(28'h00_0000, 32'hdead_beef);
+    }
+}

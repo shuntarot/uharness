@@ -1,0 +1,27 @@
+# Target descriptions and how they resolve. Both the generator and the host
+# read them.
+#
+# The generator needs them for RTL and constraints. The host (`hio`) needs
+# them to identify the JTAG probe. A separate crate keeps each value in one
+# place.
+#
+# The descriptions (`targets/`, `targets-private/`) live under this directory
+# so that the package never reaches outside itself. Otherwise it could not be
+# moved into its own repository.
+[package]
+name        = "hns-targets"
+version     = "0.1.0"
+description = "Board target descriptions for veryl-harness, and how they resolve"
+edition     = "2024"
+# `mig.prj` files are copied from Xilinx's board store, under Apache-2.0.
+license     = "(MIT OR Apache-2.0) AND Apache-2.0"
+
+[dependencies]
+miette     = "7.6"
+rust-embed = {version = "8.12", features = ["debug-embed", "include-exclude"]}
+serde      = {version = "1.0", features = ["derive"]}
+thiserror  = "2.0"
+toml       = "1.1.2"
+
+[dev-dependencies]
+tempfile = "3.26"

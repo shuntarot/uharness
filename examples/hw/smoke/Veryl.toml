@@ -1,0 +1,9 @@
+[project]
+name    = "smoke"
+version = "0.1.0"
+
+[build]
+reset_type = "async_low"
+
+[dependencies]
+hns = { path = "../../../rtl/hns" }

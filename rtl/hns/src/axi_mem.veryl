@@ -1,0 +1,149 @@
+/// An AXI4 slave with `hns::mem` behind it.
+///
+/// A stand-in for `dram`: it terminates the DUT's AXI4 port in on-chip BRAM.
+/// The port stays the same, so only the place where data lives changes when
+/// the real memory is used.
+///
+/// The host reaches the memory directly through the back door of `hns::mem`
+/// (`i_haddr` / `i_hwdata`).
+///
+/// It accepts one transfer at a time. AXI4 allows a slave to do this. Several
+/// outstanding transfers would only add ordering rules to a stand-in.
+pub module axi_mem::<PKG: $std::axi4_prototype> #(
+    param DEPTH: u32 = 256,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    axi: modport $std::axi4_if::<PKG>::slave,
+
+    /// Host back door. Goes straight to port B of `hns::mem`.
+    i_haddr : input  logic<$clog2(DEPTH)>       ,
+    i_hwdata: input  logic<PKG::DATA_WIDTH_BYTES * 8>,
+    i_hwstrb: input  logic<PKG::DATA_WIDTH_BYTES>    ,
+    i_hwe   : input  logic                      ,
+    o_hrdata: output logic<PKG::DATA_WIDTH_BYTES * 8>,
+) {
+    const DW   : u32 = PKG::DATA_WIDTH_BYTES * 8;
+    const SW   : u32 = PKG::DATA_WIDTH_BYTES;
+    const IW   : u32 = $clog2(DEPTH);
+    /// Address bits inside one entry. AXI addresses are in bytes.
+    const SHIFT: u32 = $clog2(SW);
+
+    var w_busy : logic;
+    var r_busy : logic;
+    var index  : logic<IW>;
+    var left   : logic<8>;
+    var id     : logic<PKG::ID_LENGTH>;
+
+    // A write and a read are never accepted together. The memory has one port,
+    // so accepting both would drop one of them.
+    let idle: logic = !w_busy && !r_busy;
+
+    always_comb {
+        axi.awready = idle;
+        axi.arready = idle && !axi.awvalid;
+    }
+
+    var mem_we   : logic;
+    var mem_addr : logic<IW>;
+    var mem_wdata: logic<DW>;
+    var mem_wstrb: logic<SW>;
+    var mem_rdata: logic<DW>;
+
+    always_comb {
+        mem_addr  = index;
+        mem_we    = w_busy && axi.wvalid;
+        mem_wdata = axi.wdata;
+        mem_wstrb = axi.wstrb;
+    }
+
+    always_ff {
+        if_reset {
+            w_busy      = 0;
+            r_busy      = 0;
+            index       = 0;
+            left        = 0;
+            id          = 0;
+            axi.bvalid  = 0;
+            axi.rvalid  = 0;
+        } else {
+            if axi.bvalid && axi.bready {
+                axi.bvalid = 0;
+            }
+            if axi.rvalid && axi.rready {
+                axi.rvalid = 0;
+                if r_busy && left != 0 {
+                    index = index + 1;
+                    left  = left - 1;
+                } else if r_busy {
+                    r_busy = 0;
+                }
+            }
+
+            if idle && axi.awvalid {
+                w_busy = 1;
+                index  = axi.awaddr[IW + SHIFT - 1:SHIFT];
+                left   = axi.awlen;
+                id     = axi.awid;
+            } else if idle && axi.arvalid {
+                r_busy = 1;
+                index  = axi.araddr[IW + SHIFT - 1:SHIFT];
+                left   = axi.arlen;
+                id     = axi.arid;
+            }
+
+            if w_busy && axi.wvalid {
+                if axi.wlast {
+                    w_busy     = 0;
+                    axi.bvalid = 1;
+                    axi.bid    = id;
+                    axi.bresp  = 2'b00;
+                } else {
+                    index = index + 1;
+                }
+            }
+
+            if r_busy && !axi.rvalid {
+                axi.rvalid = 1;
+                axi.rid    = id;
+                axi.rresp  = 2'b00;
+                axi.rlast  = left == 0;
+            }
+        }
+    }
+
+    always_comb {
+        axi.wready = w_busy;
+        axi.rdata  = mem_rdata;
+    }
+
+    inst u_mem: mem #(
+        WIDTH    : DW      ,
+        SLICES   : 1       ,
+        DEPTH    : DEPTH   ,
+        LATENCY  : 1       ,
+        ADDR_W   : IW      ,
+        SHIFT    : 0       ,
+        STRB_W   : SW      ,
+        HAS_STRB : true    ,
+        HSTRB_W  : SW      ,
+        HAS_HSTRB: true    ,
+        HAS_EN   : false   ,
+    ) (
+        i_clk               ,
+        i_rst               ,
+        i_addr  : mem_addr  ,
+        o_rdata : mem_rdata ,
+        i_wdata : mem_wdata ,
+        i_wstrb : mem_wstrb ,
+        i_we    : mem_we    ,
+        i_en    : 1'b1      ,
+        o_oor   : _         ,
+        i_haddr             ,
+        i_hwdata            ,
+        i_hwstrb            ,
+        i_hwe               ,
+        o_hrdata            ,
+    );
+}

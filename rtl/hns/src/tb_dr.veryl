@@ -1,0 +1,192 @@
+/// Drives the bus DR from the TCK side and checks that reads and writes come
+/// out on AXI4-Lite.
+///
+/// BSCANE2 is not included. A vendor primitive would stop this test from
+/// running. The test bench makes the BSCANE2 outputs
+/// (sel/shift/capture/update/tdi) by itself.
+#[test(dr_read_write)]
+module test_dr {
+    const AW : u32 = 15;
+    const LEN: u32 = AW + 34;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    // TCK is a separate clock. Here it comes from the same clock_gen, but it
+    // toggles only once every few bus cycles, because TCK is slower than the bus.
+    // The clock type must be given in the declaration: a raw logic cannot
+    // connect to a clock port. Domain names and identifiers share one
+    // namespace, so `'tck` and `tck` cannot both exist.
+    var tck_r  : 'j logic;
+    let jtck   : 'j clock = tck_r;
+    var sel    : 'j logic;
+    var shift  : 'j logic;
+    var capture: 'j logic;
+    var update : 'j logic;
+    var tdi    : 'j logic;
+    var tdo    : 'j logic;
+
+    var awaddr : logic<32>;
+    var awvalid: logic    ;
+    var awready: logic    ;
+    var wdata  : logic<32>;
+    var wstrb  : logic<4> ;
+    var wvalid : logic    ;
+    var wready : logic    ;
+    var bresp  : logic<2> ;
+    var bvalid : logic    ;
+    var bready : logic    ;
+    var araddr : logic<32>;
+    var arvalid: logic    ;
+    var arready: logic    ;
+    var rdata  : logic<32>;
+    var rresp  : logic<2> ;
+    var rvalid : logic    ;
+    var rready : logic    ;
+
+    inst u: hns::dr #(
+        AW: AW,
+    ) (
+        i_tck    : jtck   ,
+        i_sel    : sel    ,
+        i_shift  : shift  ,
+        i_capture: capture,
+        i_update : update ,
+        i_tdi    : tdi    ,
+        o_tdo    : tdo    ,
+        i_clk    : clk    ,
+        i_rst    : rst    ,
+        o_awaddr : awaddr ,
+        o_awvalid: awvalid,
+        i_awready: awready,
+        o_wdata  : wdata  ,
+        o_wstrb  : wstrb  ,
+        o_wvalid : wvalid ,
+        i_wready : wready ,
+        i_bresp  : bresp  ,
+        i_bvalid : bvalid ,
+        o_bready : bready ,
+        o_araddr : araddr ,
+        o_arvalid: arvalid,
+        i_arready: arready,
+        i_rdata  : rdata  ,
+        i_rresp  : rresp  ,
+        i_rvalid : rvalid ,
+        o_rready : rready ,
+    );
+
+    /// Stands in for the window: a slave with one word and a fixed 1-cycle
+    /// latency. It follows the fixed-latency assumption of the transport.
+    var word: logic<32>;
+    always_ff (clk, rst) {
+        if_reset {
+            word    = 0;
+            awready = 0;
+            wready  = 0;
+            bvalid  = 0;
+            arready = 0;
+            rvalid  = 0;
+            rdata   = 0;
+        } else {
+            awready = awvalid;
+            wready  = wvalid;
+            bvalid  = wvalid && wready;
+            if wvalid && wready {
+                word = wdata;
+            }
+            arready = arvalid;
+            rvalid  = arready && arvalid;
+            rdata   = word;
+        }
+    }
+    assign bresp = 2'b00;
+    assign rresp = 2'b00;
+
+    /// One TCK pulse, slower than the bus clock.
+    function tck_pulse () {
+        tck_r = 0;
+        clk.next(2);
+        tck_r = 1;
+        clk.next(2);
+        tck_r = 0;
+        clk.next(2);
+    }
+
+    /// Shifts the DR once. Shifts in `send` and returns the bits shifted out.
+    function scan (
+        send: input logic<LEN>,
+    ) -> logic<LEN> {
+        var got: logic<LEN>;
+        // The TAP path (Exit1-DR -> Update-DR -> Select-DR -> Capture-DR) always
+        // takes several TCK edges. The 2-FF synchronizer on the TCK side relies
+        // on that, so the test gives the same number of edges.
+        sel     = 1;
+        capture = 0;
+        shift   = 0;
+        update  = 0;
+        tck_pulse();
+        tck_pulse();
+        tck_pulse();
+        capture = 1;
+        tck_pulse();
+        capture = 0;
+        shift   = 1;
+        for i in 0..LEN {
+            got[i] = tdo;
+            tdi    = send[i];
+            tck_pulse();
+        }
+        shift  = 0;
+        update = 1;
+        tck_pulse();
+        update = 0;
+        sel    = 0;
+        return got;
+    }
+
+    var out: logic<LEN>;
+    var cmd: logic<LEN>;
+
+    initial {
+        sel     = 0;
+        shift   = 0;
+        capture = 0;
+        update  = 0;
+        tdi     = 0;
+        tck_r   = 0;
+        rst.assert(4);
+        clk.next(8);
+
+        // Write: addr = 0x10, data = 0xa5a5_1234, op = write
+        cmd             = 0;
+        cmd[1:0]        = 2'b10;
+        cmd[33:2]       = 32'ha5a5_1234;
+        cmd[LEN - 1:34] = 15'h10;
+        out             = scan(cmd);
+        $display("after write cmd: busy=%b err=%b", out[0], out[1]);
+
+        // Wait until it is done (busy goes low).
+        clk.next(40);
+
+        // Read the same address. The previous result is from a write, so rdata
+        // is not checked here.
+        cmd             = 0;
+        cmd[1:0]        = 2'b01;
+        cmd[LEN - 1:34] = 15'h10;
+        out             = scan(cmd);
+        $display("after read cmd: busy=%b err=%b rdata=%h", out[0], out[1], out[33:2]);
+        $assert(out[0] == 1'b0); // not busy
+        $assert(out[1] == 1'b0); // no sticky_err
+
+        clk.next(40);
+
+        // Send a nop to collect the result of the previous read (the scan is
+        // pipelined).
+        cmd = 0;
+        out = scan(cmd);
+        $display("after nop: busy=%b err=%b rdata=%h", out[0], out[1], out[33:2]);
+        $assert(out[0] == 1'b0);
+        $assert(out[1] == 1'b0);
+        $assert(out[33:2] == 32'ha5a5_1234);
+    }
+}

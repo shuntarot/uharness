@@ -1,0 +1,158 @@
+/// Two AXI4 masters, one slave, taken in turns.
+///
+/// `dram` is not only for the DUT. The host must reach the same memory, and a
+/// real memory controller has no back door, so this is the only path. The
+/// downstream side is the same for the stand-in (`hns::axi_mem`) and a real
+/// MIG, so this arbiter stays when one replaces the other.
+///
+/// Round robin, not priority, for the same reason as `hns::axil_rr`: with a
+/// fixed priority, the losing side is locked out for as long as the other
+/// keeps requesting. Here the side locked out would be the host, which is also
+/// the path used to tell a stopped DUT from a broken transfer.
+///
+/// Reads and writes are arbitrated separately. AXI4 channels are independent,
+/// so a read from one side has no reason to wait behind a write from the other.
+///
+/// The winner keeps the path until its response returns: `BVALID` for a write,
+/// `RLAST` for a read. Handing over a channel in the middle would put one
+/// side's data under the other side's address.
+///
+/// Masters must follow the AXI4 rule: `VALID` stays high until `READY`. A
+/// master that raises it for one cycle and does not wait withdraws its address
+/// just after winning, and the downstream side waits forever.
+pub module axi_rr::<PKG: $std::axi4_prototype> (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    m0: modport $std::axi4_if::<PKG>::slave ,
+    m1: modport $std::axi4_if::<PKG>::slave ,
+    s : modport $std::axi4_if::<PKG>::master,
+) {
+    var w_busy: logic;
+    var w_own : logic;
+    var w_prev: logic;
+    var r_busy: logic;
+    var r_own : logic;
+    var r_prev: logic;
+
+    // Ask the side that did not win last time first. This only matters when
+    // both sides request.
+    let w_pick: logic = if w_prev == 0 ? (if m1.awvalid ? 1 : 0) : (if m0.awvalid ? 0 : 1);
+    let r_pick: logic = if r_prev == 0 ? (if m1.arvalid ? 1 : 0) : (if m0.arvalid ? 0 : 1);
+
+    let w_ask: logic = m0.awvalid | m1.awvalid;
+    let r_ask: logic = m0.arvalid | m1.arvalid;
+
+    // The grant is combinational. A register would only add one cycle.
+    let w_sel: logic = if w_busy ? w_own : w_pick;
+    let r_sel: logic = if r_busy ? r_own : r_pick;
+
+    let w_on: logic = w_busy | w_ask;
+    let r_on: logic = r_busy | r_ask;
+
+    always_comb {
+        // --- Write address ---
+        s.awaddr   = if w_sel ? m1.awaddr : m0.awaddr;
+        s.awsize   = if w_sel ? m1.awsize : m0.awsize;
+        s.awburst  = if w_sel ? m1.awburst : m0.awburst;
+        s.awcache  = if w_sel ? m1.awcache : m0.awcache;
+        s.awprot   = if w_sel ? m1.awprot : m0.awprot;
+        s.awid     = if w_sel ? m1.awid : m0.awid;
+        s.awlen    = if w_sel ? m1.awlen : m0.awlen;
+        s.awlock   = if w_sel ? m1.awlock : m0.awlock;
+        s.awqos    = if w_sel ? m1.awqos : m0.awqos;
+        s.awregion = if w_sel ? m1.awregion : m0.awregion;
+        s.awuser   = if w_sel ? m1.awuser : m0.awuser;
+        s.awvalid  = w_on & (if w_sel ? m1.awvalid : m0.awvalid);
+
+        m0.awready = w_on & ~w_sel & s.awready;
+        m1.awready = w_on & w_sel & s.awready;
+
+        // --- Write data ---
+        s.wdata  = if w_sel ? m1.wdata : m0.wdata;
+        s.wstrb  = if w_sel ? m1.wstrb : m0.wstrb;
+        s.wlast  = if w_sel ? m1.wlast : m0.wlast;
+        s.wuser  = if w_sel ? m1.wuser : m0.wuser;
+        s.wvalid = w_on & (if w_sel ? m1.wvalid : m0.wvalid);
+
+        m0.wready = w_on & ~w_sel & s.wready;
+        m1.wready = w_on & w_sel & s.wready;
+
+        // --- Write response ---
+        s.bready = w_on & (if w_sel ? m1.bready : m0.bready);
+
+        m0.bvalid = w_on & ~w_sel & s.bvalid;
+        m1.bvalid = w_on & w_sel & s.bvalid;
+        m0.bresp  = s.bresp;
+        m1.bresp  = s.bresp;
+        m0.bid    = s.bid;
+        m1.bid    = s.bid;
+        m0.buser  = s.buser;
+        m1.buser  = s.buser;
+
+        // --- Read address ---
+        s.araddr   = if r_sel ? m1.araddr : m0.araddr;
+        s.arsize   = if r_sel ? m1.arsize : m0.arsize;
+        s.arburst  = if r_sel ? m1.arburst : m0.arburst;
+        s.arcache  = if r_sel ? m1.arcache : m0.arcache;
+        s.arprot   = if r_sel ? m1.arprot : m0.arprot;
+        s.arid     = if r_sel ? m1.arid : m0.arid;
+        s.arlen    = if r_sel ? m1.arlen : m0.arlen;
+        s.arlock   = if r_sel ? m1.arlock : m0.arlock;
+        s.arqos    = if r_sel ? m1.arqos : m0.arqos;
+        s.arregion = if r_sel ? m1.arregion : m0.arregion;
+        s.aruser   = if r_sel ? m1.aruser : m0.aruser;
+        s.arvalid  = r_on & (if r_sel ? m1.arvalid : m0.arvalid);
+
+        m0.arready = r_on & ~r_sel & s.arready;
+        m1.arready = r_on & r_sel & s.arready;
+
+        // --- Read data ---
+        s.rready = r_on & (if r_sel ? m1.rready : m0.rready);
+
+        m0.rvalid = r_on & ~r_sel & s.rvalid;
+        m1.rvalid = r_on & r_sel & s.rvalid;
+        m0.rdata  = s.rdata;
+        m1.rdata  = s.rdata;
+        m0.rresp  = s.rresp;
+        m1.rresp  = s.rresp;
+        m0.rid    = s.rid;
+        m1.rid    = s.rid;
+        m0.rlast  = s.rlast;
+        m1.rlast  = s.rlast;
+        m0.ruser  = s.ruser;
+        m1.ruser  = s.ruser;
+    }
+
+    always_ff {
+        if_reset {
+            w_busy = 0;
+            w_own  = 0;
+            w_prev = 1;
+            r_busy = 0;
+            r_own  = 0;
+            r_prev = 1;
+        } else {
+            // Hold until the response returns. Handing over at the end of the
+            // address phase would send one side's write data under the other
+            // side's address.
+            if w_on && s.bvalid && s.bready {
+                w_busy = 0;
+                w_prev = w_sel;
+            } else if !w_busy && w_ask {
+                w_busy = 1;
+                w_own  = w_pick;
+            }
+
+            // A read holds until `RLAST`. Handing over mid-burst would send the
+            // rest of the burst to the other side.
+            if r_on && s.rvalid && s.rready && s.rlast {
+                r_busy = 0;
+                r_prev = r_sel;
+            } else if !r_busy && r_ask {
+                r_busy = 1;
+                r_own  = r_pick;
+            }
+        }
+    }
+}

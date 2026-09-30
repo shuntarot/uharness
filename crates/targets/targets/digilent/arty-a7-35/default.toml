@@ -1,0 +1,194 @@
+# Digilent Arty A7-35T
+#
+# This describes what the board **can do**, not where every signal goes. Pin
+# assignments are added when the XDC is generated; the only pins here are the
+# ones whose identity changes the meaning (the board clock and reset).
+#
+# **The schema is provisional.** It is being settled by writing targets rather
+# than declared up front.
+#
+# Every value comes from a Vivado flow that runs on the board, or from a
+# measurement noted below. Nothing here is a guess.
+
+[board]
+provider    = "digilent"
+name        = "arty-a7-35"
+description = "Digilent Arty A7-35T"
+url         = "https://digilent.com/reference/programmable-logic/arty-a7/start"
+
+[device]
+vendor = "xilinx"
+family = "artix7"
+part   = "xc7a35ticsg324-1L"
+
+# Regex matched against the device names hw_manager lists, to pick one when
+# several FPGAs are attached. It cannot be derived from the part number: on
+# 7-series the temperature grade and package run together
+# (`xc7a35t` + `icsg324` + `-1L`).
+hw_pattern = "xc7a35t"
+
+# The MIG is generated from `mig.prj` beside this file, a copy of the board
+# file (see README.md). No Vivado board files are needed.
+[vivado]
+board_part = "digilentinc.com:arty:part0:1.1"
+mig_prj    = "mig.prj"
+
+[provides]
+# JTAG only; this board has no PCIe.
+transport = ["jtag"]
+
+# 36Kb x 50 = 1,800 Kbit on the XC7A35T. **From the datasheet** — not confirmed
+# against a utilization report.
+bram_kb = 225
+
+# What the MIG needs and what it presents. **Read out of `mig.prj`**
+# (2026-09-08). Both `sys_clk` and `ref_clk` are "No Buffer", so the harness
+# MMCM makes them.
+dram = {kind = "ddr3l", device = "MT41K128M16XX-15E", channels = 1, mb = 256, width = 16, controller = "mig", sys_clk_mhz = 166.666, ref_clk_mhz = 200.0, ui_clk_mhz = 83.333, axi_data_bits = 128, axi_addr_bits = 28, axi_id_bits = 4, row_bits = 14, bank_bits = 3, sys_rst_active = "low"}
+
+# The board's clock source. Frequency and pin are fixed by the board.
+[clocks.sys]
+freq_mhz = 100
+diff     = false
+pin      = "E3"
+standard = "LVCMOS33"
+
+# ck_rst. A push button, **active low**.
+[resets.sys]
+pin      = "C2"
+standard = "LVCMOS33"
+active   = "low"
+
+# Signals the board brings out. **Facts about the board only** — which port is
+# connected to which is decided in the manifest's `[pin]`, by resource name.
+#
+# From Digilent's board files, `board_files/arty/C.0/{part0_pins.xml,
+# board.xml}`. **Directions are as the FPGA sees them**, taken from
+# `<port_map logical_port="TxD" ... dir="out">`: the pin names
+# (`usb_uart_txd` / `rxd`) are named from the USB chip's side and read backwards
+# here.
+[pins.uart_tx]
+pin       = "D10"
+standard  = "LVCMOS33"
+direction = "output"
+
+[pins.uart_rx]
+pin       = "A9"
+standard  = "LVCMOS33"
+direction = "input"
+
+[jtag]
+# How Vivado reaches the device. `hio` does not use this; it drives the FTDI
+# directly with the values below.
+via = "vivado_hw_server"
+
+# The ceiling constrained on the bridge's TCK. **This is a choice, not a
+# measurement**, so it can be stated: if the host runs faster than this, the
+# timing analysis done at synthesis is no longer true.
+max_tck_mhz = 30
+
+# The adapter `hio` opens. **Measured** (2026-08-25, `lsusb -d 0403: -v`):
+#
+#   idVendor  0x0403  Future Technology Devices International
+#   idProduct 0x6010  FT2232C/D/H Dual UART/FIFO
+#   iProduct  "Digilent USB Device"
+#   two interfaces, 0 and 1
+#
+# On the FT2232H, **channel A (interface 0) is JTAG and B (interface 1) is the
+# UART**. The heartbeat is read on B, at the same time as JTAG is in use.
+vid       = 0x0403
+pid       = 0x6010
+interface = 0
+product   = "Digilent USB Device"
+
+# **No serial number here.** That identifies one board, not the type; pass it to
+# `hio` at run time when several of the same type are attached.
+
+# The MPSSE GPIO values that enable the level shifters (data, direction).
+#
+# **Measured** (2026-08-25, OpenOCD 0.11). Without them:
+#
+#   Error: JTAG scan chain interrogation failed: all ones
+#
+# — **TDO never comes back**. With `0x0088 0x008b`:
+#
+#   Info : JTAG tap: tap/device found: 0x0362d093 (mfg: 0x049 (Xilinx), part: 0x362d)
+#
+# The values come from OpenOCD's `interface/ftdi/digilent-hs1.cfg` (same
+# `0403:6010`), but they are recorded here **because they were confirmed on this
+# board**. Note that hs1.cfg matches `"Digilent Adept USB Device"` while the
+# on-board module reports `"Digilent USB Device"`, so it does not apply as-is:
+# Digilent uses a different descriptor per product.
+layout_init = [0x0088, 0x008b]
+
+# **What the host may actually clock. Not the same as `max_tck_mhz`.**
+#
+# `max_tck_mhz` is what the device accepts, and constrains the XDC. This one is
+# set by the round-trip delay through the cable and the level shifters, and can
+# only be measured.
+#
+# At 30 MHz `hio bench` came back corrupted (2026-09-02). Neither `Dropped` nor
+# `sticky_err` appeared, so the bridge was not discarding commands — **TDO was
+# not being sampled in time**: the round trip does not fit in the 16.7 ns half
+# period. At 20 MHz, 10000 reads came back clean at 0.94 MB/s.
+host_tck_mhz = 20
+
+# IR length of the TAP. **Measured** — with `-irlen 6` the IR capture pattern
+# comes back as expected (`0x01`); a wrong value gives `IR capture error`.
+ir_length = 6
+
+# The device IDCODE. **Measured** (XC7A35T). Confirms that the device that was
+# opened really is this board.
+idcode = 0x0362d093
+
+# The IR value that selects BSCANE2 `JTAG_CHAIN 1` (USER1). **Measured**
+# (2026-08-25).
+#
+# With a bitstream carrying the bridge, `irscan 0x02` followed by two 41-bit DR
+# scans returned `0x159214938` on the second — magic (`0x5648524e`) << 2, the low
+# two bits being busy and err, both 0. **This was confirmed by the bridge
+# answering, not copied out of UG470.**
+user1_ir = 0x02
+
+# The IRs for configuring over JTAG (UG470 Table 6-3, 7-series). **Measured**
+# (2026-09-03).
+#
+# `hio program` loaded a bitstream and **the design it loaded answered on the
+# window**. All four have to be right for that, so passing confirms the set.
+#
+# `jprogram_ir` was also confirmed on its own with `hio erase`: a running
+# harness stopped answering. **That is what made the table trustworthy**, after
+# which only the data path had to be watched.
+jprogram_ir = 0x0b
+cfg_in_ir   = 0x05
+jstart_ir   = 0x0c
+bypass_ir   = 0x3f
+
+# **Read back rather than just waited for**, which is what Vivado's SVF does
+# (read on 2026-09-03). The bits carry no meaning here; `TDO`/`MASK` are copied
+# from the SVF as they are, because guessing at their meaning breaks quietly
+# when the sequence changes.
+#
+#   SIR 6 TDI (14) TDO (11) MASK (31)   after JPROGRAM, the erase finished
+#   SIR 6 TDI (09) TDO (31) MASK (11)   after JSTART, DONE
+[jtag.ready]
+ir     = 0x14   # ISC_NOOP
+expect = 0x11
+mask   = 0x31
+
+[jtag.done]
+ir     = 0x09   # IDCODE
+expect = 0x31
+mask   = 0x11
+# Hardware actually returns `0x35` here, which differs from the SVF's `0x31` but
+# matches once the mask is applied. **Do not compare exactly.**
+
+# One SLR, so no `[[jtag.slr]]`: the whole `.bit` goes in one shift. Vivado's SVF
+# does the same (a single CFG_IN of 17536096 bits, the length of the `.bit`
+# payload).
+
+# Written with the same schema a multi-device board would use. Branching on
+# "just one" leaves the multi-device path to rot.
+[topology]
+nodes = 1
+links = []

@@ -1,0 +1,31 @@
+# full -- hio run bringup.hio
+# With regs.json next to you, neither --regs nor --target is needed.
+
+echo == identity ==
+id
+
+echo == control ports round-trip ==
+write i_addr 0x1234
+read i_addr
+write i_wdata 0x44444444 0x33333333 0x22222222 0x11111111
+read i_wdata
+
+echo == bram bundle: 8 entries x 16 bytes ==
+read mem_depth
+memtest mem
+read mem_oor
+
+echo == slave: a register file inside the DUT ==
+# `slave` is the opposite of `reg`: the data lives in the DUT and the harness
+# opens a window onto it. From here it looks like any other region.
+write csr 0 0xc0de0000 0xc0de0001 0xc0de0002 0xc0de0003
+read csr 0 4
+memtest csr
+
+echo == poll fifo ==
+read tx_depth
+read tx_level
+drain tx --max 8
+
+echo == the whole window ==
+dump

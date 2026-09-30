@@ -1,0 +1,191 @@
+/// Two AXI4-Lite masters, one slave, taken in turns.
+///
+/// With PCIe, the window has two masters: the JTAG bridge and the BAR. JTAG
+/// stays as the way to tell "the window is broken" from "PCIe is broken",
+/// which only works if JTAG can still get through.
+///
+/// Round robin, not priority. Under a fixed priority the favoured master
+/// can keep the other out for as long as it keeps asking -- and the one that
+/// would be starved is the escape route. Taking turns costs both of them a
+/// little and starves neither.
+///
+/// Reads and writes are arbitrated separately, so a read on one master does
+/// not wait behind a write on the other. Within each, the winner holds the
+/// path until its response lands: a transaction whose channels were split
+/// between two masters would return the wrong data to the wrong one.
+///
+/// Arbitration makes a collision harmless, not correct. Two masters writing
+/// the same register still leaves an undefined value -- that is the user's
+/// business, not the harness's.
+///
+/// This assumes the slave takes one read (and one write) at a time, holding
+/// `arready` low while a response is outstanding. The path is handed over the
+/// moment a response lands, so a slave with two in flight would send the first
+/// answer to whoever asked second. `hns::axil` behaves this way.
+pub module axil_rr #(
+    param ADDR_W: u32 = 32,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    // --- master 0 ---
+    i_m0_awaddr : input  logic<ADDR_W>,
+    i_m0_awvalid: input  logic        ,
+    o_m0_awready: output logic        ,
+    i_m0_wdata  : input  logic<32>    ,
+    i_m0_wstrb  : input  logic<4>     ,
+    i_m0_wvalid : input  logic        ,
+    o_m0_wready : output logic        ,
+    o_m0_bresp  : output logic<2>     ,
+    o_m0_bvalid : output logic        ,
+    i_m0_bready : input  logic        ,
+    i_m0_araddr : input  logic<ADDR_W>,
+    i_m0_arvalid: input  logic        ,
+    o_m0_arready: output logic        ,
+    o_m0_rdata  : output logic<32>    ,
+    o_m0_rresp  : output logic<2>     ,
+    o_m0_rvalid : output logic        ,
+    i_m0_rready : input  logic        ,
+
+    // --- master 1 ---
+    i_m1_awaddr : input  logic<ADDR_W>,
+    i_m1_awvalid: input  logic        ,
+    o_m1_awready: output logic        ,
+    i_m1_wdata  : input  logic<32>    ,
+    i_m1_wstrb  : input  logic<4>     ,
+    i_m1_wvalid : input  logic        ,
+    o_m1_wready : output logic        ,
+    o_m1_bresp  : output logic<2>     ,
+    o_m1_bvalid : output logic        ,
+    i_m1_bready : input  logic        ,
+    i_m1_araddr : input  logic<ADDR_W>,
+    i_m1_arvalid: input  logic        ,
+    o_m1_arready: output logic        ,
+    o_m1_rdata  : output logic<32>    ,
+    o_m1_rresp  : output logic<2>     ,
+    o_m1_rvalid : output logic        ,
+    i_m1_rready : input  logic        ,
+
+    // --- the slave (the window) ---
+    o_s_awaddr : output logic<ADDR_W>,
+    o_s_awvalid: output logic        ,
+    i_s_awready: input  logic        ,
+    o_s_wdata  : output logic<32>    ,
+    o_s_wstrb  : output logic<4>     ,
+    o_s_wvalid : output logic        ,
+    i_s_wready : input  logic        ,
+    i_s_bresp  : input  logic<2>     ,
+    i_s_bvalid : input  logic        ,
+    o_s_bready : output logic        ,
+    o_s_araddr : output logic<ADDR_W>,
+    o_s_arvalid: output logic        ,
+    i_s_arready: input  logic        ,
+    i_s_rdata  : input  logic<32>    ,
+    i_s_rresp  : input  logic<2>     ,
+    i_s_rvalid : input  logic        ,
+    o_s_rready : output logic        ,
+
+    /// Which master the slave is serving right now. 0 = m0, 1 = m1.
+    ///
+    /// The window needs this once a terminator keeps per-master state -- a
+    /// moving aperture over a memory too big for the window keeps one base
+    /// register per master, so that one master moving its base cannot make
+    /// the other read a different address without noticing. Reads and writes
+    /// are arbitrated separately, so there are two of these.
+    o_s_wmaster: output logic        ,
+    o_s_rmaster: output logic        ,
+) {
+    var w_busy: logic; // a write owns the path
+    var w_own : logic; // which master owns it
+    var w_last: logic; // who won last, so the other goes first
+    var r_busy: logic;
+    var r_own : logic;
+    var r_last: logic;
+
+    // Whoever did not win last gets asked first. With only one asking the
+    // choice is forced anyway; the memory only matters when both ask.
+    let w_pick: logic = if w_last == 0 ?
+        (if i_m1_awvalid ? 1 : 0)
+        : (if i_m0_awvalid ? 0 : 1);
+    let r_pick: logic = if r_last == 0 ?
+        (if i_m1_arvalid ? 1 : 0)
+        : (if i_m0_arvalid ? 0 : 1);
+
+    let w_ask: logic = i_m0_awvalid | i_m1_awvalid;
+    let r_ask: logic = i_m0_arvalid | i_m1_arvalid;
+
+    // The grant is combinational, so an idle arbiter is transparent.
+    // Registering it would cost a cycle, and a master that pulses `valid` for
+    // one cycle without waiting for `ready` -- which the JTAG bridge and the
+    // testbenches do -- would lose the request entirely.
+    let w_sel   : logic = if w_busy ? w_own : w_pick;
+    let r_sel   : logic = if r_busy ? r_own : r_pick;
+    let w_active: logic = w_busy | w_ask;
+    let r_active: logic = r_busy | r_ask;
+
+    always_comb {
+        o_s_wmaster = w_sel;
+        o_s_rmaster = r_sel;
+
+        // Write path: only the master that holds it is connected.
+        o_s_awaddr  = if w_sel ? i_m1_awaddr : i_m0_awaddr;
+        o_s_awvalid = w_active & (if w_sel ? i_m1_awvalid : i_m0_awvalid);
+        o_s_wdata   = if w_sel ? i_m1_wdata : i_m0_wdata;
+        o_s_wstrb   = if w_sel ? i_m1_wstrb : i_m0_wstrb;
+        o_s_wvalid  = w_active & (if w_sel ? i_m1_wvalid : i_m0_wvalid);
+        o_s_bready  = w_active & (if w_sel ? i_m1_bready : i_m0_bready);
+
+        o_m0_awready = w_active & ~w_sel & i_s_awready;
+        o_m1_awready = w_active & w_sel & i_s_awready;
+        o_m0_wready  = w_active & ~w_sel & i_s_wready;
+        o_m1_wready  = w_active & w_sel & i_s_wready;
+        o_m0_bvalid  = w_active & ~w_sel & i_s_bvalid;
+        o_m1_bvalid  = w_active & w_sel & i_s_bvalid;
+        o_m0_bresp   = i_s_bresp;
+        o_m1_bresp   = i_s_bresp;
+
+        // Read path.
+        o_s_araddr  = if r_sel ? i_m1_araddr : i_m0_araddr;
+        o_s_arvalid = r_active & (if r_sel ? i_m1_arvalid : i_m0_arvalid);
+        o_s_rready  = r_active & (if r_sel ? i_m1_rready : i_m0_rready);
+
+        o_m0_arready = r_active & ~r_sel & i_s_arready;
+        o_m1_arready = r_active & r_sel & i_s_arready;
+        o_m0_rvalid  = r_active & ~r_sel & i_s_rvalid;
+        o_m1_rvalid  = r_active & r_sel & i_s_rvalid;
+        o_m0_rdata   = i_s_rdata;
+        o_m1_rdata   = i_s_rdata;
+        o_m0_rresp   = i_s_rresp;
+        o_m1_rresp   = i_s_rresp;
+    }
+
+    always_ff {
+        if_reset {
+            w_busy = 0;
+            w_own  = 0;
+            w_last = 1;
+            r_busy = 0;
+            r_own  = 0;
+            r_last = 1;
+        } else {
+            // Held until the response lands. Handing the path over at the
+            // end of the address phase would send the write data of one master
+            // under the address of the other.
+            if w_active && o_s_bready && i_s_bvalid {
+                w_busy = 0;
+                w_last = w_sel;
+            } else if !w_busy && w_ask {
+                w_busy = 1;
+                w_own  = w_pick;
+            }
+
+            if r_active && o_s_rready && i_s_rvalid {
+                r_busy = 0;
+                r_last = r_sel;
+            } else if !r_busy && r_ask {
+                r_busy = 1;
+                r_own  = r_pick;
+            }
+        }
+    }
+}

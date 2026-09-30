@@ -1,0 +1,168 @@
+/// Turns the host window into an AXI4 master.
+///
+/// A real memory controller has no back door. The only way for the host to
+/// reach `dram` contents is a second master in the harness, arbitrated with
+/// the DUT. This is that host-side master. It works the same whether the
+/// downstream side is the stand-in (`hns::axi_mem`) or a real MIG.
+///
+/// Reads and writes run independently. The window (`hns::axil`) is AXI4-Lite,
+/// so its read and write channels are independent, and a read pulse can arrive
+/// during a write. With a single state machine, that pulse would be lost and
+/// the window would never answer again.
+///
+/// The window is 32 bits; the AXI bus can be wider. The word is selected here:
+/// a write sets `WSTRB` only for its 4 bytes, and a read is cut out of the
+/// returned beat. The window-side decode then stays at one entry per word.
+pub module axi_host::<PKG: $std::axi4_prototype> #(
+    /// Width of the window's 32-bit word index.
+    param ADDR_W: u32 = 8,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    axi: modport $std::axi4_if::<PKG>::master,
+
+    i_haddr  : input  logic<ADDR_W>,
+    i_hwdata : input  logic<32>    ,
+    i_hwe    : input  logic        ,
+    i_hre    : input  logic        ,
+    o_hrdata : output logic<32>    ,
+    /// Read data is valid (one cycle). Connect to `i_rvalid` of `hns::axil`.
+    o_hrvalid: output logic        ,
+    /// A write can be accepted. Connect to `i_wready` of `hns::axil`.
+    o_hwready: output logic        ,
+) {
+    const SW   : u32 = PKG::DATA_WIDTH_BYTES;
+    const DW   : u32 = SW * 8;
+    /// 32-bit words per AXI bus beat.
+    const WORDS: u32 = SW / 4;
+    /// Bits that pick a word inside a beat. It is 1 bit even when a beat holds
+    /// one word, because width 0 is not allowed; the value is then forced to 0.
+    const SEL_W: u32 = if WORDS >: 1 ? $clog2(WORDS) : 1;
+    const LSB  : u32 = $clog2(WORDS);
+    /// AWSIZE / ARSIZE is log2 of the byte count. Beats are full width, so this
+    /// is the bus width.
+    const SHIFT: u32 = $clog2(SW);
+
+    /// The part of the window word index that points inside an AXI beat.
+    let word_mask: logic<SEL_W>             = WORDS - 1                 ;
+    let word     : logic<SEL_W>             = i_haddr[SEL_W - 1:0] & word_mask;
+    /// Byte address, aligned to the bus width.
+    let bus_index: logic<PKG::ADDRESS_WIDTH> = i_haddr >> LSB           ;
+    let byte_addr: logic<PKG::ADDRESS_WIDTH> = bus_index << SHIFT       ;
+    /// The value for AWSIZE / ARSIZE.
+    let size_c   : logic<3>                 = SHIFT                     ;
+    /// The 4 strobe bits to set, and their position.
+    let strb_one : logic<SW>                = 4'hf                      ;
+    let strb_shift: logic<8>                = {word, 2'b00}             ;
+
+    var w_busy : logic                     ;
+    var aw_done: logic                     ;
+    var wd_done: logic                     ;
+    var w_addr : logic<PKG::ADDRESS_WIDTH> ;
+    var w_data : logic<DW>                 ;
+    var w_strb : logic<SW>                 ;
+
+    var r_busy : logic                     ;
+    var ar_done: logic                     ;
+    var r_addr : logic<PKG::ADDRESS_WIDTH> ;
+    var r_word : logic<SEL_W>              ;
+    var r_data : logic<32>                 ;
+    var r_out  : logic                     ;
+
+    always_comb {
+        axi.awvalid  = w_busy & ~aw_done;
+        axi.awaddr   = w_addr;
+        axi.awlen    = 0;
+        axi.awsize   = size_c;
+        axi.awburst  = 2'b01;
+        axi.awcache  = 0;
+        axi.awprot   = 0;
+        axi.awid     = 0;
+        axi.awlock   = 0;
+        axi.awqos    = 0;
+        axi.awregion = 0;
+        axi.awuser   = 0;
+
+        axi.wvalid = w_busy & ~wd_done;
+        axi.wdata  = w_data;
+        axi.wstrb  = w_strb;
+        axi.wlast  = 1;
+        axi.wuser  = 0;
+
+        axi.bready = 1;
+
+        axi.arvalid  = r_busy & ~ar_done;
+        axi.araddr   = r_addr;
+        axi.arlen    = 0;
+        axi.arsize   = size_c;
+        axi.arburst  = 2'b01;
+        axi.arcache  = 0;
+        axi.arprot   = 0;
+        axi.arid     = 0;
+        axi.arlock   = 0;
+        axi.arqos    = 0;
+        axi.arregion = 0;
+        axi.aruser   = 0;
+
+        axi.rready = 1;
+    }
+
+    always_ff {
+        if_reset {
+            w_busy  = 0;
+            aw_done = 0;
+            wd_done = 0;
+            w_addr  = 0;
+            w_data  = 0;
+            w_strb  = 0;
+            r_busy  = 0;
+            ar_done = 0;
+            r_addr  = 0;
+            r_word  = 0;
+            r_data  = 0;
+            r_out   = 0;
+        } else {
+            r_out = 0;
+
+            if !w_busy && i_hwe {
+                w_busy  = 1;
+                aw_done = 0;
+                wd_done = 0;
+                w_addr  = byte_addr;
+                w_data  = {i_hwdata repeat WORDS};
+                w_strb  = strb_one << strb_shift;
+            } else {
+                if axi.awvalid && axi.awready {
+                    aw_done = 1;
+                }
+                if axi.wvalid && axi.wready {
+                    wd_done = 1;
+                }
+                if axi.bvalid && axi.bready {
+                    w_busy = 0;
+                }
+            }
+
+            if !r_busy && i_hre {
+                r_busy  = 1;
+                ar_done = 0;
+                r_addr  = byte_addr;
+                r_word  = word;
+            } else {
+                if axi.arvalid && axi.arready {
+                    ar_done = 1;
+                }
+                if axi.rvalid && axi.rready {
+                    r_busy = 0;
+                    r_data = axi.rdata[r_word * 32+:32];
+                    r_out  = 1;
+                }
+            }
+        }
+    }
+
+    assign o_hwready = ~w_busy;
+    assign o_hrvalid = r_out;
+    assign o_hrdata  = r_data;
+}

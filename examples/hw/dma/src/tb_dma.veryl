@@ -1,0 +1,173 @@
+/// Check that the DMA **moves the whole transfer, both ways**.
+///
+/// The engine is wired to the same terminator the harness generates, and the
+/// memory is loaded and inspected through its backdoor. **What was put in is
+/// what has to come out at the destination** -- the copy needs no expected
+/// value of its own.
+#[test(dma_copies_within_host_memory)]
+module test_dma {
+    const BEATS: u32 = 4;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var start: logic    ;
+    var addr : logic<64>;
+    var dst  : logic<64>;
+    var size : logic<32>;
+    var busy : logic    ;
+    var done : logic    ;
+    var sum  : logic<64>;
+    var beats: logic<32>;
+
+    var cmd_valid: logic    ;
+    var cmd_ready: logic    ;
+    var cmd_addr : logic<64>;
+    var cmd_size : logic<32>;
+    var rd_valid : logic    ;
+    var rd_ready : logic    ;
+    var rd_data  : logic<64>;
+    var rd_last  : logic    ;
+
+    var wcmd_valid: logic    ;
+    var wcmd_ready: logic    ;
+    var wcmd_addr : logic<64>;
+    var wcmd_size : logic<32>;
+    var w_valid   : logic    ;
+    var w_ready   : logic    ;
+    var w_data    : logic<64>;
+    var w_last    : logic    ;
+    var w_done    : logic    ;
+
+    var haddr : logic<4> ;
+    var hwdata: logic<64>;
+    var hwe   : logic    ;
+    var hrdata: logic<64>;
+    var oor   : logic<32>;
+
+    inst d: dut_top (
+        i_clk       : clk       ,
+        i_rst       : rst       ,
+        i_start     : start     ,
+        i_addr      : addr      ,
+        i_dst       : dst       ,
+        i_size      : size      ,
+        o_busy      : busy      ,
+        o_done      : done      ,
+        o_sum       : sum       ,
+        o_beats     : beats     ,
+        o_cmd_valid : cmd_valid ,
+        i_cmd_ready : cmd_ready ,
+        o_cmd_addr  : cmd_addr  ,
+        o_cmd_size  : cmd_size  ,
+        i_rd_valid  : rd_valid  ,
+        o_rd_ready  : rd_ready  ,
+        i_rd_data   : rd_data   ,
+        i_rd_last   : rd_last   ,
+        o_wcmd_valid: wcmd_valid,
+        i_wcmd_ready: wcmd_ready,
+        o_wcmd_addr : wcmd_addr ,
+        o_wcmd_size : wcmd_size ,
+        o_w_valid   : w_valid   ,
+        i_w_ready   : w_ready   ,
+        o_w_data    : w_data    ,
+        o_w_last    : w_last    ,
+        i_w_done    : w_done    ,
+    );
+
+    inst h: hns::hmem #(
+        DW    : 64,
+        DEPTH : 16,
+        ADDR_W: 64,
+        SIZE_W: 32,
+    ) (
+        i_clk          : clk       ,
+        i_rst          : rst       ,
+        i_rd_cmd_valid : cmd_valid ,
+        o_rd_cmd_ready : cmd_ready ,
+        i_rd_cmd_addr  : cmd_addr  ,
+        i_rd_cmd_size  : cmd_size  ,
+        o_rd_valid     : rd_valid  ,
+        i_rd_ready     : rd_ready  ,
+        o_rd_data      : rd_data   ,
+        o_rd_last      : rd_last   ,
+        i_wr_cmd_valid : wcmd_valid,
+        o_wr_cmd_ready : wcmd_ready,
+        i_wr_cmd_addr  : wcmd_addr ,
+        i_wr_cmd_size  : wcmd_size ,
+        i_wr_valid     : w_valid   ,
+        o_wr_ready     : w_ready   ,
+        i_wr_data      : w_data    ,
+        i_wr_last      : w_last    ,
+        o_wr_done_valid: w_done    ,
+        i_haddr        : haddr     ,
+        i_hwdata       : hwdata    ,
+        i_hwe          : hwe       ,
+        o_hrdata       : hrdata    ,
+        o_oor          : oor       ,
+    );
+
+    function peek (
+        at: input logic<4>,
+    ) -> logic<64> {
+        haddr = at;
+        clk.next(2);
+        return hrdata;
+    }
+
+    initial {
+        start  = 0;
+        addr   = 0;
+        dst    = 0;
+        size   = 0;
+        haddr  = 0;
+        hwdata = 0;
+        hwe    = 0;
+
+        rst.assert(4);
+        clk.next(4);
+
+        // Entry i holds i+1, through the backdoor.
+        for i in 0..BEATS {
+            haddr  = i as 4;
+            hwdata = (i + 1) as 64;
+            hwe    = 1;
+            clk.next(1);
+        }
+        hwe = 0;
+        clk.next(2);
+
+        // Copy the four beats to entry 8 and up.
+        addr  = 0;
+        dst   = 8 * 8;
+        size  = BEATS * 8;
+        start = 1;
+        clk.next(1);
+        start = 0;
+
+        for _i in 0..200 {
+            if done {
+                break;
+            }
+            clk.next(1);
+        }
+
+        $display("beats=%d sum=%d oor=%d", beats, sum, oor);
+        $assert(beats == BEATS);
+        // 1+2+3+4. **Check the values too** -- the count can be right while the
+        // contents are wrong.
+        $assert(sum == 10);
+        $assert(oor == 0);
+
+        // **What was loaded is what has to be at the destination.**
+        $assert(peek(8) == 1);
+        $assert(peek(9) == 2);
+        $assert(peek(10) == 3);
+        $assert(peek(11) == 4);
+        // The source is untouched.
+        $assert(peek(0) == 1);
+
+        clk.next(2);
+        $assert(busy == 0);
+    }
+}

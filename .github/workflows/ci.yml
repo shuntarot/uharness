@@ -1,0 +1,38 @@
+# Rust checks. The Veryl compiler is a pinned crates.io dependency, so no
+# checkout and no parol generation is needed.
+#
+# Only one Veryl version is tracked: the five `=` pins in `Cargo.toml`. This
+# workflow does not override them.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# No debug info: the build goes from 4m05s to 1m43s, and `target/` from
+# 9.0 GB to 2.6 GB (0.6 GB compressed), measured on a 32-core machine. This
+# is needed to stay under the 10 GB cache limit.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Keep v5. v4 targets Node.js 20; the runner forces Node 24 and warns.
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo test --workspace

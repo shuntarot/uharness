@@ -1,0 +1,28 @@
+# rocket -- hio run bringup.hio
+#
+# Hold the core in reset, put sw/smoke.elf in DRAM, release it, and read what
+# it wrote to MMIO (a 1KB BRAM at core address 0x2_0000).
+
+echo == identity ==
+id
+# The controller calibrates after configuration; nothing reaches DRAM before 1.
+read mem_calib
+
+echo == load the program while the core is held ==
+reset --hold
+write mmio 0x00 0 0 0 0 0 0 0 0
+load mem sw/smoke.elf --base 0x80000000 --verify
+reset --release
+sleep 100
+
+echo == what the core wrote ==
+# 0x21534e48 ("HNS!")
+read mmio 0x00 1
+# misa (low / high word): 0x00801105 0x80000000 is RV64IMAC
+read mmio 0x08 2
+# mhartid
+read mmio 0x10 2
+# counter: must differ between the two reads
+read mmio 0x18 2
+sleep 100
+read mmio 0x18 2

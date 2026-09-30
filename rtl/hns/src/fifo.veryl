@@ -1,0 +1,61 @@
+/// A stream the DUT pushes; the host polls it out through the CSR.
+/// Depth and width come from the instance, so one module serves every bundle.
+pub module fifo #(
+    param WIDTH: u32 = 8  ,
+    param DEPTH: u32 = 256,
+) (
+    i_clk  : input  clock                   ,
+    i_rst  : input  reset                   ,
+    i_push : input  logic                   ,
+    i_data : input  logic<WIDTH>            ,
+    o_ready: output logic                   ,
+    i_pop  : input  logic                   ,
+    o_data : output logic<WIDTH>            ,
+    o_level: output logic<$clog2(DEPTH) + 1>,
+    o_drops: output logic<32>               ,
+) {
+    var mem  : logic<WIDTH>             [DEPTH];
+    var wp   : logic<$clog2(DEPTH)>            ;
+    var rp   : logic<$clog2(DEPTH)>            ;
+    var level: logic<$clog2(DEPTH) + 1>        ;
+    var drops: logic<32>                       ;
+
+    let full : logic = level == DEPTH;
+    let empty: logic = level == 0;
+
+    // A beat is dropped exactly when a push arrives with no room left.
+    let drop: logic = i_push & full;
+    let take: logic = i_push & ~full;
+    let give: logic = i_pop & ~empty;
+
+    always_ff {
+        if_reset {
+            wp    = 0;
+            rp    = 0;
+            level = 0;
+            drops = 0;
+        } else {
+            if take {
+                mem[wp] = i_data;
+                wp      = wp + 1;
+            }
+            if give {
+                rp = rp + 1;
+            }
+            if take && !give {
+                level = level + 1;
+            } else if give && !take {
+                level = level - 1;
+            }
+            // Saturate. A counter that wraps reads as "only a few were lost".
+            if drop && drops != 32'hffff_ffff {
+                drops = drops + 1;
+            }
+        }
+    }
+
+    assign o_ready = ~full;
+    assign o_data  = mem[rp];
+    assign o_level = level;
+    assign o_drops = drops;
+}

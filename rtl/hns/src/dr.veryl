@@ -1,0 +1,233 @@
+/// Bus DR: sits between the BSCANE2 user DR and the harness window (AXI4-Lite).
+///
+/// BSCANE2 itself is not included. A vendor primitive cannot be simulated, and
+/// then the CDC logic here could not be tested. The primitive lives in `bscan`;
+/// this module takes the TCK-side signals as plain ports.
+///
+/// DR layout:
+///
+/// ```text
+///   in : [AW+33:34] addr | [33:2] wdata | [1:0] op   (00=nop, 01=read, 10=write)
+///   out: [AW+33:34] 0    | [33:2] rdata | [1] sticky_err | [0] busy
+/// ```
+///
+/// Results are pipelined: the result of a command appears at the next Capture
+/// (as in RISC-V DMI). The host can keep sending without waiting for results.
+pub module dr #(
+    /// Window address width. A shorter one makes each transaction faster.
+    /// AW=15 gives a DR length of 49 = 8*6+1, the cheapest shape for MPSSE.
+    param AW: u32 = 15,
+) (
+    // ── TCK side (from BSCANE2) ──
+    /// TCK is used as a plain clock, not DRCK. DRCK is a gated clock and makes
+    /// timing analysis hard. The enable is `i_sel && i_shift`.
+    i_tck    : input  'tck clock,
+    i_sel    : input  'tck logic,
+    i_shift  : input  'tck logic,
+    i_capture: input  'tck logic,
+    i_update : input  'tck logic,
+    i_tdi    : input  'tck logic,
+    o_tdo    : output 'tck logic,
+
+    // ── Bus side (harness clock) ──
+    i_clk: input 'bus clock,
+    i_rst: input 'bus reset,
+
+    o_awaddr : output 'bus logic<32>,
+    o_awvalid: output 'bus logic    ,
+    i_awready: input  'bus logic    ,
+    o_wdata  : output 'bus logic<32>,
+    o_wstrb  : output 'bus logic<4> ,
+    o_wvalid : output 'bus logic    ,
+    i_wready : input  'bus logic    ,
+    i_bresp  : input  'bus logic<2> ,
+    i_bvalid : input  'bus logic    ,
+    o_bready : output 'bus logic    ,
+    o_araddr : output 'bus logic<32>,
+    o_arvalid: output 'bus logic    ,
+    i_arready: input  'bus logic    ,
+    i_rdata  : input  'bus logic<32>,
+    i_rresp  : input  'bus logic<2> ,
+    i_rvalid : input  'bus logic    ,
+    o_rready : output 'bus logic    ,
+) {
+    const LEN: u32 = AW + 34;
+
+    const OP_NOP  : logic<2> = 2'b00;
+    const OP_READ : logic<2> = 2'b01;
+    const OP_WRITE: logic<2> = 2'b10;
+
+    // ── Bus-side state ──────────────────────────────────────────────────
+    // Declared before the TCK side: Veryl requires declaration before use.
+    var req_meta : 'bus logic    ;
+    var req_sync : 'bus logic    ;
+    var req_prev : 'bus logic    ;
+    var ack_bus  : 'bus logic    ;
+    var rdata_bus: 'bus logic<32>;
+    var err_bus  : 'bus logic    ;
+
+    // ── TCK side ────────────────────────────────────────────────────────
+    var sr: 'tck logic<LEN>;
+
+    /// The command. It is set at Update and holds until the next Update.
+    /// Because it holds, only the toggle needs a synchronizer (MCP handshake).
+    var cmd_addr: 'tck logic<AW>;
+    var cmd_data: 'tck logic<32>;
+    var cmd_op  : 'tck logic<2> ;
+    var req_tck : 'tck logic    ;
+
+    /// The done toggle from the bus side, synchronized to TCK.
+    var ack_meta: 'tck logic;
+    var ack_tck : 'tck logic;
+
+    let busy: 'tck logic = req_tck != ack_tck;
+
+    assign o_tdo = sr[0];
+
+    // Capture reads bus-side data in TCK. The data only matters while busy is
+    // low, so only the toggle is synchronized, not the data (MCP). This
+    // crossing is intended.
+    unsafe (cdc) {
+        always_ff (i_tck) {
+            if i_sel && i_capture {
+                // Load the result of the previous command. Veryl `as` casts
+                // only to fixed types and cannot zero-extend to a width, so
+                // each field is set on its own.
+                sr[0]          = busy;
+                sr[1]          = err_bus;
+                sr[33:2]       = rdata_bus;
+                sr[LEN - 1:34] = 0;
+            } else if i_sel && i_shift {
+                sr = {i_tdi, sr[LEN - 1:1]};
+            }
+        }
+    }
+
+    always_ff (i_tck) {
+        if i_sel && i_update {
+            cmd_op   = sr[1:0];
+            cmd_data = sr[33:2];
+            cmd_addr = sr[LEN - 1:34];
+            // A command that arrives while busy is dropped without an error.
+            // sticky_err is not set: it stays set until reset, so a retry
+            // would make the bridge unusable. The host sees `busy` at Capture
+            // and sends again (as in RISC-V DMI). Capture comes before
+            // Update, so the Update of a scan that returned busy=0 is always
+            // accepted.
+            if !busy && sr[1:0] != OP_NOP {
+                req_tck = !req_tck;
+            }
+        }
+    }
+
+    unsafe (cdc) {
+        always_ff (i_tck) {
+            ack_meta = ack_bus;
+            ack_tck  = ack_meta;
+        }
+    }
+
+    // ── Bus side ────────────────────────────────────────────────────────
+    unsafe (cdc) {
+        always_ff (i_clk, i_rst) {
+            if_reset {
+                req_meta = 0;
+                req_sync = 0;
+            } else {
+                req_meta = req_tck;
+                req_sync = req_meta;
+            }
+        }
+    }
+
+    let start: 'bus logic = req_sync != req_prev;
+
+    enum State {
+        IDLE,
+        WRITE,
+        WRITE_RESP,
+        READ,
+        READ_DATA,
+    }
+    var state: 'bus State;
+
+    unsafe (cdc) {
+        always_ff (i_clk, i_rst) {
+            if_reset {
+                req_prev  = 0;
+                ack_bus   = 0;
+                rdata_bus = 0;
+                err_bus   = 0;
+                state     = State::IDLE;
+                o_awaddr  = 0;
+                o_awvalid = 0;
+                o_wdata   = 0;
+                o_wvalid  = 0;
+                o_araddr  = 0;
+                o_arvalid = 0;
+            } else {
+                req_prev = req_sync;
+                case state {
+                    State::IDLE: {
+                        if start {
+                            // cmd_* is safe to read: it holds after Update.
+                            if cmd_op == OP_WRITE {
+                                o_awaddr           = 0;
+                                o_awaddr[AW - 1:0] = cmd_addr;
+                                o_awvalid          = 1;
+                                o_wdata            = cmd_data;
+                                o_wvalid           = 1;
+                                state              = State::WRITE;
+                            } else {
+                                o_araddr           = 0;
+                                o_araddr[AW - 1:0] = cmd_addr;
+                                o_arvalid          = 1;
+                                state              = State::READ;
+                            }
+                        }
+                    }
+                    State::WRITE: {
+                        if i_awready {
+                            o_awvalid = 0;
+                        }
+                        if i_wready {
+                            o_wvalid = 0;
+                        }
+                        if (i_awready || !o_awvalid) && (i_wready || !o_wvalid) {
+                            state = State::WRITE_RESP;
+                        }
+                    }
+                    State::WRITE_RESP: {
+                        if i_bvalid {
+                            if i_bresp != 2'b00 {
+                                err_bus = 1;
+                            }
+                            ack_bus = !ack_bus;
+                            state   = State::IDLE;
+                        }
+                    }
+                    State::READ: {
+                        if i_arready {
+                            o_arvalid = 0;
+                            state     = State::READ_DATA;
+                        }
+                    }
+                    State::READ_DATA: {
+                        if i_rvalid {
+                            rdata_bus = i_rdata;
+                            if i_rresp != 2'b00 {
+                                err_bus = 1;
+                            }
+                            ack_bus = !ack_bus;
+                            state   = State::IDLE;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    assign o_wstrb  = 4'hf;
+    assign o_bready = 1;
+    assign o_rready = 1;
+}

@@ -1,0 +1,195 @@
+/// `hns::axi_dw` connects a 32-bit master to a 512-bit memory.
+///
+/// The ratio is 16. The VCU118 DDR4 has this width, and it packs more words
+/// per beat than Arty (ratio 4). If the handling of partial beats or offset
+/// starts depends on the ratio, this test finds it.
+///
+/// The main point is packing bursts. Single beats only need `WSTRB`, but then
+/// each DRAM access moves only 4 bytes. The test always covers a length that
+/// is not a multiple of the ratio, and a burst that starts in the middle of a
+/// wide beat. A bug there makes the bridge fast but sometimes wrong, which is
+/// the hardest kind of bug to find.
+#[test(axi_dw_packs_sixteen_to_one)]
+module test_axi_dw_wide {
+    const DEPTH: u32 = 16; // 16 words of 512 bits = 1024 bytes
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk: clk );
+
+    inst nar: $std::axi4_if::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>>;
+    inst wid: $std::axi4_if::<$std::axi4_pkg::<32, 64, 4, 1, 1, 1, 1, 1>>;
+
+    inst u_dw: axi_dw::<
+        $std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>,
+        $std::axi4_pkg::<32, 64, 4, 1, 1, 1, 1, 1>,
+    > (
+        i_clk: clk,
+        i_rst: rst,
+        s_axi: nar,
+        m_axi: wid,
+    );
+
+    inst u_mem: axi_mem::<$std::axi4_pkg::<32, 64, 4, 1, 1, 1, 1, 1>> #(
+        DEPTH: DEPTH,
+    ) (
+        i_clk   : clk,
+        i_rst   : rst,
+        axi     : wid,
+        i_haddr : '0 ,
+        i_hwdata: '0 ,
+        i_hwstrb: '0 ,
+        i_hwe   : '0 ,
+        o_hrdata: _  ,
+    );
+
+    always_comb {
+        nar.awsize   = 3'd2;
+        nar.awburst  = 2'b01;
+        nar.awcache  = 0;
+        nar.awprot   = 0;
+        nar.awlock   = 0;
+        nar.awqos    = 0;
+        nar.awregion = 0;
+        nar.awuser   = 0;
+        nar.wuser    = 0;
+        nar.arsize   = 3'd2;
+        nar.arburst  = 2'b01;
+        nar.arcache  = 0;
+        nar.arprot   = 0;
+        nar.arlock   = 0;
+        nar.arqos    = 0;
+        nar.arregion = 0;
+        nar.aruser   = 0;
+    }
+
+    /// Writes a burst of `len+1` words at `addr`. Word `i` is `seed + i`.
+    function put (
+        addr: input logic<32>,
+        len : input logic<8> ,
+        seed: input logic<32>,
+    ) {
+        nar.awaddr  = addr;
+        nar.awlen   = len;
+        nar.awid    = 3;
+        nar.awvalid = 1;
+        for _i in 0..64 {
+            if nar.awready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        nar.awvalid = 0;
+
+        for i in 0..256 {
+            if i >: len {
+                break;
+            }
+            nar.wdata  = seed + i;
+            nar.wstrb  = 4'hf;
+            nar.wlast  = if i == len ? 1 : 0;
+            nar.wvalid = 1;
+            for _j in 0..64 {
+                if nar.wready {
+                    break;
+                }
+                clk.next(1);
+            }
+            clk.next(1);
+        }
+        nar.wvalid = 0;
+
+        for _i in 0..64 {
+            if nar.bvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $assert(nar.bvalid);
+        $assert(nar.bid == 3);
+        nar.bready = 1;
+        clk.next(1);
+        nar.bready = 0;
+    }
+
+    /// Reads a burst of `len+1` words and checks that word `i` is `seed + i`.
+    function check (
+        addr: input logic<32>,
+        len : input logic<8> ,
+        seed: input logic<32>,
+    ) {
+        nar.araddr  = addr;
+        nar.arlen   = len;
+        nar.arid    = 4;
+        nar.arvalid = 1;
+        for _i in 0..64 {
+            if nar.arready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        nar.arvalid = 0;
+
+        for i in 0..256 {
+            if i >: len {
+                break;
+            }
+            for _j in 0..64 {
+                if nar.rvalid {
+                    break;
+                }
+                clk.next(1);
+            }
+            $assert(nar.rvalid);
+            $assert(nar.rid == 4);
+            $assert(nar.rlast == (if i == len ? 1 : 0));
+            if nar.rdata != seed + i {
+                $display("  MISMATCH at beat %d: got %h want %h", i, nar.rdata, seed + i);
+            }
+            $assert(nar.rdata == seed + i);
+            nar.rready = 1;
+            clk.next(1);
+            nar.rready = 0;
+        }
+    }
+
+    initial {
+        nar.awvalid = 0;
+        nar.wvalid  = 0;
+        nar.arvalid = 0;
+        nar.bready  = 0;
+        nar.rready  = 0;
+        rst.assert(4);
+        clk.next(4);
+
+        // 4 words at the start of one wide beat.
+        put(32'h00, 3, 32'ha000_0000);
+        check(32'h00, 3, 32'ha000_0000);
+
+        // Single beat. It writes part of a wide beat; the rest must not change.
+        put(32'h14, 0, 32'hb000_0000);
+        check(32'h14, 0, 32'hb000_0000);
+        check(32'h10, 0, 32'h0000_0000);
+
+        // Length not a multiple of the ratio (3 words). The wide beat is
+        // partial.
+        put(32'h20, 2, 32'hc000_0000);
+        check(32'h20, 2, 32'hc000_0000);
+        check(32'h2c, 0, 32'h0000_0000);
+
+        // 6 words starting in the middle of a wide beat (0x38 = lane 14).
+        // They cross into the next wide beat, and both ends are partial.
+        put(32'h38, 5, 32'hd000_0000);
+        check(32'h38, 5, 32'hd000_0000);
+        check(32'h30, 0, 32'h0000_0000);
+        check(32'h50, 0, 32'h0000_0000);
+
+        // The first write is still there.
+        check(32'h00, 3, 32'ha000_0000);
+        $display("width conversion: single, packed, ragged and offset bursts all match");
+
+        clk.next(4);
+        $finish();
+    }
+}

@@ -1,0 +1,17 @@
+[dut]
+module = "dut_top"
+
+[clock.i_clk]
+freq_mhz = 100
+
+[bundle.push]
+backing = "reg"
+ports = { valid = "i_push", ready = "!o_full", data = "i_data" }
+
+[bundle.pop]
+backing = "reg"
+ports = { valid = "i_pop", ready = "!o_empty", data = "o_data" }
+
+# Signs of life from outside the transport. Readable even if JTAG is not.
+[heartbeat]
+pin = "uart_tx"

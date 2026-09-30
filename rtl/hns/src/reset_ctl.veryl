@@ -1,0 +1,80 @@
+/// Puts a target (the DUT or a harness DMA engine) into reset and takes it out
+/// again. Use it together with `hns::axi_fence`.
+///
+/// 1. On a request, close the fence (`o_fence`).
+/// 2. When the fence is closed (`i_closed`), reset the target (`o_rst`).
+/// 3. Release it after the minimum width, once the request is gone and the
+///    downstream side is empty (`i_idle`).
+///
+/// `o_rst` comes from a flip-flop. A reset net must not be driven by a LUT.
+///
+/// For a target without AXI, tie `i_closed` and `i_idle` to 1.
+pub module reset_ctl #(
+    /// Minimum reset length in cycles. Do not rely on the spacing of host
+    /// writes: over a PCIe BAR, two writes can be only 1 us apart.
+    param MIN_CYCLES: u32 = 256,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// Holds the target in reset while 1 (the host's `dut_reset`).
+    i_hold: input logic,
+    /// A one-cycle pulse applies and releases reset once.
+    i_pulse: input logic,
+
+    /// The fence is closed / the downstream side is empty.
+    i_closed: input logic,
+    i_idle  : input logic,
+
+    o_fence: output logic,
+    /// 1 = hold the target in reset.
+    o_rst: output logic,
+    /// The sequence is in progress (fence closed, or in reset).
+    o_busy: output logic,
+) {
+    enum state_t: logic<2> {
+        RUN,
+        FENCE,
+        HOLD,
+    }
+
+    const CW: u32 = $clog2(MIN_CYCLES + 1);
+
+    var state: state_t    ;
+    var count: logic  <CW>;
+    var rst_q: logic      ;
+
+    let done: logic = count == MIN_CYCLES;
+
+    always_ff {
+        if_reset {
+            state = state_t::RUN;
+            count = 0;
+            rst_q = 0;
+        } else {
+            case state {
+                state_t::RUN  : if i_hold || i_pulse {
+                    state = state_t::FENCE;
+                }
+                state_t::FENCE: if i_closed {
+                    state = state_t::HOLD;
+                    count = 0;
+                    rst_q = 1;
+                }
+                state_t::HOLD : if done && !i_hold && i_idle {
+                    state = state_t::RUN;
+                    rst_q = 0;
+                } else if !done {
+                    count += 1;
+                }
+                default       : state = state_t::RUN;
+            }
+        }
+    }
+
+    always_comb {
+        o_fence = state != state_t::RUN;
+        o_rst   = rst_q;
+        o_busy  = state != state_t::RUN;
+    }
+}

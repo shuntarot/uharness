@@ -1,0 +1,32 @@
+[dut]
+module = "dut_top"
+
+[clock.i_clk]
+freq_mhz = 100
+
+[bundle.ctl]
+backing  = "reg"
+ports    = ["i_addr", "i_wdata", "i_start_wr", "i_start_rd", "i_sweep",
+            "o_rdata", "o_busy", "o_reads", "o_writes", "o_resp"]
+
+# The DUT's AXI4 master, terminated by FPGA memory. The host reaches the same
+# memory through an arbiter -- not through a backdoor, because a real memory
+# controller does not have one, and moving to `dram` later must not change how
+# the host gets there.
+#
+# **`backing` says where the data lives, not what the port looks like.** The
+# same AXI4 master takes `backing = "dram"` on a board with a controller; see
+# `examples/hw/dram`, which is this design one word away.
+[bundle.mem]
+backing  = "bram"
+depth    = 256
+# A memory bigger than the window, seen through a moving one: 1KB of memory
+# through 256 bytes of window. `mem_base_jtag` says which page is showing, and
+# `hio` moves it for us. DRAM is the reason this exists -- 256MB does not fit
+# in a window at all.
+aperture = 256
+ports    = ["axi"]
+
+# Heartbeat UART. Readable even when the transport is not working.
+[heartbeat]
+pin = "uart_tx"

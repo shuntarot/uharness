@@ -1,0 +1,198 @@
+/// AXI4-Lite slave -> internal bus.
+pub module axil #(
+    /// Window address width, set by the window size.
+    param ADDR_BITS: u32 = 8,
+    /// Maximum wait for the terminator to answer, in bus cycles. 0 disables it.
+    ///
+    /// The window must always answer. Over JTAG, a silent window only shows as
+    /// busy. But a read over a BAR is a non-posted TLP: with no completion, the
+    /// root complex hits a completion timeout. PCIe allows a minimum of 50 us;
+    /// the kernel logs it, and some machines treat it as fatal.
+    ///
+    /// The generator derives the cycle count for 10 us of wall time from
+    /// `[clock] freq_mhz`. That is well above a calibrated MIG (a few hundred
+    /// ns) or a CDC round trip, and well below the RC minimum. The default 0 is
+    /// for test benches; generated code always sets a value.
+    param TIMEOUT: u32 = 0,
+) (
+    i_clk    : input  clock           ,
+    i_rst    : input  reset           ,
+    i_awaddr : input  logic<32>       ,
+    i_awvalid: input  logic           ,
+    o_awready: output logic           ,
+    i_wdata  : input  logic<32>       ,
+    i_wstrb  : input  logic<4>        ,
+    i_wvalid : input  logic           ,
+    o_wready : output logic           ,
+    o_bresp  : output logic<2>        ,
+    o_bvalid : output logic           ,
+    i_bready : input  logic           ,
+    i_araddr : input  logic<32>       ,
+    i_arvalid: input  logic           ,
+    o_arready: output logic           ,
+    o_rdata  : output logic<32>       ,
+    o_rresp  : output logic<2>        ,
+    o_rvalid : output logic           ,
+    i_rready : input  logic           ,
+    o_addr   : output logic<ADDR_BITS>,
+    o_wdata  : output logic<32>       ,
+    o_we     : output logic           ,
+    o_re     : output logic           ,
+    i_rdata  : input  logic<32>       ,
+    /// The terminator says read data is valid. For a terminator that always
+    /// takes one cycle, connect `o_re` delayed by one cycle. Outside the
+    /// window `o_re` never rises, so the answer does not wait for this (it
+    /// would never come).
+    i_rvalid : input  logic           ,
+    /// The terminator can accept a write. Tie it to 1 for a terminator that
+    /// always accepts. Outside the window `o_we` never rises, so the answer
+    /// does not wait for this (it would never come).
+    ///
+    /// Do not derive it from `o_we`: that makes a combinational loop.
+    i_wready : input  logic           ,
+    /// Clears the count (w1c). It is high for one cycle when the host writes a
+    /// nonzero value to `harness_timeout`.
+    ///
+    /// Without a clear, every read after the first timeout returns nonzero, and
+    /// "just happened" cannot be told from "happened once at start-up". A
+    /// timeout during calibration is almost certain, so this matters.
+    i_clear   : input  logic          ,
+    /// Number of transactions ended by timeout (saturating counter).
+    ///
+    /// This keeps a timeout from looking like a plain 0. A host over PCIe
+    /// cannot tell "the value is 0" from "no answer": the borrowed CQ/CC bridge
+    /// does not turn `rresp` into an error completion, so `SLVERR` never
+    /// arrives. The host needs a count it can read.
+    o_timeouts: output logic<32>      ,
+) {
+    /// Accesses outside the window get `SLVERR`. The size comes from
+    /// `ADDR_BITS`: a fixed constant would let out-of-range accesses in a
+    /// smaller window return `OKAY`, and the host would go on as if the read
+    /// worked.
+    const SIZE_BYTES : u32      = 1 << ADDR_BITS;
+    const RESP_OKAY  : logic<2> = 2'b00;
+    const RESP_SLVERR: logic<2> = 2'b10;
+
+    /// Bits needed to count the wait. 1 bit when `TIMEOUT` is 0 or 1.
+    const CNT_W: u32 = if TIMEOUT >: 1 ? $clog2(TIMEOUT) : 1;
+    /// The last count. Unused when `TIMEOUT` is 0 (`armed` is 0).
+    const LIMIT: u32 = if TIMEOUT >: 0 ? TIMEOUT - 1 : 0;
+
+    var bvalid  : logic       ;
+    var bresp   : logic<2>    ;
+    var rvalid  : logic       ;
+    var rresp   : logic<2>    ;
+    var rd_wait : logic       ;
+    var rdata   : logic<32>   ;
+    var rcnt    : logic<CNT_W>;
+    var wcnt    : logic<CNT_W>;
+    var timeouts: logic<32>   ;
+
+    let armed: logic = if TIMEOUT >: 0 ? 1 : 0;
+
+    // Out-of-window access and partial writes answer SLVERR; they are never
+    // dropped silently.
+    let wr_ok: logic = (i_awaddr <: SIZE_BYTES) & (i_wstrb == 4'hf);
+    let rd_ok: logic = i_araddr <: SIZE_BYTES;
+
+    // A write is taken once AW and W are both valid and the terminator can take
+    // it. Outside the window it does not wait: `o_we` never rises, so nobody
+    // would answer.
+    let wr_go: logic = i_awvalid & ~bvalid & i_wvalid & (i_wready | ~wr_ok);
+    let rd_go: logic = i_arvalid & ~rvalid & ~rd_wait;
+
+    // Cut off a terminator that does not answer. A write handshake needs
+    // `i_wready`, so after the limit the handshake completes with `SLVERR`.
+    // `o_we` stays low: a write that was not accepted is not reported as done.
+    let wr_stall: logic = i_awvalid & ~bvalid & i_wvalid & wr_ok & ~i_wready;
+    let wr_kill : logic = armed & wr_stall & (wcnt == LIMIT);
+    let wr_take : logic = wr_go | wr_kill;
+
+    // A read times out when `rd_wait` stays high with no `i_rvalid`. Outside
+    // the window the answer does not wait (`rresp != OKAY`), so only in-window
+    // reads are counted.
+    let rd_kill: logic = armed & rd_wait & (rresp == RESP_OKAY) & ~i_rvalid & (rcnt == LIMIT);
+
+    assign o_awready = wr_take;
+    assign o_wready  = wr_take;
+    assign o_arready = rd_go;
+
+    // Take `ADDR_BITS` bits. A fixed `[7:0]` would drop the upper bits of a
+    // window larger than 256 B and hit the wrong address.
+    assign o_addr  = if rd_go ? i_araddr[ADDR_BITS - 1:0] : i_awaddr[ADDR_BITS - 1:0];
+    assign o_wdata = i_wdata;
+    assign o_we    = wr_go & wr_ok;
+    assign o_re    = rd_go & rd_ok;
+
+    always_ff {
+        if_reset {
+            bvalid   = 0;
+            bresp    = 0;
+            rvalid   = 0;
+            rresp    = 0;
+            rd_wait  = 0;
+            rdata    = 0;
+            rcnt     = 0;
+            wcnt     = 0;
+            timeouts = 0;
+        } else {
+            // Cycles waited. Back to 0 when the answer comes or the handshake
+            // completes.
+            wcnt = if wr_stall && !wr_kill ? wcnt + 1 : 0;
+            rcnt = if rd_wait && !rd_kill && !i_rvalid && rresp == RESP_OKAY ? rcnt + 1 : 0;
+
+            // The count saturates, because wrapping back to 0 is the worst
+            // outcome.
+            //
+            // A timeout in the same cycle as a clear is kept, not lost. The
+            // host reads and then clears; losing that one would make the next
+            // read return 0, as if nothing happened.
+            if i_clear {
+                timeouts = {31'b0, rd_kill} + {31'b0, wr_kill};
+            } else if rd_kill && wr_kill {
+                timeouts = if timeouts <: 32'hffff_fffe ? timeouts + 2 : 32'hffff_ffff;
+            } else if rd_kill || wr_kill {
+                timeouts = if timeouts != 32'hffff_ffff ? timeouts + 1 : timeouts;
+            }
+
+            if wr_take {
+                bvalid = 1;
+                bresp  = if wr_ok && !wr_kill ? RESP_OKAY : RESP_SLVERR;
+            } else if bvalid & i_bready {
+                bvalid = 0;
+            }
+            if rd_go {
+                rd_wait = 1;
+                rresp   = if rd_ok ? RESP_OKAY : RESP_SLVERR;
+            } else if rd_wait && (i_rvalid || rresp != RESP_OKAY || rd_kill) {
+                // Wait until the terminator says the data is valid. Capturing
+                // after a fixed one cycle works only for a one-cycle terminator
+                // such as `hns_csr`. A terminator with other latency (a DUT
+                // behind a region) would return undefined data.
+                rd_wait = 0;
+                rvalid  = 1;
+                // A timeout is `SLVERR`. A JTAG host sees it (the bridge folds
+                // it into sticky_err). A PCIe host never gets it, so it reads
+                // `o_timeouts`.
+                if rd_kill {
+                    rresp = RESP_SLVERR;
+                }
+                // Outside the window, return 0. A terminator updates its read
+                // register only when selected, so passing it through would
+                // return the last successful read. Even with SLVERR, the host
+                // would see a plausible value. The result stays in `rresp`.
+                rdata   = if rresp == RESP_OKAY && !rd_kill ? i_rdata : 0;
+            } else if rvalid & i_rready {
+                rvalid = 0;
+            }
+        }
+    }
+
+    assign o_bvalid = bvalid;
+    assign o_bresp  = bresp;
+    assign o_rvalid = rvalid;
+    assign o_rresp  = rresp;
+    assign o_rdata  = rdata;
+
+    assign o_timeouts = timeouts;
+}

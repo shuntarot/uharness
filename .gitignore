@@ -1,0 +1,59 @@
+
+# Rust build artifacts
+/target
+
+# Local TMPDIR kept under the repo so sandboxed temp writes stay within the
+# allowed path (set via .claude/settings.local.json env.TMPDIR).
+/.tmp/
+
+# Veryl stdlib cache (CI can point XDG_CACHE_HOME here to cache it).
+/.cache/
+
+# Claude
+/.claude/
+
+# Sandbox bind-mount placeholders at the repo root (empty, read-only,
+# recreated each session). They are not project files.
+/.bash_profile
+/.gitmodules
+/.bashrc
+/.gitconfig
+/.idea
+/.vscode
+/.ripgreprc
+/.profile
+/.zprofile
+/.zshrc
+/.mcp.json
+
+
+# Veryl build artifacts
+*.sv
+*.sv.map
+*.f
+*.vcd
+.build/
+dependencies/
+
+# Hand-written SystemVerilog testbenches (Verilator/VCS) must override *.sv
+!sim/verilator/*.sv
+!sim/vcs/*.sv
+
+# User local
+tmp/
+
+# Output of the Veryl packages under rtl/. The source is the .veryl files;
+# `veryl build` recreates the .sv files.
+/rtl/*/src/*.sv
+/rtl/*/src/*.sv.map
+/rtl/*/*.f
+/rtl/*/target/
+/rtl/*/dependencies/
+
+# Under hw/, only the seed projects are tracked, not what gen and the build
+# create. Veryl.lock records absolute paths, which would leak local paths.
+/examples/hw/*/hns/
+/examples/hw/*/dependencies/
+/examples/hw/*/target/
+/examples/hw/*/Veryl.lock
+/examples/hw/*/*.f

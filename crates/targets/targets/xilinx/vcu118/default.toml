@@ -1,0 +1,319 @@
+# Xilinx Virtex UltraScale+ VCU118 Evaluation Platform
+#
+# Values come from the board files Vivado ships
+# ($XILINX_VIVADO/data/xhub/boards/XilinxBoardStore/boards/Xilinx/vcu118/2.4)
+# and from a synthesis flow that runs on the board. Nothing here is a guess.
+
+[board]
+provider    = "xilinx"
+name        = "vcu118"
+description = "Virtex UltraScale+ VCU118 Evaluation Platform"
+url         = "https://www.xilinx.com/vcu118"
+
+[device]
+vendor = "xilinx"
+family = "virtexuplus"
+part   = "xcvu9p-flga2104-2L-e"
+
+# Regex matched against the device names hw_manager lists. **Do not assume the
+# first one**: the order `get_hw_devices` returns depends on what is attached.
+hw_pattern = "xcvu9p"
+
+# **The board used here carries an ES (engineering sample) device.** Without
+# this, `program_hw_devices` stops on a bitstream version check, so
+# `xicom.use_bitstream_version_check` has to be turned off.
+#
+# A production board does not need that, and turning the check off there would
+# hide an ES/production mix-up. Put it back with a patch:
+#
+#     # production.toml
+#     [device]
+#     engineering_sample = false
+#
+#     veryl harness gen --target xilinx/vcu118 --target-patch production.toml
+engineering_sample = true
+
+[vivado]
+board_part = "xilinx.com:vcu118:part0:2.4"
+
+[provides]
+# **Both.** `gen` can emit the PCIe window (BAR) as of 2026-09-06. With two
+# listed, `check` and `gen` stop unless `--transport` says which — they do not
+# guess. JTAG stays available even in a PCIe build: when the window does not
+# answer, it is what tells "PCIe is broken" from "the window is broken".
+transport = ["jtag", "pcie"]
+
+# 36Kb x 2160 = 75,600 Kbit on the VU9P. From the datasheet, not confirmed
+# against a utilization report.
+bram_kb = 9450
+
+# **Measured out of the generated IP** (2026-09-09), not read off a datasheet:
+# the configuration below was generated once and its ports and properties read
+# back. `sys_clk` names the board clock the controller receives **directly**,
+# without passing through the harness MMCM -- this board routes a dedicated
+# 250 MHz pair to the memory, where the Arty expects the fabric to supply one.
+# **Naming `board_interface` lets the board files fill the rest in** -- the part,
+# the speed grade, the CAS latencies, and **the pin constraints too**. Listing
+# the parameters by hand leaves the pins undeclared, and `opt_design` fails with
+# "ports are not placed" (seen 2026-09-09). What gets filled in is
+# `MT40A256M16GE-083E` / 833 ps / 64 bits wide, and **that is what is on the
+# board** -- corundum's settings (`-075E` / 750 / 72) are its own choice, not
+# this board's default. Only the values the harness itself needs for wiring are
+# kept below.
+#
+# **Confirmed on hardware** (2026-09-10): a `backing = "dram"` design calibrated
+# and answered, with the DUT and the host reaching one memory. Only the first
+# channel is wired up.
+dram = {kind = "ddr4", channels = 2, gb = 4, width = 64, controller = "ddr4", board_interface = "ddr4_sdram_c1_083", sys_clk = "ddr", axi_data_bits = 512, axi_addr_bits = 31, axi_id_bits = 8, ui_clk_mhz = 333.333, row_bits = 17, bank_bits = 2, bank_group_bits = 1, sys_rst_active = "high"}
+
+# The 125 MHz LVDS differential clock (sysclk_125 in the board files). There is
+# also a 300 MHz source (default_sysclk1_300), but the flow that runs on the
+# board uses this one. **Choosing among several sources is not supported yet**,
+# so only one is listed.
+[clocks.sys]
+freq_mhz = 125
+diff     = true
+pin_p    = "AY24"
+pin_n    = "AY23"
+standard = "LVDS"
+
+# **Synthesis emits two critical warnings** (seen 2026-09-03):
+#
+#   Clock 'sys_clk' completely overrides clock 'i_sys_clk_p'
+#
+# Our `create_clock -name sys_clk` overrides the constraint the IP puts on the
+# same port. **The period is right** (8.000 ns = 125 MHz, as above) and timing
+# closes (WNS +8.458 ns with the reference DUT), but constraints referring to
+# the overridden clock are dropped. If the board behaves inexplicably, suspect
+# this first.
+
+# The clock the DDR4 controller takes, straight from the board (2026-09-09).
+#
+# **It does not go through the harness MMCM.** The IP receives the differential
+# pair itself; `[provides] dram.sys_clk = "ddr"` is what says so. Pins are from
+# a design that runs on this board (`clk_250mhz_1_p/n`); there is a second pair
+# at `AW26`/`AW27` for the other channel, which is not used yet.
+[clocks.ddr]
+freq_mhz = 250
+diff     = true
+pin_p    = "E12"
+pin_n    = "D12"
+standard = "DIFF_SSTL12"
+
+# The CPU_RESET push button. The board files say "Active High".
+[resets.sys]
+pin      = "L19"
+standard = "LVCMOS12"
+active   = "high"
+
+# Signals the board brings out. **Facts about the board only.**
+#
+# From the board files Vivado ships,
+# `data/xhub/boards/XilinxBoardStore/boards/Xilinx/vcu118/2.3/{part0_pins.xml,
+# board.xml}`: pins `USB_UART_TX = BB21` / `USB_UART_RX = AW25`, IOSTANDARD from
+# the `rs232_uart` component in the same file (LVCMOS18). **Directions are as
+# the FPGA sees them**, from `<port_map logical_port="TxD" ... dir="out">`.
+[pins.uart_tx]
+pin       = "BB21"
+standard  = "LVCMOS18"
+direction = "output"
+
+[pins.uart_rx]
+pin       = "AW25"
+standard  = "LVCMOS18"
+direction = "input"
+
+[jtag]
+# How Vivado reaches the device. The VCU118 has USB-JTAG on board.
+via = "vivado_hw_server"
+
+# The ceiling constrained on the bridge's TCK. **A choice, not a measurement**:
+# if the host runs faster than this, the timing analysis done at synthesis is no
+# longer true.
+max_tck_mhz = 30
+
+# The adapter `hio` opens. **Measured** (2026-08-25, `lsusb -d 0403: -v`):
+#
+#   idVendor  0x0403
+#   idProduct 0x6014  FT232H Single HS USB-UART/FIFO
+#   iProduct  "Digilent USB Device"
+#   interface 0 only (the FT232H has one channel)
+vid       = 0x0403
+pid       = 0x6014
+interface = 0
+
+# **Measured** (2026-09-03, on hardware). Two `0403:6014` devices were attached,
+# but **their descriptors differ**: this one reports `"Digilent USB Device"` and
+# the other `"Single RS232-HS"` (an FTDI default EEPROM). **The pid and product
+# pair identifies it**, so it can be written down. This was first thought to be
+# impossible, from looking only at the order `lsusb` printed; asking the device
+# settled it.
+product = "Digilent USB Device"
+
+# **No serial number here.** That identifies one board, not the type; pass it to
+# `hio` at run time.
+#
+# The UART is **not this chip**. The FT232H has a single channel; the VCU118's
+# USB serial is a CP2105 (`10c4:ea70`), matching the `rs232_uart` component
+# (SiliconLabs CP2105) in the board files. The heartbeat is read there.
+
+# Level-shifter enable (data, direction). **Measured** (2026-09-03).
+#
+# The values come from OpenOCD's `interface/ftdi/digilent_jtag_smt2_nc.cfg`,
+# which matches on `vid_pid 0403:6014` and `device_desc "Digilent USB Device"`.
+# The on-board JTAG is a Digilent SMT2-NC.
+#
+# **Digilent does not mean one value.** The Arty's on-board FT2232H uses
+# `0x0088 0x008b`, which is different, and `0x2088 0x308b` (HS3) returned no TDO
+# here. The product string is the same on both; the wiring is not.
+layout_init = [0x00e8, 0x60eb]
+
+# IR length of the TAP. **Measured** (2026-09-03) — asked the chain rather than
+# read from a table (`hio probe` fills IR with ones, shifts a zero in and counts
+# until it appears on TDO).
+#
+# **It is not 6 as on 7-series. UltraScale+ is 18.** Copying the 7-series table
+# would have been wrong. With `--ir-length 18` the IR capture returns `0x35d75`,
+# whose low two bits are `01` as IEEE 1149.1 requires.
+ir_length = 18
+
+# The device IDCODE. **Measured** (2026-09-03, XCVU9P). One device in the chain.
+idcode = 0x04b31093
+
+# **What the host may actually clock. Not the same as `max_tck_mhz`.** Measured
+# (2026-09-03).
+#
+# Up to 14 MHz, 10000 reads came back clean; at 15 MHz they corrupted. The wrong
+# value was `0xecd0e4dc` every time — not noise, but **the way this bit pattern
+# fails when TCK is too fast**. The Arty produced the same value at 30 MHz.
+#
+# **Above 10 MHz it stops getting faster** (10 and 14 MHz both give 5.7 µs per
+# read): USB and the host are the limit from there. 12 leaves some margin.
+host_tck_mhz = 12
+
+# --- JTAG instructions (from the BSDL, 2026-09-03) ---
+#
+# Taken from **the BSDL Vivado ships**:
+#
+#   <Vivado>/data/parts/xilinx/virtexuplus/public/bsdl/xcvu9p_flga2104.bsd
+#
+# `INSTRUCTION_LENGTH` is 18 and `INSTRUCTION_OPCODE` holds the bit patterns.
+# **The same file also confirmed the Arty's measured values**
+# (0x02/0x0b/0x05/0x0c/0x3f), which is why reading it this way is trusted.
+#
+# **18 bits because there are three SLRs.** Three six-bit instruction fields sit
+# side by side, each holding what 7-series would use:
+#
+#   JPROGRAM  001011 001011 001011   0x0b to every SLR
+#   JSTART    001100 001100 001100   0x0c to every SLR
+#   USER1     000010 100100 100100   0x02 to SLR1 (the master) only
+#   CFG_IN    000101 100100 100100   likewise (CFG_IN_SLR1)
+#
+# **Use the `CFG_IN` that addresses SLR1.** The BSDL has one per SLR and states
+# that "SLR1 is the master SLR".
+#
+# **`user1_ir` is confirmed on hardware** (2026-09-03): a harness was loaded and
+# `hio id` returned magic. A value taken from the BSDL worked as-is, so **the
+# other instructions from the same file are trusted to the same degree**.
+#
+# **No padding was needed on the DR side.** Three SLRs suggested the DR might be
+# split too, but `hio probe` counts one device in the chain: only the IR is
+# divided.
+#
+# For reference, other IRs Vivado uses: IDCODE `0x09249`, and `0x014514` /
+# `0x004924` for the ready and status reads.
+user1_ir    = 0x02924
+jprogram_ir = 0x0b2cb
+jstart_ir   = 0x0c30c
+bypass_ir   = 0x3ffff
+
+# **Read back rather than just waited for** (from Vivado's SVF, 2026-09-03):
+#
+#   SIR 18 TDI (014514) TDO (011000) MASK (031000)   the erase finished
+#   SIR 18 TDI (009249) TDO (031000) MASK (011000)   DONE
+[jtag.ready]
+ir     = 0x14514   # ISC_NOOP
+expect = 0x11000
+mask   = 0x31000
+
+[jtag.done]
+ir     = 0x09249   # IDCODE
+expect = 0x31000
+mask   = 0x11000
+# **Hardware returns `0x35d75`** (2026-09-03), which differs from the SVF's
+# `0x31000` but agrees once masked (both `0x11000`). **That is what the mask is
+# for**: split into six-bit fields it is `110101` three times, one per SLR — the
+# same shape as the Arty's `0x35`. An exact comparison would never pass.
+
+# **How the `.bit` is divided.** With three SLRs, a `.bit` is three
+# sub-bitstreams end to end, and **the boundaries are not marked in the file**,
+# so they are recorded here.
+#
+# Where these came from (2026-09-03): Vivado was asked for an SVF
+# (`create_hw_target`, so no board needed) and each `SDR` payload was **compared
+# byte for byte** against the `.bit`.
+#
+# **They do not depend on the design.** Two unrelated designs produce identical
+# SLR boundaries — it is a property of the device.
+#
+# `skip` is the CRC word at an SLR boundary (`3003c000` plus a value); **Vivado
+# does not send it either**. Chunks marked `sync` are prefixed with the sync word
+# `aa995566`.
+#
+# The chunks plus the skipped bytes must add up to the file length exactly; `hio`
+# checks and refuses to program if they do not.
+[[jtag.slr]]
+bytes     = 26719136
+cfg_in_ir = 0x05924   # CFG_IN_SLR1 (master)
+skip      = 8
+[[jtag.slr]]
+bytes     = 26719136
+cfg_in_ir = 0x24164   # CFG_IN_SLR0
+skip      = 8
+[[jtag.slr]]
+bytes     = 26719116
+cfg_in_ir = 0x24905   # CFG_IN_SLR2
+[[jtag.slr]]
+bytes     = 1644
+cfg_in_ir = 0x05924   # tail for SLR1
+sync      = true
+[[jtag.slr]]
+bytes     = 60
+cfg_in_ir = 0x24164   # tail for SLR0
+sync      = true
+
+# **Erase wait.** The default 200 ms was measured on an XC7A35T, and the VU9P is
+# far larger, so it may not be enough: try `hio program --erase-wait-ms 2000`.
+# When it is too short, **programming fails without an error** — that symptom was
+# hit on the Arty on 2026-09-03.
+
+[topology]
+nodes = 1
+links = []
+
+# --- PCIe (2026-09-06) ---
+#
+# **Facts about the board only.** How it is used (BAR size, IDs, link speed) is
+# a design choice and lives in the manifest.
+#
+# The pins were extracted mechanically from the verilog-pcie VCU118 example
+# (`example/VCU118/fpga_axi_x8/fpga.xdc`) — **not copied by hand**: eighteen
+# entries copied by eye are eighteen chances to be wrong. They originate in the
+# Vivado board files, so they can be checked there too.
+#
+# **Another configuration is known to work on this board**: x4, reference clock
+# `AL9` (refclk_2, quad 225), lanes left unconstrained. **Try that if the link
+# does not come up**.
+[pcie]
+lanes      = 8
+# Gen3 is what the board can do; what the link actually trains at is another
+# matter.
+max_gen    = 3
+refclk_mhz = 100
+refclk_p   = "AC9"   # MGTREFCLK0P_227
+reset_n    = "AM17"  # PULLUP
+reset_standard = "LVCMOS18"
+# Only the p side of each differential lane. The n side is fixed by the board
+# wiring and Vivado derives it.
+rx_p = ["AA4", "AB2", "AC4", "AD2", "AE4", "AF2", "AG4", "AH2"]
+tx_p = ["Y7", "AB7", "AD7", "AF7", "AH7", "AK7", "AM7", "AN5"]

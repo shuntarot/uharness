@@ -1,0 +1,167 @@
+/// Passes descriptors one at a time and never issues one outside the agreed
+/// window.
+///
+/// For the card to write host memory, the IOMMU must pass it through, and then
+/// nothing stops a wrong address. This module takes that role: it does not
+/// issue a descriptor that leaves the one region the host wrote once to
+/// `i_base` / `i_size`.
+///
+/// It cannot catch a wrong bit position in the TLP header. The bring-up order
+/// checks that before DMA is used.
+pub module dma_gate #(
+    /// Counter width. The counters saturate.
+    param COUNT_W: u32 = 16,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// The allowed window. The host writes it once.
+    i_base: input logic<64>,
+    i_size: input logic<32>,
+
+    /// The descriptor the host wrote.
+    i_pcie_addr: input logic<64>,
+    i_axi_addr : input logic<64>,
+    i_len      : input logic<20>,
+    /// Direction. 0: the card writes host memory. 1: the card reads it.
+    /// The window check is the same for both directions.
+    i_dir: input logic,
+    /// A one-cycle pulse from a self-clearing CSR bit.
+    i_go: input logic,
+
+    /// To the borrowed DMA engines. The descriptor is the same for both
+    /// directions; only the handshake differs.
+    o_desc_pcie_addr: output logic<64>,
+    o_desc_axi_addr : output logic<64>,
+    o_desc_len      : output logic<20>,
+    o_desc_tag      : output logic<8> ,
+
+    /// Write side (`hns::dma_wr`).
+    o_wr_valid: output logic,
+    i_wr_ready: input  logic,
+
+    /// Read side (`hns::dma_rd`).
+    o_rd_valid: output logic,
+    i_rd_ready: input  logic,
+
+    /// Status from the borrowed engines. Only one descriptor is in flight, so
+    /// only one side answers.
+    i_wr_status_valid: input logic   ,
+    i_wr_status_error: input logic<4>,
+    i_rd_status_valid: input logic   ,
+    i_rd_status_error: input logic<4>,
+
+    /// A descriptor is running. The host must not write the next one until
+    /// this drops.
+    o_busy: output logic,
+    /// The last error returned. 0 means none yet.
+    o_error: output logic<4>,
+    /// Number of finished descriptors.
+    o_done: output logic<COUNT_W>,
+    /// Number not issued because they pointed outside the window.
+    o_out_of_range: output logic<COUNT_W>,
+    /// Number not issued because they came before the previous one finished.
+    /// Counted apart from out-of-range, because the fix differs (the address
+    /// versus the wait).
+    o_while_busy: output logic<COUNT_W>,
+) {
+    /// Whether the whole transfer fits in the window.
+    ///
+    /// The sum uses 65 bits. `i_base + i_size` can overflow 64 bits, and a
+    /// wrapped sum would make an address outside the window look inside.
+    let first: logic<65> = {1'b0, i_pcie_addr};
+    let last : logic<65> = first + {45'b0, i_len};
+    let limit: logic<65> = {1'b0, i_base} + {33'b0, i_size};
+
+    /// Length 0 is refused. The borrowed engine would run it as a zero-length
+    /// TLP, but it means the host got the count wrong.
+    ///
+    /// Do not name this `within`: it is an SV keyword and Vivado fails on it.
+    /// Veryl's keyword check does not catch a `let` name.
+    let in_window: logic = i_len != 0 && first >= {1'b0, i_base} && last <= limit;
+
+    var busy   : logic         ;
+    var valid  : logic         ;
+    var tag    : logic<8>      ;
+    var error  : logic<4>      ;
+    var done   : logic<COUNT_W>;
+    var refused: logic<COUNT_W>;
+    var blocked: logic<COUNT_W>;
+
+    /// Copied when issued. If the host rewrites the registers while waiting for
+    /// ready, a different descriptor from the checked one would go out.
+    var d_pcie: logic<64>;
+    var d_axi : logic<64>;
+    var d_len : logic<20>;
+    var d_tag : logic<8> ;
+    var d_dir : logic    ;
+
+    /// Selected by the direction of the running descriptor.
+    let ready       : logic    = if d_dir ? i_rd_ready : i_wr_ready;
+    let status_valid: logic    = i_wr_status_valid | i_rd_status_valid;
+    let status_error: logic<4> = if i_rd_status_valid ? i_rd_status_error : i_wr_status_error;
+
+    /// Saturating. A wrapping counter could read as 0.
+    function bump (
+        n: input logic<COUNT_W>,
+    ) -> logic<COUNT_W> {
+        return if n == '1 ? n : n + 1;
+    }
+
+    always_ff {
+        if_reset {
+            busy    = 0;
+            valid   = 0;
+            tag     = 0;
+            error   = 0;
+            done    = 0;
+            refused = 0;
+            blocked = 0;
+            d_pcie  = 0;
+            d_axi   = 0;
+            d_len   = 0;
+            d_tag   = 0;
+            d_dir   = 0;
+        } else {
+            if valid && ready {
+                valid = 0;
+            }
+            if status_valid {
+                busy  = 0;
+                error = status_error;
+                done  = bump(done);
+            }
+            if i_go {
+                if busy {
+                    blocked = bump(blocked);
+                } else if !in_window {
+                    refused = bump(refused);
+                } else {
+                    busy   = 1;
+                    valid  = 1;
+                    d_pcie = i_pcie_addr;
+                    d_axi  = i_axi_addr;
+                    d_len  = i_len;
+                    d_tag  = tag;
+                    d_dir  = i_dir;
+                    tag    = tag + 1;
+                }
+            }
+        }
+    }
+
+    always_comb {
+        o_desc_pcie_addr = d_pcie;
+        o_desc_axi_addr  = d_axi;
+        o_desc_len       = d_len;
+        o_desc_tag       = d_tag;
+        o_wr_valid       = valid & ~d_dir;
+        o_rd_valid       = valid & d_dir;
+
+        o_busy         = busy;
+        o_error        = error;
+        o_done         = done;
+        o_out_of_range = refused;
+        o_while_busy   = blocked;
+    }
+}

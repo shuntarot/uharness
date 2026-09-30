@@ -1,0 +1,127 @@
+# Xilinx Kintex-7 KC705 Evaluation Platform
+#
+# Values come from the board files (XilinxBoardStore, branch 2022.2,
+# boards/Xilinx/kc705/1.6; Vivado 2021.2 ships the same files), from the BSDL
+# Vivado ships, and from the MIG Vivado 2021.2 generated from `mig.prj`. Pins
+# were cross-checked against the KC705 XDC of verilog-ethernet. Nothing here is
+# a guess.
+#
+# **Not yet run on the board** (2026-09-30). The probe facts `hio` needs (USB
+# ids, level-shifter values, IR capture, the TCK it can run) are measured there.
+
+[board]
+provider    = "xilinx"
+name        = "kc705"
+description = "Kintex-7 KC705 Evaluation Platform"
+url         = "https://www.xilinx.com/kc705"
+untested    = true
+
+[device]
+vendor = "xilinx"
+family = "kintex7"
+part   = "xc7k325tffg900-2"
+
+# Regex matched against the device names hw_manager lists.
+hw_pattern = "xc7k325t"
+
+# The MIG is generated from `mig.prj` beside this file, a changed copy of the
+# board file (see README.md). No Vivado board files are needed.
+[vivado]
+board_part = "xilinx.com:kc705:part0:1.6"
+mig_prj    = "mig.prj"
+
+# The DDR3 banks 32 and 34 take their DCI reference from bank 33 (`mig.prj`
+# has `dci_cascade` 1). Without it, placement fails: the CPU_RESET button sits
+# on AB7, one of bank 34's own reference pins (seen 2026-09-30, Place 30-110).
+dci_cascade = { master = 33, slaves = [32, 34] }
+
+# With the MIG, the board clock's region (bank 33) has its MMCM taken by the
+# MIG, so the harness MMCM goes one region up and takes the clock over the
+# backbone. Without it, placement stops (Place 30-575, 2026-09-30).
+sys_clk_backbone = true
+
+[provides]
+# **JTAG only.** The board has PCIe (gen2 x8), but the 7-series block has
+# another interface, which the borrowed PCIe code does not handle.
+transport = ["jtag"]
+
+# 36Kb x 445 = 16,020 Kbit on the XC7K325T. From the datasheet.
+bram_kb = 2002
+
+# The DDR3 SODIMM (MT8JTF12864HZ-1G6, 1 GB). **Read out of the MIG** Vivado
+# generated from `mig.prj` (2026-09-30): AXI 512 bits / address 30 / id 1, 64
+# data bits, row 14 / bank 3. 1250 ps at 4:1 gives the 200 MHz user clock. Both
+# `sys_clk` and `ref_clk` are "No Buffer" in the copy, so the harness MMCM makes
+# them from the board's 200 MHz clock. The reset is active high (the file's
+# SysResetPolarity).
+dram = {kind = "ddr3", device = "MT8JTF12864HZ-1G6", channels = 1, gb = 1, width = 64, controller = "mig", sys_clk_mhz = 200.0, ref_clk_mhz = 200.0, ui_clk_mhz = 200.0, axi_data_bits = 512, axi_addr_bits = 30, axi_id_bits = 1, row_bits = 14, bank_bits = 3, sys_rst_active = "high"}
+
+# The 200 MHz clock (sys_diff_clock). It is the board's only general clock, so
+# the harness MMCM takes it and also makes the MIG's clocks from it. The
+# IOSTANDARD is the one the board files and the MIG give it; the pins sit in the
+# 1.5 V DDR3 bank.
+[clocks.sys]
+freq_mhz = 200
+diff     = true
+pin_p    = "AD12"
+pin_n    = "AD11"
+standard = "DIFF_SSTL15"
+
+# The CPU_RESET push button. The board files say "Active High".
+[resets.sys]
+pin      = "AB7"
+standard = "LVCMOS15"
+active   = "high"
+
+# The USB-UART (a CP2103). Directions are as the FPGA sees them, from the
+# `port_map ... dir=` of the rs232_uart interface.
+[pins.uart_tx]
+pin       = "K24"
+standard  = "LVCMOS25"
+direction = "output"
+
+[pins.uart_rx]
+pin       = "M19"
+standard  = "LVCMOS25"
+direction = "input"
+
+[jtag]
+via = "vivado_hw_server"
+
+# The ceiling constrained on the bridge's TCK. **A choice, not a measurement**,
+# the same as the other boards.
+max_tck_mhz = 30
+
+# Not stated yet: `vid`, `pid`, `interface`, `product`, `layout_init`,
+# `host_tck_mhz` and `idcode`. They are measured on the board (`lsusb -v`,
+# `hio probe`, `hio bench`); until then `hio` searches for the probe itself.
+
+# --- JTAG instructions (from the BSDL) ---
+#
+#   <Vivado>/data/parts/xilinx/kintex7/public/bsdl/xc7k325t_ffg900.bsd
+#
+# The same values as the Arty (7-series, one SLR).
+ir_length   = 6
+user1_ir    = 0x02
+jprogram_ir = 0x0b
+cfg_in_ir   = 0x05
+jstart_ir   = 0x0c
+bypass_ir   = 0x3f
+
+# Read back rather than waited for, as Vivado's SVF does. **Checked against the
+# SVF Vivado wrote for this part** (`make svf`, 2026-09-30): the same IRs,
+# expected values and masks, and the same JPROGRAM / CFG_IN / JSTART. That SVF
+# also checks IDCODE 0x03651093 under mask 0x0fffffff.
+[jtag.ready]
+ir     = 0x14   # ISC_NOOP
+expect = 0x11
+mask   = 0x31
+
+[jtag.done]
+ir     = 0x09   # IDCODE
+expect = 0x31
+mask   = 0x11
+
+[topology]
+nodes = 1
+links = []

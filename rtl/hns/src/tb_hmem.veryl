@@ -1,0 +1,262 @@
+/// The stand-in for host memory serves both directions, and **says so when it
+/// cannot**.
+///
+/// The backdoor is what makes this checkable without a bus: a pattern is put in
+/// through it before the read, and what the write left behind is read back out
+/// through it afterwards.
+#[test(hmem_serves_both_directions)]
+module test_hmem {
+    const DW   : u32 = 64;
+    const DEPTH: u32 = 8 ;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var rd_cmd_valid : logic    ;
+    var rd_cmd_ready : logic    ;
+    var rd_cmd_addr  : logic<64>;
+    var rd_cmd_size: logic<32>;
+    var rd_valid     : logic    ;
+    var rd_ready     : logic    ;
+    var rd_data      : logic<64>;
+    var rd_last      : logic    ;
+
+    var wr_cmd_valid : logic    ;
+    var wr_cmd_ready : logic    ;
+    var wr_cmd_addr  : logic<64>;
+    var wr_cmd_size: logic<32>;
+    var wr_valid     : logic    ;
+    var wr_ready     : logic    ;
+    var wr_data      : logic<64>;
+    var wr_last      : logic    ;
+    var wr_done      : logic    ;
+
+    var haddr : logic<3> ;
+    var hwdata: logic<64>;
+    var hwe   : logic    ;
+    var hrdata: logic<64>;
+    var oor   : logic<32>;
+
+    var beats   : logic<32>;
+    var sum     : logic<64>;
+    var saw_last: logic    ;
+    var dones   : logic<32>;
+    var clear   : logic    ;
+
+    always_ff (clk, rst) {
+        if_reset {
+            beats    = 0;
+            sum      = 0;
+            saw_last = 0;
+            dones    = 0;
+        } else {
+            if clear {
+                beats    = 0;
+                sum      = 0;
+                saw_last = 0;
+            } else if rd_valid && rd_ready {
+                beats = beats + 1;
+                sum   = sum + rd_data;
+                if rd_last {
+                    saw_last = 1;
+                }
+            }
+            if wr_done {
+                dones = dones + 1;
+            }
+        }
+    }
+
+    inst u: hmem #(
+        DW      : DW   ,
+        DEPTH   : DEPTH,
+        ADDR_W  : 64   ,
+        SIZE_W: 32   ,
+    ) (
+        i_clk          : clk          ,
+        i_rst          : rst          ,
+        i_rd_cmd_valid : rd_cmd_valid ,
+        o_rd_cmd_ready : rd_cmd_ready ,
+        i_rd_cmd_addr  : rd_cmd_addr  ,
+        i_rd_cmd_size: rd_cmd_size,
+        o_rd_valid     : rd_valid     ,
+        i_rd_ready     : rd_ready     ,
+        o_rd_data      : rd_data      ,
+        o_rd_last      : rd_last      ,
+        i_wr_cmd_valid : wr_cmd_valid ,
+        o_wr_cmd_ready : wr_cmd_ready ,
+        i_wr_cmd_addr  : wr_cmd_addr  ,
+        i_wr_cmd_size: wr_cmd_size,
+        i_wr_valid     : wr_valid     ,
+        o_wr_ready     : wr_ready     ,
+        i_wr_data      : wr_data      ,
+        i_wr_strb      : '1,
+        i_wr_last      : wr_last      ,
+        o_wr_done_valid: wr_done      ,
+        i_haddr        : haddr        ,
+        i_hwdata       : hwdata       ,
+        i_hwe          : hwe          ,
+        o_hrdata       : hrdata       ,
+        o_widened      : _,
+        o_oor          : oor          ,
+    );
+
+    function backdoor_read (
+        at: input logic<3>,
+    ) -> logic<64> {
+        haddr = at;
+        clk.next(2);
+        return hrdata;
+    }
+
+    initial {
+        rd_cmd_valid  = 0;
+        rd_cmd_addr   = 0;
+        rd_cmd_size = 0;
+        rd_ready      = 1;
+        wr_cmd_valid  = 0;
+        wr_cmd_addr   = 0;
+        wr_cmd_size = 0;
+        wr_valid      = 0;
+        wr_data       = 0;
+        wr_last       = 0;
+        haddr         = 0;
+        hwdata        = 0;
+        hwe           = 0;
+        clear         = 0;
+
+        rst.assert(4);
+        clk.next(4);
+
+        // --- put a pattern in through the backdoor: entry i holds i+1 ---
+        for i in 0..DEPTH {
+            haddr  = i as 3;
+            hwdata = (i + 1) as 64;
+            hwe    = 1;
+            clk.next(1);
+        }
+        hwe = 0;
+        clk.next(2);
+        $assert(backdoor_read(3) == 4);
+
+        // --- 1. read four beats: 1+2+3+4 ---
+        rd_cmd_addr   = 0;
+        rd_cmd_size = 32;
+        rd_cmd_valid  = 1;
+        clk.next(1);
+        rd_cmd_valid = 0;
+        for _i in 0..64 {
+            if saw_last {
+                break;
+            }
+            clk.next(1);
+        }
+        $display("read: beats=%d sum=%d oor=%d", beats, sum, oor);
+        $assert(beats == 4);
+        $assert(sum == 10);
+        $assert(oor == 0);
+
+        clear = 1;
+        clk.next(1);
+        clear = 0;
+        clk.next(1);
+
+        // --- 2. write three beats into entries 4..6, then look with the backdoor ---
+        wr_cmd_addr   = 4 * 8;
+        wr_cmd_size = 24;
+        wr_cmd_valid  = 1;
+        clk.next(1);
+        wr_cmd_valid = 0;
+        for i in 0..3 {
+            wr_data  = (16'hbeef * (i + 1)) as 64;
+            wr_last  = i == 2;
+            wr_valid = 1;
+            clk.next(1);
+        }
+        wr_valid = 0;
+        wr_last  = 0;
+        for _i in 0..64 {
+            if dones != 0 {
+                break;
+            }
+            clk.next(1);
+        }
+        $display("write: dones=%d oor=%d", dones, oor);
+        $assert(dones == 1);
+        // **The backdoor is how the write is checked.** Nothing else can see it.
+        $assert(backdoor_read(4) == 16'hbeef);
+        $assert(backdoor_read(5) == 16'hbeef * 2);
+        $assert(backdoor_read(6) == 16'hbeef * 3);
+        // Entry 7 was not part of the transfer.
+        $assert(backdoor_read(7) == 8);
+        $assert(oor == 0);
+
+        // --- 2b. the same shape the generated harness drives: a command
+        //     accepted in one cycle, then beats back to back. ---
+        wr_cmd_addr   = 16;
+        wr_cmd_size = 24;
+        wr_cmd_valid  = 1;
+        clk.next(1);
+        wr_cmd_valid = 0;
+        for i in 0..3 {
+            wr_data  = (12'ha50 + i) as 64;
+            wr_last  = i == 2;
+            wr_valid = 1;
+            clk.next(1);
+        }
+        wr_valid = 0;
+        wr_last  = 0;
+        clk.next(8);
+        $display("back to back: e2=%h e3=%h e4=%h dones=%d", backdoor_read(2), backdoor_read(3), backdoor_read(4), dones);
+        $assert(backdoor_read(2) == 12'ha50);
+        $assert(backdoor_read(3) == 12'ha51);
+        $assert(backdoor_read(4) == 12'ha52);
+
+        // --- 3. read past the end: entries 6 and 7 only ---
+        rd_cmd_addr   = 6 * 8;
+        rd_cmd_size = 48;
+        rd_cmd_valid  = 1;
+        clk.next(1);
+        rd_cmd_valid = 0;
+        for _i in 0..64 {
+            if saw_last {
+                break;
+            }
+            clk.next(1);
+        }
+        // Entry 6 now holds 3 * 0xbeef (the write above), entry 7 still holds 8.
+        $display("past the end: beats=%d oor=%d", beats, oor);
+        $assert(beats == 2);
+        $assert(oor == 1);
+
+        clear = 1;
+        clk.next(1);
+        clear = 0;
+        clk.next(1);
+
+        // --- 4. read entirely outside: no beats, so no `last` either ---
+        //     A DUT waiting for `last` stops here. Found on hardware, 2026-09-05.
+        rd_cmd_addr   = 16 * 8;
+        rd_cmd_size = 32;
+        rd_cmd_valid  = 1;
+        clk.next(1);
+        rd_cmd_valid = 0;
+        clk.next(16);
+        $display("fully outside: beats=%d saw_last=%b oor=%d", beats, saw_last, oor);
+        $assert(beats == 0);
+        $assert(saw_last == 0);
+        $assert(oor == 2);
+
+        // --- 5. a zero-byte write still ends. **The write side can say so.** ---
+        wr_cmd_addr   = 0;
+        wr_cmd_size = 0;
+        wr_cmd_valid  = 1;
+        clk.next(1);
+        wr_cmd_valid = 0;
+        clk.next(8);
+        // Step 2 (entries 4..6), step 2b (entries 2..4), and this zero-byte write.
+        $display("zero write: dones=%d oor=%d", dones, oor);
+        $assert(dones == 3);
+        $assert(oor == 3);
+    }
+}

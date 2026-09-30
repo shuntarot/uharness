@@ -1,0 +1,274 @@
+/// Widens AXI4 data: connects a narrow master to a wide slave.
+///
+/// A memory controller bus is often wider than the DUT (the Arty MIG is 128
+/// bits; a DUT is usually 32 or 64). MIG also does not accept narrow bursts,
+/// so the narrow master cannot simply issue small transfers.
+///
+/// Bursts are packed: R master beats become one slave beat, and reads are
+/// spread back out. `WSTRB` handles a length that is not a multiple of R and an
+/// unaligned start, so no burst is refused. Accepting only single beats would
+/// move only a few bytes per DRAM access.
+///
+/// Three preconditions, all checked by the generator in `check`:
+///
+/// - both widths are powers of two, and the slave is as wide or wider
+/// - `awsize` / `arsize` equal the full master width (no sub-word transfers)
+/// - bursts are INCR
+///
+/// One transfer at a time (reads and writes are independent). Several
+/// outstanding transfers would only add ordering rules here.
+pub module axi_dw::<MPKG: $std::axi4_prototype, SPKG: $std::axi4_prototype> (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// The narrow side (DUT).
+    s_axi: modport $std::axi4_if::<MPKG>::slave,
+    /// The wide side (controller).
+    m_axi: modport $std::axi4_if::<SPKG>::master,
+) {
+    const MB: u32 = MPKG::DATA_WIDTH_BYTES;
+    const SB: u32 = SPKG::DATA_WIDTH_BYTES;
+    const MW: u32 = MB * 8;
+    const SW: u32 = SB * 8;
+    /// Narrow beats per wide beat.
+    const R: u32 = SB / MB;
+    /// Lane index width. It is 1 bit even for R = 1, because width 0 is not
+    /// allowed.
+    const LANE_W: u32 = if R >: 1 ? $clog2(R) : 1;
+    const MSHIFT: u32 = $clog2(MB);
+    const SSHIFT: u32 = $clog2(SB);
+
+    /// The lane of the first beat.
+    let aw_lane: logic<LANE_W> = if R >: 1 ? s_axi.awaddr[SSHIFT - 1:MSHIFT] : 0;
+    let ar_lane: logic<LANE_W> = if R >: 1 ? s_axi.araddr[SSHIFT - 1:MSHIFT] : 0;
+
+    /// Wide-side beat count - 1, computed from the covered range.
+    function sbeats (
+        lane: input logic<LANE_W>,
+        len : input logic<10>    ,
+    ) -> logic<10> {
+        var total: logic<12>;
+        total = ({2'b0, len} + 1 + (lane as 12));
+        return ((total + R - 1) >> LANE_W) - 1;
+    }
+
+    // ── Write ───────────────────────────────────────────────────────────
+    var w_busy : logic               ;
+    var aw_done: logic               ;
+    var w_lane : logic       <LANE_W>;
+    var w_id   : MPKG::id_t          ;
+    var aw_addr: SPKG::addr_t        ;
+    var aw_len : logic       <8>     ;
+    var acc_d  : logic       <SW>    ;
+    var acc_s  : logic       <SB>    ;
+    var sw_val : logic               ;
+    var sw_d   : logic       <SW>    ;
+    var sw_s   : logic       <SB>    ;
+    var sw_last: logic               ;
+
+    /// Accept W only while a burst is still open and the holding stage is free.
+    ///
+    /// `w_busy` stays 1 until B returns. Using it alone keeps `wready` high
+    /// after `wlast`. AXI4 lets a master send W before AW, so the first beat
+    /// of the next burst would land in the finished burst's packing stage and
+    /// be lost without an error.
+    ///
+    /// This happened on hardware: the PCIe read DMA engine streams W as each
+    /// completion arrives, and one 32-byte beat was lost, which shifted all
+    /// later data. A master that sends one beat and waits for B does not hit it.
+    var w_open: logic;
+    let w_take: logic = w_busy && w_open && (!sw_val || m_axi.wready);
+
+    // ── Read ────────────────────────────────────────────────────────────
+    var r_busy : logic               ;
+    var ar_done: logic               ;
+    var r_lane : logic       <LANE_W>;
+    var r_left : logic       <9>     ;
+    var r_id   : MPKG::id_t          ;
+    var ar_addr: SPKG::addr_t        ;
+    var ar_len : logic       <8>     ;
+    var r_have : logic               ;
+    var r_hold : logic       <SW>    ;
+    var r_resp : logic       <2>     ;
+
+    always_comb {
+        // --- Narrow side ---
+        s_axi.awready = !w_busy;
+        s_axi.wready  = w_take;
+        s_axi.arready = !r_busy;
+
+        s_axi.rvalid = r_busy && r_have;
+        s_axi.rdata  = r_hold[w_slice(r_lane)+:MW];
+        s_axi.rresp  = r_resp;
+        s_axi.rlast  = r_left == 1;
+        s_axi.rid    = r_id;
+        s_axi.ruser  = 0;
+
+        // --- Wide side ---
+        m_axi.awvalid  = w_busy & ~aw_done;
+        m_axi.awaddr   = aw_addr;
+        m_axi.awlen    = aw_len;
+        m_axi.awsize   = SSHIFT;
+        m_axi.awburst  = 2'b01;
+        m_axi.awcache  = 0;
+        m_axi.awprot   = 0;
+        m_axi.awid     = 0;
+        m_axi.awlock   = 0;
+        m_axi.awqos    = 0;
+        m_axi.awregion = 0;
+        m_axi.awuser   = 0;
+
+        m_axi.wvalid = sw_val;
+        m_axi.wdata  = sw_d;
+        m_axi.wstrb  = sw_s;
+        m_axi.wlast  = sw_last;
+        m_axi.wuser  = 0;
+        m_axi.bready = 1;
+
+        m_axi.arvalid  = r_busy & ~ar_done;
+        m_axi.araddr   = ar_addr;
+        m_axi.arlen    = ar_len;
+        m_axi.arsize   = SSHIFT;
+        m_axi.arburst  = 2'b01;
+        m_axi.arcache  = 0;
+        m_axi.arprot   = 0;
+        m_axi.arid     = 0;
+        m_axi.arlock   = 0;
+        m_axi.arqos    = 0;
+        m_axi.arregion = 0;
+        m_axi.aruser   = 0;
+        m_axi.rready   = r_busy && !r_have;
+
+        // The write response passes through, with the id held here.
+        s_axi.bvalid = m_axi.bvalid;
+        s_axi.bresp  = m_axi.bresp;
+        s_axi.bid    = w_id;
+        s_axi.buser  = 0;
+    }
+
+    /// The first bit position of a lane.
+    function w_slice (
+        lane: input logic<LANE_W>,
+    ) -> logic<16> {
+        return (lane as 16) * MW;
+    }
+
+    /// The first byte position of a lane (for the strobe).
+    function b_slice (
+        lane: input logic<LANE_W>,
+    ) -> logic<16> {
+        return (lane as 16) * MB;
+    }
+
+    always_ff {
+        if_reset {
+            w_busy  = 0;
+            w_open  = 0;
+            aw_done = 0;
+            w_lane  = 0;
+            w_id    = 0;
+            aw_addr = 0;
+            aw_len  = 0;
+            acc_d   = 0;
+            acc_s   = 0;
+            sw_val  = 0;
+            sw_d    = 0;
+            sw_s    = 0;
+            sw_last = 0;
+            r_busy  = 0;
+            ar_done = 0;
+            r_lane  = 0;
+            r_left  = 0;
+            r_id    = 0;
+            ar_addr = 0;
+            ar_len  = 0;
+            r_have  = 0;
+            r_hold  = 0;
+            r_resp  = 0;
+        } else {
+            // ── Write ──
+            if sw_val && m_axi.wready {
+                sw_val = 0;
+            }
+            if m_axi.awvalid && m_axi.awready {
+                aw_done = 1;
+            }
+            if s_axi.wready && s_axi.wvalid && s_axi.wlast {
+                w_open = 0;
+            }
+            if !w_busy && s_axi.awvalid {
+                w_busy  = 1;
+                w_open  = 1;
+                aw_done = 0;
+                w_lane  = aw_lane;
+                w_id    = s_axi.awid;
+                aw_addr = s_axi.awaddr & ~((SB - 1) as SPKG::addr_t);
+                aw_len  = sbeats(aw_lane, {2'b0, s_axi.awlen}) as 8;
+                acc_d   = 0;
+                acc_s   = 0;
+            } else if w_take && s_axi.wvalid {
+                // Put the beat in its lane. Bytes that are not written have
+                // their strobe low, so stale data in the stage is never
+                // written.
+                acc_d[w_slice(w_lane)+:MW] = s_axi.wdata;
+                acc_s[b_slice(w_lane)+:MB] = s_axi.wstrb;
+                if (w_lane == R - 1) || s_axi.wlast {
+                    sw_val                    = 1;
+                    sw_d                      = acc_d;
+                    sw_d[w_slice(w_lane)+:MW] = s_axi.wdata;
+                    sw_s                      = acc_s;
+                    sw_s[b_slice(w_lane)+:MB] = s_axi.wstrb;
+                    sw_last                   = s_axi.wlast;
+                    acc_d                     = 0;
+                    acc_s                     = 0;
+                    w_lane                    = 0;
+                } else {
+                    w_lane = w_lane + 1;
+                }
+            }
+            if m_axi.bvalid && m_axi.bready {
+                w_busy = 0;
+            }
+
+            // ── Read ──
+            if m_axi.arvalid && m_axi.arready {
+                ar_done = 1;
+            }
+            if !r_busy && s_axi.arvalid {
+                r_busy  = 1;
+                ar_done = 0;
+                r_have  = 0;
+                r_lane  = ar_lane;
+                r_left  = {1'b0, s_axi.arlen} + 1;
+                r_id    = s_axi.arid;
+                ar_addr = s_axi.araddr & ~((SB - 1) as SPKG::addr_t);
+                ar_len  = sbeats(ar_lane, {2'b0, s_axi.arlen}) as 8;
+            } else {
+                if m_axi.rvalid && m_axi.rready {
+                    r_have = 1;
+                    r_hold = m_axi.rdata;
+                    r_resp = m_axi.rresp;
+                }
+                if s_axi.rvalid && s_axi.rready {
+                    r_left = r_left - 1;
+                    if r_left == 1 {
+                        r_busy = 0;
+                        r_have = 0;
+                    } else if w_lane_wraps(r_lane) {
+                        r_lane = 0;
+                        r_have = 0;
+                    } else {
+                        r_lane = r_lane + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether this is the last lane (the next one starts a new wide beat).
+    function w_lane_wraps (
+        lane: input logic<LANE_W>,
+    ) -> logic {
+        return lane == R - 1;
+    }
+}

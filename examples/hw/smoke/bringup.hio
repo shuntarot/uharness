@@ -1,0 +1,31 @@
+# smoke -- hio run bringup.hio
+# The DUT is nothing but a wrapper around std::fifo (WIDTH 8, DEPTH 16).
+
+echo == identity ==
+id
+
+echo == after reset: empty, not full ==
+read o_empty
+read o_full
+
+# valid_ready over `reg` becomes a **one-shot**. Writing 1 to i_push moves
+# exactly one beat -- the harness drops it again as soon as ready was high --
+# so even though the JTAG write is held for more than 1000 DUT cycles, only one
+# entry goes in and o_full stays 0. This is what regs.json records as
+# self_clearing = { on: o_full, invert: true }.
+echo == push 0xa5 -- one beat, not a level ==
+write i_data 0xa5
+write i_push 1
+write i_push 0
+read o_empty
+read o_full
+
+echo == pop until empty ==
+write i_pop 1
+write i_pop 0
+read o_data
+read o_empty
+read o_full
+
+echo == the whole window ==
+dump

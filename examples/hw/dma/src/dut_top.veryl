@@ -1,0 +1,163 @@
+/// The smallest DMA engine that copies within host memory. **It exists to carry
+/// the port that M6 has to terminate.**
+///
+/// The port is **transfer-level**: one command asks for "N bytes from address
+/// A", and the data comes back as a stream of 64-bit beats. **No latency is
+/// assumed** -- the answer may arrive any number of cycles later, and
+/// valid / ready carry the flow.
+///
+/// The shape follows a working transfer-level host port, but **with no tags,
+/// no 2D fields and no split**. All that is needed here is to state what
+/// `host_mem` must provide; multiple outstanding commands and page tables are
+/// not part of M6.
+///
+/// **Whether it worked is visible from the host, in two ways.** The sum of the
+/// beats and their count are registers, so a known pattern in memory gives a
+/// known sum. And the copy lands somewhere the host can read back through the
+/// backdoor -- **what was loaded is what should be there**, so the write side
+/// needs no expected value of its own.
+///
+/// Each beat is forwarded as it arrives: the read side is only made ready when
+/// the write side can take one. Nothing is buffered here, which is the point --
+/// **the queues that make that work belong to the terminator, not to the DUT.**
+module dut_top (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    // --- control (reg) ---
+    i_start: input  logic    , // 1 starts a transfer; ignored while busy
+    i_addr : input  logic<64>, // where to read from (8-byte aligned)
+    i_dst  : input  logic<64>, // where to write it back to
+    i_size : input  logic<32>, // bytes to move (a multiple of 8)
+    o_busy : output logic    ,
+    o_done : output logic    , // one-cycle pulse
+
+    // --- summary of what moved (reg) ---
+    o_sum  : output logic<64>, // sum of the beats seen
+    o_beats: output logic<32>, // how many beats were seen
+
+    // --- the read port into host memory (this is what `host_mem` terminates) ---
+    o_cmd_valid: output logic    ,
+    i_cmd_ready: input  logic    ,
+    o_cmd_addr : output logic<64>,
+    o_cmd_size : output logic<32>,
+    i_rd_valid : input  logic    ,
+    o_rd_ready : output logic    ,
+    i_rd_data  : input  logic<64>,
+    i_rd_last  : input  logic    ,
+
+    // --- the write port back into host memory ---
+    o_wcmd_valid: output logic    ,
+    i_wcmd_ready: input  logic    ,
+    o_wcmd_addr : output logic<64>,
+    o_wcmd_size : output logic<32>,
+    o_w_valid   : output logic    ,
+    i_w_ready   : input  logic    ,
+    o_w_data    : output logic<64>,
+    o_w_last    : output logic    ,
+    i_w_done    : input  logic    ,
+) {
+    const S_IDLE: logic<2> = 2'd0;
+    const S_CMD : logic<2> = 2'd1; // commands offered until they are accepted
+    const S_COPY: logic<2> = 2'd2; // beats streaming through
+    const S_WAIT: logic<2> = 2'd3; // the write was sent; waiting for it to land
+
+    var state    : logic<2> ;
+    var addr     : logic<64>;
+    var dst      : logic<64>;
+    var size     : logic<32>;
+    var sum      : logic<64>;
+    var beats    : logic<32>;
+    var done     : logic    ;
+    var rd_posted: logic    ;
+    var wr_posted: logic    ;
+
+    // **A beat moves only when both sides agree.** The read side is not made
+    // ready unless the write side can take what arrives.
+    let beat_taken: logic = state == S_COPY && i_rd_valid && i_w_ready;
+
+    always_comb {
+        o_cmd_valid  = state == S_CMD && !rd_posted;
+        o_cmd_addr   = addr;
+        o_cmd_size   = size;
+        o_wcmd_valid = state == S_CMD && !wr_posted;
+        o_wcmd_addr  = dst;
+        o_wcmd_size  = size;
+
+        o_rd_ready = state == S_COPY && i_w_ready;
+        o_w_valid  = state == S_COPY && i_rd_valid;
+        o_w_data   = i_rd_data;
+        o_w_last   = i_rd_last;
+
+        o_busy  = state != S_IDLE;
+        o_done  = done;
+        o_sum   = sum;
+        o_beats = beats;
+    }
+
+    always_ff {
+        if_reset {
+            state     = S_IDLE;
+            addr      = 0;
+            dst       = 0;
+            size      = 0;
+            sum       = 0;
+            beats     = 0;
+            done      = 0;
+            rd_posted = 0;
+            wr_posted = 0;
+        } else {
+            done = 0;
+            case state {
+                S_IDLE: {
+                    if i_start && i_size != 0 {
+                        addr = i_addr;
+                        dst  = i_dst;
+                        size = i_size;
+                        // **Count from zero on every run.** Leftovers from the
+                        // previous transfer would make a mismatched sum
+                        // impossible to explain.
+                        sum       = 0;
+                        beats     = 0;
+                        rd_posted = 0;
+                        wr_posted = 0;
+                        state     = S_CMD;
+                    }
+                }
+                S_CMD: {
+                    // The two commands are accepted independently; neither
+                    // waits for the other.
+                    if i_cmd_ready {
+                        rd_posted = 1;
+                    }
+                    if i_wcmd_ready {
+                        wr_posted = 1;
+                    }
+                    if (rd_posted || i_cmd_ready) && (wr_posted || i_wcmd_ready) {
+                        state = S_COPY;
+                    }
+                }
+                S_COPY: {
+                    if beat_taken {
+                        sum   = sum + i_rd_data;
+                        beats = beats + 1;
+                        if i_rd_last {
+                            state = S_WAIT;
+                        }
+                    }
+                }
+                S_WAIT: {
+                    // **The transfer is over when the write has landed**, not
+                    // when the last beat was handed over.
+                    if i_w_done {
+                        state = S_IDLE;
+                        done  = 1;
+                    }
+                }
+                default: {
+                    state = S_IDLE;
+                }
+            }
+        }
+    }
+}

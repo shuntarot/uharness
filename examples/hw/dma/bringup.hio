@@ -1,0 +1,38 @@
+# dma -- hio run bringup.hio
+# The DUT copies within host memory (a BRAM stands in). pattern.bin holds four
+# 64-bit beats: 1, 2, 3, 4 -- so the sum has to be 10, and the copy has to land
+# the same four values at the destination.
+
+echo == identity ==
+id
+read hmem_depth
+read hmem_oor
+
+echo == put a known pattern in the stand-in ==
+load hmem pattern.bin --verify
+
+echo == copy the first four beats to entry 8 ==
+write i_addr 0 0
+write i_dst 64 0
+write i_size 32
+write i_start 1
+write i_start 0
+read o_busy
+read o_beats
+read o_sum
+
+echo == read the destination back through the backdoor ==
+# What was loaded is what has to be there. Entries 8..11 must read 1, 2, 3, 4.
+# The address has to be set each time: a read does not advance it, so that
+# `dump` cannot walk the memory just by looking at it.
+write hmem_maddr 8
+read hmem_mdata
+write hmem_maddr 9
+read hmem_mdata
+write hmem_maddr 10
+read hmem_mdata
+write hmem_maddr 11
+read hmem_mdata
+
+echo == nothing was refused ==
+read hmem_oor

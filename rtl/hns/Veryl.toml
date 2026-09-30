@@ -1,0 +1,22 @@
+# Fixed-shape RTL parts that the harness uses. A user depends on this package
+# with one line.
+#
+# It holds only parts whose shape does not depend on the manifest; only their
+# parameters change: terminators (fifo / mem), the window slave (axil), and the
+# JTAG bridge (dr / bscan). Wiring and register decode change shape per
+# project, so the generator emits them.
+#
+# The parts are a separate package so that hand-verified CDC logic is not
+# rewritten per project. The user's Veryl.toml needs the dependency; the
+# generator reports a missing one with an error that prints the line to add.
+#
+# The directory name is free, but the project name is not. Veryl prefixes
+# generated SV module names with the project name, and those names share one
+# flat namespace with vendor IP.
+[project]
+name    = "hns"
+version = "0.1.0"
+
+[build]
+clock_type = "posedge"
+reset_type = "async_low"

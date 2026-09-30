@@ -1,0 +1,138 @@
+# Xilinx Kintex UltraScale KCU105 Evaluation Platform
+#
+# Values come from the board files (XilinxBoardStore, branch 2022.2,
+# boards/Xilinx/kcu105/1.7; Vivado 2021.2 ships the same files), from the BSDL
+# Vivado ships, and from the IPs Vivado 2021.2 generated for this part. Pins
+# were cross-checked against the KCU105 XDC of taxi (cndm/board/KCU105). Nothing
+# here is a guess.
+#
+# **Not yet run on the board** (2026-09-30). The probe facts `hio` needs (USB
+# ids, level-shifter values, IR capture, the TCK it can run) are measured there.
+
+[board]
+provider    = "xilinx"
+name        = "kcu105"
+description = "Kintex UltraScale KCU105 Evaluation Platform"
+url         = "https://www.xilinx.com/kcu105"
+untested    = true
+
+[device]
+vendor = "xilinx"
+family = "kintexu"
+part   = "xcku040-ffva1156-2-e"
+
+# Regex matched against the device names hw_manager lists.
+hw_pattern = "xcku040"
+
+# The DDR4 controller takes its settings from the board files through
+# `board_interface` (see the configs), which needs the board part.
+[vivado]
+board_part = "xilinx.com:kcu105:part0:1.7"
+
+[provides]
+# PCIe is the PCIE3 block (`pcie3_ultrascale`), gen3 x8. JTAG stays available
+# in a PCIe build.
+transport = ["jtag", "pcie"]
+
+# 36Kb x 600 = 21,600 Kbit on the XCKU040. From the datasheet.
+bram_kb = 2700
+
+# **No `dram` here.** The board carries one of two DDR4 parts, and the
+# controller must be told which. Pick the config that matches the chips:
+#
+#     --target xilinx/kcu105:dr    EDY4016AABG-DR-F (older boards)
+#     --target xilinx/kcu105:062   MT40A256M16LY-062E (newer boards)
+
+# The 125 MHz LVDS clock (sysclk_125). There is also a 300 MHz source, which
+# the DDR4 controller takes directly; the configs add it as [clocks.ddr].
+[clocks.sys]
+freq_mhz = 125
+diff     = true
+pin_p    = "G10"
+pin_n    = "F10"
+standard = "LVDS"
+
+# The CPU_RESET push button. The board files say "Active High".
+[resets.sys]
+pin      = "AN8"
+standard = "LVCMOS18"
+active   = "high"
+
+# The USB-UART (a CP2105). Directions are as the FPGA sees them, from the
+# `port_map ... dir=` of the rs232_uart interface. The IOSTANDARD is the one on
+# the rs232_uart component.
+[pins.uart_tx]
+pin       = "K26"
+standard  = "LVCMOS18"
+direction = "output"
+
+[pins.uart_rx]
+pin       = "G25"
+standard  = "LVCMOS18"
+direction = "input"
+
+[jtag]
+via = "vivado_hw_server"
+
+# The ceiling constrained on the bridge's TCK. **A choice, not a measurement**,
+# the same as the other boards.
+max_tck_mhz = 30
+
+# Not stated yet: `vid`, `pid`, `interface`, `product`, `layout_init`,
+# `host_tck_mhz` and `idcode`. They are measured on the board (`lsusb -v`,
+# `hio probe`, `hio bench`); until then `hio` searches for the probe itself.
+
+# --- JTAG instructions (from the BSDL) ---
+#
+#   <Vivado>/data/parts/xilinx/kintexu/public/bsdl/xcku040_ffva1156.bsd
+#
+# `INSTRUCTION_LENGTH` is 6 and there is one SLR, so these are the 7-series
+# values, as on the Arty.
+ir_length   = 6
+user1_ir    = 0x02
+jprogram_ir = 0x0b
+cfg_in_ir   = 0x05
+jstart_ir   = 0x0c
+bypass_ir   = 0x3f
+
+# Read back rather than waited for, as Vivado's SVF does. **Checked against the
+# SVF Vivado wrote for this part** (`make svf`, 2026-09-30): the same IRs,
+# expected values and masks, and the same JPROGRAM / CFG_IN. That SVF also
+# checks IDCODE 0x03822093 under mask 0x0fffffff.
+#
+# **That SVF sends no JSTART**, unlike the 7-series ones: the startup command is
+# in the bitstream. `hio program` sends JSTART anyway, as it does on the VCU118,
+# where programming works. Confirm on the board.
+[jtag.ready]
+ir     = 0x14   # ISC_NOOP
+expect = 0x11
+mask   = 0x31
+
+[jtag.done]
+ir     = 0x09   # IDCODE
+expect = 0x31
+mask   = 0x11
+
+[topology]
+nodes = 1
+links = []
+
+# --- PCIe ---
+#
+# Facts about the board only. From the board files (the pci_express_x8
+# interface and part0_pins.xml), cross-checked with taxi's KCU105 XDC. The block
+# is PCIE_3_1 X0Y0 on GTH quads 224/225, which is the IP's default.
+#
+# A gen3 x4 link with the same IP has come up on this board in another project
+# (link up and BAR reads), so the block, the reference clock and PERST# are
+# known to work.
+[pcie]
+lanes      = 8
+max_gen    = 3
+refclk_mhz = 100
+refclk_p   = "AB6"   # MGTREFCLK0P_225
+reset_n    = "K22"
+reset_standard = "LVCMOS18"
+# Lane 0 first. Only the p side; Vivado derives the n side.
+rx_p = ["AB2", "AD2", "AF2", "AH2", "AJ4", "AK2", "AM2", "AP2"]
+tx_p = ["AC4", "AE4", "AG4", "AH6", "AK6", "AL4", "AM6", "AN4"]

@@ -1,0 +1,15 @@
+# Reader for `regs.json`. The generator writes it; the host client reads it.
+#
+# This is a separate crate so that it can move into its own repository. Using
+# the generator's types directly would pull the whole generator along. Keep
+# the dependencies to the two below.
+[package]
+name        = "hns-regs"
+version     = "0.1.0"
+description = "Reader for the veryl-harness register map (regs.json)"
+edition     = "2024"
+license     = "MIT OR Apache-2.0"
+
+[dependencies]
+serde      = {version = "1.0", features = ["derive"]}
+serde_json = "1.0"

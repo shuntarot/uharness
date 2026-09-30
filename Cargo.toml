@@ -1,0 +1,47 @@
+# Software lives in crates/, hardware in rtl/. Each part must stay easy to
+# move into its own repository: shared types go in their own crate, and every
+# path dependency also states a version.
+#
+# `default-members` lists both the root and `crates/*`. In a workspace with a
+# root package, a plain `cargo build` / `cargo test` covers only the root, and
+# the tests under `crates/` would silently not run.
+[workspace]
+members = ["crates/*"]
+default-members = [".", "crates/*"]
+
+[package]
+name = "harness"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+# Veryl runs external subcommands by binary name, so `veryl harness ...`
+# needs the binary to be `veryl-harness`.
+[[bin]]
+name = "veryl-harness"
+path = "src/main.rs"
+
+[dependencies]
+hns-regs    = {version = "0.1.0", path = "crates/regs"}
+hns-targets = {version = "0.1.0", path = "crates/targets"}
+# Pinned. The `veryl` binary on PATH must be the same version. Otherwise the
+# library sees an IR that the CLI does not produce, and the symptoms are
+# confusing. Change all five pins together.
+veryl           = "=0.21.0"
+veryl-analyzer  = "=0.21.0"
+veryl-formatter = "=0.21.0"
+veryl-metadata  = "=0.21.0"
+veryl-parser    = "=0.21.0"
+# Versions follow the veryl workspace, so that no crate is built twice.
+clap           = {version = "4.6", features = ["derive"]}
+miette         = {version = "7.6", features = ["fancy"]}
+# Embeds files into the binary, as veryl-std does. `debug-embed` stops debug
+# builds from reading the repository path at run time.
+rust-embed     = {version = "8.12", features = ["debug-embed", "include-exclude"]}
+serde          = {version = "1.0", features = ["derive"]}
+serde_json     = "1.0"
+thiserror      = "2.0"
+toml           = "1.1.2"
+
+[dev-dependencies]
+tempfile = "3.26"

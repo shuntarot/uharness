@@ -1,0 +1,94 @@
+/// BSCANE2 connected to the bus DR. It needs no extra pins.
+///
+/// It uses a user DR on the same cable and TAP that load the bitstream, so no
+/// JTAG-in-JTAG tunnel (XVC, Debug Bridge) is needed. The primitive name is the
+/// same on 7-series, UltraScale and UltraScale+.
+///
+/// This module cannot be simulated: it holds a `$sv::` blackbox. The logic to
+/// verify lives in `dr`, which a test bench can drive.
+///
+/// `DRCK` is a gated clock and makes timing analysis hard. So `TCK` is used as
+/// a plain clock, and `SEL && SHIFT` is the enable.
+pub module bscan #(
+    /// Window address width. DR length = AW + 34.
+    param AW: u32 = 15,
+    /// USER slot. 1 = USER1. ILA, VIO and the debug hub also use USER slots,
+    /// so pick one that does not collide with them in the same design.
+    param CHAIN: u32 = 1,
+) (
+    i_clk: input 'bus clock,
+    i_rst: input 'bus reset,
+
+    o_awaddr : output 'bus logic<32>,
+    o_awvalid: output 'bus logic    ,
+    i_awready: input  'bus logic    ,
+    o_wdata  : output 'bus logic<32>,
+    o_wstrb  : output 'bus logic<4> ,
+    o_wvalid : output 'bus logic    ,
+    i_wready : input  'bus logic    ,
+    i_bresp  : input  'bus logic<2> ,
+    i_bvalid : input  'bus logic    ,
+    o_bready : output 'bus logic    ,
+    o_araddr : output 'bus logic<32>,
+    o_arvalid: output 'bus logic    ,
+    i_arready: input  'bus logic    ,
+    i_rdata  : input  'bus logic<32>,
+    i_rresp  : input  'bus logic<2> ,
+    i_rvalid : input  'bus logic    ,
+    o_rready : output 'bus logic    ,
+) {
+    var tck_raw: 'j logic;
+    var sel    : 'j logic;
+    var shift  : 'j logic;
+    var capture: 'j logic;
+    var update : 'j logic;
+    var tdi    : 'j logic;
+    var tdo    : 'j logic;
+
+    let tck: 'j clock = tck_raw;
+
+    unsafe (cdc) {
+        inst u_bscan: $sv::BSCANE2 #(
+            JTAG_CHAIN: CHAIN,
+        ) (
+            TCK    : tck_raw,
+            SEL    : sel    ,
+            SHIFT  : shift  ,
+            CAPTURE: capture,
+            UPDATE : update ,
+            TDI    : tdi    ,
+            TDO    : tdo    ,
+        );
+    }
+
+    inst u_dr: dr #(
+        AW: AW,
+    ) (
+        i_tck    : tck      ,
+        i_sel    : sel      ,
+        i_shift  : shift    ,
+        i_capture: capture  ,
+        i_update : update   ,
+        i_tdi    : tdi      ,
+        o_tdo    : tdo      ,
+        i_clk    : i_clk    ,
+        i_rst    : i_rst    ,
+        o_awaddr : o_awaddr ,
+        o_awvalid: o_awvalid,
+        i_awready: i_awready,
+        o_wdata  : o_wdata  ,
+        o_wstrb  : o_wstrb  ,
+        o_wvalid : o_wvalid ,
+        i_wready : i_wready ,
+        i_bresp  : i_bresp  ,
+        i_bvalid : i_bvalid ,
+        o_bready : o_bready ,
+        o_araddr : o_araddr ,
+        o_arvalid: o_arvalid,
+        i_arready: i_arready,
+        i_rdata  : i_rdata  ,
+        i_rresp  : i_rresp  ,
+        i_rvalid : i_rvalid ,
+        o_rready : o_rready ,
+    );
+}

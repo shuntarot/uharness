@@ -1,0 +1,231 @@
+/// The stress stage **makes a transfer take longer without changing it**.
+///
+/// The same read is run twice, once with the stage disabled and once with it
+/// holding off eight cycles after every transfer. Both must hand back the same
+/// four beats and the same sum; only the time differs. **A stage that changed
+/// the data would be worse than no stage at all.**
+#[test(delay_slows_a_transfer_without_altering_it)]
+module test_delay {
+    const DW   : u32 = 64;
+    const DEPTH: u32 = 8 ;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var hold  : logic<8>;
+    var jitter: logic   ;
+
+    // DUT side of the stage.
+    var d_cmd_valid: logic    ;
+    var d_cmd_ready: logic    ;
+    var d_cmd_addr : logic<64>;
+    var d_cmd_size : logic<32>;
+    var d_rd_valid : logic    ;
+    var d_rd_ready : logic    ;
+    var d_rd_data  : logic<64>;
+    var d_rd_last  : logic    ;
+
+    // Terminator side of the stage.
+    var t_cmd_valid: logic    ;
+    var t_cmd_ready: logic    ;
+    var t_cmd_addr : logic<64>;
+    var t_cmd_size : logic<32>;
+    var t_rd_valid : logic    ;
+    var t_rd_ready : logic    ;
+    var t_rd_data  : logic<64>;
+    var t_rd_last  : logic    ;
+
+    var haddr : logic<3> ;
+    var hwdata: logic<64>;
+    var hwe   : logic    ;
+    var oor   : logic<32>;
+
+    var beats   : logic<32>;
+    var sum     : logic<64>;
+    var saw_last: logic    ;
+    var ticks   : logic<32>;
+    var counting: logic    ;
+    var clear   : logic    ;
+
+    always_ff (clk, rst) {
+        if_reset {
+            beats    = 0;
+            sum      = 0;
+            saw_last = 0;
+            ticks    = 0;
+        } else {
+            if clear {
+                beats    = 0;
+                sum      = 0;
+                saw_last = 0;
+                ticks    = 0;
+            } else {
+                if counting {
+                    ticks = ticks + 1;
+                }
+                if d_rd_valid && d_rd_ready {
+                    beats = beats + 1;
+                    sum   = sum + d_rd_data;
+                    if d_rd_last {
+                        saw_last = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    inst s: delay #(
+        DW    : DW,
+        ADDR_W: 64,
+        SIZE_W: 32,
+    ) (
+        i_clk           : clk              ,
+        i_rst           : rst              ,
+        i_delay         : hold             ,
+        i_jitter        : jitter           ,
+        i_d_rd_cmd_valid: d_cmd_valid      ,
+        o_d_rd_cmd_ready: d_cmd_ready      ,
+        i_d_rd_cmd_addr : d_cmd_addr       ,
+        i_d_rd_cmd_size : d_cmd_size       ,
+        o_d_rd_valid    : d_rd_valid       ,
+        i_d_rd_ready    : d_rd_ready       ,
+        o_d_rd_data     : d_rd_data        ,
+        o_d_rd_last     : d_rd_last        ,
+        i_d_wr_cmd_valid: 1'b0             ,
+        o_d_wr_cmd_ready: _                ,
+        i_d_wr_cmd_addr : 64'b0            ,
+        i_d_wr_cmd_size : 32'b0            ,
+        i_d_wr_valid    : 1'b0             ,
+        o_d_wr_ready    : _                ,
+        i_d_wr_data     : 64'b0            ,
+        i_d_wr_strb     : 8'b0             ,
+        i_d_wr_last     : 1'b0             ,
+        o_d_wr_done     : _                ,
+        o_t_rd_cmd_valid: t_cmd_valid      ,
+        i_t_rd_cmd_ready: t_cmd_ready      ,
+        o_t_rd_cmd_addr : t_cmd_addr       ,
+        o_t_rd_cmd_size : t_cmd_size       ,
+        i_t_rd_valid    : t_rd_valid       ,
+        o_t_rd_ready    : t_rd_ready       ,
+        i_t_rd_data     : t_rd_data        ,
+        i_t_rd_last     : t_rd_last        ,
+        o_t_wr_cmd_valid: _                ,
+        i_t_wr_cmd_ready: 1'b1             ,
+        o_t_wr_cmd_addr : _                ,
+        o_t_wr_cmd_size : _                ,
+        o_t_wr_valid    : _                ,
+        i_t_wr_ready    : 1'b1             ,
+        o_t_wr_data     : _                ,
+        o_t_wr_strb     : _                ,
+        o_t_wr_last     : _                ,
+        i_t_wr_done     : 1'b0             ,
+    );
+
+    inst h: hmem #(
+        DW    : DW   ,
+        DEPTH : DEPTH,
+        ADDR_W: 64   ,
+        SIZE_W: 32   ,
+    ) (
+        i_clk           : clk              ,
+        i_rst          : rst               ,
+        i_rd_cmd_valid : t_cmd_valid       ,
+        o_rd_cmd_ready : t_cmd_ready       ,
+        i_rd_cmd_addr  : t_cmd_addr        ,
+        i_rd_cmd_size  : t_cmd_size        ,
+        o_rd_valid     : t_rd_valid        ,
+        i_rd_ready     : t_rd_ready        ,
+        o_rd_data      : t_rd_data         ,
+        o_rd_last      : t_rd_last         ,
+        i_wr_cmd_valid : 1'b0              ,
+        o_wr_cmd_ready : _                 ,
+        i_wr_cmd_addr  : 64'b0             ,
+        i_wr_cmd_size  : 32'b0             ,
+        i_wr_valid     : 1'b0              ,
+        o_wr_ready     : _                 ,
+        i_wr_data      : 64'b0             ,
+        i_wr_strb      : '1,
+        i_wr_last      : 1'b0              ,
+        o_wr_done_valid: _                 ,
+        i_haddr        : haddr             ,
+        i_hwdata       : hwdata            ,
+        i_hwe          : hwe               ,
+        o_hrdata       : _                 ,
+        o_widened      : _,
+        o_oor          : oor               ,
+    );
+
+    var quick: logic<32>;
+
+    function one_read () {
+        clear = 1;
+        clk.next(1);
+        clear       = 0;
+        counting    = 1;
+        d_cmd_addr  = 0;
+        d_cmd_size  = 32;
+        d_cmd_valid = 1;
+        clk.next(1);
+        d_cmd_valid = 0;
+        for _i in 0..400 {
+            if saw_last {
+                break;
+            }
+            clk.next(1);
+        }
+        counting = 0;
+        clk.next(1);
+    }
+
+    initial {
+        hold        = 0;
+        jitter      = 0;
+        d_cmd_valid = 0;
+        d_cmd_addr  = 0;
+        d_cmd_size  = 0;
+        d_rd_ready  = 1;
+        haddr       = 0;
+        hwdata      = 0;
+        hwe         = 0;
+        clear       = 0;
+        counting    = 0;
+        quick       = 0;
+
+        rst.assert(4);
+        clk.next(4);
+
+        for i in 0..DEPTH {
+            haddr  = i as 3;
+            hwdata = (i + 1) as 64;
+            hwe    = 1;
+            clk.next(1);
+        }
+        hwe = 0;
+        clk.next(2);
+
+        // 1. the stage disabled: it must be out of the way entirely.
+        one_read();
+        $display("hold=0: beats=%d sum=%d ticks=%d", beats, sum, ticks);
+        $assert(beats == 4);
+        $assert(sum == 10);
+        quick = ticks;
+
+        // 2. the same read, held off eight cycles after every transfer.
+        hold = 8;
+        one_read();
+        $display("hold=8: beats=%d sum=%d ticks=%d", beats, sum, ticks);
+        // **The answer is the same.**
+        $assert(beats == 4);
+        $assert(sum == 10);
+        // **The time is not.** If it were, the stage would not be doing anything.
+        $assert(ticks >: quick);
+
+        // 3. jitter varies the hold-off; the answer still does not change.
+        jitter = 1;
+        one_read();
+        $display("jitter: beats=%d sum=%d ticks=%d", beats, sum, ticks);
+        $assert(beats == 4);
+        $assert(sum == 10);
+        $assert(oor == 0);
+    }
+}

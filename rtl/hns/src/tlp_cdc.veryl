@@ -1,0 +1,93 @@
+/// Passes a PCIe TLP stream between clock domains. Used for both RQ and RC.
+///
+/// These two streams are the only crossings. The DMA engines sit in the
+/// harness clock domain, so only the outgoing RQ and the returning RC cross to
+/// the hard block. (With the engines on the other side, whole AXI buses would
+/// cross.) The cost: bandwidth is capped at 256 bits x the harness clock
+/// (3.2 GB/s at 100 MHz).
+///
+/// The instance decides the direction. `is_*` is the source and `od_*` the
+/// destination: harness to hard block for RQ, the reverse for RC.
+///
+/// The logic is one `hns::async_fifo`. Keep it that way: like `hns::axi_cdc`,
+/// this has no test bench yet, so correctness is kept inside the FIFO.
+/// `hns::async_fifo` is a copy of `std::async_fifo` with a one-line CDC fix;
+/// switch back when std is fixed.
+pub module tlp_cdc #(
+    /// FIFO depth: how much it absorbs when the receiver stalls.
+    param DEPTH: u32 = 8,
+    /// Width of `tuser`. 60 for RQ, 75 for RC: RC also carries completion
+    /// status and error bits.
+    param USER_W: u32 = 60,
+) (
+    /// Source.
+    is_clk   : input  's clock        ,
+    is_rst   : input  's reset        ,
+    is_tdata : input  's logic<256>   ,
+    is_tkeep : input  's logic<8>     ,
+    is_tlast : input  's logic        ,
+    is_tuser : input  's logic<USER_W>,
+    is_tvalid: input  's logic        ,
+    os_tready: output 's logic        ,
+
+    /// Destination.
+    id_clk   : input  'd clock        ,
+    id_rst   : input  'd reset        ,
+    od_tdata : output 'd logic<256>   ,
+    od_tkeep : output 'd logic<8>     ,
+    od_tlast : output 'd logic        ,
+    od_tuser : output 'd logic<USER_W>,
+    od_tvalid: output 'd logic        ,
+    id_tready: input  'd logic        ,
+) {
+    struct beat_t {
+        tdata: logic<256>   ,
+        tkeep: logic<8>     ,
+        tlast: logic        ,
+        tuser: logic<USER_W>,
+    }
+
+    // The clock domain is part of each type. Without it, the checker cannot
+    // tell which side a signal is on, and a crossing would pass unchecked.
+    var full : 's logic ;
+    var empty: 'd logic ;
+    var dout : 'd beat_t;
+
+    let din  : 's beat_t = beat_t'{tdata: is_tdata, tkeep: is_tkeep, tlast: is_tlast, tuser: is_tuser,};
+
+    always_comb {
+        os_tready = ~full;
+    }
+
+    always_comb {
+        od_tdata  = dout.tdata;
+        od_tkeep  = dout.tkeep;
+        od_tlast  = dout.tlast;
+        od_tuser  = dout.tuser;
+        od_tvalid = ~empty;
+    }
+
+    // A reset on either side resets both. One side uses the PCIe user reset
+    // (PERST# also asserts it), the other the harness reset, and a host reboot
+    // asserts only the first. If only one side's pointer returns to 0, the
+    // counts disagree and a stale entry can come out as a TLP. std has the
+    // MERGE_RESET option for this. It assumes active-low resets: std merges
+    // them as `is_rst & id_rst`.
+    inst u_fifo: async_fifo::<$std::synchronizer_basic> #(
+        TYPE       : beat_t,
+        DEPTH      : DEPTH ,
+        MERGE_RESET: true  ,
+    ) (
+        is_clk                            ,
+        is_rst                            ,
+        os_almost_full: _                 ,
+        os_full       : full              ,
+        is_push       : is_tvalid & ~full,
+        is_data       : din               ,
+        id_clk                            ,
+        id_rst                            ,
+        od_empty      : empty             ,
+        id_pop        : id_tready & ~empty,
+        od_data       : dout              ,
+    );
+}

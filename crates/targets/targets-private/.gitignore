@@ -1,0 +1,5 @@
+# Descriptions here are not published. Only this file and README.md are
+# tracked; everything else stays on the machines that build for these boards.
+*
+!.gitignore
+!README.md

@@ -1,0 +1,233 @@
+/// `hns::axi_fence` cuts the master off in the middle of a burst without
+/// stalling the slave.
+///
+/// The slave is `hns::axi_mem`, which takes one transfer at a time. If the rest
+/// of W never comes, it waits in `w_busy` forever. So if the next transfer goes
+/// through after the cut, the fence has cleaned up.
+///
+/// 1. Normally the fence passes everything. Write a 4-beat burst and read it
+///    back.
+/// 2. Close in the middle of a write. After 2 of 4 beats the fence closes and
+///    the master goes quiet (as if it was reset). The fence fills the last
+///    2 beats with strobe 0, so the memory keeps the old values.
+/// 3. Close in the middle of a read. After 1 of 4 beats the fence closes. The
+///    fence takes the rest and drops it.
+/// 4. After the fence opens, a read of the same address shows the results of
+///    steps 1 and 2.
+#[test(axi_fence_cuts_a_burst_without_stalling_the_slave)]
+module test_axi_fence {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen (
+        clk: clk,
+    );
+
+    inst mst: $std::axi4_if::<$std::axi4_pkg::<16, 4, 4, 1, 1, 1, 1, 1>>;
+    inst slv: $std::axi4_if::<$std::axi4_pkg::<16, 4, 4, 1, 1, 1, 1, 1>>;
+
+    var fence : logic;
+    var closed: logic;
+    var idle  : logic;
+
+    inst u_fence: axi_fence::<$std::axi4_pkg::<16, 4, 4, 1, 1, 1, 1, 1>> (
+        i_clk   : clk   ,
+        i_rst   : rst   ,
+        i_fence : fence ,
+        o_closed: closed,
+        o_idle  : idle  ,
+        s_axi   : mst   ,
+        m_axi   : slv   ,
+    );
+
+    inst u_mem: axi_mem::<$std::axi4_pkg::<16, 4, 4, 1, 1, 1, 1, 1>> #(
+        DEPTH: 64,
+    ) (
+        i_clk   : clk,
+        i_rst   : rst,
+        axi     : slv,
+        i_haddr : '0 ,
+        i_hwdata: '0 ,
+        i_hwstrb: '0 ,
+        i_hwe   : '0 ,
+        o_hrdata: _  ,
+    );
+
+    always_comb {
+        mst.awsize   = 3'd2;
+        mst.awburst  = 2'b01;
+        mst.awcache  = 0;
+        mst.awprot   = 0;
+        mst.awlock   = 0;
+        mst.awqos    = 0;
+        mst.awregion = 0;
+        mst.awuser   = 0;
+        mst.awid     = 1;
+        mst.wuser    = 0;
+        mst.arsize   = 3'd2;
+        mst.arburst  = 2'b01;
+        mst.arcache  = 0;
+        mst.arprot   = 0;
+        mst.arlock   = 0;
+        mst.arqos    = 0;
+        mst.arregion = 0;
+        mst.aruser   = 0;
+        mst.arid     = 2;
+    }
+
+    function aw (
+        addr: input logic<16>,
+        len : input logic<8> ,
+    ) {
+        mst.awaddr  = addr;
+        mst.awlen   = len;
+        mst.awvalid = 1;
+        for _i in 0..64 {
+            if mst.awready {
+                break;
+            }
+            clk.next(1);
+        }
+        $assert(mst.awready, "the fence never took the AW");
+        clk.next(1);
+        mst.awvalid = 0;
+    }
+
+    function w (
+        data: input logic<32>,
+        last: input logic    ,
+    ) {
+        mst.wdata  = data;
+        mst.wstrb  = 4'hf;
+        mst.wlast  = last;
+        mst.wvalid = 1;
+        for _i in 0..64 {
+            if mst.wready {
+                break;
+            }
+            clk.next(1);
+        }
+        $assert(mst.wready, "the fence never took a W beat");
+        clk.next(1);
+        mst.wvalid = 0;
+    }
+
+    function b {
+        for _i in 0..64 {
+            if mst.bvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $assert(mst.bvalid, "no write response");
+        mst.bready = 1;
+        clk.next(1);
+        mst.bready = 0;
+    }
+
+    function ar (
+        addr: input logic<16>,
+        len : input logic<8> ,
+    ) {
+        mst.araddr  = addr;
+        mst.arlen   = len;
+        mst.arvalid = 1;
+        for _i in 0..64 {
+            if mst.arready {
+                break;
+            }
+            clk.next(1);
+        }
+        $assert(mst.arready, "the fence never took the AR");
+        clk.next(1);
+        mst.arvalid = 0;
+    }
+
+    /// Takes one R beat and checks its value.
+    function r (
+        want: input logic<32>,
+        last: input logic    ,
+    ) {
+        mst.rready = 1;
+        for _i in 0..64 {
+            if mst.rvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $assert(mst.rvalid, "no read data");
+        $assert(mst.rdata == want, "read back the wrong word");
+        $assert(mst.rlast == last, "rlast in the wrong place");
+        clk.next(1);
+        mst.rready = 0;
+    }
+
+    /// Raises the fence and waits until it is closed and the slave is idle.
+    /// The master sends nothing more.
+    function cut {
+        fence = 1;
+        for _i in 0..64 {
+            if closed {
+                break;
+            }
+            clk.next(1);
+        }
+        $assert(closed, "the fence never closed");
+        for _i in 0..64 {
+            if idle {
+                break;
+            }
+            clk.next(1);
+        }
+        $assert(idle, "the fence never drained the slave");
+        clk.next(1);
+        fence = 0;
+        clk.next(1);
+    }
+
+    initial {
+        fence       = 0;
+        mst.awvalid = 0;
+        mst.wvalid  = 0;
+        mst.bready  = 0;
+        mst.arvalid = 0;
+        mst.rready  = 0;
+        rst.assert(4);
+        clk.next(2);
+        $assert(idle, "idle out of reset");
+
+        // 1. Pass through. 4 words at 0x40.
+        aw(16'h40, 3);
+        w(32'h55, 0);
+        w(32'h56, 0);
+        w(32'h57, 0);
+        w(32'h58, 1);
+        b();
+        ar(16'h40, 3);
+        r(32'h55, 0);
+        r(32'h56, 0);
+        r(32'h57, 0);
+        r(32'h58, 1);
+        $assert(idle, "idle after a clean burst");
+
+        // 2. Close in the middle of a write. Send only 2 beats.
+        aw(16'h40, 3);
+        w(32'ha, 0);
+        w(32'hb, 0);
+        cut();
+
+        // 3. Close in the middle of a read. Take only 1 beat.
+        ar(16'h40, 3);
+        r(32'ha, 0);
+        cut();
+
+        // 4. The 2 words sent are written; the 2 filled words keep old values.
+        ar(16'h40, 3);
+        r(32'ha, 0);
+        r(32'hb, 0);
+        r(32'h57, 0);
+        r(32'h58, 1);
+
+        // With nothing in flight, the fence closes and drains at once.
+        cut();
+        $finish();
+    }
+}

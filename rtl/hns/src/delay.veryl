@@ -1,0 +1,192 @@
+/// A stage that makes the DUT wait, inserted between it and a terminator.
+///
+/// The terminators are fast and even-tempered: a BRAM answers in two cycles,
+/// every time, and a queue that is never full always says ready. A DUT can
+/// therefore pass on hardware while assuming things the real thing will not
+/// honour -- that a command is always accepted, that the first beat arrives
+/// within so many cycles, that back-pressure never happens. This stage takes
+/// those assumptions away on purpose.
+///
+/// Off by default. `i_delay = 0` passes everything through combinationally,
+/// so a harness that does not ask for stress behaves exactly as before.
+///
+/// Driven from a register, not from the manifest. Re-synthesising to change
+/// a number would cost minutes on a small board and an hour on a large one; the
+/// point is to sweep it, which only works if the host can turn the knob between
+/// runs on one bitstream.
+///
+/// A stall masks both halves of a handshake at once, so no beat is lost:
+/// while stalled, neither side sees a transfer, and both hold what they have.
+pub module delay #(
+    param DW    : u32 = 64,
+    param ADDR_W: u32 = 64,
+    param SIZE_W: u32 = 32,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// Cycles to hold off after each transfer. 0 disables the stage.
+    i_delay: input logic<8>,
+    /// Vary the hold-off between 0 and `i_delay` instead of using it exactly.
+    i_jitter: input logic,
+
+    // --- the DUT side ---
+    i_d_rd_cmd_valid: input  logic          ,
+    o_d_rd_cmd_ready: output logic          ,
+    i_d_rd_cmd_addr : input  logic<ADDR_W>  ,
+    i_d_rd_cmd_size : input  logic<SIZE_W>  ,
+    o_d_rd_valid    : output logic          ,
+    i_d_rd_ready    : input  logic          ,
+    o_d_rd_data     : output logic<DW>      ,
+    o_d_rd_last     : output logic          ,
+    i_d_wr_cmd_valid: input  logic          ,
+    o_d_wr_cmd_ready: output logic          ,
+    i_d_wr_cmd_addr : input  logic<ADDR_W>  ,
+    i_d_wr_cmd_size : input  logic<SIZE_W>  ,
+    i_d_wr_valid    : input  logic          ,
+    o_d_wr_ready    : output logic          ,
+    i_d_wr_data     : input  logic<DW>      ,
+    i_d_wr_strb     : input  logic<DW / 8>  ,
+    i_d_wr_last     : input  logic          ,
+    o_d_wr_done     : output logic          ,
+
+    // --- the terminator side ---
+    o_t_rd_cmd_valid: output logic          ,
+    i_t_rd_cmd_ready: input  logic          ,
+    o_t_rd_cmd_addr : output logic<ADDR_W>  ,
+    o_t_rd_cmd_size : output logic<SIZE_W>  ,
+    i_t_rd_valid    : input  logic          ,
+    o_t_rd_ready    : output logic          ,
+    i_t_rd_data     : input  logic<DW>      ,
+    i_t_rd_last     : input  logic          ,
+    o_t_wr_cmd_valid: output logic          ,
+    i_t_wr_cmd_ready: input  logic          ,
+    o_t_wr_cmd_addr : output logic<ADDR_W>  ,
+    o_t_wr_cmd_size : output logic<SIZE_W>  ,
+    o_t_wr_valid    : output logic          ,
+    i_t_wr_ready    : input  logic          ,
+    o_t_wr_data     : output logic<DW>      ,
+    o_t_wr_strb     : output logic<DW / 8>  ,
+    o_t_wr_last     : output logic          ,
+    i_t_wr_done     : input  logic          ,
+) {
+    var s_rd_cmd: logic;
+    var s_rd    : logic;
+    var s_wr_cmd: logic;
+    var s_wr    : logic;
+
+    // Each channel stalls on its own schedule; sharing one would make the four
+    // move together, which is the one pattern a real link never produces.
+    inst g_rd_cmd: stall #(
+        SEED: 16'h1234,
+    ) (
+        i_clk                                                ,
+        i_rst                                                ,
+        i_delay                                              ,
+        i_jitter                                             ,
+        i_fire : o_t_rd_cmd_valid & i_t_rd_cmd_ready         ,
+        o_stall: s_rd_cmd                                    ,
+    );
+    inst g_rd: stall #(
+        SEED: 16'h89ab,
+    ) (
+        i_clk                                    ,
+        i_rst                                    ,
+        i_delay                                  ,
+        i_jitter                                 ,
+        i_fire : o_d_rd_valid & i_d_rd_ready     ,
+        o_stall: s_rd                            ,
+    );
+    inst g_wr_cmd: stall #(
+        SEED: 16'hcdef,
+    ) (
+        i_clk                                                ,
+        i_rst                                                ,
+        i_delay                                              ,
+        i_jitter                                             ,
+        i_fire : o_t_wr_cmd_valid & i_t_wr_cmd_ready         ,
+        o_stall: s_wr_cmd                                    ,
+    );
+    inst g_wr: stall #(
+        SEED: 16'h5a5a,
+    ) (
+        i_clk                                    ,
+        i_rst                                    ,
+        i_delay                                  ,
+        i_jitter                                 ,
+        i_fire : o_t_wr_valid & i_t_wr_ready     ,
+        o_stall: s_wr                            ,
+    );
+
+    always_comb {
+        // Read command: the DUT offers, the terminator accepts.
+        o_t_rd_cmd_valid = i_d_rd_cmd_valid & ~s_rd_cmd;
+        o_d_rd_cmd_ready = i_t_rd_cmd_ready & ~s_rd_cmd;
+        o_t_rd_cmd_addr  = i_d_rd_cmd_addr;
+        o_t_rd_cmd_size  = i_d_rd_cmd_size;
+
+        // Read data: the terminator offers, the DUT accepts.
+        o_d_rd_valid = i_t_rd_valid & ~s_rd;
+        o_t_rd_ready = i_d_rd_ready & ~s_rd;
+        o_d_rd_data  = i_t_rd_data;
+        o_d_rd_last  = i_t_rd_last;
+
+        // Write command.
+        o_t_wr_cmd_valid = i_d_wr_cmd_valid & ~s_wr_cmd;
+        o_d_wr_cmd_ready = i_t_wr_cmd_ready & ~s_wr_cmd;
+        o_t_wr_cmd_addr  = i_d_wr_cmd_addr;
+        o_t_wr_cmd_size  = i_d_wr_cmd_size;
+
+        // Write data.
+        o_t_wr_valid = i_d_wr_valid & ~s_wr;
+        o_d_wr_ready = i_t_wr_ready & ~s_wr;
+        o_t_wr_data  = i_d_wr_data;
+        // The strobe moves with the data. Delaying it on its own would
+        // misalign the two.
+        o_t_wr_strb  = i_d_wr_strb;
+        o_t_wr_last  = i_d_wr_last;
+
+        // The completion is not delayed. It carries no handshake, so
+        // holding it would drop it rather than postpone it.
+        o_d_wr_done = i_t_wr_done;
+    }
+}
+
+/// Hold off for a while after each transfer.
+///
+/// The count is loaded when a transfer happens, not when one is offered, so
+/// a channel that is idle never stalls -- the stress lands on traffic, not on
+/// waiting.
+module stall #(
+    param SEED: logic<16> = 16'h1234,
+) (
+    i_clk   : input  clock    ,
+    i_rst   : input  reset    ,
+    i_delay : input  logic<8> ,
+    i_jitter: input  logic    ,
+    i_fire  : input  logic    ,
+    o_stall : output logic    ,
+) {
+    var count: logic<8> ;
+    var lfsr : logic<16>;
+
+    // Galois LFSR, x^16 + x^14 + x^13 + x^11 + 1. Enough spread for a stall
+    // pattern; nothing here depends on its statistical quality.
+    let next_lfsr: logic<16> = if lfsr[0] ? ((lfsr >> 1) ^ 16'hb400) : (lfsr >> 1);
+
+    assign o_stall = count != 0;
+
+    always_ff {
+        if_reset {
+            count = 0;
+            lfsr  = SEED;
+        } else {
+            lfsr = next_lfsr;
+            if count != 0 {
+                count = count - 1;
+            } else if i_fire && i_delay != 0 {
+                count = if i_jitter ? (lfsr[7:0] & i_delay) : i_delay;
+            }
+        }
+    }
+}

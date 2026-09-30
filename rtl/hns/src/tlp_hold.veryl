@@ -1,0 +1,134 @@
+/// Buffers each whole RQ TLP before passing it to the hard block.
+///
+/// On RQ, `tvalid` must not drop in the middle of a TLP, or the hard block
+/// nullifies that TLP (PG213 "Requester Memory Write Operation"). The DMA
+/// engine runs at 100 MHz and the hard block at 250 MHz, with one async FIFO
+/// between them, so the FIFO runs empty mid-TLP. Measured on a VCU118: almost
+/// every TLP with payload 256 had a gap. The hard block sent most of them, but
+/// a few per 2 GB never arrived, and the root port raised `FatalErr` (payload
+/// 128 lost none). Which TLP breaks cannot be chosen, so all are buffered.
+/// With buffering, 10 GB passed with no loss and no root port error.
+///
+/// Only a TLP that is complete up to `tlast` goes out. When it starts, the
+/// last beat is already here, so the hard block never sees a gap.
+///
+/// It sits in the hard block clock domain (after `hns::tlp_cdc`). It has one
+/// clock, so the native simulator runs it (`tb_tlp_hold.veryl`).
+pub module tlp_hold #(
+    /// Depth. It must be deeper than the longest TLP: payload 1024 is 33 beats
+    /// with the header. If it is too shallow, it fills before a TLP is
+    /// complete. Then it sends on full (better than a stall), but that TLP can
+    /// have gaps.
+    param DEPTH: u32 = 64,
+    /// Width of `tuser`. 60 for RQ.
+    param USER_W: u32 = 60,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// Input (output of `hns::tlp_cdc`).
+    i_tdata : input  logic<256>   ,
+    i_tkeep : input  logic<8>     ,
+    i_tlast : input  logic        ,
+    i_tuser : input  logic<USER_W>,
+    i_tvalid: input  logic        ,
+    o_tready: output logic        ,
+
+    /// Output (RQ of the hard block).
+    o_tdata : output logic<256>   ,
+    o_tkeep : output logic<8>     ,
+    o_tlast : output logic        ,
+    o_tuser : output logic<USER_W>,
+    o_tvalid: output logic        ,
+    i_tready: input  logic        ,
+
+    /// Number of TLPs whose `tvalid` dropped mid-TLP at the input (saturating).
+    /// It shows that the buffer is doing its job. It is gray code from a
+    /// flip-flop, so another clock domain can take it through a 2-stage
+    /// per-bit synchronizer.
+    o_gaps_gray: output logic<16>,
+) {
+    struct beat_t {
+        tdata: logic<256>   ,
+        tkeep: logic<8>     ,
+        tlast: logic        ,
+        tuser: logic<USER_W>,
+    }
+
+    var empty: logic ;
+    var full : logic ;
+    var head : beat_t;
+
+    let push: logic  = i_tvalid && !full;
+    let pop : logic  = o_tvalid && i_tready;
+    let din : beat_t = beat_t'{tdata: i_tdata, tkeep: i_tkeep, tlast: i_tlast, tuser: i_tuser,};
+
+    inst u_fifo: $std::fifo #(
+        TYPE : beat_t,
+        DEPTH: DEPTH ,
+    ) (
+        i_clk                 ,
+        i_rst                 ,
+        i_clear      : 0      ,
+        o_empty      : empty  ,
+        o_almost_full: _      ,
+        o_full       : full   ,
+        o_word_count : _      ,
+        i_push       : push   ,
+        i_data       : din    ,
+        i_pop        : pop    ,
+        o_data       : head   ,
+    );
+
+    /// Number of complete TLPs inside. The TLP being sent still counts (it is
+    /// removed at its last beat), so once sending starts, `o_tvalid` stays high
+    /// to the end.
+    const PW: u32 = $clog2(DEPTH + 1);
+    var packets: logic<PW>;
+    always_ff {
+        if_reset {
+            packets = 0;
+        } else {
+            packets = packets + ((push && i_tlast) as PW) - ((pop && head.tlast) as PW);
+        }
+    }
+
+    always_comb {
+        o_tready = !full;
+        o_tvalid = !empty && (packets != 0 || full);
+        o_tdata  = head.tdata;
+        o_tkeep  = head.tkeep;
+        o_tlast  = head.tlast;
+        o_tuser  = head.tuser;
+    }
+
+    /// Input gaps. A TLP is counted if `i_tvalid` drops after at least one of
+    /// its beats and before its `tlast`.
+    var in_pkt   : logic    ;
+    var gapped   : logic    ;
+    var gaps     : logic<16>;
+    var gaps_gray: logic<16>;
+    let gaps_next: logic<16> = gaps + 1;
+    always_ff {
+        if_reset {
+            in_pkt    = 0;
+            gapped    = 0;
+            gaps      = 0;
+            gaps_gray = 0;
+        } else if push {
+            if i_tlast {
+                if gapped && gaps != '1 {
+                    gaps      = gaps_next;
+                    gaps_gray = gaps_next ^ (gaps_next >> 1);
+                }
+                in_pkt = 0;
+                gapped = 0;
+            } else {
+                in_pkt = 1;
+            }
+        } else if in_pkt && !i_tvalid {
+            gapped = 1;
+        }
+    }
+    assign o_gaps_gray = gaps_gray;
+}

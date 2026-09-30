@@ -1,0 +1,28 @@
+[dut]
+module = "dut_top"
+
+[clock.i_clk]
+freq_mhz = 100
+
+# Engine control and results: the host writes these and reads these.
+[bundle.ctl]
+backing  = "reg"
+ports    = ["i_start", "i_addr", "i_dst", "i_size", "o_busy", "o_done", "o_sum", "o_beats"]
+
+# A transfer-level port: "read N bytes from address A" and the data comes back
+# as a stream. The DUT is written as though it were reaching host memory, and
+# it is -- once there is a PCIe requester, `backing = "host_mem"` puts the data
+# there. **Until then it lives in the FPGA**, which is what `bram` says: the
+# same port, one word away, and this runs over JTAG alone.
+[bundle.hmem]
+backing = "bram"
+depth   = 512
+ports   = { rd_cmd_valid = "o_cmd_valid", rd_cmd_ready  = "i_cmd_ready",
+            rd_cmd_addr  = "o_cmd_addr",  rd_cmd_size = "o_cmd_size",
+            rd_valid     = "i_rd_valid",  rd_ready      = "o_rd_ready",
+            rd_data      = "i_rd_data",   rd_last       = "i_rd_last",
+            wr_cmd_valid = "o_wcmd_valid", wr_cmd_ready = "i_wcmd_ready",
+            wr_cmd_addr  = "o_wcmd_addr",  wr_cmd_size  = "o_wcmd_size",
+            wr_valid     = "o_w_valid",    wr_ready     = "i_w_ready",
+            wr_data      = "o_w_data",     wr_last      = "o_w_last",
+            wr_done_valid = "i_w_done" }

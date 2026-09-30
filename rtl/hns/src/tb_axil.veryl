@@ -1,0 +1,241 @@
+/// The AXI4-Lite slave answers `SLVERR` outside the window.
+///
+/// The upper limit of the range must come from the window size. With a fixed
+/// constant, a smaller window lets out-of-range accesses through with `OKAY`,
+/// and the host goes on as if the read worked.
+#[test(axil_out_of_window)]
+module test_axil {
+    const ADDR_BITS: u32 = 5;
+    const SIZE     : u32 = 1 << ADDR_BITS; // 32 bytes
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var awaddr : logic<32>;
+    var awvalid: logic    ;
+    var awready: logic    ;
+    var wdata  : logic<32>;
+    var wstrb  : logic<4> ;
+    var wvalid : logic    ;
+    var wready : logic    ;
+    var bresp  : logic<2> ;
+    var bvalid : logic    ;
+    var bready : logic    ;
+    var araddr : logic<32>;
+    var arvalid: logic    ;
+    var arready: logic    ;
+    var rdata  : logic<32>;
+    var rresp  : logic<2> ;
+    var rvalid : logic    ;
+    var rready : logic    ;
+
+    var addr : logic<ADDR_BITS>;
+    var wdat : logic<32>       ;
+    var we   : logic           ;
+    var re   : logic           ;
+    var rdat : logic<32>       ;
+    var hold : logic<32>       ;
+    var pipe : logic<3>        ;
+    var slow : logic           ;
+    var busy : logic           ;
+    var touts: logic<32>       ;
+
+    // The window contents. Like a real terminator (`hns_csr`), it updates only
+    // when it is selected. A pass-through model would hide the bug where an
+    // out-of-window access returns the previous value.
+    //
+    // `slow` selects the latency. The test uses both 1 cycle (like `hns_csr`)
+    // and 3 cycles (like a DUT behind a region).
+    always_ff (clk, rst) {
+        if_reset {
+            hold = 0;
+            pipe = 0;
+        } else {
+            pipe = {pipe[1:0], re};
+            if re {
+                hold = {24'b0, addr};
+            }
+        }
+    }
+
+    let rdv: logic = if slow ? pipe[2] : pipe[0];
+
+    // Data is driven only while valid. If it were always driven, a design that
+    // does not wait could still read the right value, and the test would not
+    // check the wait.
+    assign rdat = if rdv ? hold : 32'hdead_beef;
+
+    inst u: axil #(
+        ADDR_BITS: ADDR_BITS,
+    ) (
+        i_clk    : clk    ,
+        i_rst    : rst    ,
+        i_awaddr : awaddr ,
+        i_awvalid: awvalid,
+        o_awready: awready,
+        i_wdata  : wdata  ,
+        i_wstrb  : wstrb  ,
+        i_wvalid : wvalid ,
+        o_wready : wready ,
+        o_bresp  : bresp  ,
+        o_bvalid : bvalid ,
+        i_bready : bready ,
+        i_araddr : araddr ,
+        i_arvalid: arvalid,
+        o_arready: arready,
+        o_rdata  : rdata  ,
+        o_rresp  : rresp  ,
+        o_rvalid : rvalid ,
+        i_rready : rready ,
+        o_addr   : addr   ,
+        o_wdata  : wdat   ,
+        o_we     : we     ,
+        o_re     : re     ,
+        i_rdata  : rdat   ,
+        i_rvalid : rdv    ,
+        i_wready : ~busy  ,
+        i_clear  : 1'b0   ,
+        // The watchdog is off (`TIMEOUT` defaults to 0), so this stays 0.
+        // `tb_axil_timeout` tests the watchdog when it is on.
+        o_timeouts: touts ,
+    );
+
+    initial {
+        awvalid = 0;
+        wvalid  = 0;
+        arvalid = 0;
+        rready  = 1;
+        bready  = 1;
+        wstrb   = 4'hf;
+        slow    = 0;
+        busy    = 0;
+
+        rst.assert(4);
+        clk.next(4);
+
+        // Inside the window: OKAY, up to the last word.
+        arvalid = 1;
+        araddr  = SIZE - 4;
+        clk.next(1);
+        for _i in 0..16 {
+            if rvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $display("in-window: rvalid=%b rresp=%b rdata=%h", rvalid, rresp, rdata);
+        $assert(rresp == 2'b00);
+        // The next step checks that the out-of-window read does not return
+        // this value.
+        $assert(rdata == SIZE - 4);
+        arvalid = 0;
+        clk.next(2);
+
+        // Outside the window: SLVERR. Otherwise the host thinks the read worked.
+        arvalid = 1;
+        araddr  = SIZE;
+        clk.next(1);
+        for _i in 0..16 {
+            if rvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $display("at SIZE: rvalid=%b rresp=%b rdata=%h", rvalid, rresp, rdata);
+        $assert(rresp == 2'b10);
+        // Outside the window the data is 0. The terminator is not selected, so
+        // it does not update its value. A pass-through would return the value
+        // of the last good read, which looks real to the host even with
+        // `SLVERR`. On a VCU118 over PCIe, every access once fell outside the
+        // window, and reads still looked like they worked because of this.
+        $assert(rdata == 0);
+        arvalid = 0;
+        clk.next(2);
+
+        // Far past the window end. A fixed upper limit would let this through.
+        arvalid = 1;
+        araddr  = 100;
+        clk.next(1);
+        for _i in 0..16 {
+            if rvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $display("at 100: rvalid=%b rresp=%b", rvalid, rresp);
+        $assert(rresp == 2'b10);
+        arvalid = 0;
+        clk.next(2);
+
+        // A partial write is also SLVERR. Writing the whole word and ignoring
+        // the byte enables would change bytes the host did not write.
+        awvalid = 1;
+        wvalid  = 1;
+        awaddr  = 0;
+        wdata   = 32'hdead_beef;
+        wstrb   = 4'b0011;
+        clk.next(1);
+        for _i in 0..16 {
+            if bvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $display("partial write: bvalid=%b bresp=%b", bvalid, bresp);
+        $assert(bresp == 2'b10);
+        awvalid = 0;
+        wvalid  = 0;
+        clk.next(2);
+
+        // No write reaches a terminator that cannot take it. While `wready` is
+        // low there is no handshake. After it rises, the write happens once.
+        // A write before that would be lost silently.
+        busy    = 1;
+        awvalid = 1;
+        wvalid  = 1;
+        awaddr  = 4;
+        wdata   = 32'h1234_5678;
+        wstrb   = 4'hf;
+        clk.next(8);
+        $display("while busy: bvalid=%b awready=%b", bvalid, awready);
+        $assert(bvalid == 0);
+        $assert(awready == 0);
+        // By default the watchdog is off. 8 cycles of waiting is no timeout.
+        // The generator decides whether to turn it on.
+        $assert(touts == 0);
+
+        busy = 0;
+        for _i in 0..16 {
+            if bvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $display("after busy: bvalid=%b bresp=%b", bvalid, bresp);
+        $assert(bvalid == 1);
+        $assert(bresp == 2'b00);
+        awvalid = 0;
+        wvalid  = 0;
+        clk.next(2);
+
+        // A terminator slower than 1 cycle still reads correctly. This is the
+        // main check: a design that captures after a fixed 1 cycle reads
+        // `0xdeadbeef` and fails.
+        slow    = 1;
+        arvalid = 1;
+        araddr  = 8;
+        clk.next(1);
+        for _i in 0..16 {
+            if rvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $display("slow terminator: rvalid=%b rresp=%b rdata=%h", rvalid, rresp, rdata);
+        $assert(rresp == 2'b00);
+        $assert(rdata == 8);
+        arvalid = 0;
+
+        clk.next(4);
+    }
+}

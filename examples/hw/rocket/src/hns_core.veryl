@@ -1,0 +1,193 @@
+// Core RTL, generated from rocket-chip v1.6 (see the comment below)
+include (inline, "HNSCore.v");
+
+/// HNS CPU core (rocket-chip `HNSRocketSystem`) wrapped for the FPGA harness.
+///
+/// The core itself is a black box (`$sv::HNSCore`, `HNSCore.v` next to this
+/// file). It is rocket-chip v1.6 built with a small Chisel generator: one
+/// RV64IMAC Rocket core (no VM, FPU or BTB), a 4KB ICache, a 4KB DTIM instead
+/// of a DCache, no interrupts, and a debug module on DMI. `include(inline, ..)`
+/// puts it in this module's output, so it reaches synthesis through the
+/// filelist. This wrapper only adapts its ports:
+///
+///   - `mem`  : AXI4 master to DRAM, 64-bit data. The core maps it at
+///              0x8000_0000; the port carries the low 28 bits (256MB) only.
+///   - `mmio` : AXI4 master to MMIO, 64-bit data. The core maps it at
+///              0x0002_0000 - 0x0002_FFFF; the port carries the offset.
+///   - `dmi`  : Debug Module Interface (RISC-V debug spec DMI), valid/ready
+///   - `i_boot_mode`: 0 = jump to DRAM, 1 = wait for debugger in the BootROM
+///
+/// The debug module and the DMI run on `i_clk`. `ndreset` from the debug module
+/// resets the core, but not the debug module itself.
+module hns_core (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    i_boot_mode: input logic,
+
+    // --- DMI request (debugger -> debug module) ---
+    i_dmi_req_valid: input  logic    ,
+    o_dmi_req_ready: output logic    ,
+    i_dmi_req_addr : input  logic<7> ,
+    i_dmi_req_data : input  logic<32>,
+    i_dmi_req_op   : input  logic<2> , // 0: nop, 1: read, 2: write
+
+    // --- DMI response (debug module -> debugger) ---
+    o_dmi_resp_valid: output logic    ,
+    i_dmi_resp_ready: input  logic    ,
+    o_dmi_resp_data : output logic<32>,
+    o_dmi_resp_resp : output logic<2> , // 0: success, 1: failure, 2: hw failure
+
+    // --- memory (DRAM) ---
+    mem: modport $std::axi4_if::<$std::axi4_pkg::<28, 8, 6, 1, 1, 1, 1, 1>>::master,
+
+    // --- MMIO ---
+    mmio: modport $std::axi4_if::<$std::axi4_pkg::<16, 8, 4, 1, 1, 1, 1, 1>>::master,
+) {
+    // Active-high synchronous resets for the core
+    var sys_rst  : logic;
+    var ndreset  : logic;
+    var ndreset_q: logic;
+    var core_rst : logic;
+    var dmactive : logic;
+
+    always_ff {
+        if_reset {
+            sys_rst   = 1;
+            ndreset_q = 0;
+        } else {
+            sys_rst   = 0;
+            ndreset_q = ndreset;
+        }
+    }
+
+    assign core_rst = sys_rst | ndreset_q;
+
+    // Addresses from the core, before dropping the base
+    var mem_awaddr : logic<32>;
+    var mem_araddr : logic<32>;
+    var mmio_awaddr: logic<18>;
+    var mmio_araddr: logic<18>;
+
+    assign mem.awaddr  = mem_awaddr[27:0];
+    assign mem.araddr  = mem_araddr[27:0];
+    assign mmio.awaddr = mmio_awaddr[15:0];
+    assign mmio.araddr = mmio_araddr[15:0];
+
+    // Signals of the AXI4 ports that the core does not have
+    always_comb {
+        mem.awregion  = 0;
+        mem.awuser    = 0;
+        mem.wuser     = 0;
+        mem.arregion  = 0;
+        mem.aruser    = 0;
+        mmio.awregion = 0;
+        mmio.awuser   = 0;
+        mmio.wuser    = 0;
+        mmio.arregion = 0;
+        mmio.aruser   = 0;
+    }
+
+    inst u_core: $sv::HNSCore (
+        r#clock: i_clk   ,
+        r#reset: core_rst,
+
+        mem_axi4_0_aw_ready     : mem.awready,
+        mem_axi4_0_aw_valid     : mem.awvalid,
+        mem_axi4_0_aw_bits_id   : mem.awid   ,
+        mem_axi4_0_aw_bits_addr : mem_awaddr ,
+        mem_axi4_0_aw_bits_len  : mem.awlen  ,
+        mem_axi4_0_aw_bits_size : mem.awsize ,
+        mem_axi4_0_aw_bits_burst: mem.awburst,
+        mem_axi4_0_aw_bits_lock : mem.awlock ,
+        mem_axi4_0_aw_bits_cache: mem.awcache,
+        mem_axi4_0_aw_bits_prot : mem.awprot ,
+        mem_axi4_0_aw_bits_qos  : mem.awqos  ,
+        mem_axi4_0_w_ready      : mem.wready ,
+        mem_axi4_0_w_valid      : mem.wvalid ,
+        mem_axi4_0_w_bits_data  : mem.wdata  ,
+        mem_axi4_0_w_bits_strb  : mem.wstrb  ,
+        mem_axi4_0_w_bits_last  : mem.wlast  ,
+        mem_axi4_0_b_ready      : mem.bready ,
+        mem_axi4_0_b_valid      : mem.bvalid ,
+        mem_axi4_0_b_bits_id    : mem.bid    ,
+        mem_axi4_0_b_bits_resp  : mem.bresp  ,
+        mem_axi4_0_ar_ready     : mem.arready,
+        mem_axi4_0_ar_valid     : mem.arvalid,
+        mem_axi4_0_ar_bits_id   : mem.arid   ,
+        mem_axi4_0_ar_bits_addr : mem_araddr ,
+        mem_axi4_0_ar_bits_len  : mem.arlen  ,
+        mem_axi4_0_ar_bits_size : mem.arsize ,
+        mem_axi4_0_ar_bits_burst: mem.arburst,
+        mem_axi4_0_ar_bits_lock : mem.arlock ,
+        mem_axi4_0_ar_bits_cache: mem.arcache,
+        mem_axi4_0_ar_bits_prot : mem.arprot ,
+        mem_axi4_0_ar_bits_qos  : mem.arqos  ,
+        mem_axi4_0_r_ready      : mem.rready ,
+        mem_axi4_0_r_valid      : mem.rvalid ,
+        mem_axi4_0_r_bits_id    : mem.rid    ,
+        mem_axi4_0_r_bits_data  : mem.rdata  ,
+        mem_axi4_0_r_bits_resp  : mem.rresp  ,
+        mem_axi4_0_r_bits_last  : mem.rlast  ,
+
+        mmio_axi4_0_aw_ready     : mmio.awready,
+        mmio_axi4_0_aw_valid     : mmio.awvalid,
+        mmio_axi4_0_aw_bits_id   : mmio.awid   ,
+        mmio_axi4_0_aw_bits_addr : mmio_awaddr ,
+        mmio_axi4_0_aw_bits_len  : mmio.awlen  ,
+        mmio_axi4_0_aw_bits_size : mmio.awsize ,
+        mmio_axi4_0_aw_bits_burst: mmio.awburst,
+        mmio_axi4_0_aw_bits_lock : mmio.awlock ,
+        mmio_axi4_0_aw_bits_cache: mmio.awcache,
+        mmio_axi4_0_aw_bits_prot : mmio.awprot ,
+        mmio_axi4_0_aw_bits_qos  : mmio.awqos  ,
+        mmio_axi4_0_w_ready      : mmio.wready ,
+        mmio_axi4_0_w_valid      : mmio.wvalid ,
+        mmio_axi4_0_w_bits_data  : mmio.wdata  ,
+        mmio_axi4_0_w_bits_strb  : mmio.wstrb  ,
+        mmio_axi4_0_w_bits_last  : mmio.wlast  ,
+        mmio_axi4_0_b_ready      : mmio.bready ,
+        mmio_axi4_0_b_valid      : mmio.bvalid ,
+        mmio_axi4_0_b_bits_id    : mmio.bid    ,
+        mmio_axi4_0_b_bits_resp  : mmio.bresp  ,
+        mmio_axi4_0_ar_ready     : mmio.arready,
+        mmio_axi4_0_ar_valid     : mmio.arvalid,
+        mmio_axi4_0_ar_bits_id   : mmio.arid   ,
+        mmio_axi4_0_ar_bits_addr : mmio_araddr ,
+        mmio_axi4_0_ar_bits_len  : mmio.arlen  ,
+        mmio_axi4_0_ar_bits_size : mmio.arsize ,
+        mmio_axi4_0_ar_bits_burst: mmio.arburst,
+        mmio_axi4_0_ar_bits_lock : mmio.arlock ,
+        mmio_axi4_0_ar_bits_cache: mmio.arcache,
+        mmio_axi4_0_ar_bits_prot : mmio.arprot ,
+        mmio_axi4_0_ar_bits_qos  : mmio.arqos  ,
+        mmio_axi4_0_r_ready      : mmio.rready ,
+        mmio_axi4_0_r_valid      : mmio.rvalid ,
+        mmio_axi4_0_r_bits_id    : mmio.rid    ,
+        mmio_axi4_0_r_bits_data  : mmio.rdata  ,
+        mmio_axi4_0_r_bits_resp  : mmio.rresp  ,
+        mmio_axi4_0_r_bits_last  : mmio.rlast  ,
+
+        resetctrl_hartIsInReset_0: core_rst,
+
+        debug_clock                        : i_clk           ,
+        debug_reset                        : sys_rst         ,
+        debug_clockeddmi_dmi_req_ready     : o_dmi_req_ready ,
+        debug_clockeddmi_dmi_req_valid     : i_dmi_req_valid ,
+        debug_clockeddmi_dmi_req_bits_addr : i_dmi_req_addr  ,
+        debug_clockeddmi_dmi_req_bits_data : i_dmi_req_data  ,
+        debug_clockeddmi_dmi_req_bits_op   : i_dmi_req_op    ,
+        debug_clockeddmi_dmi_resp_ready    : i_dmi_resp_ready,
+        debug_clockeddmi_dmi_resp_valid    : o_dmi_resp_valid,
+        debug_clockeddmi_dmi_resp_bits_data: o_dmi_resp_data ,
+        debug_clockeddmi_dmi_resp_bits_resp: o_dmi_resp_resp ,
+        debug_clockeddmi_dmiClock          : i_clk           ,
+        debug_clockeddmi_dmiReset          : sys_rst         ,
+        debug_ndreset                      : ndreset         ,
+        debug_dmactive                     : dmactive        ,
+        debug_dmactiveAck                  : dmactive        ,
+
+        meip_0   : 1'b0       ,
+        boot_mode: i_boot_mode,
+    );
+}

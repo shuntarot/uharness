@@ -1,0 +1,182 @@
+/// Both masters get through, and **neither can shut the other out**.
+///
+/// Master 0 asks without ever stopping -- the pattern a fixed priority turns
+/// into starvation. Master 1 asks once. **Master 1 has to be served**, and the
+/// value it reads has to be its own.
+#[test(axil_rr_lets_both_through)]
+module test_axil_rr {
+    const ADDR_BITS: u32 = 5;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    // master 0 (the greedy one)
+    var m0_araddr : logic<32>;
+    var m0_arvalid: logic    ;
+    var m0_arready: logic    ;
+    var m0_rdata  : logic<32>;
+    var m0_rvalid : logic    ;
+    var m0_rready : logic    ;
+
+    // master 1 (asks once)
+    var m1_araddr : logic<32>;
+    var m1_arvalid: logic    ;
+    var m1_arready: logic    ;
+    var m1_rdata  : logic<32>;
+    var m1_rvalid : logic    ;
+    var m1_rready : logic    ;
+
+    // the slave side
+    var s_araddr : logic<32>;
+    var s_arvalid: logic    ;
+    var s_arready: logic    ;
+    var s_rdata  : logic<32>;
+    var s_rvalid : logic    ;
+    var s_rready : logic    ;
+
+    var m0_reads: logic<32>;
+    var m1_reads: logic<32>;
+    var m1_saw  : logic<32>;
+
+    always_ff (clk, rst) {
+        if_reset {
+            m0_reads = 0;
+            m1_reads = 0;
+            m1_saw   = 0;
+        } else {
+            if m0_rvalid && m0_rready {
+                m0_reads = m0_reads + 1;
+            }
+            if m1_rvalid && m1_rready {
+                m1_reads = m1_reads + 1;
+                m1_saw   = m1_rdata;
+            }
+        }
+    }
+
+    inst u: axil_rr #(
+        ADDR_W: 32,
+    ) (
+        i_clk       : clk       ,
+        i_rst       : rst       ,
+        i_m0_awaddr : 32'b0     ,
+        i_m0_awvalid: 1'b0      ,
+        o_m0_awready: _         ,
+        i_m0_wdata  : 32'b0     ,
+        i_m0_wstrb  : 4'b0      ,
+        i_m0_wvalid : 1'b0      ,
+        o_m0_wready : _         ,
+        o_m0_bresp  : _         ,
+        o_m0_bvalid : _         ,
+        i_m0_bready : 1'b1      ,
+        i_m0_araddr : m0_araddr ,
+        i_m0_arvalid: m0_arvalid,
+        o_m0_arready: m0_arready,
+        o_m0_rdata  : m0_rdata  ,
+        o_m0_rresp  : _         ,
+        o_m0_rvalid : m0_rvalid ,
+        i_m0_rready : m0_rready ,
+        i_m1_awaddr : 32'b0     ,
+        i_m1_awvalid: 1'b0      ,
+        o_m1_awready: _         ,
+        i_m1_wdata  : 32'b0     ,
+        i_m1_wstrb  : 4'b0      ,
+        i_m1_wvalid : 1'b0      ,
+        o_m1_wready : _         ,
+        o_m1_bresp  : _         ,
+        o_m1_bvalid : _         ,
+        i_m1_bready : 1'b1      ,
+        i_m1_araddr : m1_araddr ,
+        i_m1_arvalid: m1_arvalid,
+        o_m1_arready: m1_arready,
+        o_m1_rdata  : m1_rdata  ,
+        o_m1_rresp  : _         ,
+        o_m1_rvalid : m1_rvalid ,
+        i_m1_rready : m1_rready ,
+        o_s_awaddr  : _         ,
+        o_s_awvalid : _         ,
+        i_s_awready : 1'b1      ,
+        o_s_wdata   : _         ,
+        o_s_wstrb   : _         ,
+        o_s_wvalid  : _         ,
+        i_s_wready  : 1'b1      ,
+        i_s_bresp   : 2'b0      ,
+        i_s_bvalid  : 1'b1      ,
+        o_s_bready  : _         ,
+        o_s_araddr  : s_araddr  ,
+        o_s_arvalid : s_arvalid ,
+        i_s_arready : s_arready ,
+        i_s_rdata   : s_rdata   ,
+        i_s_rresp   : 2'b0      ,
+        i_s_rvalid  : s_rvalid  ,
+        o_s_rready  : s_rready  ,
+        o_s_wmaster: _        ,
+        o_s_rmaster: _        ,
+    );
+
+    // The window: a read returns its own address, one cycle later.
+    //
+    // **It refuses a new address while a response is outstanding.** A slave that
+    // accepted one would have two reads in flight with nowhere to keep the
+    // second, and the arbiter (which hands over as soon as a response lands)
+    // would route the first answer to whoever asked second. `hns::axil` behaves
+    // this way; a testbench that did not would be testing something else.
+    var pend: logic;
+    var held: logic<32>;
+    assign s_arready = ~pend;
+    assign s_rvalid  = pend;
+    assign s_rdata   = held;
+
+    always_ff (clk, rst) {
+        if_reset {
+            pend = 0;
+            held = 0;
+        } else {
+            if s_arvalid && s_arready {
+                pend = 1;
+                held = s_araddr;
+            } else if s_rvalid && s_rready {
+                pend = 0;
+            }
+        }
+    }
+
+    initial {
+        m0_araddr  = 32'h11;
+        m0_arvalid = 0;
+        m0_rready  = 1;
+        m1_araddr  = 32'h22;
+        m1_arvalid = 0;
+        m1_rready  = 1;
+
+        rst.assert(4);
+        clk.next(4);
+
+        // **Master 0 never lets go.** Under a fixed priority this is exactly
+        // what starves master 1.
+        m0_arvalid = 1;
+        clk.next(20);
+        $display("m0 alone: m0=%d m1=%d", m0_reads, m1_reads);
+        $assert(m0_reads >: 2);
+        $assert(m1_reads == 0);
+
+        // Master 1 asks once, while master 0 keeps asking.
+        m1_arvalid = 1;
+        for _i in 0..40 {
+            if m1_reads != 0 {
+                break;
+            }
+            clk.next(1);
+        }
+        m1_arvalid = 0;
+        clk.next(2);
+
+        $display("both: m0=%d m1=%d m1_saw=%h", m0_reads, m1_reads, m1_saw);
+        // **It got through.**
+        $assert(m1_reads == 1);
+        // **And it got its own answer**, not master 0's.
+        $assert(m1_saw == 32'h22);
+        // Master 0 kept going too.
+        $assert(m0_reads >: 3);
+    }
+}

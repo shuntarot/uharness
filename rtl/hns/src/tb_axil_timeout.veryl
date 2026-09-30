@@ -1,0 +1,214 @@
+/// The window still answers when a terminator behind it never answers.
+///
+/// PCIe needs this. A read through a BAR is a non-posted TLP. If the window
+/// stays silent, the root complex hits a completion timeout and the kernel
+/// logs it. Over JTAG this is only "busy", but on some machines it is fatal.
+///
+/// Such a terminator exists: `dram` accepts no AXI until calibration is done
+/// (tens of ms).
+#[test(axil_timeout)]
+module test_axil_timeout {
+    const ADDR_BITS: u32 = 5;
+    const TIMEOUT  : u32 = 8;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var awaddr : logic<32>;
+    var awvalid: logic    ;
+    var awready: logic    ;
+    var wdata  : logic<32>;
+    var wstrb  : logic<4> ;
+    var wvalid : logic    ;
+    var wready : logic    ;
+    var bresp  : logic<2> ;
+    var bvalid : logic    ;
+    var bready : logic    ;
+    var araddr : logic<32>;
+    var arvalid: logic    ;
+    var arready: logic    ;
+    var rdata  : logic<32>;
+    var rresp  : logic<2> ;
+    var rvalid : logic    ;
+    var rready : logic    ;
+
+    var addr  : logic<ADDR_BITS>;
+    var wdat  : logic<32>       ;
+    var we    : logic           ;
+    var re    : logic           ;
+    var rdat  : logic<32>       ;
+    var hold  : logic<32>       ;
+    var pipe  : logic           ;
+    var touts : logic<32>       ;
+    var answer: logic           ;
+    var saw_we: logic           ;
+    var clear : logic           ;
+
+    // The window contents. While `answer` is 0 it answers no read and no
+    // write, like `dram` before calibration.
+    always_ff (clk, rst) {
+        if_reset {
+            hold   = 0;
+            pipe   = 0;
+            saw_we = 0;
+        } else {
+            pipe = re;
+            if re {
+                hold = {24'b0, addr};
+            }
+            // A flag to check later that no write reached the terminator.
+            if we {
+                saw_we = 1;
+            }
+        }
+    }
+
+    let rdv: logic = answer & pipe;
+
+    assign rdat = if rdv ? hold : 32'hdead_beef;
+
+    inst u: axil #(
+        ADDR_BITS: ADDR_BITS,
+        TIMEOUT  : TIMEOUT  ,
+    ) (
+        i_clk     : clk    ,
+        i_rst     : rst    ,
+        i_awaddr  : awaddr ,
+        i_awvalid : awvalid,
+        o_awready : awready,
+        i_wdata   : wdata  ,
+        i_wstrb   : wstrb  ,
+        i_wvalid  : wvalid ,
+        o_wready  : wready ,
+        o_bresp   : bresp  ,
+        o_bvalid  : bvalid ,
+        i_bready  : bready ,
+        i_araddr  : araddr ,
+        i_arvalid : arvalid,
+        o_arready : arready,
+        o_rdata   : rdata  ,
+        o_rresp   : rresp  ,
+        o_rvalid  : rvalid ,
+        i_rready  : rready ,
+        o_addr    : addr   ,
+        o_wdata   : wdat   ,
+        o_we      : we     ,
+        o_re      : re     ,
+        i_rdata   : rdat   ,
+        i_rvalid  : rdv    ,
+        i_wready  : answer ,
+        i_clear   : clear  ,
+        o_timeouts: touts  ,
+    );
+
+    initial {
+        awvalid = 0;
+        wvalid  = 0;
+        arvalid = 0;
+        rready  = 1;
+        bready  = 1;
+        wstrb   = 4'hf;
+        answer  = 0;
+        clear   = 0;
+
+        rst.assert(4);
+        clk.next(4);
+
+        // A read from a silent terminator. After the limit, the window ends
+        // the read by itself.
+        arvalid = 1;
+        araddr  = 8;
+        clk.next(1);
+        for _i in 0..64 {
+            if rvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $display("read timeout: rvalid=%b rresp=%b rdata=%h touts=%d", rvalid, rresp, rdata, touts);
+        $assert(rvalid == 1);
+        $assert(rresp == 2'b10);
+        // The value is 0. The terminator data line shows `0xdeadbeef`. If it
+        // passed through, a value that was never read would look real.
+        $assert(rdata == 0);
+        $assert(touts == 1);
+        arvalid = 0;
+        clk.next(2);
+
+        // A write to a silent terminator. The window completes the handshake
+        // and ends it with `SLVERR`.
+        awvalid = 1;
+        wvalid  = 1;
+        awaddr  = 4;
+        wdata   = 32'h1234_5678;
+        clk.next(1);
+        for _i in 0..64 {
+            if bvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $display("write timeout: bvalid=%b bresp=%b touts=%d saw_we=%b", bvalid, bresp, touts, saw_we);
+        $assert(bvalid == 1);
+        $assert(bresp == 2'b10);
+        $assert(touts == 2);
+        // A beat the terminator cannot take must not count as written. If
+        // this flag is set, the dropped write reached the terminator.
+        $assert(saw_we == 0);
+        awvalid = 0;
+        wvalid  = 0;
+        clk.next(2);
+
+        // With a terminator that answers, nothing changes. The watchdog is
+        // not visible in normal operation.
+        answer  = 1;
+        arvalid = 1;
+        araddr  = 8;
+        clk.next(1);
+        for _i in 0..64 {
+            if rvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $display("after recovery: rresp=%b rdata=%h touts=%d", rresp, rdata, touts);
+        $assert(rresp == 2'b00);
+        $assert(rdata == 8);
+        // The count does not grow. The counter never counts down, so it
+        // stays at 2.
+        $assert(touts == 2);
+        arvalid = 0;
+        clk.next(2);
+
+        // The host can clear the count (w1c). Otherwise every read returns
+        // non-zero after the first timeout, and the host cannot tell whether
+        // a timeout just happened.
+        clear = 1;
+        clk.next(1);
+        clear = 0;
+        clk.next(1);
+        $display("after clear: touts=%d", touts);
+        $assert(touts == 0);
+
+        // The watchdog still works after a clear. Even with clear held high,
+        // the timeout happens and returns `SLVERR`.
+        answer  = 0;
+        clear   = 1;
+        arvalid = 1;
+        araddr  = 12;
+        clk.next(1);
+        for _i in 0..64 {
+            if rvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $display("clear held: rvalid=%b rresp=%b", rvalid, rresp);
+        $assert(rvalid == 1);
+        $assert(rresp == 2'b10);
+        arvalid = 0;
+        clear   = 0;
+
+        clk.next(4);
+    }
+}

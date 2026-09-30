@@ -1,0 +1,35 @@
+[dut]
+module = "hns_core"
+
+[clock.i_clk]
+freq_mhz = 50
+
+# Boot from DRAM
+[tie_off]
+i_boot_mode      = 0
+i_dmi_req_valid  = 0
+i_dmi_req_addr   = 0
+i_dmi_req_data   = 0
+i_dmi_req_op     = 0
+i_dmi_resp_ready = 0
+
+# DMI is not used
+[leave_open]
+ports = ["o_dmi_req_ready", "o_dmi_resp_valid", "o_dmi_resp_data", "o_dmi_resp_resp"]
+
+# Core memory (0x8000_0000) on the board's DRAM
+[bundle.mem]
+backing  = "dram"
+aperture = "32M"
+ports    = ["mem"]
+
+# MMIO (0x0002_0000) on a 1KB FPGA memory
+[bundle.mmio]
+backing = "bram"
+depth   = 128
+ports   = ["mmio"]
+
+# Over PCIe (VCU118) the whole window has to fit in BAR0: the 32M DRAM aperture
+# and the MMIO region round it up to 64MB.
+[pcie]
+bar_bytes = "64M"

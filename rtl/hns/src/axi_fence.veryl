@@ -1,0 +1,180 @@
+/// Sits between an AXI4 master that can be reset and the downstream side, so
+/// that resetting only the master does not break the downstream side.
+///
+/// If only the master is reset in the middle of a burst, the downstream side
+/// stops. When AW was sent but the rest of W never comes, `hns::axi_rr` keeps
+/// the path and waits for B forever. This module prevents that.
+///
+/// When `i_fence` goes high:
+///
+/// 1. No new AW / AR passes. A handshake already shown downstream still
+///    completes: AXI does not allow valid to drop before ready.
+/// 2. When that is done, `o_closed` goes high. Only now may the master be
+///    reset.
+/// 3. The rest of W for each sent AW is filled with strobe-0 beats. B and R
+///    are accepted and dropped.
+/// 4. When nothing is left downstream, `o_idle` goes high. Only now may the
+///    fence open.
+///
+/// Normally it passes everything through with no register. Only W starts one
+/// cycle after its AW goes downstream, so the remaining beats can be counted.
+/// AXI allows a slave to wait for AW before it accepts W, and the downstream
+/// parts already work that way.
+pub module axi_fence::<PKG: $std::axi4_prototype> #(
+    /// Maximum number of AWs whose W is not fully sent yet.
+    param OUTSTANDING: u32 = 4,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// While 1, detach the master and finish what is left.
+    i_fence: input logic,
+    /// No handshake is in progress; the master may be reset.
+    o_closed: output logic,
+    /// Nothing is left downstream; the fence may open.
+    o_idle: output logic,
+
+    /// Master side.
+    s_axi: modport $std::axi4_if::<PKG>::slave,
+    /// Downstream side (arbiter).
+    m_axi: modport $std::axi4_if::<PKG>::master,
+) {
+    /// Width of the pending-response counters. New requests stop when a counter
+    /// saturates, so it never overflows.
+    const PEND_W: u32 = 8;
+
+    var aw_hold: logic        ;
+    var ar_hold: logic        ;
+    var w_hold : logic        ;
+    var b_pend : logic<PEND_W>;
+    var r_pend : logic<PEND_W>;
+
+    // Lengths of the sent AWs. The head is the AW whose W is being sent now.
+    var q_empty: logic            ;
+    var q_full : logic            ;
+    var q_head : PKG::num_bursts_t;
+    var w_beat : PKG::num_bursts_t;
+
+    let aw_go: logic = m_axi.awvalid && m_axi.awready;
+    let w_go : logic = m_axi.wvalid && m_axi.wready;
+    let b_go : logic = m_axi.bvalid && m_axi.bready;
+    let ar_go: logic = m_axi.arvalid && m_axi.arready;
+    let r_go : logic = m_axi.rvalid && m_axi.rready;
+
+    /// The last beat of the burst, by our own count. The master's `wlast` is
+    /// not used: no master drives the beats that the fence fills.
+    let w_last: logic = w_beat == q_head;
+
+    let aw_open: logic = (!i_fence || aw_hold) && !q_full && b_pend != '1;
+    let ar_open: logic = (!i_fence || ar_hold) && r_pend != '1;
+    /// Pass the master's W.
+    let w_pass: logic = !q_empty && (!i_fence || w_hold);
+    /// The fence fills W itself.
+    let w_fill: logic = !q_empty && i_fence && !w_hold;
+
+    inst u_len: $std::fifo #(
+        TYPE : PKG::num_bursts_t,
+        DEPTH: OUTSTANDING      ,
+    ) (
+        i_clk                        ,
+        i_rst                        ,
+        i_clear      : 0             ,
+        o_empty      : q_empty       ,
+        o_almost_full: _             ,
+        o_full       : q_full        ,
+        o_word_count : _             ,
+        i_push       : aw_go         ,
+        i_data       : m_axi.awlen   ,
+        i_pop        : w_go && w_last,
+        o_data       : q_head        ,
+    );
+
+    always_comb {
+        // --- Write address ---
+        m_axi.awaddr   = s_axi.awaddr;
+        m_axi.awsize   = s_axi.awsize;
+        m_axi.awburst  = s_axi.awburst;
+        m_axi.awcache  = s_axi.awcache;
+        m_axi.awprot   = s_axi.awprot;
+        m_axi.awid     = s_axi.awid;
+        m_axi.awlen    = s_axi.awlen;
+        m_axi.awlock   = s_axi.awlock;
+        m_axi.awqos    = s_axi.awqos;
+        m_axi.awregion = s_axi.awregion;
+        m_axi.awuser   = s_axi.awuser;
+        m_axi.awvalid  = s_axi.awvalid && aw_open;
+        s_axi.awready  = m_axi.awready && aw_open;
+
+        // --- Write data ---
+        m_axi.wdata  = if w_fill ? '0 : s_axi.wdata;
+        m_axi.wstrb  = if w_fill ? '0 : s_axi.wstrb;
+        m_axi.wlast  = if w_fill ? w_last : s_axi.wlast;
+        m_axi.wuser  = if w_fill ? '0 : s_axi.wuser;
+        m_axi.wvalid = (w_pass && s_axi.wvalid) || w_fill;
+        s_axi.wready = w_pass && m_axi.wready;
+
+        // --- Write response --- Accepted and dropped while fenced.
+        m_axi.bready = i_fence || s_axi.bready;
+        s_axi.bvalid = !i_fence && m_axi.bvalid;
+        s_axi.bresp  = m_axi.bresp;
+        s_axi.bid    = m_axi.bid;
+        s_axi.buser  = m_axi.buser;
+
+        // --- Read address ---
+        m_axi.araddr   = s_axi.araddr;
+        m_axi.arsize   = s_axi.arsize;
+        m_axi.arburst  = s_axi.arburst;
+        m_axi.arcache  = s_axi.arcache;
+        m_axi.arprot   = s_axi.arprot;
+        m_axi.arid     = s_axi.arid;
+        m_axi.arlen    = s_axi.arlen;
+        m_axi.arlock   = s_axi.arlock;
+        m_axi.arqos    = s_axi.arqos;
+        m_axi.arregion = s_axi.arregion;
+        m_axi.aruser   = s_axi.aruser;
+        m_axi.arvalid  = s_axi.arvalid && ar_open;
+        s_axi.arready  = m_axi.arready && ar_open;
+
+        // --- Read data --- Accepted and dropped while fenced.
+        m_axi.rready = i_fence || s_axi.rready;
+        s_axi.rvalid = !i_fence && m_axi.rvalid;
+        s_axi.rdata  = m_axi.rdata;
+        s_axi.rresp  = m_axi.rresp;
+        s_axi.rid    = m_axi.rid;
+        s_axi.rlast  = m_axi.rlast;
+        s_axi.ruser  = m_axi.ruser;
+    }
+
+    always_ff {
+        if_reset {
+            aw_hold = 0;
+            ar_hold = 0;
+            w_hold  = 0;
+            b_pend  = 0;
+            r_pend  = 0;
+            w_beat  = 0;
+        } else {
+            // Shown downstream but not yet accepted. These pass even when
+            // fenced.
+            aw_hold = m_axi.awvalid && !m_axi.awready;
+            ar_hold = m_axi.arvalid && !m_axi.arready;
+            w_hold  = w_pass && s_axi.wvalid && !m_axi.wready;
+
+            b_pend = b_pend + (aw_go as PEND_W) - (b_go as PEND_W);
+            if ar_go && !(r_go && m_axi.rlast) {
+                r_pend += 1;
+            } else if !ar_go && r_go && m_axi.rlast {
+                r_pend -= 1;
+            }
+
+            if w_go {
+                w_beat = if w_last ? 0 : w_beat + 1;
+            }
+        }
+    }
+
+    always_comb {
+        o_closed = i_fence && !aw_hold && !ar_hold && !w_hold;
+        o_idle   = !aw_hold && !ar_hold && !w_hold && q_empty && b_pend == 0 && r_pend == 0;
+    }
+}

@@ -1,0 +1,50 @@
+[dut]
+module = "dut_top"
+
+[clock.i_clk]
+freq_mhz = 100
+
+[bundle.ctl]
+backing  = "reg"
+ports    = ["i_addr", "i_wdata", "i_start_wr", "i_start_rd", "i_sweep",
+            "o_rdata", "o_busy", "o_reads", "o_writes", "o_resp"]
+
+# The DUT's AXI4 master, terminated by the board's memory controller. The host
+# reaches the same memory through an arbiter -- there is no backdoor, because a
+# real controller does not have one.
+#
+# **`backing` says where the data lives, not what the port looks like.** The
+# same manifest with `backing = "bram"` puts this memory in the FPGA instead;
+# see `examples/hw/axi`, which is the same design one word away.
+[bundle.mem]
+backing  = "dram"
+# **No `depth`: the whole of what the board's controller can address.** 256MB on
+# the Arty, 2GB on the VCU118 -- one manifest, the whole device either way.
+#
+# **Covering the whole device is the point.** A test that only touches the first
+# kilobyte never toggles the upper row, bank and bank-group pins, so it cannot
+# tell a working memory from one with an address line stuck. `hio memtest mem
+# --size 1024` is the quick check; `--size 256M` is the one that proves the pins.
+#
+# The price is that the register map now depends on the board (it says how many
+# entries there are). Writing `depth = "64M"` instead pins it to 256MB and keeps
+# one map for every board.
+#
+# **The window is 32MB and moves.** `mem_base_jtag` / `mem_base_pcie` say which
+# page each master sees, and `hio` moves them for us -- 8 pages cover the Arty's
+# whole chip, so a full sweep rewrites the base 8 times instead of a million.
+#
+# The window is one size for both transports, deliberately: the register map has
+# to be the same whichever way you reach it. What that costs JTAG is a few more
+# address bits per scan, which is nothing next to the round trip.
+aperture = "32M"
+ports    = ["axi"]
+
+# The BAR has to hold the window plus the registers, so it is the next power of
+# two above 32MB.
+[pcie]
+bar_bytes = "64M"
+
+# Heartbeat UART. Readable even when the transport is not working.
+[heartbeat]
+pin = "uart_tx"

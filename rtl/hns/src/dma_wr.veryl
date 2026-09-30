@@ -1,0 +1,233 @@
+/// Reads card memory and writes it to host memory. The only part where the
+/// card issues requests.
+///
+/// The logic is borrowed (`rtl/pcie/rtl/pcie_us_axi_dma_wr.v`, verilog-pcie,
+/// MIT). It builds the TLP headers; this module is only a wrapper that
+/// matches widths and ties off unused channels. Do not add logic here: it
+/// holds `$sv::`, so `veryl test` cannot run it (same as `hns::bscan`).
+///
+/// AXI is fixed at 256 bits (the borrowed code stops with `$error`
+/// otherwise). `hns::axi_dw` only widens, so the generator places this module
+/// only behind the controller. Measured: 620 MB/s.
+///
+/// The two RQ streams are merged here. Feed the RQ output of `hns::dma_rd`
+/// into `i_join_*`, and the borrowed code arbitrates them into one, so no
+/// stream arbiter is needed.
+pub module dma_wr::<PKG: $std::axi4_prototype> (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// One descriptor from `hns::dma_gate`, already checked against the window.
+    i_desc_pcie_addr: input  logic<64>,
+    i_desc_axi_addr : input  logic<64>,
+    i_desc_len      : input  logic<20>,
+    i_desc_tag      : input  logic<8> ,
+    i_desc_valid    : input  logic    ,
+    o_desc_ready    : output logic    ,
+
+    /// Completion status. `o_status_error` is the borrowed 4-bit code as is.
+    o_status_tag  : output logic<8>,
+    o_status_error: output logic<4>,
+    o_status_valid: output logic   ,
+
+    /// To card memory, read only. `hns::dma_rd` owns the write channels, so
+    /// both connect to the same interface and form one master.
+    m_axi: modport $std::axi4_if::<PKG>::read_master,
+
+    /// PCIe requester stream. It is in the harness clock domain, so
+    /// `hns::tlp_cdc` carries it to the hard block.
+    o_rq_tdata : output logic<256>,
+    o_rq_tkeep : output logic<8>  ,
+    o_rq_tlast : output logic     ,
+    o_rq_tuser : output logic<60> ,
+    o_rq_tvalid: output logic     ,
+    i_rq_tready: input  logic     ,
+
+    /// The RQ to merge (output of `hns::dma_rd`). Tie it to 0 when unused: the
+    /// borrowed code interleaves it with its own TLPs.
+    i_join_tdata : input  logic<256>,
+    i_join_tkeep : input  logic<8>  ,
+    i_join_tlast : input  logic     ,
+    i_join_tuser : input  logic<60> ,
+    i_join_tvalid: input  logic     ,
+    o_join_tready: output logic     ,
+
+    /// Max payload size negotiated by the link (`o_max_payload` of
+    /// `hns_pcie_wrap`). Sampled only while idle: a change in the middle of a
+    /// transfer would break the borrowed code's splitting.
+    i_max_payload: input logic<3>,
+
+    /// Limit set by the host. 0 means no limit; otherwise `i_limit - 1` is the
+    /// encoded maximum. The minimum with the negotiated value is taken, so the
+    /// host can never exceed what the link allows. The limit is a knob for
+    /// measurement; correctness stays here.
+    i_limit: input logic<3>,
+
+    /// The payload size in use now: the value after `i_limit`, not the
+    /// negotiated one. The host must see this value to check that the limit
+    /// took effect.
+    o_mps: output logic<3>,
+
+    /// A descriptor is running.
+    o_busy: output logic,
+) {
+    const ADDR_W: u32 = PKG::ADDRESS_WIDTH;
+    const ID_W  : u32 = PKG::ID_LENGTH;
+
+
+    /// The borrowed `status_busy` cannot be used, so running transfers are
+    /// counted here.
+    ///
+    /// It checks whether `active_tx_count` is 0, but that count drops only when
+    /// an RQ sequence number returns. With `RQ_SEQ_NUM_ENABLE` 0, none returns,
+    /// so it sticks at 1 after the first TLP. On hardware this showed as `mps`
+    /// staying frozen after a write to `i_limit`.
+    ///
+    /// The generator issues one descriptor at a time (`hns::dma_gate`), so no
+    /// depth is needed.
+    var inflight: logic<8>;
+    let taken   : logic    = i_desc_valid && o_desc_ready;
+    always_ff {
+        if_reset {
+            inflight = 0;
+        } else {
+            inflight = inflight + (taken as u8) - (o_status_valid as u8);
+        }
+    }
+    let busy: logic = inflight != 0;
+
+    /// Copied only while idle. After reset it is 0 (128 bytes), the minimum
+    /// PCIe always allows, so a transfer before negotiation is still correct.
+    let want: logic<3> = if i_limit == 0 ?
+        i_max_payload
+    : if i_max_payload <: i_limit - 1 ?
+        i_max_payload
+    :
+        i_limit - 1
+    ;
+
+    var mps: logic<3>;
+    always_ff {
+        if_reset {
+            mps = 0;
+        } else if !busy {
+            mps = want;
+        }
+    }
+    assign o_busy = busy;
+    assign o_mps  = mps;
+
+    /// The borrowed code takes an active-high reset. The polarity is not
+    /// hard-coded, or it would silently invert if this package's `reset_type`
+    /// changed.
+    var rst_h: logic;
+    always_ff {
+        if_reset {
+            rst_h = 1;
+        } else {
+            rst_h = 0;
+        }
+    }
+
+    /// The address is cut to the memory width; the upper bits are dropped. The
+    /// memory side cannot reach outside the chip, so the only guard is on the
+    /// PCIe side (`hns::dma_gate`).
+    let axi_addr: logic<ADDR_W> = i_desc_axi_addr[ADDR_W - 1:0];
+
+    // Fields the borrowed code does not drive. They are tied here on purpose,
+    // not left undriven.
+    always_comb {
+        m_axi.arqos    = 0;
+        m_axi.arregion = 0;
+        m_axi.aruser   = 0;
+    }
+
+    inst u_wr: $sv::pcie_us_axi_dma_wr #(
+        AXIS_PCIE_DATA_WIDTH   : 256   ,
+        AXIS_PCIE_KEEP_WIDTH   : 8     ,
+        AXIS_PCIE_RQ_USER_WIDTH: 60    ,
+        RQ_SEQ_NUM_WIDTH       : 4     ,
+        RQ_SEQ_NUM_ENABLE      : 0     ,
+        AXI_DATA_WIDTH         : 256   ,
+        AXI_ADDR_WIDTH         : ADDR_W,
+        AXI_STRB_WIDTH         : 32    ,
+        AXI_ID_WIDTH           : ID_W  ,
+        AXI_MAX_BURST_LEN      : 256   ,
+        PCIE_ADDR_WIDTH        : 64    ,
+        LEN_WIDTH              : 20    ,
+        TAG_WIDTH              : 8     ,
+        OP_TABLE_SIZE          : 8     ,
+        TX_LIMIT               : 8     ,
+        TX_FC_ENABLE           : 0     ,
+    ) (
+        clk: i_clk,
+        rst: rst_h,
+
+        // RQ input from the read DMA engine.
+        s_axis_rq_tdata : i_join_tdata ,
+        s_axis_rq_tkeep : i_join_tkeep ,
+        s_axis_rq_tvalid: i_join_tvalid,
+        s_axis_rq_tready: o_join_tready,
+        s_axis_rq_tlast : i_join_tlast ,
+        s_axis_rq_tuser : i_join_tuser ,
+
+        m_axis_rq_tdata : o_rq_tdata ,
+        m_axis_rq_tkeep : o_rq_tkeep ,
+        m_axis_rq_tvalid: o_rq_tvalid,
+        m_axis_rq_tready: i_rq_tready,
+        m_axis_rq_tlast : o_rq_tlast ,
+        m_axis_rq_tuser : o_rq_tuser ,
+
+        // TX sequence numbers. Unused, because `RQ_SEQ_NUM_ENABLE` is 0.
+        s_axis_rq_seq_num_0      : 0,
+        s_axis_rq_seq_num_valid_0: 0,
+        s_axis_rq_seq_num_1      : 0,
+        s_axis_rq_seq_num_valid_1: 0,
+        m_axis_rq_seq_num_0      : _,
+        m_axis_rq_seq_num_valid_0: _,
+        m_axis_rq_seq_num_1      : _,
+        m_axis_rq_seq_num_valid_1: _,
+
+        // TX flow control. Unused, because `TX_FC_ENABLE` is 0.
+        pcie_tx_fc_ph_av: 0,
+        pcie_tx_fc_pd_av: 0,
+
+        s_axis_write_desc_pcie_addr: i_desc_pcie_addr,
+        s_axis_write_desc_axi_addr : axi_addr        ,
+        s_axis_write_desc_len      : i_desc_len      ,
+        s_axis_write_desc_tag      : i_desc_tag      ,
+        s_axis_write_desc_valid    : i_desc_valid    ,
+        s_axis_write_desc_ready    : o_desc_ready    ,
+
+        m_axis_write_desc_status_tag  : o_status_tag  ,
+        m_axis_write_desc_status_error: o_status_error,
+        m_axis_write_desc_status_valid: o_status_valid,
+
+        m_axi_arid   : m_axi.arid   ,
+        m_axi_araddr : m_axi.araddr ,
+        m_axi_arlen  : m_axi.arlen  ,
+        m_axi_arsize : m_axi.arsize ,
+        m_axi_arburst: m_axi.arburst,
+        m_axi_arlock : m_axi.arlock ,
+        m_axi_arcache: m_axi.arcache,
+        m_axi_arprot : m_axi.arprot ,
+        m_axi_arvalid: m_axi.arvalid,
+        m_axi_arready: m_axi.arready,
+        m_axi_rid    : m_axi.rid    ,
+        m_axi_rdata  : m_axi.rdata  ,
+        m_axi_rresp  : m_axi.rresp  ,
+        m_axi_rlast  : m_axi.rlast  ,
+        m_axi_rvalid : m_axi.rvalid ,
+        m_axi_rready : m_axi.rready ,
+
+        // No own requester ID. With `requester_id_enable` 0, the hard block
+        // fills in its own value (PG213).
+        enable             : 1  ,
+        requester_id       : 0  ,
+        requester_id_enable: 0  ,
+        max_payload_size   : mps,
+
+        // Unused. `inflight` above does this job.
+        status_busy: _,
+    );
+}

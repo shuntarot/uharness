@@ -1,0 +1,81 @@
+/// Widens only the AXI4 address. It is wiring only.
+///
+/// A memory controller can reach further than the DUT. For example, VCU118
+/// DDR4 has 31 address bits (2 GB). If a DUT with 28 bits (256 MB) is attached,
+/// and the arbiter and host port are built at 28 bits, the host also reaches
+/// only 256 MB. The upper row and bank pins of the chip then never toggle.
+///
+/// So arbitration runs at the controller width, and only the DUT is widened
+/// here. The DUT still reaches only the low part; the host reaches the whole
+/// chip.
+///
+/// `hns::axi_dw` can do the same (it handles `R = 1` and zero-extends the
+/// address to `SPKG::addr_t`). It is not used because its state machine adds
+/// one cycle of latency to the DUT path. The DUT is what is being measured, so
+/// it must not be slowed down. This module is combinational only.
+///
+/// The address is zero-extended: the upper bits the DUT cannot drive are 0.
+/// Data width, ID width and the other fields must match (the generator checks
+/// this in `check`).
+pub module axi_aw::<MPKG: $std::axi4_prototype, SPKG: $std::axi4_prototype> (
+    /// The narrow side (DUT).
+    s_axi: modport $std::axi4_if::<MPKG>::slave,
+    /// The wide side (arbiter).
+    m_axi: modport $std::axi4_if::<SPKG>::master,
+) {
+    always_comb {
+        // --- Write address ---
+        m_axi.awaddr   = s_axi.awaddr as SPKG::addr_t;
+        m_axi.awsize   = s_axi.awsize;
+        m_axi.awburst  = s_axi.awburst;
+        m_axi.awcache  = s_axi.awcache;
+        m_axi.awprot   = s_axi.awprot;
+        m_axi.awid     = s_axi.awid;
+        m_axi.awlen    = s_axi.awlen;
+        m_axi.awlock   = s_axi.awlock;
+        m_axi.awqos    = s_axi.awqos;
+        m_axi.awregion = s_axi.awregion;
+        m_axi.awuser   = s_axi.awuser;
+        m_axi.awvalid  = s_axi.awvalid;
+        s_axi.awready  = m_axi.awready;
+
+        // --- Write data ---
+        m_axi.wdata   = s_axi.wdata;
+        m_axi.wstrb   = s_axi.wstrb;
+        m_axi.wlast   = s_axi.wlast;
+        m_axi.wuser   = s_axi.wuser;
+        m_axi.wvalid  = s_axi.wvalid;
+        s_axi.wready  = m_axi.wready;
+
+        // --- Write response ---
+        m_axi.bready = s_axi.bready;
+        s_axi.bvalid = m_axi.bvalid;
+        s_axi.bresp  = m_axi.bresp;
+        s_axi.bid    = m_axi.bid;
+        s_axi.buser  = m_axi.buser;
+
+        // --- Read address ---
+        m_axi.araddr   = s_axi.araddr as SPKG::addr_t;
+        m_axi.arsize   = s_axi.arsize;
+        m_axi.arburst  = s_axi.arburst;
+        m_axi.arcache  = s_axi.arcache;
+        m_axi.arprot   = s_axi.arprot;
+        m_axi.arid     = s_axi.arid;
+        m_axi.arlen    = s_axi.arlen;
+        m_axi.arlock   = s_axi.arlock;
+        m_axi.arqos    = s_axi.arqos;
+        m_axi.arregion = s_axi.arregion;
+        m_axi.aruser   = s_axi.aruser;
+        m_axi.arvalid  = s_axi.arvalid;
+        s_axi.arready  = m_axi.arready;
+
+        // --- Read data ---
+        m_axi.rready = s_axi.rready;
+        s_axi.rvalid = m_axi.rvalid;
+        s_axi.rdata  = m_axi.rdata;
+        s_axi.rresp  = m_axi.rresp;
+        s_axi.rid    = m_axi.rid;
+        s_axi.rlast  = m_axi.rlast;
+        s_axi.ruser  = m_axi.ruser;
+    }
+}

@@ -1,0 +1,105 @@
+# dram -- hio run bringup.hio
+#
+# The DUT reaches memory over AXI4, and the host reaches the same memory
+# through an arbiter -- there is no backdoor, because a real memory controller
+# does not have one. So the thing to prove here is that **both sides see one
+# memory**. `backing = "dram"` will put a controller where the BRAM is now,
+# without changing anything above.
+#
+# Runs at the board's default TCK. Going through the AXI4 bus and the arbiter
+# answers more slowly than a register does -- too slowly for the Arty's 20 MHz
+# if the commands are packed back to back. `hio` notices and re-sends the
+# region traffic with the commands spaced further apart, which is safe because
+# harness memory reads and writes are idempotent.
+# Nothing has to be passed on the command line.
+
+echo == identity ==
+id
+read mem_depth
+# **The controller calibrates for tens of milliseconds after configuration.**
+# Nothing reaches the memory until this reads 1; the window simply waits.
+read mem_calib
+
+echo == the host writes, the host reads ==
+write mem 0 0xdeadbeef
+write mem 4 0x00c0ffee
+read mem 0 1
+read mem 4 1
+
+echo == the DUT reads what the host wrote ==
+# Byte address 4 -> the second word (this DUT is 32-bit; the harness widens it). o_rdata has to come back 0x00c0ffee.
+write i_addr 4
+write i_start_rd 1
+write i_start_rd 0
+read o_busy
+read o_rdata
+read o_reads
+
+echo == the host reads what the DUT wrote ==
+# The DUT writes 0x5a5a0001 at byte address 8; the host reads it back.
+write i_addr 8
+write i_wdata 0x5a5a0001
+write i_start_wr 1
+write i_start_wr 0
+read o_writes
+read mem 8 1
+
+echo == nothing was refused ==
+# 0 is OKAY. A SLVERR here means the address left the memory.
+read o_resp
+
+echo == the window moves, and the host does not have to know ==
+# The memory is the whole chip, the window 256B. `hio` moves `mem_base_jtag`
+# for us -- the page number is 23 bits wide here, and the host never has to
+# know that.
+# 0xfc..0x100 straddles two pages, so one command becomes two.
+write mem 252 0x11111111 0x22222222
+read mem 252 2
+read mem_base_jtag
+
+echo == the two of them share the bus ==
+# The DUT sweeps the low kilobyte over and over while the host works.
+# memtest writes and reads back every word, so it fails if the arbiter ever
+# hands an answer to the wrong master. o_reads has to keep moving too --
+# otherwise the sweep was starved and nothing was actually shared.
+write i_sweep 1
+read o_reads
+memtest mem --size 1024
+read o_reads
+write i_sweep 0
+
+echo == the DUT is reset, the memory is not ==
+# Reset the DUT while it sweeps, so the reset lands in the middle of a burst.
+# The harness lets the DUT finish the handshake it started, fills the rest of
+# the burst with empty strobes, and only then resets it. The host keeps the
+# memory the whole time. o_reads and o_writes come back 0: they are the DUT's.
+write i_sweep 1
+reset --hold
+read o_reads
+write mem 0 0x0badf00d
+read mem 0 1
+# i_sweep is a register, so it keeps its value through the reset. Clear it
+# first, or the DUT starts sweeping again as soon as it is released.
+write i_sweep 0
+reset --release
+read o_reads
+read o_writes
+
+echo == what this sequence does not do ==
+# **Every access above is in the first kilobyte.** That is enough to prove the
+# path, and not enough to prove the memory: the upper row, bank and bank-group
+# pins never toggle, so a stuck address line would pass everything here.
+#
+# Covering the whole device is a separate run, because it takes minutes over
+# PCIe and about an hour per 256MB over JTAG:
+#
+#     hio memtest mem --size 256M
+#
+# `hio` names the addresses that came back wrong, and when a value belongs to
+# an address one bit away it says which bit -- that is the difference between
+# a broken wire and a broken cell.
+
+echo == still reachable afterwards ==
+write mem 0 0xdeadbeef
+read mem 0 1
+read o_resp

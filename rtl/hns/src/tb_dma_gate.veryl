@@ -1,0 +1,255 @@
+/// `hns::dma_gate` sends no descriptor outside the window.
+///
+/// The gate takes the place of an IOMMU. On a machine with DMA in pass-through
+/// mode, the card writes to any address the gate lets out. So the main check
+/// is that bad descriptors are blocked, more than that good ones pass.
+#[test(dma_gate_does_not_let_a_descriptor_leave_the_window)]
+module test_dma_gate {
+    const BASE: logic<64> = 64'h0000_0004_3420_0000;
+    const SIZE: logic<32> = 32'h0020_0000; // 2 MB (one buffer from hio dma-check)
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen (
+        clk: clk,
+    );
+
+    var pcie_addr: logic<64>;
+    var axi_addr : logic<64>;
+    var len      : logic<20>;
+    var dir      : logic    ;
+    var go       : logic    ;
+    var base     : logic<64>;
+    var size     : logic<32>;
+
+    var wr_ready       : logic   ;
+    var rd_ready       : logic   ;
+    var wr_status_valid: logic   ;
+    var wr_status_error: logic<4>;
+    var rd_status_valid: logic   ;
+    var rd_status_error: logic<4>;
+
+    var d_pcie      : logic<64>;
+    var d_axi       : logic<64>;
+    var d_len       : logic<20>;
+    var d_tag       : logic<8> ;
+    var wr_valid    : logic    ;
+    var rd_valid    : logic    ;
+    var busy        : logic    ;
+    var error       : logic<4> ;
+    var done        : logic<16>;
+    var out_of_range: logic<16>;
+    var while_busy  : logic<16>;
+
+    inst u_gate: dma_gate (
+        i_clk: clk,
+        i_rst: rst,
+
+        i_base: base,
+        i_size: size,
+
+        i_pcie_addr: pcie_addr,
+        i_axi_addr : axi_addr ,
+        i_len      : len      ,
+        i_dir      : dir      ,
+        i_go       : go       ,
+
+        o_desc_pcie_addr: d_pcie,
+        o_desc_axi_addr : d_axi ,
+        o_desc_len      : d_len ,
+        o_desc_tag      : d_tag ,
+
+        o_wr_valid: wr_valid,
+        i_wr_ready: wr_ready,
+        o_rd_valid: rd_valid,
+        i_rd_ready: rd_ready,
+
+        i_wr_status_valid: wr_status_valid,
+        i_wr_status_error: wr_status_error,
+        i_rd_status_valid: rd_status_valid,
+        i_rd_status_error: rd_status_error,
+
+        o_busy        : busy        ,
+        o_error       : error       ,
+        o_done        : done        ,
+        o_out_of_range: out_of_range,
+        o_while_busy  : while_busy  ,
+    );
+
+    /// Raises `go` for one cycle.
+    function fire (
+        at: input logic<64>,
+        n : input logic<20>,
+    ) {
+        pcie_addr = at;
+        len       = n;
+        go        = 1;
+        clk.next(1);
+        go = 0;
+        clk.next(1);
+    }
+
+    /// Plays the borrowed DMA engine: takes the descriptor and returns status.
+    /// Only the side selected by `dir` answers.
+    function complete () {
+        wr_ready = ~dir;
+        rd_ready = dir;
+        clk.next(1);
+        wr_ready        = 0;
+        rd_ready        = 0;
+        wr_status_valid = ~dir;
+        rd_status_valid = dir;
+        clk.next(1);
+        wr_status_valid = 0;
+        rd_status_valid = 0;
+        clk.next(1);
+    }
+
+    initial {
+        base            = BASE;
+        size            = SIZE;
+        pcie_addr       = 0;
+        axi_addr        = 64'h1000;
+        len             = 0;
+        dir             = 0;
+        go              = 0;
+        wr_ready        = 0;
+        rd_ready        = 0;
+        wr_status_valid = 0;
+        wr_status_error = 0;
+        rd_status_valid = 0;
+        rd_status_error = 0;
+        clk.next(4);
+
+        $assert(!wr_valid);
+        $assert(!rd_valid);
+        $assert(!busy);
+        $assert(out_of_range == 0);
+
+        // --- descriptors that pass ---
+        fire(BASE, 20'd64);
+        $assert(wr_valid);
+        // With `dir` 0, nothing goes to the read side.
+        $assert(!rd_valid);
+        $assert(busy);
+        $assert(d_pcie == BASE);
+        $assert(d_len == 64);
+        $assert(d_tag == 0);
+        $assert(out_of_range == 0);
+
+        // Changing the inputs while it waits does not change the descriptor.
+        pcie_addr = 64'hdead_beef_0000_0000;
+        len       = 20'd4;
+        clk.next(2);
+        $assert(d_pcie == BASE);
+        $assert(d_len == 64);
+
+        complete();
+        $assert(!busy);
+        $assert(done == 1);
+
+        // Up to exactly the end of the window.
+        fire(BASE + SIZE - 4, 20'd4);
+        $assert(wr_valid);
+        $assert(out_of_range == 0);
+        complete();
+        $assert(done == 2);
+        // The tag moves on.
+        $assert(d_tag == 1);
+
+        // --- descriptors that are blocked ---
+        // One byte past the end.
+        fire(BASE + SIZE - 4, 20'd5);
+        $assert(!wr_valid);
+        $assert(!busy);
+        $assert(out_of_range == 1);
+
+        // Before the window.
+        fire(BASE - 4, 20'd4);
+        $assert(!wr_valid);
+        $assert(out_of_range == 2);
+
+        // A different place entirely. With DMA in pass-through mode, this is
+        // the most dangerous case.
+        fire(64'h0000_0000_0000_0000, 20'd4);
+        $assert(!wr_valid);
+        $assert(out_of_range == 3);
+
+        // Length 0.
+        fire(BASE, 20'd0);
+        $assert(!wr_valid);
+        $assert(out_of_range == 4);
+
+        // Blocked descriptors do not change these counts.
+        $assert(done == 2);
+        $assert(while_busy == 0);
+
+        // --- a request before the previous one is done ---
+        fire(BASE, 20'd8);
+        $assert(busy);
+        fire(BASE, 20'd8);
+        $assert(while_busy == 1);
+        // Counted apart from out-of-range.
+        $assert(out_of_range == 4);
+        complete();
+        $assert(done == 3);
+
+        // --- the error is kept ---
+        fire(BASE, 20'd8);
+        wr_ready = 1;
+        clk.next(1);
+        wr_ready        = 0;
+        wr_status_error = 4'h3;
+        wr_status_valid = 1;
+        clk.next(1);
+        wr_status_valid = 0;
+        clk.next(1);
+        $assert(error == 4'h3);
+
+        // --- the other direction ---
+        //
+        // Same window, same check, other engine. With `dir` 1, only the read
+        // side does the handshake and answers.
+        dir = 1;
+        fire(BASE, 20'd8);
+        $assert(rd_valid);
+        $assert(!wr_valid);
+        $assert(busy);
+        rd_ready = 1;
+        clk.next(1);
+        rd_ready        = 0;
+        rd_status_error = 4'h5;
+        rd_status_valid = 1;
+        clk.next(1);
+        rd_status_valid = 0;
+        clk.next(1);
+        $assert(!busy);
+        $assert(error == 4'h5);
+        $assert(done == 5);
+
+        // The window check does not depend on the direction.
+        fire(BASE - 4, 20'd4);
+        $assert(!rd_valid);
+        $assert(out_of_range == 5);
+        dir = 0;
+
+        // --- a window that wraps at 64 bits ---
+        //
+        // `base + size` does not fit in 64 bits. A wrapped compare would put
+        // an outside address inside the window. This is why the gate adds
+        // in 65 bits.
+        base = 64'hffff_ffff_ffff_0000;
+        size = 32'h0002_0000; // base + size = 2^64 + 0x10000
+        clk.next(1);
+
+        // Inside the window (before the wrap).
+        fire(64'hffff_ffff_ffff_0000, 20'd16);
+        $assert(wr_valid);
+        complete();
+
+        // Address 0 is not inside the window. A wrapped compare would let it
+        // through.
+        fire(64'h0000_0000_0000_0000, 20'd16);
+        $assert(!wr_valid);
+        $assert(out_of_range == 6);
+    }
+}

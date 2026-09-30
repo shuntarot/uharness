@@ -1,0 +1,284 @@
+/// The host and the DUT reach the same memory.
+///
+/// This uses the same structure as the generated harness. `hns::axi_rr`
+/// arbitrates between `hns::axi_host` (the master on the window side) and the
+/// DUT master, and the stand-in `hns::axi_mem` sits behind it. The backdoor is
+/// not used. A real memory controller has no backdoor, so a path that works
+/// only through it would break when the stand-in is replaced.
+#[test(axi_host_and_dut_share_one_memory)]
+module test_axi_host {
+    const DEPTH: u32 = 16;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    inst dut_axi: $std::axi4_if::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>>;
+    inst hst_axi: $std::axi4_if::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>>;
+    inst mem_axi: $std::axi4_if::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>>;
+
+    var haddr  : logic<4> ;
+    var hwdata : logic<32>;
+    var hwe    : logic    ;
+    var hre    : logic    ;
+    var hrdata : logic<32>;
+    var hrvalid: logic    ;
+    var hwready: logic    ;
+
+    inst u_host: axi_host::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>> #(
+        ADDR_W: 4,
+    ) (
+        i_clk    : clk    ,
+        i_rst    : rst    ,
+        axi      : hst_axi,
+        i_haddr  : haddr  ,
+        i_hwdata : hwdata ,
+        i_hwe    : hwe    ,
+        i_hre    : hre    ,
+        o_hrdata : hrdata ,
+        o_hrvalid: hrvalid,
+        o_hwready: hwready,
+    );
+
+    inst u_rr: axi_rr::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>> (
+        i_clk: clk    ,
+        i_rst: rst    ,
+        m0   : dut_axi,
+        m1   : hst_axi,
+        s    : mem_axi,
+    );
+
+    inst u_mem: axi_mem::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>> #(
+        DEPTH: DEPTH,
+    ) (
+        i_clk   : clk    ,
+        i_rst   : rst    ,
+        axi     : mem_axi,
+        i_haddr : '0     ,
+        i_hwdata: '0     ,
+        i_hwstrb: '0     ,
+        i_hwe   : '0     ,
+        o_hrdata: _      ,
+    );
+
+    // The DUT master signals that take no part in the handshake.
+    always_comb {
+        dut_axi.awsize   = 3'd2;
+        dut_axi.awburst  = 2'b01;
+        dut_axi.awcache  = 0;
+        dut_axi.awprot   = 0;
+        dut_axi.awlock   = 0;
+        dut_axi.awqos    = 0;
+        dut_axi.awregion = 0;
+        dut_axi.awuser   = 0;
+        dut_axi.wuser    = 0;
+        dut_axi.arsize   = 3'd2;
+        dut_axi.arburst  = 2'b01;
+        dut_axi.arcache  = 0;
+        dut_axi.arprot   = 0;
+        dut_axi.arlock   = 0;
+        dut_axi.arqos    = 0;
+        dut_axi.arregion = 0;
+        dut_axi.aruser   = 0;
+    }
+
+    /// Writes one word from the window. Like `hns::axil`, it waits for
+    /// `hwready` and then sends one pulse.
+    function host_write (
+        addr: input logic<4> ,
+        data: input logic<32>,
+    ) {
+        for _i in 0..32 {
+            if hwready {
+                break;
+            }
+            clk.next(1);
+        }
+        haddr  = addr;
+        hwdata = data;
+        hwe    = 1;
+        clk.next(1);
+        hwe = 0;
+        for _i in 0..32 {
+            if hwready {
+                break;
+            }
+            clk.next(1);
+        }
+    }
+
+    /// Reads one word from the window and waits for `hrvalid`.
+    function host_read (
+        addr: input logic<4>,
+    ) -> logic<32> {
+        haddr = addr;
+        hre   = 1;
+        clk.next(1);
+        hre = 0;
+        for _i in 0..32 {
+            if hrvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        return hrdata;
+    }
+
+    /// The DUT master writes one beat. `addr` is a byte address.
+    function dut_write (
+        addr: input logic<32>,
+        data: input logic<32>,
+    ) {
+        dut_axi.awaddr  = addr;
+        dut_axi.awlen   = 0;
+        dut_axi.awid    = 1;
+        dut_axi.awvalid = 1;
+        dut_axi.wdata   = data;
+        dut_axi.wstrb   = 4'hf;
+        dut_axi.wlast   = 1;
+        dut_axi.wvalid  = 1;
+        for _i in 0..32 {
+            if dut_axi.awready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        dut_axi.awvalid = 0;
+        for _i in 0..32 {
+            if dut_axi.wready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        dut_axi.wvalid = 0;
+        for _i in 0..32 {
+            if dut_axi.bvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+    }
+
+    /// The DUT master reads one beat.
+    function dut_read (
+        addr: input logic<32>,
+    ) -> logic<32> {
+        dut_axi.araddr  = addr;
+        dut_axi.arlen   = 0;
+        dut_axi.arid    = 2;
+        dut_axi.arvalid = 1;
+        for _i in 0..32 {
+            if dut_axi.arready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        dut_axi.arvalid = 0;
+        for _i in 0..32 {
+            if dut_axi.rvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        return dut_axi.rdata;
+    }
+
+    // The host response is a 1-cycle pulse. Count it here so that none is missed.
+    var host_val : logic<32>;
+    var host_hits: logic<8> ;
+
+    always_ff (clk, rst) {
+        if_reset {
+            host_val  = 0;
+            host_hits = 0;
+        } else if hrvalid {
+            host_val  = hrdata;
+            host_hits = host_hits + 1;
+        }
+    }
+
+    initial {
+        hwe             = 0;
+        hre             = 0;
+        haddr           = 0;
+        hwdata          = 0;
+        dut_axi.awvalid = 0;
+        dut_axi.wvalid  = 0;
+        dut_axi.arvalid = 0;
+        dut_axi.bready  = 1;
+        dut_axi.rready  = 1;
+        rst.assert(4);
+        clk.next(4);
+
+        // The host writes, the host reads.
+        host_write(1, 32'ha5a5_0001);
+        $display("host wrote, host reads: %h", host_read(1));
+        $assert(host_read(1) == 32'ha5a5_0001);
+
+        // The host writes, the DUT reads. Both see one memory.
+        $display("host wrote, dut reads:  %h", dut_read(32'h4));
+        $assert(dut_read(32'h4) == 32'ha5a5_0001);
+
+        // The DUT writes, the host reads.
+        dut_write(32'h8, 32'hbeef_0002);
+        $display("dut wrote, host reads:  %h", host_read(2));
+        $assert(host_read(2) == 32'hbeef_0002);
+
+        // The neighbouring words did not change.
+        $assert(host_read(0) == 0);
+        $assert(host_read(1) == 32'ha5a5_0001);
+
+        // Two requests at the same time both go through. The arbiter must not
+        // drop one of them.
+        //
+        // The host response is a 1-cycle pulse, so it passes while the test
+        // waits for the DUT side. `host_val` / `host_hits` catch it.
+        // Wait before taking the count: `host_read` returns when it sees
+        // `hrvalid`, so that pulse is not counted yet.
+        clk.next(2);
+        var hits_before: logic<8>;
+        hits_before = host_hits;
+
+        dut_axi.araddr  = 32'h4;
+        dut_axi.arlen   = 0;
+        dut_axi.arid    = 3;
+        dut_axi.arvalid = 1;
+        haddr           = 2;
+        hre             = 1;
+        clk.next(1);
+        hre = 0;
+
+        // The DUT side follows the handshake rule: it drops `arvalid` on the
+        // edge after it sees `arready`.
+        for _i in 0..64 {
+            if dut_axi.arready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        dut_axi.arvalid = 0;
+        for _i in 0..64 {
+            if dut_axi.rvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        var both_dut: logic<32>;
+        both_dut = dut_axi.rdata;
+        clk.next(8);
+
+        $display("both at once: dut=%h host=%h hits=%d before=%d", both_dut, host_val, host_hits, hits_before);
+        $assert(both_dut == 32'ha5a5_0001);
+        $assert(host_val == 32'hbeef_0002);
+        // One host read also went through. If the arbiter dropped it, the
+        // count would not change.
+        $assert(host_hits == hits_before + 1);
+
+        clk.next(4);
+        $finish();
+    }
+}

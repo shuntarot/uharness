@@ -1,0 +1,38 @@
+[dut]
+module = "dut_top"
+
+[clock.i_clk]
+freq_mhz = 100
+
+[bundle.ctl]
+backing  = "reg"
+ports    = ["i_addr", "i_en", "i_wen", "i_wdata", "i_wstrb", "i_push", "o_read", "o_wide"]
+
+# Line writes (128 bit) and word reads (32 bit), byte-addressed, with a read
+# enable. Only 8 entries deep, so byte address 128 and up is out of range.
+[bundle.mem]
+latency    = 1
+backing    = "bram"
+addressing = "byte"
+depth      = 8
+ports      = { addr = "o_mem_addr", re = "o_mem_en", rdata = "i_mem_rdata", wdata = "o_mem_wdata", wstrb = "o_mem_wstrb", we = "o_mem_wen" }
+
+# valid_only, so entries are dropped when it is full. Payload is 64 bit (2 words).
+[bundle.tx]
+backing  = "host_poll_fifo"
+depth    = 4
+ports    = { valid = "o_tx_valid", data = "o_tx_data" }
+
+# A register file inside the DUT. `slave` says the data lives there and the
+# harness only opens a window onto it -- the opposite of `reg`, where the
+# harness holds the data. `addr` is a DUT input, which is what makes it a
+# slave.
+[bundle.csr]
+latency = 1
+backing = "slave"
+ports   = { addr = "i_csr_addr", wdata = "i_csr_wdata",
+            we = "i_csr_we", rdata = "o_csr_rdata" }
+
+# Heartbeat UART. Readable even when the transport is not working.
+[heartbeat]
+pin = "uart_tx"

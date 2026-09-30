@@ -1,0 +1,369 @@
+/// A BRAM standing in for host memory, behind the transfer-level port.
+///
+/// Built out of the parts that already exist: two command queues, two data
+/// queues and one `hns::mem`. Nothing here decodes a bus -- a command is a
+/// start index and a beat count, and an engine walks the memory.
+///
+/// ```
+///   rd_cmd_* --> cmd queue --+                     +--> data queue --> rd_*
+///                            +--> engine --> mem --+
+///   wr_cmd_* --> cmd queue --+        ^            |
+///   wr_*     --> data queue -----------+           |
+///                                      |           |
+///                            backdoor (port B) <---+
+/// ```
+///
+/// The queues are what make it behave like host memory. A command can be
+/// posted and answered later, and beats flow at whatever rate the DUT takes
+/// them -- neither side is tied to the other's timing. That is the property the
+/// port exists for, and it is what a PCIe requester will also have.
+///
+/// The backdoor is the point of standing in at all. The host reaches the
+/// same memory through port B of `hns::mem`, so it can put a pattern in before
+/// the DUT reads it, and read back what the DUT wrote. Both directions become
+/// testable with no PCIe.
+///
+/// Reading and writing walk independently; only the memory port is shared,
+/// and it is handed over a cycle at a time. A write that has no beats yet does
+/// not hold the port, so a read behind it still moves.
+///
+/// This is required, not a refinement. A DUT that reads and writes as one
+/// flight (a copy, for example) cannot make progress on either half until both
+/// are moving. Serving one command to completion before starting the next
+/// deadlocks it: the write waits for beats the DUT cannot produce until its
+/// read is served.
+///
+/// What cannot be served is counted in `o_oor`, never invented.
+///
+/// - A read that runs off the end delivers the beats that are inside, and
+///   `o_rd_last` marks the last of them.
+/// - A read that yields no beats at all ends nothing. `nbytes == 0` does it,
+///   and so does a start address at or past the end. There is no `o_rd_last`
+///   without a beat to carry it, so a DUT waiting for one waits forever; the
+///   counter and a stuck DUT are what say so. This is a gap in the port, not a
+///   choice made here: producing a beat to unblock the DUT would hand over
+///   data that was never read.
+/// - A write always consumes every beat it was promised, and stores only
+///   the ones inside the memory. Refusing to consume them would stall the DUT
+///   on a queue that never drains, and the write side has `o_wr_done_valid` to
+///   end the transfer with, which the read side has no equivalent of.
+pub module hmem #(
+    /// Whether byte writes are carried. Set false when the other side cannot
+    /// carry them (a PCIe requester cannot put arbitrary byte enables in a
+    /// TLP). When false, `o_widened` counts every strobe that was not all ones,
+    /// so a whole-word write never happens silently.
+    param HAS_STRB: bbool = false,
+    param DW      : u32 = 64 , // beat width
+    param DEPTH   : u32 = 512, // beats the stand-in holds
+    param ADDR_W  : u32 = 64 , // width of the command address
+    param SIZE_W: u32 = 32 , // width of the command length
+    param QUEUE   : u32 = 2  , // commands that can be posted before the DUT waits
+    param BURST   : u32 = 16 , // beats buffered between the memory and the DUT
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    // read command (DUT -> here)
+    i_rd_cmd_valid : input  logic          ,
+    o_rd_cmd_ready : output logic          ,
+    i_rd_cmd_addr  : input  logic<ADDR_W>  ,
+    i_rd_cmd_size: input  logic<SIZE_W>,
+
+    // read data (here -> DUT)
+    o_rd_valid: output logic    ,
+    i_rd_ready: input  logic    ,
+    o_rd_data : output logic<DW>,
+    o_rd_last : output logic    ,
+
+    // write command (DUT -> here)
+    i_wr_cmd_valid : input  logic          ,
+    o_wr_cmd_ready : output logic          ,
+    i_wr_cmd_addr  : input  logic<ADDR_W>  ,
+    i_wr_cmd_size: input  logic<SIZE_W>,
+
+    // write data (DUT -> here), and the completion that ends the transfer
+    i_wr_valid     : input  logic    ,
+    o_wr_ready     : output logic    ,
+    i_wr_data      : input  logic<DW>,
+    /// Bytes to write. Ignored when `HAS_STRB` is false.
+    i_wr_strb      : input  logic<DW / 8>,
+    i_wr_last      : input  logic    ,
+    o_wr_done_valid: output logic    ,
+
+    // the backdoor: the host reaches the same memory
+    i_haddr : input  logic<$clog2(DEPTH)>,
+    i_hwdata: input  logic<DW>           ,
+    i_hwe   : input  logic               ,
+    o_hrdata: output logic<DW>           ,
+
+    /// Commands that could not be served as asked. Saturating.
+    o_oor: output logic<32>,
+
+    /// Strobes that were not all ones while byte writes cannot be carried.
+    /// Saturating. Always 0 when `HAS_STRB` is true.
+    o_widened: output logic<32>,
+) {
+    const BYTES  : u32 = DW / 8;
+    const SHIFT  : u32 = $clog2(BYTES);
+    const INDEX_W: u32 = $clog2(DEPTH);
+    const CMD_W  : u32 = ADDR_W + SIZE_W;
+
+    // --- the two walkers ---
+    var r_active: logic         ;
+    var r_index : logic<INDEX_W>;
+    var r_left  : logic<SIZE_W> ; // beats still to hand back
+    var pend    : logic         ; // a read was issued; its beat lands next cycle
+    var plast   : logic         ;
+
+    var w_active: logic         ;
+    var w_index : logic<INDEX_W>;
+    var w_left  : logic<SIZE_W> ; // beats still to consume
+    var w_store : logic<SIZE_W> ; // of those, how many are inside the memory
+
+    var oor  : logic<32>;
+    var wdone: logic    ;
+
+    // --- command queues ---
+    var rq_pop  : logic                   ;
+    var rq_data : logic<CMD_W>            ;
+    var rq_level: logic<$clog2(QUEUE) + 1>;
+    var wq_pop  : logic                   ;
+    var wq_data : logic<CMD_W>            ;
+    var wq_level: logic<$clog2(QUEUE) + 1>;
+
+    inst rq: fifo #(
+        WIDTH: CMD_W,
+        DEPTH: QUEUE,
+    ) (
+        i_clk                                    ,
+        i_rst                                    ,
+        i_push : i_rd_cmd_valid & o_rd_cmd_ready ,
+        i_data : {i_rd_cmd_addr, i_rd_cmd_size}  ,
+        o_ready: o_rd_cmd_ready                  ,
+        i_pop  : rq_pop                          ,
+        o_data : rq_data                         ,
+        o_level: rq_level                        ,
+        o_drops: _                               ,
+    );
+
+    inst wq: fifo #(
+        WIDTH: CMD_W,
+        DEPTH: QUEUE,
+    ) (
+        i_clk                                    ,
+        i_rst                                    ,
+        i_push : i_wr_cmd_valid & o_wr_cmd_ready ,
+        i_data : {i_wr_cmd_addr, i_wr_cmd_size}  ,
+        o_ready: o_wr_cmd_ready                  ,
+        i_pop  : wq_pop                          ,
+        o_data : wq_data                         ,
+        o_level: wq_level                        ,
+        o_drops: _                               ,
+    );
+
+    // --- data queues ---
+    // The read queue carries `last` alongside the beat, so the walker decides
+    // where the transfer ends and the DUT reads it out with the data.
+    var rd_push : logic                   ;
+    var rd_entry: logic<DW + 1>           ;
+    var rd_out  : logic<DW + 1>           ;
+    var rd_level: logic<$clog2(BURST) + 1>;
+    var wd_pop  : logic                   ;
+    var wd_out  : logic<DW>               ;
+    var wd_pair : logic<DW + DW / 8>      ;
+    var wd_strb : logic<DW / 8>           ;
+    var wd_level: logic<$clog2(BURST) + 1>;
+
+    inst rdq: fifo #(
+        WIDTH: DW + 1,
+        DEPTH: BURST ,
+    ) (
+        i_clk                            ,
+        i_rst                            ,
+        i_push : rd_push                 ,
+        i_data : rd_entry                ,
+        o_ready: _                       ,
+        i_pop  : o_rd_valid & i_rd_ready ,
+        o_data : rd_out                  ,
+        o_level: rd_level                ,
+        o_drops: _                       ,
+    );
+
+    // Data and strobe share one queue. Two queues could advance apart and
+    // misalign.
+    inst wdq: fifo #(
+        WIDTH: DW + BYTES,
+        DEPTH: BURST     ,
+    ) (
+        i_clk                                   ,
+        i_rst                                   ,
+        i_push : i_wr_valid & o_wr_ready        ,
+        i_data : {i_wr_strb, i_wr_data}         ,
+        o_ready: o_wr_ready                     ,
+        i_pop  : wd_pop                         ,
+        o_data : wd_pair                        ,
+        o_level: wd_level                       ,
+        o_drops: _                              ,
+    );
+
+    assign wd_out  = wd_pair[DW - 1:0];
+    assign wd_strb = if HAS_STRB ? wd_pair[DW + BYTES - 1:DW] : {1'b1 repeat BYTES};
+
+    // Count strobes that cannot be carried. A whole-word write is fine when
+    // it is known; a silent one is not.
+    var widened: logic<32>;
+    always_ff {
+        if_reset {
+            widened = 0;
+        } else if !HAS_STRB && wd_pop && wd_pair[DW + BYTES - 1:DW] != {1'b1 repeat BYTES} {
+            if widened != 32'hffff_ffff {
+                widened = widened + 1;
+            }
+        }
+    }
+    assign o_widened = widened;
+
+    // --- what a queued command means ---
+    // Derived as wires, not inside the functions. Veryl cannot slice the
+    // result of a call, so the pieces are named here and passed in whole.
+    let rq_first: logic<ADDR_W> = rq_data[CMD_W - 1:SIZE_W] >> SHIFT;
+    let rq_beats: logic<SIZE_W> = (rq_data[SIZE_W - 1:0] + (BYTES - 1)) >> SHIFT;
+    let rq_room : logic<SIZE_W> = if rq_first <: DEPTH ? (DEPTH - rq_first[SIZE_W - 1:0]) : 0;
+    let rq_serve: logic<SIZE_W> = if rq_beats <: rq_room ? rq_beats : rq_room;
+    /// A command that cannot be served as asked. `beats == 0` counts too: it is
+    /// not "short", and it is the case most likely to leave a DUT waiting.
+    let rq_short: logic = rq_serve != rq_beats || rq_beats == 0;
+
+    let wq_first: logic<ADDR_W> = wq_data[CMD_W - 1:SIZE_W] >> SHIFT;
+    let wq_beats: logic<SIZE_W> = (wq_data[SIZE_W - 1:0] + (BYTES - 1)) >> SHIFT;
+    let wq_room : logic<SIZE_W> = if wq_first <: DEPTH ? (DEPTH - wq_first[SIZE_W - 1:0]) : 0;
+    let wq_serve: logic<SIZE_W> = if wq_beats <: wq_room ? wq_beats : wq_room;
+    let wq_short: logic = wq_serve != wq_beats || wq_beats == 0;
+
+    // --- the shared memory port, handed over one cycle at a time ---
+    // A read may be issued when there is somewhere to put the beat it returns.
+    let rd_room: logic = (rd_level + (if pend ? 1 : 0)) <: BURST;
+    // A write only takes the port when it has a beat to store. Otherwise it
+    // would hold the port while the DUT waits for the read that feeds it.
+    let w_move: logic = w_active && w_left != 0 && wd_level != 0;
+    let r_move: logic = r_active && r_left != 0 && rd_room && !w_move;
+
+    var rdata: logic<DW>;
+
+    always_comb {
+        o_rd_valid = rd_level != 0;
+        o_rd_data  = rd_out[DW - 1:0];
+        o_rd_last  = rd_out[DW];
+
+        o_wr_done_valid = wdone;
+        o_oor           = oor;
+
+        rq_pop = !r_active && rq_level != 0;
+        wq_pop = !w_active && wq_level != 0;
+        wd_pop = w_move;
+
+        rd_push  = pend;
+        rd_entry = {plast, rdata};
+    }
+
+    always_ff {
+        if_reset {
+            r_active = 0;
+            r_index  = 0;
+            r_left   = 0;
+            pend     = 0;
+            plast    = 0;
+            w_active = 0;
+            w_index  = 0;
+            w_left   = 0;
+            w_store  = 0;
+            oor      = 0;
+            wdone    = 0;
+        } else {
+            wdone = 0;
+            pend  = 0;
+
+            // --- the read walker ---
+            if r_active {
+                if r_move {
+                    pend    = 1;
+                    plast   = r_left == 1;
+                    r_left  = r_left - 1;
+                    r_index = r_index + 1;
+                }
+                if r_left == 0 && !pend {
+                    r_active = 0;
+                }
+            } else if rq_level != 0 {
+                r_index = rq_first[INDEX_W - 1:0];
+                r_left  = rq_serve;
+                if rq_short && oor != 32'hffff_ffff {
+                    oor = oor + 1;
+                }
+                // Nothing inside the memory means nothing to hand back, and
+                // there is no `last` without a beat to carry it.
+                r_active = rq_serve != 0;
+            }
+
+            // --- the write walker ---
+            if w_active {
+                if w_move {
+                    w_left = w_left - 1;
+                    if w_store != 0 {
+                        w_store = w_store - 1;
+                        w_index = w_index + 1;
+                    }
+                    if w_left == 1 {
+                        w_active = 0;
+                        wdone    = 1;
+                    }
+                }
+            } else if wq_level != 0 {
+                w_index = wq_first[INDEX_W - 1:0];
+                w_store = wq_serve;
+                // A write consumes every beat it was promised, so the DUT
+                // never stalls on a queue that stops draining.
+                w_left = wq_beats;
+                if wq_short && oor != 32'hffff_ffff {
+                    oor = oor + 1;
+                }
+                if wq_beats == 0 {
+                    // Nothing to move, but the write side can still say so.
+                    wdone = 1;
+                } else {
+                    w_active = 1;
+                }
+            }
+        }
+    }
+
+    // The storage, shared by both directions and by the backdoor.
+    inst u: mem #(
+        WIDTH  : DW     ,
+        SLICES : 1      ,
+        DEPTH  : DEPTH  ,
+        LATENCY: 1      ,
+        ADDR_W : INDEX_W,
+        SHIFT  : 0      ,
+        STRB_W  : BYTES,
+        HAS_STRB: true ,
+    ) (
+        i_clk                                    ,
+        i_rst                                    ,
+        i_addr  : if w_move ? w_index : r_index  ,
+        o_rdata : rdata                          ,
+        i_wdata : wd_out                         ,
+        i_wstrb : wd_strb                        ,
+        i_we    : w_move && w_store != 0         ,
+        i_en    : 1                              ,
+        o_oor   : _                              ,
+        i_haddr                                  ,
+        i_hwdata                                 ,
+        // The backdoor writes whole entries. `HAS_HSTRB` is false by default,
+        // so this is unused, but leaving it open causes an unconnected-port
+        // warning.
+        i_hwstrb: '0                             ,
+        i_hwe                                    ,
+        o_hrdata                                 ,
+    );
+}

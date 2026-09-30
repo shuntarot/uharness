@@ -1,0 +1,289 @@
+/// Passes AXI4 between two clock domains.
+///
+/// A real `dram` always runs on its own clock: MIG makes its own `ui_clk`, and
+/// the memory decides its rate, not the DUT. Connecting the two without a CDC
+/// would be an unsynchronized crossing.
+///
+/// Inside are five async FIFOs, one per channel. Each carries one struct with
+/// all signals of its channel, so no hand-written gray pointers or
+/// synchronizer stages are needed. The FIFO is `hns::async_fifo`, a copy of
+/// `std::async_fifo` with a one-line CDC fix. Switch back when std is fixed.
+///
+/// Order is kept: each channel has one FIFO, so nothing can overtake. AXI4
+/// does not require order between channels, so this is enough.
+pub module axi_cdc::<PKG: $std::axi4_prototype> #(
+    /// FIFO depth per channel. A deeper FIFO hides more round-trip wait.
+    param DEPTH: u32 = 4,
+) (
+    is_clk: input 's clock,
+    is_rst: input 's reset,
+    /// Master side (DUT).
+    s_axi: modport 's $std::axi4_if::<PKG>::slave,
+
+    id_clk: input 'd clock,
+    id_rst: input 'd reset,
+    /// Slave side (memory controller).
+    m_axi: modport 'd $std::axi4_if::<PKG>::master,
+) {
+    struct aw_t {
+        addr  : PKG::addr_t      ,
+        size  : PKG::size_t      ,
+        burst : PKG::burst_t     ,
+        cache : PKG::wcache_t    ,
+        prot  : PKG::proto_t     ,
+        id    : PKG::id_t        ,
+        len   : PKG::num_bursts_t,
+        lock  : PKG::lock_t      ,
+        qos   : PKG::qos_t       ,
+        region: PKG::region_t    ,
+        user  : PKG::awuser_t    ,
+    }
+
+    struct w_t {
+        data: PKG::data_t ,
+        strb: PKG::strb_t ,
+        last: logic       ,
+        user: PKG::wuser_t,
+    }
+
+    struct b_t {
+        resp: PKG::resp_t ,
+        id  : PKG::id_t   ,
+        user: PKG::buser_t,
+    }
+
+    struct ar_t {
+        addr  : PKG::addr_t      ,
+        size  : PKG::size_t      ,
+        burst : PKG::burst_t     ,
+        cache : PKG::rcache_t    ,
+        prot  : PKG::proto_t     ,
+        id    : PKG::id_t        ,
+        len   : PKG::num_bursts_t,
+        lock  : PKG::lock_t      ,
+        qos   : PKG::qos_t       ,
+        region: PKG::region_t    ,
+        user  : PKG::aruser_t    ,
+    }
+
+    struct r_t {
+        data: PKG::data_t ,
+        resp: PKG::resp_t ,
+        last: logic       ,
+        id  : PKG::id_t   ,
+        user: PKG::ruser_t,
+    }
+
+    // ── Write address ('s -> 'd) ─────────────────────────────────────────
+    var aw_full : 's logic;
+    var aw_empty: 'd logic;
+    var aw_out  : 'd aw_t ;
+
+    let aw_in: 's aw_t = aw_t'{
+        addr  : s_axi.awaddr,
+        size  : s_axi.awsize,
+        burst : s_axi.awburst,
+        cache : s_axi.awcache,
+        prot  : s_axi.awprot,
+        id    : s_axi.awid,
+        len   : s_axi.awlen,
+        lock  : s_axi.awlock,
+        qos   : s_axi.awqos,
+        region: s_axi.awregion,
+        user  : s_axi.awuser,
+    };
+
+    inst u_aw: async_fifo::<$std::synchronizer_basic> #(
+        TYPE : aw_t ,
+        DEPTH: DEPTH,
+    ) (
+        is_clk                              ,
+        is_rst                              ,
+        os_almost_full: _                   ,
+        os_full       : aw_full             ,
+        is_push       : s_axi.awvalid & ~aw_full,
+        is_data       : aw_in               ,
+        id_clk                              ,
+        id_rst                              ,
+        od_empty      : aw_empty            ,
+        id_pop        : m_axi.awready & ~aw_empty,
+        od_data       : aw_out              ,
+    );
+
+    // ── Write data ('s -> 'd) ────────────────────────────────────────────
+    var w_full : 's logic;
+    var w_empty: 'd logic;
+    var w_out  : 'd w_t  ;
+
+    let w_in: 's w_t = w_t'{
+        data: s_axi.wdata,
+        strb: s_axi.wstrb,
+        last: s_axi.wlast,
+        user: s_axi.wuser,
+    };
+
+    inst u_w: async_fifo::<$std::synchronizer_basic> #(
+        TYPE : w_t  ,
+        DEPTH: DEPTH,
+    ) (
+        is_clk                             ,
+        is_rst                             ,
+        os_almost_full: _                  ,
+        os_full       : w_full             ,
+        is_push       : s_axi.wvalid & ~w_full ,
+        is_data       : w_in               ,
+        id_clk                             ,
+        id_rst                             ,
+        od_empty      : w_empty            ,
+        id_pop        : m_axi.wready & ~w_empty,
+        od_data       : w_out              ,
+    );
+
+    // ── Write response ('d -> 's) ────────────────────────────────────────
+    var b_full : 'd logic;
+    var b_empty: 's logic;
+    var b_out  : 's b_t  ;
+
+    let b_in: 'd b_t = b_t'{
+        resp: m_axi.bresp,
+        id  : m_axi.bid,
+        user: m_axi.buser,
+    };
+
+    inst u_b: async_fifo::<$std::synchronizer_basic> #(
+        TYPE : b_t  ,
+        DEPTH: DEPTH,
+    ) (
+        is_clk        : id_clk             ,
+        is_rst        : id_rst             ,
+        os_almost_full: _                  ,
+        os_full       : b_full             ,
+        is_push       : m_axi.bvalid & ~b_full ,
+        is_data       : b_in               ,
+        id_clk        : is_clk             ,
+        id_rst        : is_rst             ,
+        od_empty      : b_empty            ,
+        id_pop        : s_axi.bready & ~b_empty,
+        od_data       : b_out              ,
+    );
+
+    // ── Read address ('s -> 'd) ──────────────────────────────────────────
+    var ar_full : 's logic;
+    var ar_empty: 'd logic;
+    var ar_out  : 'd ar_t ;
+
+    let ar_in: 's ar_t = ar_t'{
+        addr  : s_axi.araddr,
+        size  : s_axi.arsize,
+        burst : s_axi.arburst,
+        cache : s_axi.arcache,
+        prot  : s_axi.arprot,
+        id    : s_axi.arid,
+        len   : s_axi.arlen,
+        lock  : s_axi.arlock,
+        qos   : s_axi.arqos,
+        region: s_axi.arregion,
+        user  : s_axi.aruser,
+    };
+
+    inst u_ar: async_fifo::<$std::synchronizer_basic> #(
+        TYPE : ar_t ,
+        DEPTH: DEPTH,
+    ) (
+        is_clk                               ,
+        is_rst                               ,
+        os_almost_full: _                    ,
+        os_full       : ar_full              ,
+        is_push       : s_axi.arvalid & ~ar_full ,
+        is_data       : ar_in                ,
+        id_clk                               ,
+        id_rst                               ,
+        od_empty      : ar_empty             ,
+        id_pop        : m_axi.arready & ~ar_empty,
+        od_data       : ar_out               ,
+    );
+
+    // ── Read data ('d -> 's) ─────────────────────────────────────────────
+    var r_full : 'd logic;
+    var r_empty: 's logic;
+    var r_out  : 's r_t  ;
+
+    let r_in: 'd r_t = r_t'{
+        data: m_axi.rdata,
+        resp: m_axi.rresp,
+        last: m_axi.rlast,
+        id  : m_axi.rid,
+        user: m_axi.ruser,
+    };
+
+    inst u_r: async_fifo::<$std::synchronizer_basic> #(
+        TYPE : r_t  ,
+        DEPTH: DEPTH,
+    ) (
+        is_clk        : id_clk             ,
+        is_rst        : id_rst             ,
+        os_almost_full: _                  ,
+        os_full       : r_full             ,
+        is_push       : m_axi.rvalid & ~r_full ,
+        is_data       : r_in               ,
+        id_clk        : is_clk             ,
+        id_rst        : is_rst             ,
+        od_empty      : r_empty            ,
+        id_pop        : s_axi.rready & ~r_empty,
+        od_data       : r_out              ,
+    );
+
+    always_comb {
+        // Toward the master.
+        s_axi.awready = ~aw_full;
+        s_axi.wready  = ~w_full;
+        s_axi.arready = ~ar_full;
+        s_axi.bvalid  = ~b_empty;
+        s_axi.bresp   = b_out.resp;
+        s_axi.bid     = b_out.id;
+        s_axi.buser   = b_out.user;
+        s_axi.rvalid  = ~r_empty;
+        s_axi.rdata   = r_out.data;
+        s_axi.rresp   = r_out.resp;
+        s_axi.rlast   = r_out.last;
+        s_axi.rid     = r_out.id;
+        s_axi.ruser   = r_out.user;
+
+        // Toward the slave.
+        m_axi.awvalid  = ~aw_empty;
+        m_axi.awaddr   = aw_out.addr;
+        m_axi.awsize   = aw_out.size;
+        m_axi.awburst  = aw_out.burst;
+        m_axi.awcache  = aw_out.cache;
+        m_axi.awprot   = aw_out.prot;
+        m_axi.awid     = aw_out.id;
+        m_axi.awlen    = aw_out.len;
+        m_axi.awlock   = aw_out.lock;
+        m_axi.awqos    = aw_out.qos;
+        m_axi.awregion = aw_out.region;
+        m_axi.awuser   = aw_out.user;
+
+        m_axi.wvalid = ~w_empty;
+        m_axi.wdata  = w_out.data;
+        m_axi.wstrb  = w_out.strb;
+        m_axi.wlast  = w_out.last;
+        m_axi.wuser  = w_out.user;
+
+        m_axi.bready = ~b_full;
+
+        m_axi.arvalid  = ~ar_empty;
+        m_axi.araddr   = ar_out.addr;
+        m_axi.arsize   = ar_out.size;
+        m_axi.arburst  = ar_out.burst;
+        m_axi.arcache  = ar_out.cache;
+        m_axi.arprot   = ar_out.prot;
+        m_axi.arid     = ar_out.id;
+        m_axi.arlen    = ar_out.len;
+        m_axi.arlock   = ar_out.lock;
+        m_axi.arqos    = ar_out.qos;
+        m_axi.arregion = ar_out.region;
+        m_axi.aruser   = ar_out.user;
+
+        m_axi.rready = ~r_full;
+    }
+}

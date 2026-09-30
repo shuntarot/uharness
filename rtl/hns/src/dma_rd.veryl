@@ -1,0 +1,251 @@
+/// Reads host memory and writes it to card memory. The reverse of
+/// `hns::dma_wr`.
+///
+/// The logic is borrowed (`rtl/pcie/rtl/pcie_us_axi_dma_rd.v`, verilog-pcie,
+/// MIT). PCIe tag management, reordering of out-of-order completions, and
+/// split completions all happen inside it; this module is only a wrapper. Do
+/// not add logic here: it holds `$sv::`, so `veryl test` cannot run it (same
+/// as `hns::dma_wr`).
+///
+/// There are two RQ streams, and `hns::dma_wr` merges them. Feed `o_rq_*` here
+/// into `i_join_*` of `hns::dma_wr`, and the borrowed code arbitrates inside.
+///
+/// RC must always be accepted. An unaccepted completion blocks the hard block.
+/// So `i_rc_*` is fed from a FIFO, not a handshake, and the FIFO must hold one
+/// whole completion.
+pub module dma_rd::<PKG: $std::axi4_prototype> (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// One descriptor from `hns::dma_gate`, already checked against the window.
+    i_desc_pcie_addr: input  logic<64>,
+    i_desc_axi_addr : input  logic<64>,
+    i_desc_len      : input  logic<20>,
+    i_desc_tag      : input  logic<8> ,
+    i_desc_valid    : input  logic    ,
+    o_desc_ready    : output logic    ,
+
+    /// Completion status. `o_status_error` is the borrowed 4-bit code as is.
+    o_status_tag  : output logic<8>,
+    o_status_error: output logic<4>,
+    o_status_valid: output logic   ,
+
+    /// To card memory, write only. `hns::dma_wr` owns the read channels, so
+    /// both connect to the same interface and form one master.
+    m_axi: modport $std::axi4_if::<PKG>::write_master,
+
+    /// PCIe requester stream. It goes to `hns::dma_wr` to be merged, not
+    /// directly to the hard block.
+    o_rq_tdata : output logic<256>,
+    o_rq_tkeep : output logic<8>  ,
+    o_rq_tlast : output logic     ,
+    o_rq_tuser : output logic<60> ,
+    o_rq_tvalid: output logic     ,
+    i_rq_tready: input  logic     ,
+
+    /// Returning completions. tuser is wider than on RQ (75 vs 60): it carries
+    /// completion status, byte enables and error bits.
+    i_rc_tdata : input  logic<256>,
+    i_rc_tkeep : input  logic<8>  ,
+    i_rc_tlast : input  logic     ,
+    i_rc_tuser : input  logic<75> ,
+    i_rc_tvalid: input  logic     ,
+    o_rc_tready: output logic     ,
+
+    /// Max read request size negotiated by the link (`o_max_read_req` of
+    /// `hns_pcie_wrap`). Sampled only while idle, for the same reason as max
+    /// payload in `hns::dma_wr`.
+    i_max_read_req: input logic<3>,
+
+    /// Limit set by the host. 0 means no limit; otherwise `i_limit - 1` is the
+    /// encoded maximum.
+    i_limit: input logic<3>,
+
+    /// The read request size in use now.
+    o_mrrs: output logic<3>,
+
+    /// Completions the borrowed engine dropped (saturating). `cor` counts
+    /// unused tags, poisoned or bad-status completions; `uncor` counts format
+    /// mismatches and timeouts (`status_error_*` in `pcie_us_axi_dma_rd.v`).
+    /// A dropped completion is never written to memory. Without these counts
+    /// the only symptom is stale data where a write was expected.
+    o_cor_count  : output logic<16>,
+    o_uncor_count: output logic<16>,
+
+    /// At least one descriptor is running.
+    o_busy: output logic,
+) {
+    const ADDR_W: u32 = PKG::ADDRESS_WIDTH;
+    const ID_W  : u32 = PKG::ID_LENGTH;
+
+    /// The borrowed read engine has no busy output (`hns::dma_wr` has
+    /// `status_busy`), so it is counted here. The generator issues one
+    /// descriptor at a time (`hns::dma_gate`), but the counter is wide anyway:
+    /// an overflow that shows is better than a count that silently saturates.
+    var inflight: logic<8>;
+    let taken   : logic    = i_desc_valid && o_desc_ready;
+    always_ff {
+        if_reset {
+            inflight = 0;
+        } else {
+            inflight = inflight + (taken as u8) - (o_status_valid as u8);
+        }
+    }
+    assign o_busy = inflight != 0;
+
+    /// Copied only while idle. After reset it is 0 (128 bytes).
+    let want: logic<3> = if i_limit == 0 ?
+        i_max_read_req
+    : if i_max_read_req <: i_limit - 1 ?
+        i_max_read_req
+    :
+        i_limit - 1
+    ;
+
+    var mrrs: logic<3>;
+    always_ff {
+        if_reset {
+            mrrs = 0;
+        } else if inflight == 0 {
+            mrrs = want;
+        }
+    }
+    assign o_mrrs = mrrs;
+
+    var err_cor  : logic    ;
+    var err_uncor: logic    ;
+    var cor      : logic<16>;
+    var uncor    : logic<16>;
+    always_ff {
+        if_reset {
+            cor   = 0;
+            uncor = 0;
+        } else {
+            if err_cor && cor != '1 {
+                cor += 1;
+            }
+            if err_uncor && uncor != '1 {
+                uncor += 1;
+            }
+        }
+    }
+    assign o_cor_count   = cor;
+    assign o_uncor_count = uncor;
+
+    /// The borrowed code takes an active-high reset. The polarity is not
+    /// hard-coded, or it would silently invert if this package's `reset_type`
+    /// changed.
+    var rst_h: logic;
+    always_ff {
+        if_reset {
+            rst_h = 1;
+        } else {
+            rst_h = 0;
+        }
+    }
+
+    /// The address is cut to the memory width. The only guard is on the PCIe
+    /// side (`hns::dma_gate`).
+    let axi_addr: logic<ADDR_W> = i_desc_axi_addr[ADDR_W - 1:0];
+
+    // Fields the borrowed code does not drive. They are tied here on purpose,
+    // not left undriven.
+    always_comb {
+        m_axi.awqos    = 0;
+        m_axi.awregion = 0;
+        m_axi.awuser   = 0;
+        m_axi.wuser    = 0;
+    }
+
+    inst u_rd: $sv::pcie_us_axi_dma_rd #(
+        AXIS_PCIE_DATA_WIDTH   : 256   ,
+        AXIS_PCIE_KEEP_WIDTH   : 8     ,
+        AXIS_PCIE_RC_USER_WIDTH: 75    ,
+        AXIS_PCIE_RQ_USER_WIDTH: 60    ,
+        RQ_SEQ_NUM_WIDTH       : 4     ,
+        RQ_SEQ_NUM_ENABLE      : 0     ,
+        AXI_DATA_WIDTH         : 256   ,
+        AXI_ADDR_WIDTH         : ADDR_W,
+        AXI_STRB_WIDTH         : 32    ,
+        AXI_ID_WIDTH           : ID_W  ,
+        AXI_MAX_BURST_LEN      : 256   ,
+        PCIE_ADDR_WIDTH        : 64    ,
+        // At most 32. More needs extended tags, which are allowed only when
+        // the host enables them in config space. Nothing reads that bit yet,
+        // so stay in the range that needs no permission (`ext_tag_enable` 0).
+        PCIE_TAG_COUNT: 32,
+        LEN_WIDTH     : 20,
+        TAG_WIDTH     : 8 ,
+        OP_TABLE_SIZE : 8 ,
+        TX_LIMIT      : 8 ,
+        TX_FC_ENABLE  : 0 ,
+    ) (
+        clk: i_clk,
+        rst: rst_h,
+
+        s_axis_rc_tdata : i_rc_tdata ,
+        s_axis_rc_tkeep : i_rc_tkeep ,
+        s_axis_rc_tvalid: i_rc_tvalid,
+        s_axis_rc_tready: o_rc_tready,
+        s_axis_rc_tlast : i_rc_tlast ,
+        s_axis_rc_tuser : i_rc_tuser ,
+
+        m_axis_rq_tdata : o_rq_tdata ,
+        m_axis_rq_tkeep : o_rq_tkeep ,
+        m_axis_rq_tvalid: o_rq_tvalid,
+        m_axis_rq_tready: i_rq_tready,
+        m_axis_rq_tlast : o_rq_tlast ,
+        m_axis_rq_tuser : o_rq_tuser ,
+
+        // TX sequence numbers. Unused, because `RQ_SEQ_NUM_ENABLE` is 0.
+        s_axis_rq_seq_num_0      : 0,
+        s_axis_rq_seq_num_valid_0: 0,
+        s_axis_rq_seq_num_1      : 0,
+        s_axis_rq_seq_num_valid_1: 0,
+
+        // TX flow control. Unused, because `TX_FC_ENABLE` is 0.
+        pcie_tx_fc_nph_av: 0,
+
+        s_axis_read_desc_pcie_addr: i_desc_pcie_addr,
+        s_axis_read_desc_axi_addr : axi_addr        ,
+        s_axis_read_desc_len      : i_desc_len      ,
+        s_axis_read_desc_tag      : i_desc_tag      ,
+        s_axis_read_desc_valid    : i_desc_valid    ,
+        s_axis_read_desc_ready    : o_desc_ready    ,
+
+        m_axis_read_desc_status_tag  : o_status_tag  ,
+        m_axis_read_desc_status_error: o_status_error,
+        m_axis_read_desc_status_valid: o_status_valid,
+
+        m_axi_awid   : m_axi.awid   ,
+        m_axi_awaddr : m_axi.awaddr ,
+        m_axi_awlen  : m_axi.awlen  ,
+        m_axi_awsize : m_axi.awsize ,
+        m_axi_awburst: m_axi.awburst,
+        m_axi_awlock : m_axi.awlock ,
+        m_axi_awcache: m_axi.awcache,
+        m_axi_awprot : m_axi.awprot ,
+        m_axi_awvalid: m_axi.awvalid,
+        m_axi_awready: m_axi.awready,
+        m_axi_wdata  : m_axi.wdata  ,
+        m_axi_wstrb  : m_axi.wstrb  ,
+        m_axi_wlast  : m_axi.wlast  ,
+        m_axi_wvalid : m_axi.wvalid ,
+        m_axi_wready : m_axi.wready ,
+        m_axi_bid    : m_axi.bid    ,
+        m_axi_bresp  : m_axi.bresp  ,
+        m_axi_bvalid : m_axi.bvalid ,
+        m_axi_bready : m_axi.bready ,
+
+        // No own requester ID. With `requester_id_enable` 0, the hard block
+        // fills in its own value (PG213).
+        enable               : 1   ,
+        ext_tag_enable       : 0   ,
+        requester_id         : 0   ,
+        requester_id_enable  : 0   ,
+        max_read_request_size: mrrs,
+
+        status_error_cor  : err_cor  ,
+        status_error_uncor: err_uncor,
+    );
+}
