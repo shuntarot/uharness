@@ -326,6 +326,7 @@ bar_bytes = 4096
 veryl harness check [options]     # match only
 veryl harness gen   [options]     # generate
 veryl harness update [-o <dir>]   # generate again, with the recorded options
+veryl harness sim [-o <dir>]      # run a `--target sim` harness for hio
 veryl harness targets             # what ships with this build
 ```
 
@@ -334,7 +335,7 @@ veryl harness targets             # what ships with this build
 | `--target <provider>/<board>[:<config>]` | ✓ | ✓ | required for `gen`; the start of the name is enough while only one board starts that way (`--target xilinx/vcu`) |
 | `--target-file <path>` | ✓ | ✓ | your own description; reported as unverified |
 | `--target-patch <path>` | ✓ | ✓ | a TOML patch over it, repeatable |
-| `--transport <name>` | ✓ | ✓ | `jtag` (default) or `pcie`; a board without `jtag` defaults to its only transport |
+| `--transport <name>` | ✓ | ✓ | `jtag` (default) or `pcie`; a board without `jtag` defaults to its only transport (`sim` for `--target sim`) |
 | `--config <path>` | ✓ | ✓ | where `Harness.toml` is |
 | `--emit-regs <path>` | ✓ | ✓ | also write the register map there |
 | `-o`, `--out-dir <path>` | — | ✓ | default `hns/` beside `Veryl.toml` |
@@ -356,6 +357,7 @@ to fix it.
 | `xilinx/vcu118` | `jtag`, `pcie` | DDR4 |
 | `xilinx/kcu105` | `jtag`, `pcie` | DDR4, 2 GB, with `:dr` or `:062` |
 | `xilinx/kc705` | `jtag` | DDR3, 1 GB |
+| `sim` | `sim` | — (no board; see [Without a board](#without-a-board)) |
 
 The KCU105 carries one of two DDR4 parts, and the memory controller must know
 which. Add the config that matches the chips: `:dr` for EDY4016AABG-DR-F
@@ -374,6 +376,16 @@ of every module it emits:
 ```
 
 That is how two boards live side by side. The name must be a Veryl identifier.
+
+The harness also uses the fixed parts in the Veryl package `hns`. If your
+`Veryl.toml` does not name it, the output fetches the published version from
+GitHub (`shuntarot/uharness`, `rtl/hns`). To use a local checkout instead, add
+it yourself; a path needs no publishing:
+
+```toml
+[dependencies]
+hns = { path = "/path/to/uharness/rtl/hns" }
+```
 
 ```bash
 veryl harness gen -o hns/arty   --target digilent/arty-a7-35
@@ -598,6 +610,33 @@ on its ports, so a testbench can drive it directly. `top` cannot be simulated
 (it holds the MMCM and the JTAG primitive). Everything below the CSR is the same
 generated code in both. `cargo test` runs this. See `dev/design-sim.md` for what
 it does not cover.
+
+### Without a board
+
+`--target sim` runs the harness in the Veryl simulator, and `hio` talks to it
+over a local socket. The same `regs.json`, commands and procedure files work.
+
+```bash
+veryl harness gen --target sim     # writes hns/, as for a board
+veryl harness sim                  # builds, then waits for hio; Ctrl-C stops it
+hio id                             # in another terminal
+hio run bringup.hio
+```
+
+- The simulation starts at the first `hio` connection, so nothing after the
+  reset release is missed. It then keeps running between commands.
+- `veryl harness sim` builds a small Rust component with **cargo**; the first
+  build fetches `veryl-component` from crates.io. Plain `veryl test` cannot
+  run it: the `veryl` from verylup cannot load native components.
+- Run inside a generated directory, `veryl harness sim` takes that one;
+  elsewhere, `-o <dir>` names it (default `hns/`). A sim harness may sit
+  inside a board one (`-o hns/sim`): generating the board one again leaves
+  it alone.
+- It listens on a free port of `127.0.0.1` and writes the address to
+  `hns/sim.addr`, where `hio` finds it. `HNS_SIM_ADDR=<ip:port>` listens
+  elsewhere; `HNS_SIM_WATCH=1` prints the simulated clock rate every second.
+- `check` refuses what the simulator cannot run: a DUT with more than one
+  clock, or with a `$sv::` module. `dram`, `pcie` and DMA are board-only.
 
 ## Limits
 

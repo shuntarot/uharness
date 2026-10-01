@@ -6,15 +6,16 @@
 # were cross-checked against the KCU105 XDC of taxi (cndm/board/KCU105). Nothing
 # here is a guess.
 #
-# **Not yet run on the board** (2026-09-30). The probe facts `hio` needs (USB
-# ids, level-shifter values, IR capture, the TCK it can run) are measured there.
+# **Confirmed on hardware** (2026-10-01) with the `dram` example, `:dr` and
+# `--transport pcie`: `hio program`, the window over JTAG and over PCIe, DDR4
+# calibration and a 2 GB memtest, and the DMA engine both ways. The probe
+# facts below were measured then.
 
 [board]
 provider    = "xilinx"
 name        = "kcu105"
 description = "Kintex UltraScale KCU105 Evaluation Platform"
 url         = "https://www.xilinx.com/kcu105"
-untested    = true
 
 [device]
 vendor = "xilinx"
@@ -78,9 +79,34 @@ via = "vivado_hw_server"
 # the same as the other boards.
 max_tck_mhz = 30
 
-# Not stated yet: `vid`, `pid`, `interface`, `product`, `layout_init`,
-# `host_tck_mhz` and `idcode`. They are measured on the board (`lsusb -v`,
-# `hio probe`, `hio bench`); until then `hio` searches for the probe itself.
+# The adapter `hio` opens. **Measured** (2026-10-01, `hio probe`): the
+# on-board USB JTAG, an FT232H with the same descriptors as the VCU118's.
+# No serial number here: pass it to `hio` at run time.
+vid       = 0x0403
+pid       = 0x6014
+interface = 0
+product   = "Digilent USB Device"
+
+# Level-shifter enable (data, direction). **Measured** (2026-10-01): the
+# Digilent value `hio` falls back to (`0x0088, 0x008b`) gets all ones back
+# from TDO; this one, the VCU118's, reads the IDCODE.
+layout_init = [0x00e8, 0x60eb]
+
+# **The fastest TCK the FT232H can make below 30 MHz** that reads clean. It
+# only divides 30 MHz by an integer. Measured (2026-10-01, `hio bench
+# --repeat 100`, every read compared against the magic):
+#
+#   10 MHz  100,000 reads clean  10.3 us per read
+#   15 MHz  100,000 reads clean   8.0 us per read (0.50 MB/s)
+#   30 MHz  the magic came back as 0xecd0e4dc
+#
+# Programming the 16 MB `.bit` took 43.5 s at the 3 MHz `hio` uses when
+# nothing is stated.
+host_tck_mhz = 15
+
+# The device IDCODE. **Measured** (2026-10-01): version `1`; the BSDL leaves
+# those four bits open. One device in the chain.
+idcode = 0x13822093
 
 # --- JTAG instructions (from the BSDL) ---
 #
@@ -101,8 +127,9 @@ bypass_ir   = 0x3f
 # checks IDCODE 0x03822093 under mask 0x0fffffff.
 #
 # **That SVF sends no JSTART**, unlike the 7-series ones: the startup command is
-# in the bitstream. `hio program` sends JSTART anyway, as it does on the VCU118,
-# where programming works. Confirm on the board.
+# in the bitstream. `hio program` sends JSTART anyway, as it does on the VCU118.
+# **Confirmed on the board** (2026-10-01): `hio program` wrote the 16 MB `.bit`
+# and `id` matched the magic and the map hash right after.
 [jtag.ready]
 ir     = 0x14   # ISC_NOOP
 expect = 0x11
@@ -126,6 +153,17 @@ links = []
 # A gen3 x4 link with the same IP has come up on this board in another project
 # (link up and BAR reads), so the block, the reference clock and PERST# are
 # known to work.
+#
+# **Confirmed on hardware** (2026-10-01), in a slot that is x4 electrically:
+# the link came up at 8.0 GT/s x4 (the card allows x8), `hio -p check` passed
+# and `bringup.hio` ran over the BAR. The DMA engine, 1 MB less one word:
+#
+#   card -> host   982.1 MB/s
+#   host -> card  1530.9 MB/s
+#   memtest --dma over all 2 GB: written 788 MB/s, read back 449 MB/s
+#
+# The same as the VCU118 at x8 (947.7 / 1521.7 MB/s), so the link is not the
+# limit: the AXI side of the engine is.
 [pcie]
 lanes      = 8
 max_gen    = 3

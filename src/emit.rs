@@ -251,19 +251,9 @@ pub fn mig_tcl(plan: &Plan) -> Option<String> {
         return None;
     }
     let target = plan.target()?;
-    let dram = target
-        .table
-        .get("provides")
-        .and_then(|x| x.as_table())
-        .and_then(|p| p.get("dram"))
-        .and_then(|x| x.as_table());
     // UltraScale+ DDR4 has no `mig.prj`, so its settings are listed instead.
-    if dram
-        .and_then(|d| d.get("controller"))
-        .and_then(|x| x.as_str())
-        == Some("ddr4")
-    {
-        return Some(ddr4_tcl(dram?));
+    if let Some(dram) = hns_targets::dram(target).filter(|d| d.is_ddr4_ip()) {
+        return Some(ddr4_tcl(&dram));
     }
     mig_prj_name(target)?;
     let mut out = header_tcl();
@@ -354,25 +344,17 @@ fn board_part_tcl(out: &mut String, plan: &Plan) {
 
 /// Whether the controller takes its pin placement from the board files.
 fn uses_board_interface(plan: &Plan) -> bool {
-    plan.target()
-        .and_then(|t| t.table.get("provides"))
-        .and_then(|x| x.as_table())
-        .and_then(|p| p.get("dram"))
-        .and_then(|x| x.as_table())
-        .and_then(|d| d.get("board_interface"))
-        .is_some()
+    target_dram(plan).is_some_and(|d| d.board_interface.is_some())
 }
 
 /// Whether the controller is UltraScale+ DDR4. Its port names are all different.
 fn is_ddr4(plan: &Plan) -> bool {
-    plan.target()
-        .and_then(|t| t.table.get("provides"))
-        .and_then(|x| x.as_table())
-        .and_then(|p| p.get("dram"))
-        .and_then(|x| x.as_table())
-        .and_then(|d| d.get("controller"))
-        .and_then(|x| x.as_str())
-        == Some("ddr4")
+    target_dram(plan).is_some_and(|d| d.is_ddr4_ip())
+}
+
+/// `[provides.dram]` of the target, if there is a target and it has memory.
+fn target_dram(plan: &Plan) -> Option<hns_targets::Dram> {
+    hns_targets::dram(plan.target()?)
 }
 
 /// The top-level port names of the clock that the controller takes itself.
@@ -396,9 +378,7 @@ const BACKSLASH: &str = "\\";
 ///
 /// The values come from the target. They were measured by generating the IP
 /// once and reading it back, not taken from a datasheet.
-fn ddr4_tcl(dram: &toml::Table) -> String {
-    let int = |key: &str| dram.get(key).and_then(|x| x.as_integer());
-    let text = |key: &str| dram.get(key).and_then(|x| x.as_str());
+fn ddr4_tcl(dram: &hns_targets::Dram) -> String {
     let mut out = header_tcl();
     out.push_str(
         "#
@@ -432,36 +412,35 @@ fn ddr4_tcl(dram: &toml::Table) -> String {
     // A board interface makes the board file fill in everything: part, speed,
     // CAS, and the pin constraints. Without it there are no pins, and
     // `opt_design` fails with "ports are not placed" (measured).
-    let board_interface = text("board_interface");
-    if let Some(name) = board_interface {
-        put("_BOARD_INTERFACE", name.to_string());
+    if let Some(name) = &dram.board_interface {
+        put("_BOARD_INTERFACE", name.clone());
     }
     put("AxiSelection", "true".to_string());
-    if let Some(v) = int("axi_data_bits") {
+    if let Some(v) = dram.axi_data_bits {
         put("AxiDataWidth", v.to_string());
     }
-    if let Some(v) = int("axi_id_bits") {
+    if let Some(v) = dram.axi_id_bits {
         put("AxiIDWidth", v.to_string());
     }
     // The memory settings are listed only when there is no board interface.
-    if board_interface.is_none() {
-        if let Some(v) = int("mem_clk_ps") {
+    if dram.board_interface.is_none() {
+        if let Some(v) = dram.mem_clk_ps {
             put("TimePeriod", v.to_string());
         }
-        if let Some(v) = dram.get("sys_clk_ps").and_then(|x| x.as_integer()) {
+        if let Some(v) = dram.sys_clk_ps {
             put("InputClockPeriod", v.to_string());
         }
-        if let Some(v) = text("part") {
+        if let Some(v) = &dram.part {
             put("MemoryType", "Components".to_string());
-            put("MemoryPart", v.to_string());
+            put("MemoryPart", v.clone());
         }
-        if let Some(v) = int("width") {
+        if let Some(v) = dram.width {
             put("DataWidth", v.to_string());
         }
-        if let Some(v) = int("cas_latency") {
+        if let Some(v) = dram.cas_latency {
             put("CasLatency", v.to_string());
         }
-        if let Some(v) = int("cas_write_latency") {
+        if let Some(v) = dram.cas_write_latency {
             put("CasWriteLatency", v.to_string());
         }
         put("DataMask", "NO_DM_NO_DBI".to_string());
@@ -1321,6 +1300,83 @@ pub fn sim_module(plan: &Plan, prefixes: &DirectionPrefixes) -> String {
     );
     out.push_str("}\n");
     out
+}
+
+/// The source of `$comp::hns_link`, which `--target sim` copies into the
+/// output. It is tested as the `hns-sim-link` crate.
+const SIM_LINK: &str = include_str!("../crates/sim-link/src/lib.rs");
+
+/// The export name of the component, as `$comp::<name>`.
+const SIM_LINK_NAME: &str = "hns_link";
+
+/// The directory of the component package, under the output.
+pub const SIM_LINK_DIR: &str = "link";
+
+/// `sim_tb.veryl`: the testbench `veryl harness sim` runs. It drives
+/// `hns_sim` from `$comp::hns_link`, which serves the window over TCP.
+///
+/// It runs until the component finishes it (or Ctrl-C); the cycle count only
+/// has to be more than anyone waits.
+pub fn sim_testbench(plan: &Plan) -> String {
+    let heartbeat = plan.heartbeat.as_ref().map(|h| h.resource.as_str());
+    let mut out = header_veryl();
+    out.push_str("///\n/// Serves the harness window to hio over TCP (`veryl harness sim`).\n");
+    out.push_str("#[test(sim)]\nmodule sim_tb {\n");
+    out.push_str("    inst clk: $tb::clock_gen;\n");
+    out.push_str("    inst rst: $tb::reset_gen (clk);\n\n");
+    for (signal, width, _) in AXI_SIGNALS {
+        out.push_str(&format!("    var {signal}: logic<{width}>;\n"));
+    }
+    if let Some(tx) = heartbeat {
+        out.push_str(&format!("    var {tx}: logic;\n"));
+    }
+    out.push_str("\n    inst u_sim: sim (\n        i_clk: clk,\n        i_rst: rst,\n");
+    for (signal, _, from_slave) in AXI_SIGNALS {
+        let dir = if from_slave { "o" } else { "i" };
+        out.push_str(&format!("        {dir}_{signal}: {signal},\n"));
+    }
+    if let Some(tx) = heartbeat {
+        out.push_str(&format!("        o_{tx}: {tx},\n"));
+    }
+    out.push_str("    );\n\n");
+    out.push_str(&format!(
+        "    inst u_link: $comp::{SIM_LINK_NAME} (\n        clk,\n"
+    ));
+    for (signal, _, _) in AXI_SIGNALS {
+        out.push_str(&format!("        {signal},\n"));
+    }
+    out.push_str("    );\n\n");
+    out.push_str("    initial {\n        rst.assert();\n        clk.next(1000000000000);\n        $finish();\n    }\n}\n");
+    out
+}
+
+/// `link/Cargo.toml`: the package of `$comp::hns_link`. The empty
+/// `[workspace]` keeps it out of a cargo workspace around the project.
+pub fn sim_link_cargo_toml() -> String {
+    let mut out = header_tcl();
+    out.push_str(&format!("\n[package]\nname    = \"{SIM_LINK_NAME}\"\n"));
+    out.push_str("version = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n");
+    out.push_str("[lib]\ncrate-type = [\"cdylib\"]\n\n");
+    out.push_str("[dependencies]\nveryl-component = \"=0.1.1\"\n\n");
+    out.push_str("[workspace]\n");
+    out
+}
+
+/// `link/veryl.manifest.json`: the component's ports, so that Veryl can
+/// analyze the testbench before cargo has built the component. The crate's
+/// tests keep it equal to what the library exports.
+pub fn sim_link_manifest() -> String {
+    let manifest = include_str!("../crates/sim-link/veryl.manifest.json").trim_end();
+    let rest = manifest.strip_prefix('{').expect("a JSON object");
+    format!("{{\"marker\":\"{MARKER}\",{rest}\n")
+}
+
+/// `link/src/lib.rs`: the component source, behind the marker so that `gen`
+/// may rewrite and remove it.
+pub fn sim_link_source() -> String {
+    format!(
+        "// {MARKER}\n//\n// Copied by veryl-harness. DO NOT EDIT -- `veryl harness gen` rewrites this file.\n\n{SIM_LINK}"
+    )
 }
 
 /// Whether the plan reaches the window over PCIe. JTAG is always kept, so
@@ -2831,39 +2887,33 @@ pub fn dram_pins(plan: &Plan) -> Vec<(String, &'static str, usize)> {
     {
         return Vec::new();
     }
-    let Some(dram) = target
-        .table
-        .get("provides")
-        .and_then(|x| x.as_table())
-        .and_then(|p| p.get("dram"))
-        .and_then(|x| x.as_table())
-    else {
+    let Some(dram) = hns_targets::dram(target) else {
         return Vec::new();
     };
     // No defaults. `feasibility` already rejects a target that lacks a key, so
     // every key is present here. A default would let a wrong width pass until
     // synthesis.
-    let int = |key: &str| {
-        dram.get(key)
-            .and_then(|x| x.as_integer())
-            .expect("feasibility refuses a dram target that does not state this") as usize
+    let int = |value: Option<u32>| {
+        value.expect("feasibility refuses a dram target that does not state this") as usize
     };
-    let dq = int("width");
+    let dq = int(dram.width);
     let lanes = (dq / 8).max(1);
     let kind = dram
-        .get("kind")
-        .and_then(|x| x.as_str())
-        .expect("feasibility refuses a dram target that does not state this")
-        .to_string();
+        .kind
+        .expect("feasibility refuses a dram target that does not state this");
     // DDR4 is not a variant of DDR3 (measured). `ras_n` / `cas_n` / `we_n`
     // become `act_n`, and bank groups (`bg`) are added. `addr` -> `adr`,
     // `ck_p/n` -> `ck_t/c`, `dqs_p/n` -> `dqs_t/c`, `dm` -> `dm_dbi_n` (an
     // inout). No name matches after a prefix change, so the lists are separate.
     if kind.starts_with("ddr4") {
         return vec![
-            ("c0_ddr4_adr".to_string(), "output", int("row_bits")),
-            ("c0_ddr4_ba".to_string(), "output", int("bank_bits")),
-            ("c0_ddr4_bg".to_string(), "output", int("bank_group_bits")),
+            ("c0_ddr4_adr".to_string(), "output", int(dram.row_bits)),
+            ("c0_ddr4_ba".to_string(), "output", int(dram.bank_bits)),
+            (
+                "c0_ddr4_bg".to_string(),
+                "output",
+                int(dram.bank_group_bits),
+            ),
             ("c0_ddr4_act_n".to_string(), "output", 1),
             ("c0_ddr4_cke".to_string(), "output", 1),
             ("c0_ddr4_cs_n".to_string(), "output", 1),
@@ -2879,8 +2929,8 @@ pub fn dram_pins(plan: &Plan) -> Vec<(String, &'static str, usize)> {
     }
     // For `ddr3l` too, the MIG port names are `ddr3_*`.
     vec![
-        ("ddr3_addr".to_string(), "output", int("row_bits")),
-        ("ddr3_ba".to_string(), "output", int("bank_bits")),
+        ("ddr3_addr".to_string(), "output", int(dram.row_bits)),
+        ("ddr3_ba".to_string(), "output", int(dram.bank_bits)),
         ("ddr3_ras_n".to_string(), "output", 1),
         ("ddr3_cas_n".to_string(), "output", 1),
         ("ddr3_we_n".to_string(), "output", 1),
@@ -2915,22 +2965,13 @@ fn mig_instance(
     let reset_type = reset_type_name(plan.metadata.build.reset_type);
     let asserted_value = asserted(plan.metadata.build.reset_type);
     let host = plan.board().clocks.window.clone();
-    let (cpkg, needs_dw) = controller_pkg(plan, axi_mem);
+    let controller = controller_axi(plan, axi_mem);
+    let (cpkg, needs_dw) = (&controller.pkg, controller.needs_dw);
     // Widths are the controller's. `uaxi_*` is past the width converter, so
     // DUT widths would be wrong.
-    let field = |n: usize, fallback: u32| {
-        cpkg.trim_end_matches('>')
-            .split('<')
-            .nth(1)
-            .and_then(|args| args.split(',').nth(n))
-            .and_then(|x| x.trim().parse::<u32>().ok())
-            .unwrap_or(fallback)
-    };
-    let caddr = field(0, axi_mem.addr_width);
-    let dw = field(1, axi_mem.data_bytes) * 8;
-    let cid = field(2, axi_mem.id_width);
-    let aw = caddr;
-    let idw = cid;
+    let aw = controller.addr_width;
+    let dw = controller.data_bytes * 8;
+    let idw = controller.id_width;
 
     // The controller domain. The MIG makes this clock.
     out.push_str(&format!("    var mig_clk_{bundle}: 'mig clock;\n"));
@@ -2990,7 +3031,7 @@ fn mig_instance(
     // DMA engine master is fixed at 256 bits and cannot join the arbiter of
     // the DUT and the window (DUT bus width). The DUT path does not change.
     let into_cdc = if has_pcie(plan) && !dma_registers(&plan.registers).is_empty() {
-        let dpkg = format!("$std::axi4_pkg::<{caddr}, {DMA_BUS_BYTES}, {cid}, 1, 1, 1, 1, 1>");
+        let dpkg = format!("$std::axi4_pkg::<{aw}, {DMA_BUS_BYTES}, {idw}, 1, 1, 1, 1, 1>");
         out.push_str(&format!(
             "    inst qaxi_{bundle}: {domain}$std::axi4_if::<{dpkg}>;\n"
         ));
@@ -3361,15 +3402,7 @@ fn mig_instance(
     };
     // The polarity comes from the target. The Arty MIG has `RST_ACT_LOW = 1`;
     // the UltraScale+ DDR4 IP metadata says `POLARITY = ACTIVE_HIGH` (measured).
-    let active_high = plan
-        .target()
-        .and_then(|t| t.table.get("provides"))
-        .and_then(|x| x.as_table())
-        .and_then(|p| p.get("dram"))
-        .and_then(|x| x.as_table())
-        .and_then(|d| d.get("sys_rst_active"))
-        .and_then(|x| x.as_str())
-        == Some("high");
+    let active_high = target_dram(plan).and_then(|d| d.sys_rst_active).as_deref() == Some("high");
     // The harness reset has the `asserted_value` polarity. Convert it for the IP.
     let asserted_high = asserted_value != 0;
     let sys_rst = if active_high == asserted_high {
@@ -3407,16 +3440,7 @@ fn host_pkg(plan: &Plan, axi_mem: &crate::terminator::AxiMemPlan) -> (String, bo
     if axi_mem.backing != crate::manifest::Backing::Dram {
         return (axi_mem.pkg.clone(), false);
     }
-    let addr = plan
-        .target()
-        .and_then(|t| t.table.get("provides"))
-        .and_then(|x| x.as_table())
-        .and_then(|p| p.get("dram"))
-        .and_then(|x| x.as_table())
-        .and_then(|d| d.get("axi_addr_bits"))
-        .and_then(|x| x.as_integer())
-        .map(|v| v as u32);
-    match addr {
+    match target_dram(plan).and_then(|d| d.axi_addr_bits) {
         Some(addr) if addr > axi_mem.addr_width => (
             format!(
                 "$std::axi4_pkg::<{addr}, {}, {}, 1, 1, 1, 1, 1>",
@@ -3428,46 +3452,46 @@ fn host_pkg(plan: &Plan, axi_mem: &crate::terminator::AxiMemPlan) -> (String, bo
     }
 }
 
-/// The AXI4 package on the controller side, and whether a width converter is
-/// needed. Without a converter the DUT package is used as is.
-fn controller_pkg(plan: &Plan, axi_mem: &crate::terminator::AxiMemPlan) -> (String, bool) {
-    let dram = plan
-        .target()
-        .and_then(|t| t.table.get("provides"))
-        .and_then(|x| x.as_table())
-        .and_then(|p| p.get("dram"))
-        .and_then(|x| x.as_table());
-    let int = |key: &str| {
-        dram.and_then(|d| d.get(key))
-            .and_then(|x| x.as_integer())
-            .map(|v| v as u32)
-    };
-    let (Some(bits), Some(addr), Some(id)) = (
-        int("axi_data_bits"),
-        int("axi_addr_bits"),
-        int("axi_id_bits"),
-    ) else {
-        return (axi_mem.pkg.clone(), false);
+/// The AXI4 type on the controller side.
+struct ControllerAxi {
+    /// `std::axi4_pkg::<..>`. Without the controller widths it is the DUT's.
+    pkg: String,
+    addr_width: u32,
+    data_bytes: u32,
+    id_width: u32,
+    /// Whether a width converter (`hns::axi_dw`) is needed.
+    needs_dw: bool,
+}
+
+fn controller_axi(plan: &Plan, axi_mem: &crate::terminator::AxiMemPlan) -> ControllerAxi {
+    let dram = target_dram(plan).unwrap_or_default();
+    let (Some(bits), Some(addr), Some(id)) =
+        (dram.axi_data_bits, dram.axi_addr_bits, dram.axi_id_bits)
+    else {
+        return ControllerAxi {
+            pkg: axi_mem.pkg.clone(),
+            addr_width: axi_mem.addr_width,
+            data_bytes: axi_mem.data_bytes,
+            id_width: axi_mem.id_width,
+            needs_dw: false,
+        };
     };
     // Compare the arbiter type, not the DUT: what leaves the arbiter must
     // match the controller.
     let widened = addr.max(axi_mem.addr_width);
-    if bits == axi_mem.data_bytes * 8 && widened == addr && id == axi_mem.id_width {
-        return (
-            format!(
-                "$std::axi4_pkg::<{addr}, {}, {id}, 1, 1, 1, 1, 1>",
-                axi_mem.data_bytes
-            ),
-            false,
-        );
+    let needs_dw = !(bits == axi_mem.data_bytes * 8 && widened == addr && id == axi_mem.id_width);
+    let data_bytes = if needs_dw {
+        bits / 8
+    } else {
+        axi_mem.data_bytes
+    };
+    ControllerAxi {
+        pkg: format!("$std::axi4_pkg::<{addr}, {data_bytes}, {id}, 1, 1, 1, 1, 1>"),
+        addr_width: addr,
+        data_bytes,
+        id_width: id,
+        needs_dw,
     }
-    (
-        format!(
-            "$std::axi4_pkg::<{addr}, {}, {id}, 1, 1, 1, 1, 1>",
-            bits / 8
-        ),
-        true,
-    )
 }
 
 /// The module name of the memory controller that Vivado generates.
@@ -4091,6 +4115,9 @@ pub fn veryl_toml(plan: &Plan, hns: &str, dut_path: &str) -> String {
         "{} = {{ path = \"{dut_path}\" }}\n",
         plan.metadata.project.name
     ));
+    if plan.target().is_some_and(|target| target.is_sim()) {
+        out.push_str(&format!("\n[[components]]\npath = \"{SIM_LINK_DIR}\"\n"));
+    }
     out
 }
 
@@ -4249,14 +4276,7 @@ pub fn cdc_instances(plan: &Plan) -> Vec<(String, f64, &'static str)> {
     let Some(clocks) = plan.clocks() else {
         return Vec::new();
     };
-    let dram_mhz = plan
-        .target()
-        .and_then(|t| t.table.get("provides"))
-        .and_then(|x| x.as_table())
-        .and_then(|p| p.get("dram"))
-        .and_then(|x| x.as_table())
-        .and_then(|d| d.get("ui_clk_mhz"))
-        .and_then(crate::clock::value_as_f64);
+    let dram_mhz = target_dram(plan).and_then(|d| d.ui_clk_mhz);
     let mut out = Vec::new();
     for m in plan
         .axi_mems

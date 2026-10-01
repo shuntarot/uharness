@@ -1,4 +1,4 @@
-# full -- hio run bringup.hio
+# all -- hio run bringup.hio
 # With regs.json next to you, neither --regs nor --target is needed.
 
 echo == identity ==

@@ -55,6 +55,22 @@ hio (HostIO) works over JTAG (an FTDI cable) or PCIe, and needs no Vivado.
 ## Boards
 
 Arty A7-35 and A7-100, VCU118, KCU105, KC705. Adding one is a TOML file.
+No board at hand: `--target sim` runs the harness in the Veryl simulator,
+and `hio` talks to it over a socket.
+
+## Examples
+
+Each one in `examples/hw/` is a project with a `Harness.toml` and a
+`bringup.hio`.
+
+| example | what it is |
+|---|---|
+| `fifo` | `std::fifo`, nothing else: does a board still work? |
+| `all` | every backing at once: `reg`, `slave`, `bram`, `host_poll_fifo` |
+| `axi` | an AXI4 master, its memory in the FPGA (`bram`) |
+| `dram` | the same master on the board's DDR (`dram`) |
+| `dma` | a small DMA engine that copies within a memory |
+| `rocket` | a rocket-chip RISC-V core running a program from DRAM |
 
 ## Build
 
@@ -63,7 +79,7 @@ cargo build --release   # gives veryl-harness and hio
 ```
 
 Needs `veryl` on `PATH` (the version pinned in `Cargo.toml`), and Vivado for
-synthesis. More examples are in `examples/hw/`. Details:
+synthesis. Details:
 [doc/guide.md](doc/guide.md).
 
 ## License

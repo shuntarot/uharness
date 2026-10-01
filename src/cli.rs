@@ -55,8 +55,26 @@ pub enum Command {
     /// Re-generate a harness with the options it was generated with.
     Update(UpdateArgs),
 
+    /// Run a harness generated with `--target sim`, serving its window to hio.
+    Sim(SimArgs),
+
     /// List the target descriptions that ship with this build.
     Targets,
+}
+
+/// `sim` runs what `gen --target sim` wrote, so it takes only the directory.
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Environment:\n  HNS_SIM_WATCH=1        print the simulated clock rate once a second\n  HNS_SIM_ADDR=<ip:port> listen there instead of a free port on 127.0.0.1\n\nThe address is written to sim.addr in the directory, where hio finds it.\nStop with Ctrl-C."
+)]
+pub struct SimArgs {
+    /// Which harness to run. Defaults to the current directory when it is one, else hns/ beside Veryl.toml.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub out_dir: Option<PathBuf>,
+
+    /// Dump a waveform, as `veryl test --wave` does.
+    #[arg(long)]
+    pub wave: bool,
 }
 
 /// `update` only repeats a generation, so it takes only the directory. The
@@ -91,7 +109,7 @@ pub struct CheckArgs {
     #[arg(long, value_name = "PATH")]
     pub target_patch: Vec<PathBuf>,
 
-    /// Transport: `pcie` or `jtag`. Without it, jtag, or the board's only transport.
+    /// Transport: `pcie` or `jtag` (`sim` for `--target sim`). Without it, jtag, or the board's only transport.
     #[arg(long, value_name = "NAME")]
     pub transport: Option<String>,
 
@@ -264,6 +282,7 @@ fn run(cli: Cli) -> miette::Result<()> {
             let target = resolve_target(&replay)?;
             crate::generate::run(&invocation(&replay), target, Some(&out), format)
         }
+        Command::Sim(args) => crate::sim::run(args.out_dir.as_deref(), args.wave),
         Command::Targets => list_targets(),
     }
 }

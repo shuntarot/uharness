@@ -175,7 +175,7 @@ pub enum PlanError {
     #[diagnostic(
         code(harness::plan::transport_unimplemented),
         help(
-            "The harness reaches the host over `jtag` or `pcie`. Pick a target and transport with one of them."
+            "The harness reaches the host over `jtag` or `pcie`, or over a socket with `--target sim`. Pick a target and transport with one of them."
         )
     )]
     TransportUnimplemented { transport: String },
@@ -231,6 +231,27 @@ pub enum PlanError {
         )
     )]
     TckRateMissing { target: String },
+
+    /// The simulator drives the DUT straight from the testbench clock. With
+    /// more domains, the testbench would have to stand in for the MMCM, and
+    /// the simulator does not carry data across `unsafe (cdc)` anyway.
+    #[error("`--target sim` runs a DUT with one clock, and this one has {clocks}")]
+    #[diagnostic(
+        code(harness::plan::sim_needs_one_clock),
+        help(
+            "The simulator does not carry data between clock domains, so a design with several would look broken where it is not. Run this design on a board instead."
+        )
+    )]
+    SimNeedsOneClock { clocks: usize },
+
+    #[error("`--target sim` runs only Veryl, and the DUT instantiates SystemVerilog: {names}")]
+    #[diagnostic(
+        code(harness::plan::sim_sv_blackbox),
+        help(
+            "The Veryl simulator cannot run a `$sv::` module, so the design would stop at it. Write it in Veryl, or run the design on a board."
+        )
+    )]
+    SimSvBlackbox { names: String },
 
     #[error("[bundle.{bundle}] uses backing `{backing}`, which has no terminator yet")]
     #[diagnostic(
@@ -464,7 +485,7 @@ fn generatable(plan: &Plan) -> Result<(), PlanError> {
 
     // Never fall back to a JTAG harness for another transport.
     let transport = &board.feasibility.transport;
-    if transport != "jtag" && transport != "pcie" {
+    if transport != "jtag" && transport != "pcie" && transport != "sim" {
         return Err(PlanError::TransportUnimplemented {
             transport: transport.clone(),
         });
@@ -502,8 +523,23 @@ fn generatable(plan: &Plan) -> Result<(), PlanError> {
             });
         }
     }
+    if transport == "sim" && !plan.sv_blackboxes.is_empty() {
+        return Err(PlanError::SimSvBlackbox {
+            names: plan
+                .sv_blackboxes
+                .iter()
+                .map(|name| format!("$sv::{name}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        });
+    }
+    if transport == "sim" && board.clocks.outputs.len() != 1 {
+        return Err(PlanError::SimNeedsOneClock {
+            clocks: board.clocks.outputs.len(),
+        });
+    }
     // A PCIe build keeps JTAG too, so it also needs the TCK limit.
-    if crate::target::max_tck_mhz(&board.target).is_none() {
+    if transport != "sim" && crate::target::max_tck_mhz(&board.target).is_none() {
         return Err(PlanError::TckRateMissing {
             target: board.target.name.clone(),
         });

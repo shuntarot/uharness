@@ -511,11 +511,15 @@ fn print_heartbeat(heartbeat: Option<&crate::heartbeat::HeartbeatPlan>) {
     let Some(heartbeat) = heartbeat else {
         return;
     };
+    // No pin: the simulator, where the testbench takes it.
+    let to = if heartbeat.pin.is_empty() {
+        "the testbench".to_string()
+    } else {
+        format!("{} ({})", heartbeat.pin, heartbeat.standard)
+    };
     println!(
-        "heartbeat: {} -> {} ({}), {} baud, {} clocks per bit",
+        "heartbeat: {} -> {to}, {} baud, {} clocks per bit",
         heartbeat.port(),
-        heartbeat.pin,
-        heartbeat.standard,
         heartbeat.actual_baud,
         heartbeat.div
     );
@@ -779,13 +783,15 @@ fn print_summary(plan: &plan::Plan, emit_regs: Option<&Path>) {
             } else {
                 ", patched"
             };
+            let what = if target.is_sim() {
+                target.head.board.description.clone().unwrap_or_default()
+            } else {
+                target.head.device.part.clone()
+            };
             line(
                 "ok",
                 "target",
-                &format!(
-                    "{} ({}){transport}{patched}",
-                    target.name, target.head.device.part
-                ),
+                &format!("{} ({what}){transport}{patched}", target.name),
             );
             if !target.verified() {
                 line(
@@ -808,29 +814,34 @@ fn print_summary(plan: &plan::Plan, emit_regs: Option<&Path>) {
         ),
     }
 
+    // The simulator has no board clock or pins: the testbench drives the DUT.
+    let sim = plan.target().is_some_and(|target| target.is_sim());
     if let Some(clocks) = plan.clocks() {
         for output in &clocks.outputs {
+            let source = if sim {
+                "the testbench".to_string()
+            } else {
+                format!("{} {} MHz", clocks.input.name, clocks.input.freq_mhz)
+            };
             line(
                 "ok",
                 "clock",
                 &format!(
-                    "{} {} MHz (from {} {} MHz)",
+                    "{} {} MHz (from {source})",
                     clock_user(output),
-                    output.freq_mhz,
-                    clocks.input.name,
-                    clocks.input.freq_mhz
+                    output.freq_mhz
                 ),
             );
         }
     }
     if let Some(heartbeat) = &plan.heartbeat {
+        let to = if sim { "the testbench" } else { &heartbeat.pin };
         line(
             "ok",
             "uart",
             &format!(
-                "{} -> {}, {} baud",
+                "{} -> {to}, {} baud",
                 heartbeat.port(),
-                heartbeat.pin,
                 heartbeat.actual_baud
             ),
         );

@@ -21,6 +21,7 @@ pub mod json;
 pub mod manifest;
 pub mod plan;
 pub mod regmap;
+pub mod sim;
 /// Target resolution lives in `hns-targets` because the host reads the same
 /// descriptions. This only keeps the old module name.
 pub use hns_targets as target;

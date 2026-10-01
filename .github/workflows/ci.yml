@@ -40,6 +40,6 @@ jobs:
       # that starts meanwhile can read it half written ("$std doesn't have
       # member ..."). The tests start many at once, so unpack it here first.
       - run: cargo run --quiet --bin veryl-harness -- check
-        working-directory: examples/hw/smoke
+        working-directory: examples/hw/fifo
 
       - run: cargo test --workspace
