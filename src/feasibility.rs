@@ -82,11 +82,8 @@ impl Resource {
                 .get("bram_kb")
                 .and_then(|x| x.as_integer())
                 .is_some_and(|kb| kb > 0),
-            Resource::Dram => provides
-                .get("dram")
-                .and_then(|x| x.as_table())
-                .and_then(|dram| dram.get("channels"))
-                .and_then(|x| x.as_integer())
+            Resource::Dram => hns_targets::dram(target)
+                .and_then(|dram| dram.channels)
                 .is_some_and(|channels| channels > 0),
         }
     }
@@ -541,76 +538,48 @@ pub fn check(
     // The DUT's AXI4 must fit the controller's AXI4. A shape the harness
     // cannot convert is refused.
     for plan in axi_mems.iter().filter(|p| p.backing == Backing::Dram) {
-        let dram = target
-            .table
-            .get("provides")
-            .and_then(|x| x.as_table())
-            .and_then(|provides| provides.get("dram"))
-            .and_then(|x| x.as_table());
-        let want = |key: &str| {
-            dram.and_then(|d| d.get(key))
-                .and_then(|x| x.as_integer())
-                .map(|v| v as u32)
-        };
+        let dram = hns_targets::dram(target).unwrap_or_default();
         // An incomplete description is refused. Filling a missing key with a
         // default would let `check` and `gen` pass and only synthesis fail. A
         // missing key means the board's controller was not measured yet.
         // `sys_clk_mhz` is not needed when the clock comes from a board pin;
         // the frequency is then in `[clocks.<name>]`.
-        let from_board = dram
-            .and_then(|d| d.get("sys_clk"))
-            .and_then(|x| x.as_str())
-            .is_some();
+        let from_board = dram.sys_clk.is_some();
         let mut wanted = vec![
-            "axi_data_bits",
-            "axi_addr_bits",
-            "axi_id_bits",
-            "ui_clk_mhz",
-            "width",
-            "row_bits",
-            "bank_bits",
+            ("axi_data_bits", dram.axi_data_bits.is_some()),
+            ("axi_addr_bits", dram.axi_addr_bits.is_some()),
+            ("axi_id_bits", dram.axi_id_bits.is_some()),
+            ("ui_clk_mhz", dram.ui_clk_mhz.is_some()),
+            ("width", dram.width.is_some()),
+            ("row_bits", dram.row_bits.is_some()),
+            ("bank_bits", dram.bank_bits.is_some()),
         ];
         if !from_board {
-            wanted.push("sys_clk_mhz");
+            wanted.push(("sys_clk_mhz", dram.sys_clk_mhz.is_some()));
         }
         // DDR4 also needs the bank group width: its pin list differs from
         // DDR3 (`emit::dram_pins`). Without `kind`, the pins cannot be chosen.
-        let kind = dram.and_then(|d| d.get("kind")).and_then(|x| x.as_str());
-        if kind.is_some_and(|kind| kind.starts_with("ddr4")) {
-            wanted.push("bank_group_bits");
+        if dram
+            .kind
+            .as_deref()
+            .is_some_and(|kind| kind.starts_with("ddr4"))
+        {
+            wanted.push(("bank_group_bits", dram.bank_group_bits.is_some()));
         }
         let mut missing: Vec<&str> = wanted
             .into_iter()
-            // Any number counts. Clocks are floats (166.666) and widths are
-            // integers; checking only integers would miss the float keys.
-            .filter(|key| {
-                !dram
-                    .and_then(|d| d.get(*key))
-                    .is_some_and(|v| v.is_integer() || v.is_float())
-            })
+            .filter(|(_, present)| !present)
+            .map(|(key, _)| key)
             .collect();
-        if kind.is_none() {
+        if dram.kind.is_none() {
             missing.insert(0, "kind");
         }
         // A 7-series MIG takes its reference clock from the harness MMCM too.
-        let mig = dram
-            .and_then(|d| d.get("controller"))
-            .and_then(|x| x.as_str())
-            != Some("ddr4");
-        if mig
-            && !from_board
-            && !dram
-                .and_then(|d| d.get("ref_clk_mhz"))
-                .is_some_and(|v| v.is_integer() || v.is_float())
-        {
+        if !dram.is_ddr4_ip() && !from_board && dram.ref_clk_mhz.is_none() {
             missing.push("ref_clk_mhz");
         }
         // The reset polarity differs between controllers; it is not guessed.
-        if !matches!(
-            dram.and_then(|d| d.get("sys_rst_active"))
-                .and_then(|x| x.as_str()),
-            Some("low" | "high")
-        ) {
+        if !matches!(dram.sys_rst_active.as_deref(), Some("low" | "high")) {
             missing.push("sys_rst_active (\"low\" or \"high\")");
         }
         if !missing.is_empty() {
@@ -636,10 +605,8 @@ pub fn check(
         let has_prj = prj.is_some();
         // The settings are either a board-file interface, or the part and
         // both clock periods.
-        let has_settings = dram.and_then(|d| d.get("board_interface")).is_some()
-            || ["part", "mem_clk_ps", "sys_clk_ps"]
-                .into_iter()
-                .all(|key| dram.and_then(|d| d.get(key)).is_some());
+        let has_settings = dram.board_interface.is_some()
+            || (dram.part.is_some() && dram.mem_clk_ps.is_some() && dram.sys_clk_ps.is_some());
         if !has_prj && !has_settings {
             return Err(FeasibilityError::DramHasNoIpRecipe {
                 bundle: plan.bundle.clone(),
@@ -650,7 +617,7 @@ pub fn check(
         // A narrower data width is fine: the harness inserts `hns::axi_dw`. It
         // takes 32 / 64 / 128, by a power-of-two factor of the controller width.
         let bits = plan.data_bytes * 8;
-        if let Some(want_bits) = want("axi_data_bits") {
+        if let Some(want_bits) = dram.axi_data_bits {
             let (has, want) = (bits, want_bits);
             let usable = matches!(has, 32 | 64 | 128)
                 && has <= want
@@ -675,12 +642,8 @@ pub fn check(
                 });
             }
             // Equal widths insert no converter, so the id goes through as is.
-            let want_id_bits = dram
-                .and_then(|d| d.get("axi_id_bits"))
-                .and_then(|x| x.as_integer())
-                .map(|v| v as u32);
             if has == want
-                && let Some(want_id) = want_id_bits
+                && let Some(want_id) = dram.axi_id_bits
                 && want_id != plan.id_width
             {
                 return Err(FeasibilityError::ControllerWidth {
@@ -694,7 +657,7 @@ pub fn check(
         }
         // A narrower address only reaches less. A wider one is refused:
         // cutting the top bits makes addresses wrap silently.
-        if let Some(want) = want("axi_addr_bits")
+        if let Some(want) = dram.axi_addr_bits
             && plan.addr_width > want
         {
             return Err(FeasibilityError::ControllerAddress {
@@ -713,7 +676,7 @@ pub fn check(
         // the region. Beyond the reach, addresses wrap silently. Seen on the
         // board: a word written at 768 MB was read back at address 0.
         {
-            let (bits, what) = match want("axi_addr_bits") {
+            let (bits, what) = match dram.axi_addr_bits {
                 Some(c) => (c, "the controller's AXI4 address"),
                 None => (plan.addr_width, "the DUT's own AXI4 address"),
             };

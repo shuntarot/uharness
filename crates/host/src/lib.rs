@@ -19,6 +19,7 @@ pub mod frame;
 pub mod ftdi;
 pub mod mpsse;
 pub mod pcie;
+pub mod sim;
 pub mod svf;
 
 #[cfg(test)]

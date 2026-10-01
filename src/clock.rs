@@ -322,28 +322,26 @@ fn controller_clocks(manifest: &Manifest, target: &Target) -> Vec<ClockOutput> {
     if !wants_dram {
         return Vec::new();
     }
-    let Some(dram) = target
-        .table
-        .get("provides")
-        .and_then(|x| x.as_table())
-        .and_then(|provides| provides.get("dram"))
-        .and_then(|x| x.as_table())
-    else {
+    let Some(dram) = hns_targets::dram(target) else {
         return Vec::new();
     };
-    let mhz = |key: &str| dram.get(key).and_then(value_as_f64);
     // A named source means the IP takes the system clock from a board pin, so
     // the MMCM does not make it.
-    let from_board = controller_clock_name(target).is_some();
+    let from_board = dram.sys_clk.is_some();
     let mut out = Vec::new();
-    for (key, ident, what) in [
-        ("sys_clk_mhz", "migsys", "memory controller system clock"),
-        ("ref_clk_mhz", "migref", "memory controller reference clock"),
+    for (mhz, ident, what) in [
+        (
+            dram.sys_clk_mhz.filter(|_| !from_board),
+            "migsys",
+            "memory controller system clock",
+        ),
+        (
+            dram.ref_clk_mhz,
+            "migref",
+            "memory controller reference clock",
+        ),
     ] {
-        if from_board && key == "sys_clk_mhz" {
-            continue;
-        }
-        if let Some(freq_mhz) = mhz(key) {
+        if let Some(freq_mhz) = mhz {
             out.push(ClockOutput {
                 ports: Vec::new(),
                 freq_mhz,
@@ -666,15 +664,7 @@ fn input_reset(target: &Target) -> Result<InputReset, ClockError> {
 /// It must be named. Matching a 250 MHz controller to a 250 MHz source would be
 /// a guess.
 fn controller_clock_name(target: &Target) -> Option<String> {
-    target
-        .table
-        .get("provides")
-        .and_then(|x| x.as_table())
-        .and_then(|provides| provides.get("dram"))
-        .and_then(|x| x.as_table())
-        .and_then(|dram| dram.get("sys_clk"))
-        .and_then(|x| x.as_str())
-        .map(str::to_string)
+    hns_targets::dram(target)?.sys_clk
 }
 
 /// The target clock source for the MMCM. Exactly one is used.

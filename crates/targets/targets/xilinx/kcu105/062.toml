@@ -1,6 +1,9 @@
 # DDR4: MT40A256M16LY-062E, the part on newer boards (board interface
 # ddr4_sdram_062). Layered over default.toml.
 #
+# **Not run on hardware**: the board tested on 2026-10-01 carries the `:dr`
+# part. This differs from `dr.toml` only in what the board files fill in.
+#
 # **Read out of the generated IP** (Vivado 2021.2, 2026-09-30): naming the
 # board interface fills in the part, the timing and the pins. The IP reports
 # 833 ps / 4:1, AXI 512 bits / address 31 / id 8 (the id width is ours), and

@@ -1,0 +1,18 @@
+# `$comp::hns_link`: the socket end of `--target sim`.
+#
+# `gen --target sim` copies `src/lib.rs` into the output as a package of its
+# own, and `veryl harness sim` builds and loads it there. This crate is where
+# that source is tested. Keep it to the one file and the one dependency.
+[package]
+name        = "hns-sim-link"
+version     = "0.1.0"
+description = "Veryl simulator component that serves the harness window over TCP"
+edition     = "2024"
+license     = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Its version is not Veryl's. 0.1.1 is what veryl-simulator 0.21.0 loads.
+veryl-component = "=0.1.1"

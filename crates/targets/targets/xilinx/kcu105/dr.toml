@@ -8,6 +8,11 @@
 # the component "4GB". The user clock is 3.332 ns in the timing report of a
 # full build (300.12 MHz). The reset polarity is the one the VCU118's DDR4 IP
 # has.
+#
+# **Confirmed on hardware** (2026-10-01): with the `dram` example over JTAG,
+# `mem_calib` read 1, `bringup.hio` passed (host and DUT both reading what the
+# other wrote, the moving window, the DUT reset that keeps the memory) and
+# `memtest mem --size 1024` read back all 256 entries.
 [provides]
 dram = {kind = "ddr4", device = "EDY4016AABG-DR-F", channels = 1, gb = 2, width = 64, controller = "ddr4", board_interface = "ddr4_sdram_DR", sys_clk = "ddr", axi_data_bits = 512, axi_addr_bits = 31, axi_id_bits = 8, ui_clk_mhz = 300.12, row_bits = 17, bank_bits = 2, bank_group_bits = 1, sys_rst_active = "high"}
 

@@ -301,10 +301,12 @@ fn resolve_one(
     binding: &Binding,
     prefixes: &DirectionPrefixes,
 ) -> Result<BundleContract, ContractError> {
-    let declared = manifest.bundle[&binding.bundle].contract;
-    let spec = manifest.bundle[&binding.bundle].ports.as_ref();
+    let bundle = &manifest.bundle[&binding.bundle];
+    let declared = bundle.contract;
+    let spec = bundle.ports.as_ref();
+    let backing = bundle.backing;
     // The dictionary has memory names only for memory terminators.
-    let memory = manifest.bundle[&binding.bundle].backing.is_memory();
+    let memory = backing.is_memory();
     let mut roles = assign_roles(dut, binding, spec, prefixes, memory);
     // AXI4 comes from the type, not from a name or `ports`: a modport of
     // `std::axi4_if` is the role. Without this, it would become payload.
@@ -324,7 +326,6 @@ fn resolve_one(
     // A `slave` bundle uses the same names as `bram`, with the directions
     // reversed: `addr` is a DUT input, the host starts each access, and the
     // DUT answers. The direction is a DUT fact, so the user does not declare it.
-    let backing = manifest.bundle[&binding.bundle].backing;
     if !memory && let Some(found) = roles.iter().find(|r| r.role.is_memory()) {
         let addr_port = roles
             .iter()
@@ -354,16 +355,13 @@ fn resolve_one(
 
     // Transfer-level roles have meaning only on an addressable backing. The
     // port shape is the same for `bram` and `host_mem`.
-    let addressable = matches!(
-        manifest.bundle[&binding.bundle].backing,
-        Backing::Bram | Backing::HostMem
-    );
+    let addressable = matches!(backing, Backing::Bram | Backing::HostMem);
     if !addressable && let Some(found) = roles.iter().find(|r| r.role.is_host_mem()) {
         return Err(ContractError::HostMemRoleOnOther {
             bundle: binding.bundle.clone(),
             port: found.port.clone(),
             role: found.role.as_str(),
-            backing: manifest.bundle[&binding.bundle].backing.to_string(),
+            backing: backing.to_string(),
         });
     }
 

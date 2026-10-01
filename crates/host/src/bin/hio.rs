@@ -678,8 +678,8 @@ fn run_script(cli: &Cli, file: &str) -> Result<(), String> {
     // not fail after lines 1-19 have already run.
     let steps = parse_script(&text)?;
 
-    let (_, map) = find_regs(cli)?;
-    let mut bus = open_bus(cli, &map)?;
+    let (map_path, map) = find_regs(cli)?;
+    let mut bus = open_bus(cli, &map_path, &map)?;
 
     if !cli.no_verify {
         check_identity(&mut bus, &map)?;
@@ -1035,8 +1035,11 @@ fn erase(cli: &Cli) -> Result<(), String> {
 /// `gen` writes it to `syn/output/`, whose parent holds `regs.json`. So once
 /// the map is found, the bitstream is found too.
 ///
-/// With two or more candidates it lists them and refuses. Silently writing
-/// the wrong one leaves a board that does not work, with no clue why.
+/// A `.bit` wins over a `.svf`: `make svf` writes the `.svf` from the `.bit`,
+/// so the two are the same design. Only with no `.bit` is a single `.svf`
+/// taken. With two or more of the same kind it lists them and refuses.
+/// Silently writing the wrong one leaves a board that does not work, with no
+/// clue why.
 fn beside_the_map(cli: &Cli) -> Result<PathBuf, String> {
     let (map_path, _) = find_regs(cli)?;
     bitstream_beside(&map_path)
@@ -1065,6 +1068,10 @@ fn bitstream_beside(map_path: &str) -> Result<PathBuf, String> {
         })
         .collect();
     found.sort();
+    let is_bit = |p: &PathBuf| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("bit"));
+    if found.iter().any(is_bit) {
+        found.retain(is_bit);
+    }
     match found.len() {
         1 => {
             println!("using {}", found[0].display());
@@ -1678,7 +1685,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
         require_requester(&map)?;
     }
 
-    let mut bus = open_bus(&cli, &map)?;
+    let mut bus = open_bus(&cli, &map_path, &map)?;
 
     // Always check the identity first. Many probe values can come from
     // defaults, and a wrong one silently reaches something else. It costs
@@ -1801,8 +1808,23 @@ fn set_update_gap<C: hns_host::mpsse::Chan>(cli: &Cli, map: &RegisterMap, m: &mu
 
 /// Opens the window over the chosen transport. JTAG is the default: a PCIe
 /// design has both, and JTAG is the one used to debug the other.
-fn open_bus(cli: &Cli, map: &RegisterMap) -> Result<Bus, String> {
-    match cli.transport_name() {
+fn open_bus(cli: &Cli, map_path: &str, map: &RegisterMap) -> Result<Bus, String> {
+    // A map generated for the simulator has only the socket.
+    let sim = map.target.as_deref() == Some(hns_targets::SIM);
+    let transport = if sim && cli.transport.is_none() && !cli.pcie {
+        "sim"
+    } else {
+        cli.transport_name()
+    };
+    match transport {
+        "sim" => {
+            let dir = std::path::Path::new(map_path)
+                .parent()
+                .unwrap_or(std::path::Path::new("."));
+            Ok(Bus::Sim(
+                hns_host::sim::Link::open(dir).map_err(|e| e.to_string())?,
+            ))
+        }
         "jtag" => {
             let cfg = resolve_probe(cli)?;
             let mut io = Mpsse::open(Ftdi::open(&cfg).map_err(|e| e.to_string())?, &cfg)
@@ -1812,7 +1834,7 @@ fn open_bus(cli: &Cli, map: &RegisterMap) -> Result<Bus, String> {
         }
         "pcie" => Ok(Bus::Pcie(open_bar(cli, map)?)),
         other => Err(format!(
-            "`--transport {other}` is not a transport this tool has; use `jtag` or `pcie`."
+            "`--transport {other}` is not a transport this tool has; use `jtag`, `pcie` or `sim`."
         )),
     }
 }
@@ -2080,7 +2102,7 @@ fn check(cli: &Cli, map_path: &str, map: &RegisterMap) -> Result<(), String> {
             "cannot be opened until the NG lines above are fixed",
         );
     } else {
-        match open_bus(cli, map) {
+        match open_bus(cli, map_path, map) {
             Ok(opened) => bus = Some(opened),
             Err(why) => c.ng_err("window", &why),
         }
@@ -3066,6 +3088,8 @@ fn wide_words(value: u64, words: usize) -> Vec<u32> {
 enum Bus {
     Jtag(Bridge<Mpsse<Ftdi>>),
     Pcie(hns_host::pcie::Bar),
+    /// `--target sim`: a socket to `veryl harness sim`.
+    Sim(hns_host::sim::Link),
 }
 
 impl Bus {
@@ -3073,6 +3097,7 @@ impl Bus {
         match self {
             Bus::Jtag(bridge) => bridge.run(batch).map_err(|e| e.to_string()),
             Bus::Pcie(bar) => bar.run(batch).map_err(|e| e.to_string()),
+            Bus::Sim(link) => link.run(batch).map_err(|e| e.to_string()),
         }
     }
 
@@ -3081,7 +3106,8 @@ impl Bus {
     /// read a different address.
     fn master(&self) -> &'static str {
         match self {
-            Bus::Jtag(_) => "jtag",
+            // The simulator drives the AXI4-Lite port JTAG drives on a board.
+            Bus::Jtag(_) | Bus::Sim(_) => "jtag",
             Bus::Pcie(_) => "pcie",
         }
     }
@@ -3090,6 +3116,7 @@ impl Bus {
         match self {
             Bus::Jtag(bridge) => bridge.read32(addr).map_err(|e| e.to_string()),
             Bus::Pcie(bar) => bar.read32(addr).map_err(|e| e.to_string()),
+            Bus::Sim(link) => link.read32(addr).map_err(|e| e.to_string()),
         }
     }
 
@@ -3097,6 +3124,7 @@ impl Bus {
         match self {
             Bus::Jtag(bridge) => bridge.read_burst(addr, out).map_err(|e| e.to_string()),
             Bus::Pcie(bar) => bar.read_burst(addr, out).map_err(|e| e.to_string()),
+            Bus::Sim(link) => link.read_burst(addr, out).map_err(|e| e.to_string()),
         }
     }
 
@@ -3108,6 +3136,7 @@ impl Bus {
             Bus::Pcie(bar) => bar
                 .read_parallel(addr, out, threads)
                 .map_err(|e| e.to_string()),
+            Bus::Sim(link) => link.read_burst(addr, out).map_err(|e| e.to_string()),
         }
     }
 }
@@ -3181,7 +3210,12 @@ fn id(bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
     println!("dut      {}", map.dut);
     check_identity_values(magic, hash, map)?;
     report_timeouts(bus, map)?;
-    println!("ok: the board is running this register map");
+    let what = if matches!(bus, Bus::Sim(_)) {
+        "the simulation"
+    } else {
+        "the board"
+    };
+    println!("ok: {what} is running this register map");
     Ok(())
 }
 
@@ -5382,8 +5416,24 @@ mod tests {
         assert!(err.contains("dut_hns_top.bit"), "{err}");
         assert!(err.contains("other.bit"), "{err}");
 
-        // Files that are neither .bit nor .svf do not count.
+        // A .svf beside the .bit is the same design: the .bit is taken.
         std::fs::remove_file(out.join("other.bit")).unwrap();
+        std::fs::write(out.join("dut_hns_top.svf"), b"x").unwrap();
+        assert_eq!(
+            bitstream_beside(map.to_str().unwrap()).unwrap(),
+            out.join("dut_hns_top.bit")
+        );
+
+        // A .svf alone is taken.
+        std::fs::remove_file(out.join("dut_hns_top.bit")).unwrap();
+        assert_eq!(
+            bitstream_beside(map.to_str().unwrap()).unwrap(),
+            out.join("dut_hns_top.svf")
+        );
+        std::fs::remove_file(out.join("dut_hns_top.svf")).unwrap();
+        std::fs::write(out.join("dut_hns_top.bit"), b"x").unwrap();
+
+        // Files that are neither .bit nor .svf do not count.
         std::fs::write(out.join("dut_hns_top.dcp"), b"x").unwrap();
         std::fs::write(out.join("timing.rpt"), b"x").unwrap();
         assert_eq!(
@@ -5625,7 +5675,7 @@ mod tests {
     fn an_unknown_transport_is_refused() {
         let map: RegisterMap = RegisterMap::from_json(&sample_map()).unwrap();
         let cli = Cli::parse_from(["hio", "--transport", "nonsense", "id"]);
-        let err = match open_bus(&cli, &map) {
+        let err = match open_bus(&cli, "regs.json", &map) {
             Err(err) => err,
             Ok(_) => panic!("an unknown transport must not open anything"),
         };

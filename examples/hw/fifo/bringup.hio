@@ -1,4 +1,4 @@
-# smoke -- hio run bringup.hio
+# fifo -- hio run bringup.hio
 # The DUT is nothing but a wrapper around std::fifo (WIDTH 8, DEPTH 16).
 
 echo == identity ==

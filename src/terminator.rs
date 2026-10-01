@@ -1819,14 +1819,7 @@ fn dram_not_on_target(bundle: &str, target: &hns_targets::Target) -> TerminatorE
                 let name = format!("{board}:{config}");
                 let device = hns_targets::resolve(&name, &[])
                     .ok()
-                    .and_then(|t| {
-                        t.table
-                            .get("provides")?
-                            .get("dram")?
-                            .get("device")?
-                            .as_str()
-                            .map(str::to_string)
-                    })
+                    .and_then(|t| hns_targets::dram(&t)?.device)
                     .unwrap_or_default();
                 format!("    --target {name}    {device}")
                     .trim_end()
@@ -1850,15 +1843,7 @@ fn dram_not_on_target(bundle: &str, target: &hns_targets::Target) -> TerminatorE
 /// The address width is `axi_addr_bits` in the target description, read from
 /// the generated IP. Without it, the result is `None`; no default is used.
 fn controller_reach(target: Option<&hns_targets::Target>, data_bytes: u32) -> Option<u32> {
-    let bits = target?
-        .table
-        .get("provides")?
-        .as_table()?
-        .get("dram")?
-        .as_table()?
-        .get("axi_addr_bits")?
-        .as_integer()?;
-    let bits = u32::try_from(bits).ok()?;
+    let bits = hns_targets::dram(target?)?.axi_addr_bits?;
     // words = 2^bits / word bytes; both are powers of two, so it divides
     // exactly. Cap it at a power of two that fits `depth` (`u32`). Do not return
     // `None` for a large value: `None` means "no description", and the error

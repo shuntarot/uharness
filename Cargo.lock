@@ -2396,12 +2396,14 @@ name = "harness"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "hns-host",
  "hns-regs",
  "hns-targets",
  "miette",
  "rust-embed",
  "serde",
  "serde_json",
+ "signal-hook",
  "tempfile",
  "thiserror",
  "toml",
@@ -2531,6 +2533,13 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "hns-sim-link"
+version = "0.1.0"
+dependencies = [
+ "veryl-component",
 ]
 
 [[package]]
@@ -5534,6 +5543,29 @@ dependencies = [
  "serde",
  "toml",
  "veryl-path",
+]
+
+[[package]]
+name = "veryl-component"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed7a85d85da27f5668bee71a6a2934953b3c6e40347f0113aa784c2a424e4e7f"
+dependencies = [
+ "anyhow",
+ "smallvec",
+ "veryl-component-macros",
+ "veryl-component-sys",
+]
+
+[[package]]
+name = "veryl-component-macros"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd530b675739472607615b8baac9d41b75de54734c813a6d2cb193634189ec09"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]

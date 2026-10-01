@@ -137,6 +137,12 @@ impl Invocation {
     }
 }
 
+/// Whether `dir` holds a harness that `gen` wrote: a `harness.json` with the
+/// marker.
+pub fn is_harness_dir(dir: &Path) -> bool {
+    Invocation::read(dir).is_ok_and(|recorded| recorded.marker == MARKER)
+}
+
 /// Output directory without `--out-dir`: `hns/` beside `Veryl.toml`.
 ///
 /// `update` reads the record before it generates again, so it needs this
@@ -264,8 +270,13 @@ pub fn run(
     // The window clock, as decided once by `clock::resolve`.
     let csr_ident = plan.board().clocks.window.clone();
 
+    let sim = plan.target().is_some_and(|target| target.is_sim());
+    if sim {
+        written.extend(sim_files(&plan, &out)?);
+    }
+
     // Always `Some`: `gen` has a target.
-    if let Some(clocks) = plan.clocks() {
+    if let Some(clocks) = plan.clocks().filter(|_| !sim) {
         // Formatting also parses our own output (`src/emit.rs`).
         let clock_veryl = emit::format(
             &emit::clock_module(clocks, plan.metadata.build.reset_type, &csr_ident),
@@ -447,7 +458,11 @@ pub fn run(
                 );
                 println!();
             }
-            print_next_steps(&out);
+            if sim {
+                print_sim_next_steps(&out);
+            } else {
+                print_next_steps(&out);
+            }
         }
         Format::Json => {
             let project = json::Project {
@@ -476,6 +491,57 @@ pub fn run(
     Ok(())
 }
 
+/// The files of `--target sim`: the harness without its transport, a
+/// testbench, and the component that serves the window over TCP. Nothing for
+/// Vivado.
+fn sim_files(plan: &plan::Plan, out: &Path) -> miette::Result<Vec<Pending>> {
+    let prefixes = crate::bundle::DirectionPrefixes::from_metadata(&plan.metadata);
+    let mut written = Vec::new();
+    let csr = emit::format(&emit::csr_module(plan, &prefixes), &plan.metadata)?;
+    written.push(write(
+        &out.join("src").join("csr.veryl"),
+        &csr,
+        "reg terminator (Veryl)",
+    )?);
+    if let Some(heartbeat) = &plan.heartbeat {
+        let uart = emit::format(&emit::uart_module(heartbeat), &plan.metadata)?;
+        written.push(write(
+            &out.join("src").join("uart.veryl"),
+            &uart,
+            "heartbeat UART (Veryl)",
+        )?);
+    }
+    let sim = emit::format(&emit::sim_module(plan, &prefixes), &plan.metadata)?;
+    written.push(write(
+        &out.join("src").join("sim.veryl"),
+        &sim,
+        "simulation top (Veryl)",
+    )?);
+    let tb = emit::format(&emit::sim_testbench(plan), &plan.metadata)?;
+    written.push(write(
+        &out.join("src").join("sim_tb.veryl"),
+        &tb,
+        "testbench for veryl harness sim (Veryl)",
+    )?);
+    let link = out.join(emit::SIM_LINK_DIR);
+    written.push(write(
+        &link.join("Cargo.toml"),
+        &emit::sim_link_cargo_toml(),
+        "socket component package (Cargo)",
+    )?);
+    written.push(write(
+        &link.join("veryl.manifest.json"),
+        &emit::sim_link_manifest(),
+        "socket component ports (Veryl)",
+    )?);
+    written.push(write(
+        &link.join("src").join("lib.rs"),
+        &emit::sim_link_source(),
+        "socket component (Rust)",
+    )?);
+    Ok(written)
+}
+
 /// Removes generated files in the output that this run did not write.
 ///
 /// Only files with the marker, and anything under `vendor/`. Borrowed files
@@ -493,8 +559,16 @@ fn remove_stale(out: &Path, written: &[Written]) -> miette::Result<Vec<PathBuf>>
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            // Build output (cargo, for `--target sim`) holds nothing of ours.
+            if path == out.join("target") {
+                continue;
+            }
             if path.is_dir() {
-                stack.push(path);
+                // Another harness inside this one (`-o hns/sim`) is not ours
+                // to clean up; its own `gen` does that.
+                if !is_harness_dir(&path) {
+                    stack.push(path);
+                }
                 continue;
             }
             if kept.contains(&path) {
@@ -609,6 +683,16 @@ fn print_next_steps(out: &Path) {
     println!("The harness uses its own BSCANE2 bridge, which Vivado cannot see, so the");
     println!("window is reached with `hio` rather than hw_server. `make program`");
     println!("still goes through Vivado. Configuration uses a separate JTAG path.");
+}
+
+/// What to run next for `--target sim`.
+fn print_sim_next_steps(out: &Path) {
+    println!("next:");
+    println!("  veryl harness sim -o {}", out.display());
+    println!("      # builds the socket component with cargo, then waits for hio");
+    println!("  hio id");
+    println!();
+    println!("Stop the simulation with Ctrl-C.");
 }
 
 /// Where `hns` comes from when the DUT project does not say.

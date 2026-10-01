@@ -47,6 +47,45 @@ struct Private;
 
 const DEFAULT_CONFIG: &str = "default";
 
+/// The Veryl native simulator, named as a target (`--target sim`).
+///
+/// It has no description file: there is no device, pin or Vivado behind it.
+/// Resolution checks this name before any board, and prefix matching never
+/// reaches it.
+pub const SIM: &str = "sim";
+
+/// What the generator reads from a target, for the simulator. The clock and
+/// the reset have no pins, because the testbench drives them. The clock goes
+/// straight to the DUT, so its rate here is never used.
+const SIM_TABLE: &str = r#"
+[board]
+provider    = "veryl"
+name        = "sim"
+description = "Veryl native simulator"
+
+[device]
+vendor = "veryl"
+family = "sim"
+part   = "sim"
+
+[provides]
+transport = ["sim"]
+# A choice, not a device: the simulator holds memories as arrays, and Veryl
+# stops evaluating one above 67108864 elements.
+bram_kb = 4096
+
+[clocks.sys]
+freq_mhz = 100
+diff     = false
+
+[resets.sys]
+active = "low"
+
+# The heartbeat goes to the testbench, not to a pin.
+[pins.uart_tx]
+direction = "output"
+"#;
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -76,6 +115,11 @@ impl Target {
         self.patches.is_empty() && !matches!(self.source, Source::File { .. })
     }
 
+    /// Whether this is the simulator (`--target sim`), not a board.
+    pub fn is_sim(&self) -> bool {
+        self.source == Source::Builtin
+    }
+
     /// Why the target is not verified, for both the human report and JSON.
     pub fn unverified_reasons(&self) -> Vec<String> {
         let mut reasons = Vec::new();
@@ -100,6 +144,8 @@ pub enum Source {
     Private { path: String },
     /// Given with `--target-file`.
     File { path: PathBuf },
+    /// Built into the tool (`--target sim`).
+    Builtin,
 }
 
 impl Source {
@@ -109,6 +155,7 @@ impl Source {
             Source::Public { .. } => "targets",
             Source::Private { .. } => "targets-private",
             Source::File { .. } => "file",
+            Source::Builtin => "builtin",
         }
     }
 
@@ -117,6 +164,7 @@ impl Source {
         match self {
             Source::Public { path } | Source::Private { path } => path.clone(),
             Source::File { path } => path.display().to_string(),
+            Source::Builtin => "(builtin)".to_string(),
         }
     }
 
@@ -144,6 +192,7 @@ pub fn read_beside(target: &Target, name: &str) -> Option<String> {
             .data
             .to_vec(),
         Source::File { path } => std::fs::read(path.parent()?.join(name)).ok()?,
+        Source::Builtin => return None,
     };
     String::from_utf8(bytes).ok()
 }
@@ -702,6 +751,94 @@ pub fn pcie(target: &Target) -> Pcie {
     }
 }
 
+/// `[provides.dram]` of a target description: the memory on the board, and
+/// the controller settings measured for it.
+///
+/// A key that is absent, or has the wrong type, is `None`. Nothing is
+/// defaulted: `feasibility` refuses a description that lacks a key it needs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Dram {
+    /// `ddr3`, `ddr3l` or `ddr4`. It decides the pin list.
+    pub kind: Option<String>,
+    /// `ddr4` is the UltraScale+ DDR4 IP; anything else is the 7-series MIG.
+    pub controller: Option<String>,
+    pub channels: Option<u32>,
+    /// The memory part, shown when a board has several configs to pick from.
+    pub device: Option<String>,
+    pub width: Option<u32>,
+    pub row_bits: Option<u32>,
+    pub bank_bits: Option<u32>,
+    pub bank_group_bits: Option<u32>,
+    pub axi_data_bits: Option<u32>,
+    pub axi_addr_bits: Option<u32>,
+    pub axi_id_bits: Option<u32>,
+    pub ui_clk_mhz: Option<f64>,
+    pub sys_clk_mhz: Option<f64>,
+    pub ref_clk_mhz: Option<f64>,
+    /// The `[clocks.<name>]` the controller takes its system clock from.
+    pub sys_clk: Option<String>,
+    /// `low` or `high`.
+    pub sys_rst_active: Option<String>,
+    /// The board-file interface that fills in the part and the pins.
+    pub board_interface: Option<String>,
+    pub part: Option<String>,
+    pub mem_clk_ps: Option<u32>,
+    pub sys_clk_ps: Option<u32>,
+    pub cas_latency: Option<u32>,
+    pub cas_write_latency: Option<u32>,
+}
+
+impl Dram {
+    /// Whether the controller is the UltraScale+ DDR4 IP.
+    pub fn is_ddr4_ip(&self) -> bool {
+        self.controller.as_deref() == Some("ddr4")
+    }
+}
+
+/// Reads `[provides.dram]`. `None` when the target has no memory.
+pub fn dram(target: &Target) -> Option<Dram> {
+    let t = target
+        .table
+        .get("provides")
+        .and_then(|v| v.as_table())
+        .and_then(|p| p.get("dram"))
+        .and_then(|v| v.as_table())?;
+    let int = |key: &str| {
+        t.get(key)
+            .and_then(|v| v.as_integer())
+            .and_then(|i| u32::try_from(i).ok())
+    };
+    let num = |key: &str| {
+        let v = t.get(key)?;
+        v.as_float().or_else(|| v.as_integer().map(|i| i as f64))
+    };
+    let text = |key: &str| t.get(key).and_then(|v| v.as_str()).map(|s| s.to_string());
+    Some(Dram {
+        kind: text("kind"),
+        controller: text("controller"),
+        channels: int("channels"),
+        device: text("device"),
+        width: int("width"),
+        row_bits: int("row_bits"),
+        bank_bits: int("bank_bits"),
+        bank_group_bits: int("bank_group_bits"),
+        axi_data_bits: int("axi_data_bits"),
+        axi_addr_bits: int("axi_addr_bits"),
+        axi_id_bits: int("axi_id_bits"),
+        ui_clk_mhz: num("ui_clk_mhz"),
+        sys_clk_mhz: num("sys_clk_mhz"),
+        ref_clk_mhz: num("ref_clk_mhz"),
+        sys_clk: text("sys_clk"),
+        sys_rst_active: text("sys_rst_active"),
+        board_interface: text("board_interface"),
+        part: text("part"),
+        mem_clk_ps: int("mem_clk_ps"),
+        sys_clk_ps: int("sys_clk_ps"),
+        cas_latency: int("cas_latency"),
+        cas_write_latency: int("cas_write_latency"),
+    })
+}
+
 pub fn jtag(target: &Target) -> Jtag {
     let Some(t) = target.table.get("jtag").and_then(|v| v.as_table()) else {
         return Jtag::default();
@@ -816,6 +953,9 @@ pub fn pin_resources(target: &Target) -> String {
 /// The board part may be cut short: `d` names `digilent/arty-a7-35` while no
 /// other target starts with `d`. The returned target carries the full name.
 pub fn resolve(name: &str, patches: &[PathBuf]) -> Result<Target, TargetError> {
+    if name == SIM {
+        return sim(patches);
+    }
     let (given, config) = split_name(name)?;
     let board = complete(&given, &board_names())?;
     let name = match &config {
@@ -913,6 +1053,21 @@ pub fn resolve(name: &str, patches: &[PathBuf]) -> Result<Target, TargetError> {
     };
     apply_patches(&mut target, patches)?;
     check_board_signals(&target)?;
+    Ok(target)
+}
+
+/// The simulator target. The board signals are not checked: they have no pins.
+fn sim(patches: &[PathBuf]) -> Result<Target, TargetError> {
+    let table = parse(SIM_TABLE, SIM)?;
+    let head = read_head(&table, SIM)?;
+    let mut target = Target {
+        name: SIM.to_string(),
+        source: Source::Builtin,
+        head,
+        table,
+        patches: Vec::new(),
+    };
+    apply_patches(&mut target, patches)?;
     Ok(target)
 }
 
@@ -1316,7 +1471,7 @@ mod tests {
 
     #[test]
     fn a_board_not_run_on_hardware_says_so() {
-        assert!(resolve("xilinx/kcu105", &[]).unwrap().head.board.untested);
+        assert!(resolve("xilinx/kc705", &[]).unwrap().head.board.untested);
         assert!(
             !resolve("digilent/arty-a7-35", &[])
                 .unwrap()
@@ -1345,6 +1500,19 @@ mod tests {
         assert_eq!(resolve("xilinx/v", &[]).unwrap().name, "xilinx/vcu118");
         let err = resolve("xilinx/v:nope", &[]).unwrap_err();
         assert!(matches!(err, TargetError::ConfigNotFound { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn sim_is_a_name_of_its_own() {
+        let sim = resolve("sim", &[]).unwrap();
+        assert!(sim.is_sim());
+        assert_eq!(sim.name, "sim");
+        assert!(sim.verified());
+        assert!(pin_resource(&sim, "uart_tx").is_some_and(|p| p.fpga_drives()));
+        // Never a board, and never reached by the start of a name.
+        assert!(!resolve("digilent/arty-a7-35", &[]).unwrap().is_sim());
+        assert!(resolve("si", &[]).is_err());
+        assert!(!list_names().iter().any(|name| name == "sim"));
     }
 
     #[test]
@@ -1433,6 +1601,27 @@ mod tests {
         let dram = provides["dram"].as_table().unwrap();
         assert_eq!(dram["channels"].as_integer(), Some(1));
         assert_eq!(dram["mb"].as_integer(), Some(512));
+    }
+
+    #[test]
+    fn the_memory_is_read_with_its_types() {
+        let arty = dram(&resolve("digilent/arty-a7-35", &[]).unwrap()).unwrap();
+        assert_eq!(arty.kind.as_deref(), Some("ddr3l"));
+        assert_eq!(arty.axi_addr_bits, Some(28));
+        // An integer clock is a number too.
+        assert_eq!(arty.ref_clk_mhz, Some(200.0));
+        assert!(!arty.is_ddr4_ip());
+
+        let vcu = dram(&resolve("xilinx/vcu118", &[]).unwrap()).unwrap();
+        assert!(vcu.is_ddr4_ip());
+        assert!(vcu.board_interface.is_some());
+
+        // A key of the wrong type is absent, not guessed.
+        let dir = tempfile::tempdir().unwrap();
+        let patch = dir.path().join("wrong.toml");
+        std::fs::write(&patch, "[provides.dram]\nwidth = \"16\"\n").unwrap();
+        let patched = resolve("digilent/arty-a7-35", std::slice::from_ref(&patch)).unwrap();
+        assert_eq!(dram(&patched).unwrap().width, None);
     }
 
     #[test]

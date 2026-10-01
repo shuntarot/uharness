@@ -160,7 +160,10 @@ pub fn resolve(
             available: crate::target::pin_resources(target),
         }
     })?;
-    if let Some(missing) = found.missing() {
+    // The simulator writes no constraints, so its pins have no number.
+    if !target.is_sim()
+        && let Some(missing) = found.missing()
+    {
         return Err(HeartbeatError::PinIncomplete {
             resource: resource.clone(),
             target: target.name.clone(),
