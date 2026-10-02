@@ -571,11 +571,11 @@ fn board_link(board: &hns_targets::Pcie) -> (u32, u32, &'static str, u32) {
 pub fn pcie_tcl(plan: &Plan, board: &hns_targets::Pcie) -> String {
     let pcie = plan.loaded.manifest.pcie.clone().unwrap_or_default();
     let (generation, lanes, width, freq) = board_link(board);
-    let ip = plan
+    let block = plan
         .target()
         .and_then(pcie_block)
-        .expect("plan::generatable checks the family")
-        .ip();
+        .expect("plan::generatable checks the family");
+    let ip = block.ip();
     let speed = if generation == 4 {
         "16.0_GT/s"
     } else {
@@ -620,10 +620,29 @@ pub fn pcie_tcl(plan: &Plan, board: &hns_targets::Pcie) -> String {
         "    CONFIG.PF0_SUBSYSTEM_ID {{{:04x}}} \\\n",
         pcie.device_id
     ));
-    // Class code "other". The example claims to be an Ethernet controller, but
-    // this is not a network card, and a host driver must not bind to it.
+    // The class code. The verilog-pcie example claims to be an Ethernet
+    // controller, but this is not a network card, and a host driver must not
+    // bind to it; the default is "none of the classes" (`ff0000`).
     out.push_str("    CONFIG.PF0_Use_Class_Code_Lookup_Assistant {false} \\\n");
-    out.push_str("    CONFIG.PF0_CLASS_CODE {ff0000} \\\n");
+    match block {
+        PcieBlock::Pcie4 => out.push_str(&format!(
+            "    CONFIG.PF0_CLASS_CODE {{{:06x}}} \\\n",
+            pcie.class_code
+        )),
+        // On the PCIE3 IP, `PF0_CLASS_CODE` is derived and cannot be set:
+        // Vivado ignores it with a warning (IP_Flow 19-3374) and the card
+        // reports `058000`. It is built from these three.
+        PcieBlock::Pcie3 => {
+            let [_, base, sub, interface] = pcie.class_code.to_be_bytes();
+            out.push_str(&format!(
+                "    CONFIG.pf0_class_code_base {{{base:02x}}} \\\n"
+            ));
+            out.push_str(&format!("    CONFIG.pf0_class_code_sub {{{sub:02x}}} \\\n"));
+            out.push_str(&format!(
+                "    CONFIG.pf0_class_code_interface {{{interface:02x}}} \\\n"
+            ));
+        }
+    }
     let (scale, size) = bar_scale(pcie.bar_bytes);
     out.push_str(&format!("    CONFIG.pf0_bar0_scale {{{scale}}} \\\n"));
     out.push_str(&format!("    CONFIG.pf0_bar0_size {{{size}}} \\\n"));
@@ -631,7 +650,13 @@ pub fn pcie_tcl(plan: &Plan, board: &hns_targets::Pcie) -> String {
     // registers change state on read (a FIFO pop).
     out.push_str("    CONFIG.pf0_bar0_64bit {false} \\\n");
     out.push_str("    CONFIG.pf0_bar0_prefetchable {false} \\\n");
-    // Interrupts are not used, so they stay disabled.
+    // A `host_irq` bundle is sent as INTA. Without one the card has no
+    // interrupt pin; the PCIE3 IP would otherwise default to INTA. MSI and
+    // MSI-X stay off.
+    out.push_str(&format!(
+        "    CONFIG.PF0_INTERRUPT_PIN {{{}}} \\\n",
+        if plan.irqs.is_empty() { "NONE" } else { "INTA" }
+    ));
     out.push_str("    CONFIG.pf0_msi_enabled {false} \\\n");
     out.push_str("    CONFIG.pf0_msix_enabled {false} \\\n");
     out.push_str(&format!("] [get_ips {ip}_0]\n"));
@@ -1549,6 +1574,20 @@ fn core_body(
         out.push_str(&format!(
             "    var w_{}: {domain}logic<{}>;\n",
             register.name, register.width
+        ));
+    }
+
+    // The interrupt line. The CSR shows its level; on PCIe, `top_module`
+    // also sends it to the hard block.
+    for irq in &plan.irqs {
+        out.push_str(&format!("    var w_{}: {domain}logic;\n", irq.port));
+        out.push_str(&format!(
+            "    var t_{}_irq_level: {domain}logic;\n",
+            irq.bundle
+        ));
+        out.push_str(&format!(
+            "    assign t_{}_irq_level = w_{};\n",
+            irq.bundle, irq.port
         ));
     }
 
@@ -3677,6 +3716,9 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
                 clocks.window
             ));
         }
+        // The interrupt line, in the window clock. The wrapper brings it into
+        // the hard block clock. Declared here because the wrapper comes first.
+        out.push_str(&format!("    var pcie_intx: '{} logic;\n", clocks.window));
         // The requester stream is in the hard block clock; `hns::tlp_cdc`
         // brings it from the harness side. It gets a domain name, or it would
         // look like a crossing with an unknown domain.
@@ -3766,6 +3808,7 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
         out.push_str(&format!("        i_rst_n: rst_{ident},\n"));
         // Nothing reads the link state yet.
         out.push_str("        o_link_up: _,\n");
+        out.push_str("        i_intx   : pcie_intx,\n");
         // Only the DMA engine drives RQ. Without it, RQ is tied to 0; left
         // open, the hard block `tvalid` would be an unconnected input.
         if engine {
@@ -3922,6 +3965,14 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
             tag: &format!("'{csr_ident} "),
         },
     );
+    if has_pcie(plan) {
+        // No `host_irq`: the line stays low, and the IP has no interrupt pin.
+        let line = plan
+            .irqs
+            .first()
+            .map_or("0".to_string(), |irq| format!("w_{}", irq.port));
+        out.push_str(&format!("    assign pcie_intx = {line};\n"));
+    }
     out.push_str("}\n");
     out
 }
@@ -4319,28 +4370,34 @@ pub fn cdc_instances(plan: &Plan) -> Vec<(String, f64, &'static str)> {
     out
 }
 
-/// The two-stage synchronizers that the XDC bounds, by `-to` only.
+/// The two-stage synchronizers that the XDC bounds, by `-to` only: a name
+/// for the comment, the first-stage cells, and the period.
 ///
 /// Unlike `hns::axi_cdc`, the source is outside the harness hierarchy (for
 /// example inside the controller), so a bound inside one hierarchy misses it.
-pub fn sync_instances(plan: &Plan) -> Vec<(String, f64)> {
+pub fn sync_instances(plan: &Plan) -> Vec<(String, String, f64)> {
     let Some(clocks) = plan.clocks() else {
         return Vec::new();
     };
+    // `$std::synchronizer_basic` names its flops `rg`.
+    let std_sync = |path: String, period_ns: f64| {
+        let cells = format!("*{path}/*rg_reg*");
+        (path, cells, period_ns)
+    };
     let host_mhz = clocks.window_output().freq_mhz;
-    let mut out: Vec<(String, f64)> = plan
+    let mut out: Vec<(String, String, f64)> = plan
         .axi_mems
         .iter()
         .filter(|m| m.backing == crate::manifest::Backing::Dram)
-        .map(|m| (format!("u_calib_{}", m.bundle), 1000.0 / host_mhz))
+        .map(|m| std_sync(format!("u_calib_{}", m.bundle), 1000.0 / host_mhz))
         .collect();
     if has_pcie(plan)
         && !dma_registers(&plan.registers).is_empty()
         && let Some(target) = plan.target()
     {
         // RQ TLPs dropped by the hard block (Gray coded), to the window clock.
-        out.push(("u_rqdrop_sync".to_string(), 1000.0 / host_mhz));
-        out.push(("u_rqgap_sync".to_string(), 1000.0 / host_mhz));
+        out.push(std_sync("u_rqdrop_sync".to_string(), 1000.0 / host_mhz));
+        out.push(std_sync("u_rqgap_sync".to_string(), 1000.0 / host_mhz));
         // The reset merge in `hns::tlp_cdc` (`MERGE_RESET`). The other side's
         // reset reaches the synchronizer's asynchronous clear, so that path is
         // bounded too. It ends on both sides, so the faster period is used.
@@ -4348,8 +4405,25 @@ pub fn sync_instances(plan: &Plan) -> Vec<(String, f64)> {
         let (_, _, _, user_mhz) = board_link(&board);
         let fastest = host_mhz.max(f64::from(user_mhz));
         for cdc in ["u_rq_cdc", "u_rc_cdc"] {
-            out.push((format!("{cdc}/u_fifo/u_reset_sync"), 1000.0 / fastest));
+            out.push(std_sync(
+                format!("{cdc}/u_fifo/u_reset_sync"),
+                1000.0 / fastest,
+            ));
         }
+    }
+    // The interrupt line, from the window clock into the hard block clock.
+    // The wrapper registers it first, so the source is a flop.
+    if has_pcie(plan)
+        && !plan.irqs.is_empty()
+        && let Some(target) = plan.target()
+    {
+        let board = hns_targets::pcie(target);
+        let (_, _, _, user_mhz) = board_link(&board);
+        out.push((
+            "u_pcie/intx_meta".to_string(),
+            "*u_pcie/intx_meta_reg".to_string(),
+            1000.0 / f64::from(user_mhz),
+        ));
     }
     out
 }
@@ -4369,7 +4443,7 @@ pub fn sync_instances(plan: &Plan) -> Vec<(String, f64)> {
 pub fn harness_xdc(
     tck_mhz: f64,
     cdc_instances: &[(String, f64, &'static str)],
-    sync_instances: &[(String, f64)],
+    sync_instances: &[(String, String, f64)],
 ) -> String {
     let mut out = header_tcl();
     out.push_str("#\n# Constraints for the circuits the harness itself inserted.\n#\n");
@@ -4422,12 +4496,12 @@ pub fn harness_xdc(
 
     // Two-stage synchronizers. The source is outside the harness, so only
     // `-to` is bounded.
-    for (path, period_ns) in sync_instances {
+    for (path, cells, period_ns) in sync_instances {
         out.push_str(&format!(
             "# The synchroniser at {path}. Bounded, not cut.\n"
         ));
         out.push_str(&format!(
-            "set hns_sync [get_cells -hier -filter {{IS_SEQUENTIAL && NAME =~ *{path}/*rg_reg*}}]\n"
+            "set hns_sync [get_cells -hier -filter {{IS_SEQUENTIAL && NAME =~ {cells}}}]\n"
         ));
         out.push_str("if {[llength $hns_sync]} {\n");
         // `-from` is required (Vivado 18-540). The source is inside the
@@ -4711,14 +4785,21 @@ source [file join [file dirname [info script]] board.tcl]
 set svf [file rootname $::hns::bitstream].svf
 
 open_hw_manager
-# A target that is not a probe: it records instead of driving pins.
+# A target that is not a probe: it records instead of driving pins. A
+# hw_server that is still running keeps the last run's target, and creating
+# it again fails. The server must be connected before its targets show.
+connect_hw_server
+foreach old [get_hw_targets -quiet *hns_svf] {
+    delete_hw_target $old
+}
 create_hw_target hns_svf
 open_hw_target [get_hw_targets *hns_svf]
 create_hw_device -part $::hns::part
 set dev [lindex [get_hw_devices] 0]
 set_property PROGRAM.FILE $::hns::bitstream $dev
 program_hw_devices $dev
-write_hw_svf $svf
+# The last run's SVF is replaced: it belongs to the last bitstream.
+write_hw_svf -force $svf
 close_hw_target
 puts "wrote: $svf"
 "#,
@@ -4982,6 +5063,9 @@ fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
             "oldest entry; only meaningful while `{bundle}_level` is not 0. Reading does not consume it"
         )),
         Some("level") => notes.push("entries waiting to be read".to_string()),
+        Some("irq_level") => notes.push(
+            "the DUT's interrupt line now; each change is sent to the host as Assert_INTA or Deassert_INTA".to_string(),
+        ),
         Some("depth") => notes.push("entries the terminator holds".to_string()),
         Some("drops") => notes.push(
             "beats lost because the FIFO was full; saturates instead of wrapping".to_string(),

@@ -199,6 +199,14 @@ pub struct Info {
     pub bar0_flags: u64,
     /// Whether memory decoding is on.
     pub enabled: bool,
+    /// The class code (sysfs `class`). `None` when unreadable: it is only for
+    /// diagnosis.
+    pub class: Option<u32>,
+    /// The Interrupt Pin (config space 0x3d): 0 for none, 1 for INTA.
+    /// `None` when unreadable.
+    pub interrupt_pin: Option<u8>,
+    /// The IRQ the kernel gave the card (sysfs `irq`). 0 when it has none.
+    pub irq: Option<u32>,
 }
 
 /// Link speed and width, and their maximum.
@@ -272,10 +280,12 @@ pub fn info_at(root: &Path, bdf: &str) -> Result<Info, Error> {
 
     // Any user can read the first 64 bytes of config space; BAR0 is at 0x10.
     // It is only for diagnosis, so an unreadable file is not an error.
-    let bar0_reg = fs::read(dir.join("config"))
-        .ok()
+    let config = fs::read(dir.join("config")).ok();
+    let bar0_reg = config
+        .as_ref()
         .filter(|raw| raw.len() >= 0x14)
         .map(|raw| u32::from_le_bytes([raw[0x10], raw[0x11], raw[0x12], raw[0x13]]) & !0xf);
+    let interrupt_pin = config.as_ref().and_then(|raw| raw.get(0x3d).copied());
 
     Ok(Info {
         bdf: bdf.to_string(),
@@ -286,6 +296,13 @@ pub fn info_at(root: &Path, bdf: &str) -> Result<Info, Error> {
         bar0_reg,
         bar0_flags: fields[2],
         enabled: read_trimmed(&dir.join("enable"))? != "0",
+        class: read_trimmed(&dir.join("class"))
+            .ok()
+            .and_then(|text| u32::from_str_radix(text.trim_start_matches("0x"), 16).ok()),
+        interrupt_pin,
+        irq: read_trimmed(&dir.join("irq"))
+            .ok()
+            .and_then(|text| text.parse().ok()),
     })
 }
 
@@ -731,6 +748,8 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.join("enable"), if enabled { "1\n" } else { "0\n" }).unwrap();
+        fs::write(dir.join("class"), "0xff0000\n").unwrap();
+        fs::write(dir.join("irq"), "16\n").unwrap();
         fs::write(dir.join("resource0"), vec![0u8; bytes as usize]).unwrap();
         write_config(&dir, 0x7a00_0000);
     }
@@ -739,6 +758,7 @@ mod tests {
     fn write_config(dir: &Path, bar0: u32) {
         let mut raw = vec![0u8; 64];
         raw[0x10..0x14].copy_from_slice(&bar0.to_le_bytes());
+        raw[0x3d] = 1;
         fs::write(dir.join("config"), raw).unwrap();
     }
 
@@ -750,6 +770,9 @@ mod tests {
         assert_eq!(info.device, 0x0001);
         assert_eq!(info.bar0_bytes, 4096);
         assert!(info.enabled);
+        assert_eq!(info.class, Some(0xff0000));
+        assert_eq!(info.interrupt_pin, Some(1));
+        assert_eq!(info.irq, Some(16));
     }
 
     #[test]

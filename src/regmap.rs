@@ -384,6 +384,51 @@ pub enum RegMapError {
         )
     )]
     DuplicateName { name: String },
+
+    /// The RTL decodes a region by its upper address bits only.
+    #[error(
+        "[bundle.{bundle}] has base = {base:#x}, which is not a multiple of its {size:#x}-byte size"
+    )]
+    #[diagnostic(
+        code(harness::regmap::base_not_aligned),
+        help(
+            "A region must start at a multiple of its size, because the window finds it by its upper address bits. The nearest bases that work are {below:#x} and {above:#x}."
+        )
+    )]
+    BaseNotAligned {
+        bundle: String,
+        base: usize,
+        size: usize,
+        below: usize,
+        above: usize,
+    },
+
+    #[error(
+        "[bundle.{bundle}] at base = {base:#x} overlaps `{other}` ({other_base:#x}..{other_end:#x})"
+    )]
+    #[diagnostic(
+        code(harness::regmap::base_overlaps),
+        help(
+            "Two regions cannot share an address. Move one of them: `{bundle}` takes {size:#x} bytes from its base."
+        )
+    )]
+    BaseOverlaps {
+        bundle: String,
+        base: usize,
+        size: usize,
+        other: String,
+        other_base: usize,
+        other_end: usize,
+    },
+
+    #[error("[bundle.{bundle}] has `base`, but it has no region in the window")]
+    #[diagnostic(
+        code(harness::regmap::base_without_region),
+        help(
+            "`base` places a region: `bram` or `bram_preload` with access = \"region\", `dram`, or `slave`. Remove `base` from this bundle."
+        )
+    )]
+    BaseWithoutRegion { bundle: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -418,46 +463,20 @@ pub fn build(
     let mut registers = Vec::new();
 
     // Regions come first, so that user addresses start at 0. The registers and
-    // the identity header sit above them. Regions are in declaration order, so
-    // adding a bundle at the end does not move an existing base. Each region is
-    // aligned to its size so the RTL decodes it with a mask. `--info` shows the
-    // gaps that the alignment leaves.
-    let mut regions = Vec::new();
-    let mut offset = 0usize;
-    let place_region = |bundle: String,
-                        kind: RegionKind,
-                        entry_bytes: usize,
-                        depth: u64,
-                        aperture: Option<usize>,
-                        offset: &mut usize| {
-        let total_bytes = depth * entry_bytes as u64;
-        // Only the aperture goes into the window; without one, the whole memory.
-        let size_bytes = aperture.unwrap_or((total_bytes as usize).next_power_of_two());
-        *offset = offset.next_multiple_of(size_bytes);
-        let region = Region {
-            bundle,
-            kind,
-            base: *offset,
-            size_bytes,
-            entry_bytes,
-            depth,
-            total_bytes,
-        };
-        *offset += size_bytes;
-        region
-    };
+    // the identity header sit above them. `place_regions` gives the bases;
+    // `--info` shows the gaps that the alignment leaves.
+    let mut wanted = Vec::new();
     for mem in memories
         .iter()
         .filter(|mem| mem.access == crate::manifest::MemAccess::Region)
     {
         let entry_bytes = mem.entry_width.div_ceil(WORD_BITS).max(1) * (WORD_BITS / 8);
-        regions.push(place_region(
-            mem.bundle.clone(),
+        wanted.push(Wanted::new(
+            &mem.bundle,
             RegionKind::Memory,
             entry_bytes,
             mem.depth,
             mem.aperture_bytes,
-            &mut offset,
         ));
     }
     // The host side door of `dram` is a region too. It shows the storage behind
@@ -465,27 +484,31 @@ pub fn build(
     for dram in axi_mems {
         // One entry in the window is one word. For a wider AXI bus,
         // `hns::axi_host` does the split.
-        regions.push(place_region(
-            dram.bundle.clone(),
+        wanted.push(Wanted::new(
+            &dram.bundle,
             RegionKind::Memory,
             WORD_BITS / 8,
             dram.region_words(),
             dram.aperture_bytes,
-            &mut offset,
         ));
     }
     // A DUT slave interface is a region too. The only difference is whether
     // `hns::mem` or the DUT is behind it, so decoding and allocation are shared.
     for slave in slaves {
-        regions.push(place_region(
-            slave.bundle.clone(),
+        wanted.push(Wanted::new(
+            &slave.bundle,
             RegionKind::Dut,
             WORD_BITS / 8,
             1u64 << slave.addr_width,
             None,
-            &mut offset,
         ));
     }
+    let regions = place_regions(manifest, wanted)?;
+    let mut offset = regions
+        .iter()
+        .map(|region| region.base + region.size_bytes)
+        .max()
+        .unwrap_or(0);
 
     // The base of a moving window: one per master. With a shared base, one
     // master could move it just before the other reads, and the other would
@@ -647,6 +670,27 @@ pub fn build(
                 role: "level",
             }),
         ));
+    }
+
+    // The interrupt line as the DUT drives it, so it can be watched without
+    // the host's interrupt handler, and over JTAG too.
+    for binding in bindings {
+        if manifest.bundle[&binding.bundle].backing != Backing::HostIrq {
+            continue;
+        }
+        registers.push(Register {
+            name: format!("{}_level", binding.bundle),
+            kind: Kind::Terminator,
+            offset,
+            words: 1,
+            width: 1,
+            access: Access::ReadOnly,
+            bundle: Some(binding.bundle.clone()),
+            value: None,
+            self_clearing: None,
+            role: Some("irq_level"),
+        });
+        offset += WORD_BITS / 8;
     }
 
     // The indirect memory port: only address and data, so the window stays small.
@@ -1009,7 +1053,7 @@ pub fn build(
         }
     }
 
-    let map_hash = hash(&registers);
+    let map_hash = hash(&registers, &regions);
     if let Some(register) = registers
         .iter_mut()
         .find(|register| register.name == MAP_HASH_NAME)
@@ -1024,6 +1068,128 @@ pub fn build(
         map_hash,
         requester,
     })
+}
+
+/// A region before it has a base.
+struct Wanted {
+    bundle: String,
+    kind: RegionKind,
+    entry_bytes: usize,
+    depth: u64,
+    total_bytes: u64,
+    size_bytes: usize,
+}
+
+impl Wanted {
+    fn new(
+        bundle: &str,
+        kind: RegionKind,
+        entry_bytes: usize,
+        depth: u64,
+        aperture: Option<usize>,
+    ) -> Wanted {
+        let total_bytes = depth * entry_bytes as u64;
+        // Only the aperture goes into the window; without one, the whole memory.
+        let size_bytes = aperture.unwrap_or((total_bytes as usize).next_power_of_two());
+        Wanted {
+            bundle: bundle.to_string(),
+            kind,
+            entry_bytes,
+            depth,
+            total_bytes,
+            size_bytes,
+        }
+    }
+
+    fn at(self, base: usize) -> Region {
+        Region {
+            bundle: self.bundle,
+            kind: self.kind,
+            base,
+            size_bytes: self.size_bytes,
+            entry_bytes: self.entry_bytes,
+            depth: self.depth,
+            total_bytes: self.total_bytes,
+        }
+    }
+}
+
+/// Gives each region its base, aligned to its size so the RTL decodes it with
+/// a mask. Those with `base` in Harness.toml go exactly there. The others, in
+/// the order of `wanted` (memory, dram, slave; by bundle name within a kind),
+/// each take the first aligned gap, so adding a bundle without `base` does not
+/// move an existing one. The result keeps the order of `wanted`.
+fn place_regions(manifest: &Manifest, wanted: Vec<Wanted>) -> Result<Vec<Region>, RegMapError> {
+    let pinned = |bundle: &str| {
+        manifest
+            .bundle
+            .get(bundle)
+            .and_then(|declared| declared.base)
+            .map(|base| base as usize)
+    };
+    for (name, declared) in &manifest.bundle {
+        if declared.base.is_some() && !wanted.iter().any(|w| &w.bundle == name) {
+            return Err(RegMapError::BaseWithoutRegion {
+                bundle: name.clone(),
+            });
+        }
+    }
+
+    // (start, end, bundle) of what is taken so far.
+    let mut taken: Vec<(usize, usize, String)> = Vec::new();
+    let mut bases = vec![0; wanted.len()];
+    for (i, region) in wanted.iter().enumerate() {
+        let Some(base) = pinned(&region.bundle) else {
+            continue;
+        };
+        let size = region.size_bytes;
+        if !base.is_multiple_of(size) {
+            let below = base / size * size;
+            return Err(RegMapError::BaseNotAligned {
+                bundle: region.bundle.clone(),
+                base,
+                size,
+                below,
+                above: below + size,
+            });
+        }
+        if let Some((other_base, other_end, other)) = taken
+            .iter()
+            .find(|(start, end, _)| base < *end && *start < base + size)
+        {
+            return Err(RegMapError::BaseOverlaps {
+                bundle: region.bundle.clone(),
+                base,
+                size,
+                other: other.clone(),
+                other_base: *other_base,
+                other_end: *other_end,
+            });
+        }
+        taken.push((base, base + size, region.bundle.clone()));
+        bases[i] = base;
+    }
+    for (i, region) in wanted.iter().enumerate() {
+        if pinned(&region.bundle).is_some() {
+            continue;
+        }
+        let size = region.size_bytes;
+        let mut base = 0;
+        // Each step jumps past one region in the way, so this ends.
+        while let Some((_, end, _)) = taken
+            .iter()
+            .find(|(start, end, _)| base < *end && *start < base + size)
+        {
+            base = end.next_multiple_of(size);
+        }
+        taken.push((base, base + size, region.bundle.clone()));
+        bases[i] = base;
+    }
+    Ok(wanted
+        .into_iter()
+        .zip(bases)
+        .map(|(region, base)| region.at(base))
+        .collect())
 }
 
 /// Whether this port self-clears (one write = one beat).
@@ -1084,12 +1250,15 @@ fn direction_of(dut: &Dut, name: &str) -> Option<PortDirection> {
 /// The map hash (FNV-1a, 32 bits). The host must be able to compute it again,
 /// so it is chosen to be easy to reimplement, not to be cryptographically strong.
 ///
-/// The input is `name|kind|offset|width|words|access|clear` for each register,
-/// joined with `\n` (`clear` is the other side of self-clearing, or `-`).
-/// `value` is not included: the hash is itself a value, so it would refer to
-/// itself.
-pub fn hash(registers: &[Register]) -> u32 {
-    let canonical = canonical_text(registers);
+/// The input is `name|kind|offset|width|words|access|clear` for each register
+/// (`clear` is the other side of self-clearing, or `-`), then
+/// `region|bundle|kind|base|size|entry|total` for each region, joined with
+/// `\n`. `value` is not included: the hash is itself a value, so it would
+/// refer to itself.
+///
+/// Regions are in it because `base` can move one without moving any register.
+pub fn hash(registers: &[Register], regions: &[Region]) -> u32 {
+    let canonical = canonical_text(registers, regions);
 
     let mut hash: u32 = 0x811c_9dc5;
     for byte in canonical.as_bytes() {
@@ -1101,7 +1270,18 @@ pub fn hash(registers: &[Register]) -> u32 {
 
 /// The canonical text that is hashed. Its exact form is documented: a hash that
 /// clients cannot reimplement is useless for checking.
-pub fn canonical_text(registers: &[Register]) -> String {
+pub fn canonical_text(registers: &[Register], regions: &[Region]) -> String {
+    let regions = regions.iter().map(|region| {
+        format!(
+            "region|{}|{}|{}|{}|{}|{}",
+            region.bundle,
+            region.kind.as_str(),
+            region.base,
+            region.size_bytes,
+            region.entry_bytes,
+            region.total_bytes,
+        )
+    });
     registers
         .iter()
         .map(|register| {
@@ -1119,6 +1299,7 @@ pub fn canonical_text(registers: &[Register]) -> String {
                 },
             )
         })
+        .chain(regions)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1427,7 +1608,7 @@ mod tests {
 
         // User ports first, header last. The window covers 4 (port) + 8 (DUT
         // reset) + 12 (header), so it is 32 bytes: magic at 24, hash at 28.
-        let text = canonical_text(&map.registers);
+        let text = canonical_text(&map.registers, &map.regions);
         assert!(text.starts_with("i_csr_addr|port|0|32|1|rw|-\n"), "{text}");
         assert!(
             text.ends_with("harness_map_hash|header|28|32|1|ro|-"),
@@ -1734,5 +1915,112 @@ mod tests {
         );
         let bram = names(Some(&card), std::slice::from_ref(&bram));
         assert!(!bram.iter().any(|n| n.starts_with("dma_")), "{bram:?}");
+    }
+
+    /// A driver may expect its registers at a fixed offset (NVMe reads them
+    /// from BAR offset 0). The others fill the gaps.
+    #[test]
+    fn a_region_with_a_base_goes_there_and_the_others_fill_the_gaps() {
+        let dut = dut(vec![]);
+        let slave = |bundle: &str, addr_width| crate::terminator::SlavePlan {
+            bundle: bundle.to_string(),
+            addr: format!("i_{bundle}_addr"),
+            addr_width,
+            rdata: format!("o_{bundle}_rdata"),
+            width: 32,
+            wdata: None,
+            we: None,
+            latency: 1,
+        };
+        // 4 KB and 64 bytes.
+        let slaves = [slave("big", 10), slave("small", 4)];
+        let toml = |big: &str, small: &str| {
+            format!(
+                "[dut]\nmodule = \"dut_top\"\n\n\
+                 [bundle.big]\ncontract = \"fixed_latency\"\nlatency = 1\nbacking = \"slave\"\n{big}\n\
+                 [bundle.small]\ncontract = \"fixed_latency\"\nlatency = 1\nbacking = \"slave\"\n{small}\n"
+            )
+        };
+        let map = |big: &str, small: &str| {
+            build(
+                &dut,
+                &manifest(&toml(big, small)),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &slaves,
+                &[],
+                None,
+            )
+        };
+        let bases = |big: &str, small: &str| {
+            map(big, small)
+                .unwrap()
+                .regions
+                .iter()
+                .map(|region| (region.bundle.clone(), region.base))
+                .collect::<Vec<_>>()
+        };
+        let at = |big, small| vec![("big".to_string(), big), ("small".to_string(), small)];
+
+        assert_eq!(bases("", ""), at(0, 0x1000));
+        assert_eq!(bases("", "base = 0"), at(0x1000, 0));
+        // `small` fills the gap below `big`.
+        assert_eq!(bases("base = \"8k\"", ""), at(0x2000, 0));
+        // The registers sit above the highest region.
+        let high = map("base = 0x10000", "").unwrap();
+        assert!(high.registers.iter().all(|r| r.offset >= 0x11000));
+
+        // These two move no register, but the hash still changes, so `id`
+        // catches a map that does not match the bitstream.
+        // Both end at 0x2000.
+        let swap_a = map("base = 0", "base = 0x1fc0").unwrap();
+        let swap_b = map("base = 0x1000", "base = 0").unwrap();
+        assert_eq!(
+            swap_a
+                .registers
+                .iter()
+                .map(|r| r.offset)
+                .collect::<Vec<_>>(),
+            swap_b
+                .registers
+                .iter()
+                .map(|r| r.offset)
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(swap_a.map_hash, swap_b.map_hash);
+
+        assert!(matches!(
+            map("base = 0x800", ""),
+            Err(RegMapError::BaseNotAligned {
+                below: 0,
+                above: 0x1000,
+                ..
+            })
+        ));
+        assert!(matches!(
+            map("base = 0", "base = 0x40"),
+            Err(RegMapError::BaseOverlaps { .. })
+        ));
+    }
+
+    #[test]
+    fn a_base_on_a_bundle_without_a_region_is_refused() {
+        let dut = dut(vec![port("i_csr_addr", PortDirection::Input, 32)]);
+        let result = build(
+            &dut,
+            &manifest(&format!("{CSR}base = 0\n")),
+            &[binding("csr", &["i_csr_addr"])],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        assert!(matches!(result, Err(RegMapError::BaseWithoutRegion { .. })));
     }
 }

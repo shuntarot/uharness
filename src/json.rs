@@ -43,7 +43,8 @@ use crate::unconnected::Kind;
 ///   `registers.target_source`; `gen --json` has `checked` / `not_checked`
 /// - 12: added `registers.window_clock_mhz` / `window_cycles`
 /// - 13: removed `checked[].reference` / `not_checked[].reference`
-pub const FORMAT_VERSION: u32 = 13;
+/// - 14: added `warnings` and `registers.pcie.class_code`
+pub const FORMAT_VERSION: u32 = 14;
 
 /// How deep `related` is followed. Veryl diagnostics can nest.
 const MAX_RELATED_DEPTH: usize = 3;
@@ -99,6 +100,11 @@ pub struct Output {
     pub checked: Vec<Item>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub not_checked: Vec<Item>,
+
+    /// What passed but is likely not what was meant (a PCI class code a host
+    /// driver binds to). Absent when there is none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<Item>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorOutput>,
@@ -489,6 +495,8 @@ pub struct RegisterMapOutput {
 pub struct PcieOutput {
     pub vendor_id: u32,
     pub device_id: u32,
+    /// The host compares it with the class sysfs reports.
+    pub class_code: u32,
     pub bar_bytes: u32,
     /// The bundle the card's DMA engine reaches. Used on any other bundle, it
     /// would access the wrong memory, so the host uses it only on a match.
@@ -581,6 +589,7 @@ pub fn register_map(
         pcie: pcie.map(|pcie| PcieOutput {
             vendor_id: pcie.vendor_id,
             device_id: pcie.device_id,
+            class_code: pcie.class_code,
             bar_bytes: pcie.bar_bytes,
             requester: map.requester.clone(),
         }),
@@ -926,6 +935,7 @@ pub fn ok(
         )),
         checked,
         not_checked,
+        warnings: crate::check::warnings(plan),
         error: None,
     }
 }
@@ -947,6 +957,7 @@ pub fn error(report: &miette::Report) -> Output {
         registers: None,
         checked: Vec::new(),
         not_checked: Vec::new(),
+        warnings: Vec::new(),
         error: Some(diagnostic_output(&**report, 0)),
     }
 }

@@ -451,6 +451,10 @@ pub fn run(
                 println!("removed {}  (no longer generated)", path.display());
             }
             println!();
+            for item in crate::check::warnings(&plan) {
+                println!("warning: {}", item.what);
+                println!();
+            }
             if let Some(target) = plan.target().filter(|t| t.head.board.untested) {
                 println!(
                     "note: {} has not been run on real hardware yet",
@@ -678,7 +682,7 @@ fn print_next_steps(out: &Path) {
     println!("      # veryl build -> IP generation -> synthesis -> bitstream");
     println!();
     println!("NOT GENERATED YET:");
-    println!("  - host_mem / host_irq / observe terminators");
+    println!("  - host_mem / observe terminators");
     println!();
     println!("The harness uses its own BSCANE2 bridge, which Vivado cannot see, so the");
     println!("window is reached with `hio` rather than hw_server. `make program`");

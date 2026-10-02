@@ -291,6 +291,25 @@ pub enum TerminatorError {
     )]
     SlaveNeedsRData { bundle: String },
 
+    /// INTx is one level-sensitive wire, so the bundle is one 1-bit output.
+    #[error("[bundle.{bundle}] is a host_irq with {what}, not one 1-bit output")]
+    #[diagnostic(
+        code(harness::terminator::irq_shape),
+        help(
+            "A host_irq bundle is the DUT's interrupt line: one output, 1 bit wide, high while the interrupt is pending. The harness sends it to the host as INTA.\n\nName that port alone:\n\n    [bundle.{bundle}]\n    backing = \"host_irq\"\n    ports   = [\"<port>\"]"
+        )
+    )]
+    IrqShape { bundle: String, what: String },
+
+    #[error("[bundle.{first}] and [bundle.{second}] are both host_irq")]
+    #[diagnostic(
+        code(harness::terminator::irq_more_than_one),
+        help(
+            "The card has one interrupt pin (INTA), so the harness takes one host_irq bundle. OR the lines together in the DUT, and keep the reasons in a register the host can read."
+        )
+    )]
+    IrqMoreThanOne { first: String, second: String },
+
     /// The window address is 32 bits (AXI-Lite), and the whole slave is mapped
     /// into it.
     #[error(
@@ -1087,6 +1106,66 @@ impl SlavePlan {
 /// Resolves the `backing = "slave"` bundles. The contract resolution has already
 /// checked the direction of `addr`. The other directions, the widths, and the
 /// size in the window are checked here.
+/// A `host_irq` terminator: the DUT's interrupt line, sent to the host as
+/// INTA over PCIe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrqPlan {
+    pub bundle: String,
+    /// The DUT output. High while an interrupt is pending.
+    pub port: String,
+}
+
+/// Resolves the `host_irq` bundle. There is at most one: INTx is one pin.
+pub fn resolve_irqs(
+    dut: &Dut,
+    manifest: &Manifest,
+    bindings: &[Binding],
+) -> Result<Vec<IrqPlan>, TerminatorError> {
+    let mut plans: Vec<IrqPlan> = Vec::new();
+    for binding in bindings {
+        if manifest.bundle[&binding.bundle].backing != crate::manifest::Backing::HostIrq {
+            continue;
+        }
+        if let Some(first) = plans.first() {
+            return Err(TerminatorError::IrqMoreThanOne {
+                first: first.bundle.clone(),
+                second: binding.bundle.clone(),
+            });
+        }
+        let shape = |what: String| TerminatorError::IrqShape {
+            bundle: binding.bundle.clone(),
+            what,
+        };
+        let [name] = binding.ports.as_slice() else {
+            return Err(shape(format!("{} ports", binding.ports.len())));
+        };
+        let port = port_of(dut, name);
+        if port.direction != PortDirection::Output {
+            return Err(shape(format!(
+                "`{name}` as {}",
+                match port.direction {
+                    PortDirection::Input => "an input".to_string(),
+                    other => format!("a `{}` port", other.as_str()),
+                }
+            )));
+        }
+        match port.width() {
+            Some(1) => {}
+            Some(width) => return Err(shape(format!("`{name}` {width} bits wide"))),
+            None => {
+                return Err(shape(format!(
+                    "`{name}` of a width that could not be resolved"
+                )));
+            }
+        }
+        plans.push(IrqPlan {
+            bundle: binding.bundle.clone(),
+            port: name.clone(),
+        });
+    }
+    Ok(plans)
+}
+
 pub fn resolve_slaves(
     dut: &Dut,
     manifest: &Manifest,
@@ -2036,7 +2115,7 @@ fn aperture_of(
 ///
 /// `latency` is not checked here. `contract::resolve` reports a mismatch with
 /// the contract, and each `resolve_*` reports a missing one. Backings without a
-/// terminator yet (`host_irq` and others) are rejected by `gen`.
+/// terminator yet (`observe` and others) are rejected by `gen`.
 #[allow(clippy::too_many_arguments)]
 pub fn check_claimed(
     manifest: &Manifest,
@@ -2046,6 +2125,7 @@ pub fn check_claimed(
     host_mems: &[HostMemPlan],
     slaves: &[SlavePlan],
     axi_mems: &[AxiMemPlan],
+    irqs: &[IrqPlan],
 ) -> Result<(), TerminatorError> {
     const DEPTH: &str = "depth";
     const ADDRESSING: &str = "addressing";
@@ -2081,6 +2161,11 @@ pub fn check_claimed(
                 "an AXI4 memory port",
                 &[DEPTH, APERTURE][..],
             ),
+            (
+                irqs.iter().any(|p| p.bundle == name),
+                "a `host_irq`",
+                &[][..],
+            ),
         ];
         let mut claimed = claims.iter().filter(|(hit, _, _)| *hit);
         let (shape, takes) = match (claimed.next(), claimed.next()) {
@@ -2091,7 +2176,7 @@ pub fn check_claimed(
             (None, _) => match declared.backing {
                 Backing::Reg => ("a `reg` bundle", &[][..]),
                 // No terminator yet. `gen` rejects it (`generate::terminable`).
-                Backing::HostMem | Backing::HostIrq | Backing::Observe => continue,
+                Backing::HostMem | Backing::Observe => continue,
                 backing => {
                     return Err(TerminatorError::NotTerminated {
                         bundle: name.to_string(),

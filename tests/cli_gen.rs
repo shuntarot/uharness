@@ -1546,6 +1546,61 @@ fn the_bar_aperture_reaches_the_generated_top() {
     }
 }
 
+/// The class code reaches the PCIe IP in the form each IP takes. On the PCIE3
+/// IP `PF0_CLASS_CODE` cannot be set: Vivado ignored it with a warning, and
+/// the KCU105 reported `058000`. That IP builds it from three parts.
+#[test]
+fn the_class_code_reaches_both_pcie_ips() {
+    for (class_code, want) in [(None, "ff0000"), (Some("0x120000"), "120000")] {
+        let mut harness_toml = HARNESS_TOML.to_string();
+        if let Some(code) = class_code {
+            harness_toml.push_str(&format!("\n[pcie]\nclass_code = {code}\n"));
+        }
+        let dir = fixture(&veryl_toml(), &harness_toml);
+        for target in ["xilinx/vcu118", "xilinx/kcu105"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+                .args(["gen", "--target", target, "--transport", "pcie"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let tcl = fs::read_to_string(dir.path().join("hns/syn/pcie.tcl")).unwrap();
+            if target == "xilinx/vcu118" {
+                assert!(
+                    tcl.contains(&format!("CONFIG.PF0_CLASS_CODE {{{want}}}")),
+                    "{tcl}"
+                );
+            } else {
+                assert!(!tcl.contains("PF0_CLASS_CODE"), "{tcl}");
+                let parts = [
+                    ("base", &want[0..2]),
+                    ("sub", &want[2..4]),
+                    ("interface", &want[4..6]),
+                ];
+                for (part, value) in parts {
+                    assert!(
+                        tcl.contains(&format!("CONFIG.pf0_class_code_{part} {{{value}}}")),
+                        "{part}\n{tcl}"
+                    );
+                }
+            }
+            let regs: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(dir.path().join("hns/regs.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                regs["pcie"]["class_code"].as_u64(),
+                Some(u64::from_str_radix(want, 16).unwrap())
+            );
+        }
+    }
+}
+
 /// `--transport` without a target is refused.
 ///
 /// A transport has meaning only against the target's `provides.transport`.
@@ -2506,4 +2561,131 @@ fn switching_from_pcie_to_jtag_removes_the_borrowed_verilog() {
         .unwrap_or_default();
     assert!(left.is_empty(), "left behind: {left:?}");
     assert!(dir.path().join("hns/mine.txt").exists());
+}
+
+/// A DUT with an interrupt line beside the CSR. `o_irq` follows bit 0 of
+/// what the host wrote.
+const IRQ_DUT: &str = r#"
+module dut_top (
+    i_clk      : input  clock   ,
+    i_rst      : input  reset   ,
+    i_csr_wdata: input  logic<8>,
+    o_csr_rdata: output logic<8>,
+    o_irq      : output logic   ,
+    o_irqs     : output logic<2>,
+) {
+    always_ff {
+        if_reset {
+            o_csr_rdata = 0;
+        } else {
+            o_csr_rdata = i_csr_wdata;
+        }
+    }
+    assign o_irq  = o_csr_rdata[0];
+    assign o_irqs = o_csr_rdata[2:1];
+}
+"#;
+
+fn irq_fixture(bundles: &str) -> tempfile::TempDir {
+    let harness_toml = format!(
+        "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n\
+         [bundle.csr]\ncontract = \"fixed_latency\"\nlatency = 1\nbacking = \"reg\"\nports = [\"i_csr_wdata\", \"o_csr_rdata\"]\n\n{bundles}"
+    );
+    let dir = fixture(&veryl_toml(), &harness_toml);
+    fs::write(dir.path().join("src").join("fixture.veryl"), IRQ_DUT).unwrap();
+    dir
+}
+
+fn gen_pcie(dir: &tempfile::TempDir, target: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+        .args(["gen", "--target", target, "--transport", "pcie"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap()
+}
+
+/// A `host_irq` line reaches the PCIe wrapper, the IP gets INTA, and the
+/// window shows the level. Without one the IP has no interrupt pin, on both
+/// IPs (the PCIE3 one would default to INTA).
+#[test]
+fn a_host_irq_line_becomes_inta() {
+    const IRQ: &str = "[bundle.irq]\nbacking = \"host_irq\"\nports = [\"o_irq\"]\n\n\
+                       [leave_open]\nports = [\"o_irqs\"]\n";
+    for target in ["xilinx/vcu118", "xilinx/kcu105:dr"] {
+        let dir = irq_fixture(IRQ);
+        let out = gen_pcie(&dir, target);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{target}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let top = tight(&fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap());
+        assert!(top.contains("i_intx : pcie_intx ,"), "{top}");
+        assert!(top.contains("assign pcie_intx = w_o_irq;"), "{top}");
+        assert!(top.contains("assign t_irq_irq_level = w_o_irq;"), "{top}");
+        let tcl = fs::read_to_string(dir.path().join("hns/syn/pcie.tcl")).unwrap();
+        assert!(tcl.contains("CONFIG.PF0_INTERRUPT_PIN {INTA}"), "{tcl}");
+        let xdc = fs::read_to_string(dir.path().join("hns/syn/harness.xdc")).unwrap();
+        assert!(xdc.contains("*u_pcie/intx_meta_reg"), "{xdc}");
+        let regs: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("hns/regs.json")).unwrap())
+                .unwrap();
+        let level = regs["registers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "irq_level")
+            .unwrap_or_else(|| panic!("no irq_level\n{regs}"));
+        assert_eq!(level["access"], "ro");
+        assert_eq!(level["width"], 1);
+        common::veryl_check(&dir.path().join("hns")).unwrap();
+
+        let plain = irq_fixture("[leave_open]\nports = [\"o_irq\", \"o_irqs\"]\n");
+        let out = gen_pcie(&plain, target);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{target}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let top = tight(&fs::read_to_string(plain.path().join("hns/src/top.veryl")).unwrap());
+        assert!(top.contains("assign pcie_intx = 0;"), "{top}");
+        let tcl = fs::read_to_string(plain.path().join("hns/syn/pcie.tcl")).unwrap();
+        assert!(tcl.contains("CONFIG.PF0_INTERRUPT_PIN {NONE}"), "{tcl}");
+    }
+}
+
+/// INTx is one 1-bit line, and the card has one pin.
+#[test]
+fn a_host_irq_that_is_not_one_line_is_refused() {
+    for (bundles, want) in [
+        (
+            "[bundle.irq]\nbacking = \"host_irq\"\nports = [\"o_irqs\"]\n\n[leave_open]\nports = [\"o_irq\"]\n",
+            "`o_irqs` 2 bits wide",
+        ),
+        (
+            "[bundle.irq]\nbacking = \"host_irq\"\nports = [\"o_irq\"]\n\n\
+             [bundle.more]\nbacking = \"host_irq\"\nports = [\"o_irqs\"]\n",
+            "are both host_irq",
+        ),
+    ] {
+        let dir = irq_fixture(bundles);
+        let out = gen_pcie(&dir, "xilinx/vcu118");
+        assert_ne!(out.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(want), "{stderr}");
+    }
+    // JTAG has no way to interrupt the host.
+    let dir = irq_fixture(
+        "[bundle.irq]\nbacking = \"host_irq\"\nports = [\"o_irq\"]\n\n[leave_open]\nports = [\"o_irqs\"]\n",
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+        .args(["gen", "--target", "xilinx/vcu118", "--transport", "jtag"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("host_irq"), "{stderr}");
 }

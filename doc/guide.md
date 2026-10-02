@@ -83,11 +83,12 @@ data lives (`backing`); the shape of the port is read from the DUT.**
 | `addressing` | `"byte"` / `"word"` | fixed-latency memory port only; required when a word is wider than 8 bits |
 | `access` | `"indirect"` / `"region"` | fixed-latency memory port only; default `region` |
 | `aperture` | size, power of two | a region or an AXI4 port; default is the whole memory. Required for `dram` |
+| `base` | byte offset in the window | a region only (`region` memory, `dram`, `slave`); default is the first free place |
 
 A key the bundle's shape does not use is an error, not ignored.
 
-Sizes accept a suffix: `4k`, `256M` (1024-based). `depth`, `aperture` and
-`bar_bytes` all take one.
+Sizes accept a suffix: `4k`, `256M` (1024-based). `depth`, `aperture`, `base`
+and `bar_bytes` all take one.
 
 #### backing — where the data lives
 
@@ -100,7 +101,8 @@ Sizes accept a suffix: `4k`, `256M` (1024-based). `depth`, `aperture` and
 | `bram_preload` | FPGA memory the host fills and the DUT only reads | works |
 | `dram` | the board's DRAM | works |
 | `host_mem` | host memory | not yet (needs the PCIe requester) |
-| `host_irq`, `observe` | | not yet |
+| `host_irq` | the DUT's interrupt line, sent to the host as INTA (PCIe) | works; one 1-bit output, at most one bundle |
+| `observe` | | not yet |
 
 #### contract — how refined the port is
 
@@ -272,6 +274,16 @@ hio write imem 0x0 0xc0de0000 0xc0de0001
 hio read  imem 0x0 2
 ```
 
+A region goes in the first free place that is a multiple of its size. Set
+`base` when software expects it at a fixed offset, such as a driver reading its
+registers at BAR offset 0; `check` refuses one that is unaligned or overlaps.
+
+```toml
+[bundle.nvme_regs]
+backing = "slave"
+base    = 0
+```
+
 Addresses count from 0 within the region. Anything past the end is refused
 before it is sent.
 
@@ -292,11 +304,15 @@ pin  = "uart_tx"
 baud = 115200
 
 [pcie]                    # what the endpoint reports, and its BAR
-vendor_id = 0x1234
-device_id = 0x0001
-bar_bytes = 4096
+vendor_id  = 0x1234
+device_id  = 0x0001
+class_code = 0xff0000     # base / sub / interface, as `lspci -n` shows; default: no class
+bar_bytes  = 4096
 ```
 
+- `class_code` is a warning, not an error, when a host driver binds to that
+  class (AHCI, NVMe, USB hosts, a PCI bridge ...): the driver would drive the
+  window as that device. `hio -p check` compares it with what the card reports.
 - Clock and reset ports go in neither `[tie_off]` nor `[leave_open]`.
 - Pin numbers and IOSTANDARD come from the **target description**, never from
   the manifest — otherwise the manifest is tied to one board. See what a board
@@ -438,8 +454,9 @@ hio drain tx
 hio bench mem --both
 ```
 
-**Arguments are usually unnecessary.** `regs.json` is found at `./regs.json`
-then `hns/regs.json`, and the target is recorded inside it. A map generated with
+**Arguments are usually unnecessary.** `regs.json` is found at `./regs.json`,
+then `hns/regs.json`, then `hns/*/regs.json` when there is only one (with
+several, pass `--regs`). The target is recorded inside it. A map generated with
 `--target-file` records only that it came from a file, so pass the same file to
 `hio` with `--target-file`. Probe details are
 discovered from the FTDI device, and whatever is guessed is **verified against
@@ -461,7 +478,7 @@ magic and the map hash before anything else happens** (`--no-verify` skips it).
 | `reset` | reset the DUT only; `--hold` / `--release` keep it in reset |
 | `bench` | how fast the window is; `<region> --both` measures writes too |
 | `check` | whether the board and this machine are ready, and what to fix |
-| `dma-fire` | the card moves one descriptor itself, either way (PCIe + `dram`) |
+| `dma-fire` | the card moves one descriptor itself, either way (PCIe + `dram`); `--pcie-addr` aims it at another card's BAR |
 | `run <file>` | a file of commands, holding the link open |
 
 `hio --help` shows the common commands and options. `hio --list` lists every

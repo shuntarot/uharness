@@ -90,6 +90,9 @@ pub fn run(
             print_heartbeat(plan.heartbeat.as_ref());
             print_registers(&plan.registers, emit_regs);
             print_not_checked_yet(plan.board.is_some(), &plan.sv_blackboxes);
+            for item in warnings(&plan) {
+                println!("warning: {}", item.what);
+            }
         }
         Format::Json => {
             let project = json::Project {
@@ -409,6 +412,11 @@ fn print_bundles(plan: &crate::plan::Plan) {
         let contract = match resolved {
             // Say when the contract was inferred rather than written.
             Some(resolved) if resolved.declared => resolved.contract.to_string(),
+            // An interrupt line has no transfers, so an inferred contract
+            // would only confuse.
+            Some(_) if bundle.backing == crate::manifest::Backing::HostIrq => {
+                "level line".to_string()
+            }
             Some(resolved) => format!("{} (inferred)", resolved.contract),
             None => "?".to_string(),
         };
@@ -716,6 +724,9 @@ fn print_summary(plan: &plan::Plan, emit_regs: Option<&Path>) {
             .find(|contract| contract.bundle == binding.bundle)
         {
             Some(resolved) if resolved.declared => value += &format!(", {}", resolved.contract),
+            Some(_) if bundle.backing == crate::manifest::Backing::HostIrq => {
+                value += ", level line, sent as INTA";
+            }
             Some(resolved) => value += &format!(", {} (inferred)", resolved.contract),
             None => {}
         }
@@ -862,11 +873,57 @@ fn print_summary(plan: &plan::Plan, emit_regs: Option<&Path>) {
         line("ok", "regs", &format!("wrote {}", path.display()));
     }
 
+    for item in warnings(plan) {
+        line("--", "warning", &item.what);
+    }
+
     let not_checked: Vec<&str> = not_checked_items(plan.board.is_some(), &plan.sv_blackboxes)
         .iter()
         .map(|item| short_not_checked(item.id))
         .collect();
     println!("not checked: {}", not_checked.join(", "));
+}
+
+/// PCI classes that a Linux driver binds to by class alone, with what binds.
+/// The driver then reads and writes the window as if it were that device. The
+/// mask selects the bytes that matter (`0xffff00`: any interface).
+const CLASS_DRIVERS: &[(u32, u32, &str)] = &[
+    (0x010601, 0xffffff, "AHCI (ahci)"),
+    (0x010802, 0xffffff, "NVMe (nvme)"),
+    (0x0c0330, 0xffffff, "USB xHCI (xhci_hcd)"),
+    (0x0c0320, 0xffffff, "USB EHCI (ehci_hcd)"),
+    (0x0c0310, 0xffffff, "USB OHCI (ohci_hcd)"),
+    (0x0c0300, 0xffffff, "USB UHCI (uhci_hcd)"),
+    (0x0c0010, 0xffffff, "FireWire OHCI (firewire_ohci)"),
+    (0x080501, 0xffffff, "SD host (sdhci_pci)"),
+    (0x060400, 0xffff00, "PCI bridge (pcieport)"),
+    (0x070000, 0xffff00, "serial port (8250_pci)"),
+];
+
+/// The driver that binds to this class code, if one does.
+pub fn class_driver(class_code: u32) -> Option<&'static str> {
+    CLASS_DRIVERS
+        .iter()
+        .find(|(code, mask, _)| class_code & mask == *code)
+        .map(|(_, _, driver)| *driver)
+}
+
+/// What passed but is likely not meant. `check` prints them, `--json` lists
+/// them under `warnings`, and `gen` prints them after the files.
+pub(crate) fn warnings(plan: &plan::Plan) -> Vec<Item> {
+    let mut items = Vec::new();
+    if let Some(pcie) = plan.pcie_identity()
+        && let Some(driver) = class_driver(pcie.class_code)
+    {
+        items.push(Item::owned(
+            "pcie_class_driver",
+            format!(
+                "[pcie] class_code = {:#08x} is the class of {driver}, which binds to the card by its class and drives the window as that device. Keep it only if the DUT is one; otherwise leave class_code out (0xff0000, no class)",
+                pcie.class_code
+            ),
+        ));
+    }
+    items
 }
 
 fn line(mark: &str, what: &str, value: &str) {

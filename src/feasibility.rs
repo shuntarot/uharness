@@ -150,12 +150,15 @@ pub fn capability(backing: Backing) -> Capability {
             needs: &[],
         },
 
-        // Interrupts. They need an asynchronous path to the host (such as PCIe
-        // MSI). JTAG has none; polling would be a different backing.
+        // Interrupts. They need an asynchronous path to the host (INTA over
+        // PCIe). JTAG has none; polling would be a different backing.
+        //
+        // Not a `sink`: the line is a level, held until the DUT drops it, so
+        // there is nothing to drop and nothing to count.
         Backing::HostIrq => Capability {
             serves_dut_requests: false,
             deterministic: true,
-            sink: true,
+            sink: false,
             needs_pcie: true,
             needs: &[],
         },
@@ -923,7 +926,7 @@ fn select_transport(target: &Target, requested: Option<&str>) -> Result<String, 
 fn why_pcie(backing: Backing) -> &'static str {
     match backing {
         Backing::HostMem => "it fetches from host memory one request at a time over PCIe",
-        Backing::HostIrq => "an interrupt has to reach the host asynchronously, e.g. as an MSI",
+        Backing::HostIrq => "an interrupt has to reach the host asynchronously, as INTA over PCIe",
         _ => "it needs a PCIe path to the host",
     }
 }

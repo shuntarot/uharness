@@ -72,7 +72,7 @@ fn a_successful_check_is_one_json_document() {
 
     assert_eq!(code, Some(0));
     assert_eq!(value["status"], "ok");
-    assert_eq!(value["format_version"], 13);
+    assert_eq!(value["format_version"], 14);
     assert_eq!(value["dut"]["module"], "dut_top");
     assert_eq!(value["bundles"][0]["name"], "csr");
     assert_eq!(value["bundles"][0]["matched_by"], "naming");
@@ -144,6 +144,62 @@ fn an_unknown_target_is_reported_as_json_too() {
             .as_str()
             .unwrap()
             .contains("digilent/arty-a7-35")
+    );
+}
+
+/// A class code a host driver binds to passes, with a warning that names the
+/// driver. The default class (and a class no driver claims) has none, and the
+/// map carries the code either way.
+#[test]
+fn a_class_code_a_driver_binds_to_is_a_warning() {
+    let run = |class_code: Option<&str>| {
+        let mut manifest = CSR_MANIFEST.to_string();
+        if let Some(code) = class_code {
+            manifest.push_str(&format!("\n[pcie]\nclass_code = {code}\n"));
+        }
+        let dir = fixture(&manifest);
+        let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+            .args([
+                "check",
+                "--json",
+                "--target",
+                "xilinx/vcu118",
+                "--transport",
+                "pcie",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(0), "{value:#}");
+        value
+    };
+
+    let nvme = run(Some("0x010802"));
+    let warning = &nvme["warnings"][0];
+    assert_eq!(warning["id"], "pcie_class_driver");
+    assert!(
+        warning["what"].as_str().unwrap().contains("nvme"),
+        "{warning}"
+    );
+    assert_eq!(nvme["registers"]["pcie"]["class_code"], 0x010802);
+
+    for quiet in [None, Some("0x120000")] {
+        let value = run(quiet);
+        assert!(value.get("warnings").is_none(), "{quiet:?}: {value:#}");
+    }
+    assert_eq!(run(None)["registers"]["pcie"]["class_code"], 0xff0000);
+}
+
+/// A class code wider than 24 bits is refused.
+#[test]
+fn a_class_code_wider_than_24_bits_is_refused() {
+    let dir = fixture(&format!("{CSR_MANIFEST}\n[pcie]\nclass_code = 0x1000000\n"));
+    let (value, code) = check_json(&dir);
+    assert_ne!(code, Some(0));
+    assert_eq!(
+        value["error"]["code"],
+        "harness::manifest::class_code_too_wide"
     );
 }
 
