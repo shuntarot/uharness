@@ -136,6 +136,10 @@ pub struct RegisterMap {
 pub struct Pcie {
     pub vendor_id: u32,
     pub device_id: u32,
+    /// The class code, as sysfs `class` shows it. Absent in older `regs.json`;
+    /// the host then does not compare it.
+    #[serde(default)]
+    pub class_code: Option<u32>,
     /// BAR0 size in bytes. The host compares it with the size sysfs reports;
     /// a mismatch means another bitstream is loaded.
     pub bar_bytes: u32,

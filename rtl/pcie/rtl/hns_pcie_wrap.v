@@ -52,6 +52,7 @@ module hns_pcie_wrap #(
     input  wire        i_clk,          // the window's clock
     input  wire        i_rst_n,        // active low, the window's reset
     output wire        o_link_up,      // synchronised into i_clk
+    input  wire        i_intx,         // the interrupt line, in i_clk; sent as INTA
 
     // --- requester (RQ/RC), in the block's own clock ---
     //
@@ -137,6 +138,37 @@ module hns_pcie_wrap #(
         user_reset_reg_2 <= user_reset_reg_1;
     end
     wire pcie_user_reset = user_reset_reg_2;
+
+    // The interrupt line, to INTA. A flop in i_clk first, so a glitch in the
+    // DUT's logic cannot cross; then two flops into user_clk.
+    //
+    // Each change is one message (Assert_INTA / Deassert_INTA). The next one
+    // waits for `cfg_interrupt_sent`, as the block asks; the line is compared
+    // again then, so a change in the meantime is not lost.
+    reg intx_src = 1'b0;
+    always @(posedge i_clk) begin
+        intx_src <= i_intx;
+    end
+    (* ASYNC_REG = "TRUE", shreg_extract = "no" *) reg intx_meta = 1'b0;
+    (* ASYNC_REG = "TRUE", shreg_extract = "no" *) reg intx_sync = 1'b0;
+    always @(posedge pcie_user_clk) begin
+        intx_meta <= intx_src;
+        intx_sync <= intx_meta;
+    end
+    wire intx_sent;
+    reg  intx_out  = 1'b0;
+    reg  intx_wait = 1'b0;
+    always @(posedge pcie_user_clk) begin
+        if (pcie_user_reset) begin
+            intx_out  <= 1'b0;
+            intx_wait <= 1'b0;
+        end else if (intx_wait) begin
+            if (intx_sent) intx_wait <= 1'b0;
+        end else if (intx_sync != intx_out) begin
+            intx_out  <= intx_sync;
+            intx_wait <= 1'b1;
+        end
+    end
 
     // --- the streams we use ---
     wire [255:0] axis_cq_tdata;
@@ -288,9 +320,9 @@ module hns_pcie_wrap #(
         .cfg_vf_flr_in_process(), .cfg_vf_flr_func_num(8'd0), .cfg_vf_flr_done(8'd0),
         // Without this the link never trains.
         .cfg_link_training_enable(1'b1),
-        .cfg_interrupt_int(4'd0),
+        .cfg_interrupt_int({3'b000, intx_out}),
         .cfg_interrupt_pending(4'd0),
-        .cfg_interrupt_sent(),
+        .cfg_interrupt_sent(intx_sent),
         .cfg_pm_aspm_l1_entry_reject(1'b0),
         .cfg_pm_aspm_tx_l0s_entry_disable(1'b0),
         .cfg_hot_reset_out(),

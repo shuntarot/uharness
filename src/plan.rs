@@ -47,6 +47,9 @@ pub struct Plan {
     /// Memories the DUT reaches as an AXI4 master, sorted by bundle name.
     pub axi_mems: Vec<AxiMemPlan>,
 
+    /// The `host_irq` bundle, if there is one (INTx has one pin).
+    pub irqs: Vec<crate::terminator::IrqPlan>,
+
     pub registers: RegisterMap,
 
     /// Present only with `[heartbeat]` and a target.
@@ -257,7 +260,7 @@ pub enum PlanError {
     #[diagnostic(
         code(harness::plan::no_terminator),
         help(
-            "The generator can terminate `reg`, `slave`, `host_poll_fifo`, `bram`, `bram_preload`, and `dram`. `{backing}` is not supported yet.\n\n`check` without `--target` still tells you whether the manifest is feasible."
+            "The generator can terminate `reg`, `slave`, `host_poll_fifo`, `bram`, `bram_preload`, `dram`, and `host_irq`. `{backing}` is not supported yet.\n\n`check` without `--target` still tells you whether the manifest is feasible."
         )
     )]
     NoTerminator { bundle: String, backing: String },
@@ -357,6 +360,7 @@ pub fn build(
     let slaves = terminator::resolve_slaves(&dut, &loaded.manifest, &bindings, &contracts)?;
     let axi_mems =
         terminator::resolve_axi_mems(&dut, &loaded.manifest, &bindings, target.as_ref())?;
+    let irqs = terminator::resolve_irqs(&dut, &loaded.manifest, &bindings)?;
     terminator::check_claimed(
         &loaded.manifest,
         &bindings,
@@ -365,6 +369,7 @@ pub fn build(
         &host_mems,
         &slaves,
         &axi_mems,
+        &irqs,
     )?;
 
     // The clock plan and the feasibility checks need a target.
@@ -437,6 +442,7 @@ pub fn build(
         host_mems,
         slaves,
         axi_mems,
+        irqs,
         registers,
         heartbeat,
         board,
@@ -560,6 +566,7 @@ fn generatable(plan: &Plan) -> Result<(), PlanError> {
                 | Backing::Bram
                 | Backing::BramPreload
                 | Backing::Dram
+                | Backing::HostIrq
         ) {
             return Err(PlanError::NoTerminator {
                 bundle: binding.bundle.clone(),

@@ -27,7 +27,7 @@ struct Cli {
     /// The generated regs.json.
     ///
     /// Names, widths and the window size come from it. Without it: ./regs.json if
-    /// there is one, else hns/regs.json.
+    /// there is one, else hns/regs.json, else the only hns/*/regs.json.
     #[arg(long, value_name = "PATH")]
     regs: Option<String>,
 
@@ -422,6 +422,13 @@ enum Cmd {
         /// completions came home.
         #[arg(long)]
         to_card: bool,
+        /// Fire at this bus address instead of a page hio hands out.
+        ///
+        /// For example another card's BAR, for a peer-to-peer test. hio cannot
+        /// read that address, so what lands is not checked; with --to-card the
+        /// memory is read back and shown. An address in RAM is refused.
+        #[arg(long, value_name = "ADDR", value_parser = parse_u64, conflicts_with = "expect_fault")]
+        pcie_addr: Option<u64>,
     },
 
     /// Empty a host_poll_fifo bundle, oldest entry first.
@@ -827,6 +834,7 @@ fn run_step(cli: &Cli, bus: &mut Bus, map: &RegisterMap, step: Step) -> Result<(
             expect_fault,
             mps,
             to_card,
+            pcie_addr,
         } => dma_fire(
             bus,
             map,
@@ -839,6 +847,7 @@ fn run_step(cli: &Cli, bus: &mut Bus, map: &RegisterMap, step: Step) -> Result<(
                 expect_fault,
                 mps,
                 to_card,
+                pcie_addr,
             },
         ),
     }
@@ -1225,7 +1234,10 @@ fn after_config_map(cli: &Cli, what: &str) -> Option<RegisterMap> {
                 "{what}, but it was not checked: no register map was found (looked for {}).\n\
                  Pass --regs with the map for this bitstream to check that the window \
                  answers.",
-                regs_candidates(cli).join(", ")
+                match &cli.regs {
+                    Some(path) => path.as_str(),
+                    None => REGS_PLACES,
+                }
             );
             None
         }
@@ -1370,12 +1382,47 @@ fn play_svf(cli: &Cli, file: &PathBuf) -> Result<(), String> {
 ///
 /// Fixed default places keep a written procedure portable. A path typed each
 /// time only works on the machine it was typed on.
-fn regs_candidates(cli: &Cli) -> Vec<String> {
+///
+/// `gen --out-dir hns/<board>` puts the map one level deeper. When only one
+/// such map exists, it is the one meant; with several, guessing could pick
+/// another board's map, so the user is asked.
+fn regs_candidates(cli: &Cli) -> Result<Vec<String>, String> {
     match &cli.regs {
-        Some(p) => vec![p.clone()],
-        None => vec!["regs.json".to_string(), "hns/regs.json".to_string()],
+        Some(p) => Ok(vec![p.clone()]),
+        None => regs_candidates_in(std::path::Path::new(".")),
     }
 }
+
+/// The default places, under `root`. The paths returned are relative to it.
+fn regs_candidates_in(root: &std::path::Path) -> Result<Vec<String>, String> {
+    let fixed = vec!["regs.json".to_string(), "hns/regs.json".to_string()];
+    if fixed.iter().any(|p| root.join(p).is_file()) {
+        return Ok(fixed);
+    }
+    let mut nested: Vec<String> = std::fs::read_dir(root.join("hns"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().join("regs.json").is_file())
+        .map(|entry| format!("hns/{}/regs.json", entry.file_name().to_string_lossy()))
+        .collect();
+    nested.sort();
+    match nested.as_slice() {
+        [] | [_] => Ok(fixed.into_iter().chain(nested).collect()),
+        many => Err(format!(
+            "there are {} register maps under hns/, and hio will not guess which board \
+             this is:\n{}\nPass one with --regs, or run hio in its directory.",
+            many.len(),
+            many.iter()
+                .map(|p| format!("    {p}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )),
+    }
+}
+
+/// The places `regs_candidates` looks, for messages.
+const REGS_PLACES: &str = "regs.json, hns/regs.json, hns/*/regs.json";
 
 /// Reads the map. "Missing" and "unreadable" are different results.
 ///
@@ -1398,18 +1445,21 @@ fn read_map(candidates: &[String]) -> Result<Option<(String, RegisterMap)>, Stri
 /// Like `find_regs`, but a missing map is `Ok(None)`. An unreadable map is
 /// still an error with its reason.
 fn find_regs_opt(cli: &Cli) -> Result<Option<(String, RegisterMap)>, String> {
-    read_map(&regs_candidates(cli))
+    read_map(&regs_candidates(cli)?)
 }
 
 fn find_regs(cli: &Cli) -> Result<(String, RegisterMap), String> {
-    let candidates = regs_candidates(cli);
+    let candidates = regs_candidates(cli)?;
     match read_map(&candidates)? {
         Some(found) => Ok(found),
         None => Err(format!(
             "no register map was found (looked for {}).\n\
              `veryl harness gen` writes one into hns/. Run from the project directory, \
              copy regs.json here, or pass --regs.",
-            candidates.join(", ")
+            match &cli.regs {
+                Some(path) => path.as_str(),
+                None => REGS_PLACES,
+            }
         )),
     }
 }
@@ -1759,6 +1809,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             expect_fault,
             mps,
             to_card,
+            pcie_addr,
         } => dma_fire(
             &mut bus,
             &map,
@@ -1771,6 +1822,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
                 expect_fault,
                 mps,
                 to_card,
+                pcie_addr,
             },
         ),
     }
@@ -2003,6 +2055,37 @@ fn check(cli: &Cli, map_path: &str, map: &RegisterMap) -> Result<(), String> {
                 } else {
                     c.ok("bar", size_str(info.bar0_bytes));
                 }
+                // Another bitstream, or one from a generator that wrote the
+                // class code in a form the PCIE3 IP ignores.
+                match (card.class_code, info.class) {
+                    (Some(want), Some(got)) if want != got => c.ng(
+                        "class",
+                        format!("{got:#08x} on the card, {want:#08x} in the map"),
+                        "The card runs another bitstream, or one generated before the class code \
+                         reached the PCIE3 IP. Generate again and re-synthesize.",
+                    ),
+                    (Some(_), Some(got)) => c.ok("class", format!("{got:#08x}")),
+                    _ => {}
+                }
+                // With a `host_irq` bundle the card must have INTA, or the
+                // driver gets no interrupt (a probe can fail with -22).
+                if map
+                    .registers
+                    .iter()
+                    .any(|r| r.role.as_deref() == Some("irq_level"))
+                {
+                    match (info.interrupt_pin, info.irq) {
+                        (Some(0), _) => c.ng(
+                            "irq",
+                            "the card has no interrupt pin",
+                            "The card runs a bitstream built without host_irq. Program the one \
+                             this map was generated with.",
+                        ),
+                        (Some(_), Some(0) | None) => c.ok("irq", "INTA, no IRQ assigned yet"),
+                        (Some(_), Some(irq)) => c.ok("irq", format!("INTA, IRQ {irq}")),
+                        (None, _) => {}
+                    }
+                }
                 if info.enabled {
                     c.ok("decode", "on");
                 } else {
@@ -2192,6 +2275,31 @@ struct DmaFireArgs {
     expect_fault: bool,
     mps: Option<u32>,
     to_card: bool,
+    pcie_addr: Option<u64>,
+}
+
+/// Where `dma-fire` points the card.
+enum Dest {
+    /// A huge page on this machine, which hio fills or checks.
+    Page(hns_host::dma::Buffer),
+    /// A bus address given with `--pcie-addr`, for `len` bytes.
+    Addr { addr: u64, len: u64 },
+}
+
+impl Dest {
+    fn bus_addr(&self) -> u64 {
+        match self {
+            Dest::Page(buffer) => buffer.bus_addr(),
+            Dest::Addr { addr, .. } => *addr,
+        }
+    }
+
+    fn len(&self) -> u64 {
+        match self {
+            Dest::Page(buffer) => buffer.len() as u64,
+            Dest::Addr { len, .. } => *len,
+        }
+    }
 }
 
 /// Fires one descriptor.
@@ -2217,6 +2325,7 @@ fn dma_fire(
         expect_fault,
         mps,
         to_card,
+        pcie_addr,
     } = args;
 
     require_requester(map)?;
@@ -2285,29 +2394,48 @@ fn dma_fire(
     // The host page. With --expect-fault the card cannot reach it; its address
     // is taken only to compare with the fault address.
     let bdf = find_bdf(cli, pcie)?;
-    let mut buffer = if expect_fault {
-        dma::Buffer::huge_while_translating(&bdf).map_err(|e| e.to_string())?
-    } else {
-        dma::Buffer::huge(&bdf).map_err(|e| e.to_string())?
+    let mut dest = match pcie_addr {
+        Some(addr) => {
+            if !addr.is_multiple_of(4) {
+                return Err(format!(
+                    "--pcie-addr 0x{addr:x} is not a multiple of 4. The engine moves whole words."
+                ));
+            }
+            // Under translation the address would not be the one the card
+            // reaches, and the RAM check below would mean nothing.
+            dma::require_untranslated(&bdf).map_err(|e| e.to_string())?;
+            dma::require_bus_master(&bdf).map_err(|e| e.to_string())?;
+            dma::require_not_ram(addr, len).map_err(|e| e.to_string())?;
+            Dest::Addr { addr, len }
+        }
+        None if expect_fault => {
+            Dest::Page(dma::Buffer::huge_while_translating(&bdf).map_err(|e| e.to_string())?)
+        }
+        None => Dest::Page(dma::Buffer::huge(&bdf).map_err(|e| e.to_string())?),
     };
-    if (len as usize) > buffer.len() {
+    if len > dest.len() {
         return Err(format!(
             "{len} bytes does not fit the page this machine hands out ({} bytes).",
-            buffer.len()
+            dest.len()
         ));
     }
     println!("card     {bdf}");
-    println!(
-        "page     0x{:x} for {} bytes",
-        buffer.bus_addr(),
-        buffer.len()
-    );
+    match &dest {
+        Dest::Page(buffer) => println!(
+            "page     0x{:x} for {} bytes",
+            buffer.bus_addr(),
+            buffer.len()
+        ),
+        Dest::Addr { addr, len } => println!("address  0x{addr:x} for {len} bytes (--pcie-addr)"),
+    }
 
     // Poison the destination before firing. Unwritten words keep the poison,
     // so "not arrived" and "wrong data" look different. The pattern goes to
     // the source; which side is which depends on the direction.
     const POISON_WORD: u32 = u32::from_le_bytes([POISON; 4]);
-    if to_card {
+    if let Dest::Page(buffer) = &mut dest
+        && to_card
+    {
         for e in 0..entries {
             for w in 0..words_per_entry {
                 let byte = (e * words_per_entry + w) * 4;
@@ -2318,7 +2446,7 @@ fn dma_fire(
                 buffer.as_mut_slice()[byte..byte + 4].copy_from_slice(&word);
             }
         }
-    } else {
+    } else if let Dest::Page(buffer) = &mut dest {
         buffer.as_mut_slice()[..len as usize].fill(POISON);
     }
 
@@ -2354,9 +2482,10 @@ fn dma_fire(
     write_wide(&mut b, map, "dma_mps_limit", mps_limit(mps)?)?;
     write_wide(&mut b, map, "dma_mrrs_limit", mps_limit(mps)?)?;
     write_wide(&mut b, map, "dma_dir", u64::from(to_card))?;
-    write_wide(&mut b, map, "dma_base", buffer.bus_addr())?;
-    write_wide(&mut b, map, "dma_size", buffer.len() as u64)?;
-    write_wide(&mut b, map, "dma_pcie_addr", buffer.bus_addr())?;
+    // The gate lets the card reach only this range.
+    write_wide(&mut b, map, "dma_base", dest.bus_addr())?;
+    write_wide(&mut b, map, "dma_size", dest.len())?;
+    write_wide(&mut b, map, "dma_pcie_addr", dest.bus_addr())?;
     write_wide(&mut b, map, "dma_axi_addr", at)?;
     write_wide(&mut b, map, "dma_len", len)?;
     write_wide(&mut b, map, "dma_go", 1)?;
@@ -2419,11 +2548,11 @@ fn dma_fire(
     }
     if after.out_of_range != before.out_of_range {
         return Err(format!(
-            "the gate refused the descriptor: 0x{:x} + {len} bytes is not inside the page \
+            "the gate refused the descriptor: 0x{:x} + {len} bytes is not inside the range \
              it was given (0x{:x} for {} bytes).",
-            buffer.bus_addr(),
-            buffer.bus_addr(),
-            buffer.len()
+            dest.bus_addr(),
+            dest.bus_addr(),
+            dest.len()
         ));
     }
 
@@ -2437,7 +2566,14 @@ fn dma_fire(
              pass the card through:\n\
              \x20   echo identity | sudo tee /sys/kernel/iommu_groups/<n>/type",
             if to_card { "Read" } else { "Write" },
-            buffer.bus_addr()
+            dest.bus_addr()
+        );
+        return Ok(());
+    }
+    if matches!(dest, Dest::Addr { .. }) && !to_card {
+        println!(
+            "landed   not checked: hio cannot read 0x{:x}. Read it from the other side.",
+            dest.bus_addr()
         );
         return Ok(());
     }
@@ -2462,11 +2598,38 @@ fn dma_fire(
             got.extend(hs.into_iter().map(|h| values[h]));
         }
         got
-    } else {
+    } else if let Dest::Page(buffer) = &dest {
         let got = buffer.as_slice();
         let (words, _) = got.as_chunks::<4>();
         words.iter().map(|w| u32::from_le_bytes(*w)).collect()
+    } else {
+        unreachable!("an address that is not hio's is returned above when not --to-card")
     };
+
+    // From an address that is not hio's there is nothing to compare with.
+    // Show what came back, and whether every word was written.
+    if let Dest::Addr { addr, .. } = dest {
+        let words = len as usize / 4;
+        let untouched = landed
+            .iter()
+            .take(words)
+            .filter(|&&word| word == POISON_WORD)
+            .count();
+        let first: Vec<String> = landed
+            .iter()
+            .take(words.min(8))
+            .map(|word| format!("{word:08x}"))
+            .collect();
+        println!("read     {}", first.join(" "));
+        if untouched == 0 {
+            println!("landed   {len} bytes from 0x{addr:x} in the memory");
+            return Ok(());
+        }
+        return Err(format!(
+            "{untouched} of {words} words in the memory still hold the poison \
+             (0x{POISON_WORD:08x}): no completion wrote them, or 0x{addr:x} holds that value."
+        ));
+    }
 
     let words = len as usize / 4;
     let expect = |index: usize| {
@@ -5738,6 +5901,34 @@ mod tests {
         let path = std::env::temp_dir().join(name);
         std::fs::write(&path, text).unwrap();
         path.to_string_lossy().into_owned()
+    }
+
+    /// `gen --out-dir hns/<board>` puts the map one level down. One such map
+    /// is found; with two, hio asks rather than pick another board's.
+    #[test]
+    fn the_only_map_under_hns_is_found_and_two_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let place = |sub: &str| {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+            std::fs::write(root.join(sub).join("regs.json"), "{}").unwrap();
+        };
+        let fixed = ["regs.json", "hns/regs.json"];
+
+        assert_eq!(regs_candidates_in(root).unwrap(), fixed);
+        place("hns/vcu118");
+        assert_eq!(
+            regs_candidates_in(root).unwrap(),
+            ["regs.json", "hns/regs.json", "hns/vcu118/regs.json"]
+        );
+        place("hns/sim");
+        let two = regs_candidates_in(root).unwrap_err();
+        assert!(two.contains("hns/sim/regs.json"), "{two}");
+        assert!(two.contains("hns/vcu118/regs.json"), "{two}");
+        assert!(two.contains("--regs"), "{two}");
+        // A map in a fixed place wins, as before.
+        place("hns");
+        assert_eq!(regs_candidates_in(root).unwrap(), fixed);
     }
 
     /// "Missing" and "unreadable" are different. Mixed up, a stale

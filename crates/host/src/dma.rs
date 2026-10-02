@@ -90,6 +90,17 @@ pub enum Error {
     NoBusMaster {
         bdf: String,
     },
+    /// The range asked for is this machine's RAM. A write there corrupts
+    /// whatever the kernel keeps in it, and nothing stops the card under an
+    /// identity IOMMU.
+    SystemRam {
+        start: u64,
+        end: u64,
+        ram_start: u64,
+        ram_end: u64,
+    },
+    /// `/proc/iomem` shows every range as 0, so RAM cannot be told apart.
+    IomemHidden,
     /// Not possible on this OS.
     Unsupported,
 }
@@ -136,7 +147,24 @@ impl std::fmt::Display for Error {
                  A transfer would never finish, and the engine would stay busy until the card \
                  is reprogrammed. Turn it on:\n\n\
                  \x20   sudo setpci -s {bdf} COMMAND=0x4:0x4\n\n\
-                 A reboot turns it off again."
+                 A reboot turns it off again, and so does a driver whose probe failed."
+            ),
+            Error::SystemRam {
+                start,
+                end,
+                ram_start,
+                ram_end,
+            } => write!(
+                f,
+                "0x{start:x}..0x{end:x} is inside this machine's RAM \
+                 (System RAM 0x{ram_start:x}..0x{ram_end:x} in /proc/iomem).\n\
+                 A write there corrupts memory the kernel uses. Give the address of a BAR \
+                 or other device memory, or drop --pcie-addr to use a page hio hands out."
+            ),
+            Error::IomemHidden => write!(
+                f,
+                "/proc/iomem shows every address as 0, so hio cannot check that the \
+                 address is not RAM. Run it as root (sudo)."
             ),
             Error::Unsupported => write!(
                 f,
@@ -237,7 +265,7 @@ pub fn bus_master_at(root: &Path, bdf: &str) -> Result<bool, Error> {
 
 /// The card-side condition before a transfer. Refuses with the fix when the
 /// bit is off.
-fn require_bus_master(bdf: &str) -> Result<(), Error> {
+pub fn require_bus_master(bdf: &str) -> Result<(), Error> {
     if bus_master(bdf)? {
         Ok(())
     } else {
@@ -245,6 +273,62 @@ fn require_bus_master(bdf: &str) -> Result<(), Error> {
             bdf: bdf.to_string(),
         })
     }
+}
+
+/// Refuses while the IOMMU translates for the card: the address the card
+/// sends would not be the physical address.
+pub fn require_untranslated(bdf: &str) -> Result<(), Error> {
+    if let Iommu::Translating { group, kind } = iommu(bdf)? {
+        return Err(Error::Translating {
+            bdf: bdf.to_string(),
+            group,
+            kind,
+        });
+    }
+    Ok(())
+}
+
+/// Refuses a range that overlaps this machine's RAM. Reads `/proc/iomem`,
+/// which shows real addresses only to root.
+pub fn require_not_ram(start: u64, len: u64) -> Result<(), Error> {
+    let path = Path::new("/proc/iomem");
+    let text = std::fs::read_to_string(path).map_err(io(path))?;
+    not_ram(&text, start, len)
+}
+
+fn not_ram(iomem: &str, start: u64, len: u64) -> Result<(), Error> {
+    let ranges = ram_ranges(iomem);
+    if !ranges.is_empty() && ranges.iter().all(|&(a, b)| a == 0 && b == 0) {
+        return Err(Error::IomemHidden);
+    }
+    let end = start + len;
+    match ranges.into_iter().find(|&(a, b)| start <= b && a < end) {
+        Some((ram_start, ram_end)) => Err(Error::SystemRam {
+            start,
+            end,
+            ram_start,
+            ram_end: ram_end + 1,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The `System RAM` lines of `/proc/iomem`, as inclusive ranges.
+fn ram_ranges(iomem: &str) -> Vec<(u64, u64)> {
+    iomem
+        .lines()
+        .filter_map(|line| {
+            let (range, name) = line.split_once(" : ")?;
+            if name.trim() != "System RAM" {
+                return None;
+            }
+            let (a, b) = range.trim().split_once('-')?;
+            Some((
+                u64::from_str_radix(a, 16).ok()?,
+                u64::from_str_radix(b, 16).ok()?,
+            ))
+        })
+        .collect()
 }
 
 /// The huge page pool.
@@ -318,14 +402,7 @@ impl Buffer {
     ///
     /// The conditions are checked before allocating, so a refusal can say why.
     pub fn huge(bdf: &str) -> Result<Buffer, Error> {
-        let state = iommu(bdf)?;
-        if let Iommu::Translating { group, kind } = state {
-            return Err(Error::Translating {
-                bdf: bdf.to_string(),
-                group,
-                kind,
-            });
-        }
+        require_untranslated(bdf)?;
         require_bus_master(bdf)?;
         let pages = hugepages()?;
         if pages.free == 0 {
@@ -684,5 +761,38 @@ Hugepagesize:       2048 kB
         buf.as_mut_slice()[pages.size_bytes as usize - 1] = 0x5a;
         assert_eq!(buf.as_slice()[0], 0xa5);
         assert_eq!(buf.as_slice()[pages.size_bytes as usize - 1], 0x5a);
+    }
+
+    #[test]
+    fn a_range_in_system_ram_is_refused() {
+        let iomem = "00000000-00000fff : Reserved\n\
+                     00001000-0009ffff : System RAM\n\
+                     \x20 00002000-00002fff : Kernel code\n\
+                     a0000000-a00fffff : PCI Bus 0000:01\n\
+                     \x20 a0000000-a000ffff : 0000:01:00.0\n\
+                     100000000-47fffffff : System RAM\n";
+        // A BAR is fine.
+        assert!(not_ram(iomem, 0xa000_0000, 0x1000).is_ok());
+        // Touching the last byte of RAM is not.
+        assert!(matches!(
+            not_ram(iomem, 0x9_fffc, 8),
+            Err(Error::SystemRam {
+                ram_start: 0x1000,
+                ram_end: 0xa_0000,
+                ..
+            })
+        ));
+        assert!(matches!(
+            not_ram(iomem, 0x2_0000_0000, 4),
+            Err(Error::SystemRam { .. })
+        ));
+        // Right after the end is fine.
+        assert!(not_ram(iomem, 0xa_0000, 4).is_ok());
+        // Not root: every address reads as 0.
+        let hidden = "00000000-00000000 : System RAM\n00000000-00000000 : PCI Bus 0000:01\n";
+        assert!(matches!(
+            not_ram(hidden, 0xa000_0000, 4),
+            Err(Error::IomemHidden)
+        ));
     }
 }

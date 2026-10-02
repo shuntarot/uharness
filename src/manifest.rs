@@ -595,6 +595,17 @@ pub struct Bundle {
     /// different address.
     #[serde(default, deserialize_with = "size::option_u32")]
     pub aperture: Option<u32>,
+
+    /// Where this bundle's region starts in the window, in bytes. Only for a
+    /// bundle with a region: a memory with `access = "region"`, `dram`, or
+    /// `slave`.
+    ///
+    /// Without it, the region takes the first free place. Use it when software
+    /// expects the region at a fixed offset, such as a device driver that
+    /// reads its registers from BAR offset 0. It must be a multiple of the
+    /// region size.
+    #[serde(default, deserialize_with = "size::option_u32")]
+    pub base: Option<u32>,
 }
 
 /// Sizes may also be written like `4k` or `256M`.
@@ -823,6 +834,12 @@ pub struct Pcie {
     #[serde(default = "default_device_id")]
     pub device_id: u32,
 
+    /// PCI class code, base / sub / interface in 24 bits as `lspci -n` shows
+    /// them. The default says "none of the classes", so no host driver binds
+    /// to the card by its class.
+    #[serde(default = "default_class_code")]
+    pub class_code: u32,
+
     /// BAR size in bytes. It must be a power of two larger than the window.
     ///
     /// The window is only tens of bytes. A BAR sized to the window would change
@@ -837,6 +854,7 @@ impl Default for Pcie {
         Self {
             vendor_id: default_vendor_id(),
             device_id: default_device_id(),
+            class_code: default_class_code(),
             bar_bytes: default_bar_bytes(),
         }
     }
@@ -848,6 +866,10 @@ fn default_vendor_id() -> u32 {
 
 fn default_device_id() -> u32 {
     0x0001
+}
+
+fn default_class_code() -> u32 {
+    0xff0000
 }
 
 fn default_bar_bytes() -> u32 {
@@ -976,6 +998,15 @@ pub enum ManifestError {
         help("PCI vendor and device ids are 16 bits each.")
     )]
     PciIdTooWide { what: &'static str, value: u32 },
+
+    #[error("[pcie] class_code = {value:#x} does not fit in 24 bits")]
+    #[diagnostic(
+        code(harness::manifest::class_code_too_wide),
+        help(
+            "A class code is base, sub class and interface, one byte each, as `lspci -n` shows them:\n\n    [pcie]\n    class_code = 0x120000   # processing accelerator"
+        )
+    )]
+    ClassCodeTooWide { value: u32 },
 
     #[error("cannot read `{}` given by --config", path.display())]
     #[diagnostic(
@@ -1219,6 +1250,11 @@ impl Manifest {
                 if value > 0xffff {
                     return Err(ManifestError::PciIdTooWide { what, value });
                 }
+            }
+            if pcie.class_code > 0xff_ffff {
+                return Err(ManifestError::ClassCodeTooWide {
+                    value: pcie.class_code,
+                });
             }
         }
 
