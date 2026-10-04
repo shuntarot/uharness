@@ -658,6 +658,12 @@ pub fn pcie_tcl(plan: &Plan, board: &hns_targets::Pcie) -> String {
         if plan.irqs.is_empty() { "NONE" } else { "INTA" }
     ));
     out.push_str("    CONFIG.pf0_msi_enabled {false} \\\n");
+    // A `pcie_flr` bundle sets the FLR bit in Device Capabilities. Without
+    // one the host never sends an FLR, and nothing would answer it.
+    out.push_str(&format!(
+        "    CONFIG.PF0_DEV_CAP_FUNCTION_LEVEL_RESET_CAPABLE {{{}}} \\\n",
+        !plan.flrs.is_empty()
+    ));
     out.push_str("    CONFIG.pf0_msix_enabled {false} \\\n");
     out.push_str(&format!("] [get_ips {ip}_0]\n"));
     out
@@ -1267,35 +1273,58 @@ const SIM_DRAM_ENTRIES: u32 = 4096;
 ///
 /// The body is the same `core_body` as `hns_top`, so the two cannot diverge.
 ///
-/// It is not emitted for a DUT with several clock domains (that would need an
-/// MMCM stand-in).
+/// With one clock the ports are `i_clk` / `i_rst`. With several, each clock
+/// comes in as `i_clk_<ident>` (and its reset as `i_rst_<ident>`), and the
+/// DUT reset is synchronized into each domain as `hns_clk` does.
 pub fn sim_module(plan: &Plan, prefixes: &DirectionPrefixes) -> String {
     let reset = plan.metadata.build.reset_type;
+    let clocks = plan.clocks().filter(|clocks| clocks.outputs.len() > 1);
+    // Every port names its domain once there are several clocks.
+    let tag = clocks.map_or(String::new(), |clocks| format!("'{} ", clocks.window));
 
     let mut out = header_veryl();
     out.push_str("///\n/// The harness without its transport: AXI4-Lite straight to the CSR.\n");
     out.push_str("/// A testbench can drive this; hns_top cannot be simulated as it holds the\n");
     out.push_str("/// MMCM and the JTAG-to-AXI master, both vendor black boxes.\n");
     out.push_str("module sim (\n");
-    out.push_str("    i_clk: input clock,\n");
-    out.push_str(&format!("    i_rst: input {},\n", reset_type_name(reset)));
+    match clocks {
+        None => {
+            out.push_str("    i_clk: input clock,\n");
+            out.push_str(&format!("    i_rst: input {},\n", reset_type_name(reset)));
+        }
+        Some(clocks) => {
+            for output in &clocks.outputs {
+                let ident = &output.ident;
+                out.push_str(&format!("    i_clk_{ident}: input '{ident} clock,\n"));
+            }
+            for ident in sim_reset_idents(clocks) {
+                out.push_str(&format!(
+                    "    i_rst_{ident}: input '{ident} {},\n",
+                    reset_type_name(reset)
+                ));
+            }
+        }
+    }
     for (signal, width, from_slave) in AXI_SIGNALS {
         let dir = if from_slave { "output" } else { "input" };
         out.push_str(&format!(
-            "    {}_{signal}: {dir} logic<{width}>,\n",
+            "    {}_{signal}: {dir} {tag}logic<{width}>,\n",
             if from_slave { "o" } else { "i" }
         ));
     }
     // The heartbeat is visible in simulation too, so the liveness circuit
     // itself is tested.
     if let Some(heartbeat) = &plan.heartbeat {
-        out.push_str(&format!("    o_{}: output logic,\n", heartbeat.resource));
+        out.push_str(&format!(
+            "    o_{}: output {tag}logic,\n",
+            heartbeat.resource
+        ));
     }
     out.push_str(") {\n");
 
     // `core_body` expects the bus as `axi_*`; connect it to the ports.
     for (signal, width, from_slave) in AXI_SIGNALS {
-        out.push_str(&format!("    var axi_{signal}: logic<{width}>;\n"));
+        out.push_str(&format!("    var axi_{signal}: {tag}logic<{width}>;\n"));
         if from_slave {
             out.push_str(&format!("    assign o_{signal} = axi_{signal};\n"));
         } else {
@@ -1304,9 +1333,20 @@ pub fn sim_module(plan: &Plan, prefixes: &DirectionPrefixes) -> String {
     }
     out.push('\n');
 
+    let (clk, rst) = match clocks {
+        None => ("i_clk".to_string(), "i_rst".to_string()),
+        Some(clocks) => {
+            sim_clock_names(&mut out, clocks, reset);
+            (
+                format!("clk_{}", clocks.window),
+                format!("rst_{}", clocks.window),
+            )
+        }
+    };
+
     if let Some(heartbeat) = &plan.heartbeat {
         out.push_str("    inst u_uart: uart (\n");
-        out.push_str("        i_clk: i_clk,\n        i_rst: i_rst,\n");
+        out.push_str(&format!("        i_clk: {clk},\n        i_rst: {rst},\n"));
         out.push_str(&format!("        o_tx : o_{},\n", heartbeat.resource));
         out.push_str("    );\n\n");
     }
@@ -1316,15 +1356,77 @@ pub fn sim_module(plan: &Plan, prefixes: &DirectionPrefixes) -> String {
         plan,
         false,
         prefixes,
-        None,
+        clocks,
         Domain {
-            clk: "i_clk",
-            rst: "i_rst",
-            tag: "",
+            clk: &clk,
+            rst: &rst,
+            tag: &tag,
         },
     );
     out.push_str("}\n");
     out
+}
+
+/// The clocks that `hns_sim` takes a reset for: the window (the harness runs
+/// on it), and each one a DUT reset belongs to.
+fn sim_reset_idents(clocks: &ClockPlan) -> Vec<&str> {
+    clocks
+        .outputs
+        .iter()
+        .map(|output| output.ident.as_str())
+        .filter(|ident| {
+            *ident == clocks.window || clocks.resets.iter().any(|(_, owner)| owner == ident)
+        })
+        .collect()
+}
+
+/// The names `core_body` uses with several clocks (`clk_*`, `rst_*`,
+/// `drst_*`, `dut_rst_req`), as `hns_top` declares them. The DUT reset takes
+/// the host's request through two flops in each domain, as in `hns_clk`.
+fn sim_clock_names(out: &mut String, clocks: &ClockPlan, reset: ResetType) {
+    let reset_type = reset_type_name(reset);
+    let on = asserted(reset);
+    let request = if on == 0 {
+        "~dut_rst_req"
+    } else {
+        "dut_rst_req"
+    };
+    for output in &clocks.outputs {
+        let ident = &output.ident;
+        out.push_str(&format!("    var clk_{ident}: '{ident} clock;\n"));
+        out.push_str(&format!("    assign clk_{ident} = i_clk_{ident};\n"));
+    }
+    let resets = sim_reset_idents(clocks);
+    for ident in &resets {
+        out.push_str(&format!("    var rst_{ident}: '{ident} {reset_type};\n"));
+        out.push_str(&format!("    assign rst_{ident} = i_rst_{ident};\n"));
+    }
+    out.push_str(&format!(
+        "    var dut_rst_req: '{} logic;\n\n",
+        clocks.window
+    ));
+    for ident in resets
+        .iter()
+        .filter(|ident| clocks.resets.iter().any(|(_, owner)| owner == *ident))
+    {
+        out.push_str(&format!("    var drst_meta_{ident}: '{ident} logic;\n"));
+        out.push_str(&format!("    var drst_sync_{ident}: '{ident} logic;\n"));
+        out.push_str(&format!("    var drst_{ident}: '{ident} {reset_type};\n"));
+        out.push_str("    unsafe (cdc) {\n");
+        out.push_str(&format!(
+            "        always_ff (clk_{ident}, rst_{ident}) {{\n"
+        ));
+        out.push_str(&format!(
+            "            if_reset {{\n                drst_meta_{ident} = {on};\n                drst_sync_{ident} = {on};\n"
+        ));
+        out.push_str(&format!(
+            "            }} else {{\n                drst_meta_{ident} = {request};\n                drst_sync_{ident} = drst_meta_{ident};\n            }}\n"
+        ));
+        out.push_str("        }\n    }\n");
+        out.push_str(&format!(
+            "    assign drst_{ident} = drst_sync_{ident} as {reset_type};\n\n"
+        ));
+    }
 }
 
 /// The source of `$comp::hns_link`, which `--target sim` copies into the
@@ -1341,21 +1443,56 @@ pub const SIM_LINK_DIR: &str = "link";
 /// `hns_sim` from `$comp::hns_link`, which serves the window over TCP.
 ///
 /// It runs until the component finishes it (or Ctrl-C); the cycle count only
-/// has to be more than anyone waits.
+/// has to be more than anyone waits. With several clocks, each has its own
+/// `initial` and a period in picoseconds, so they keep their ratio.
 pub fn sim_testbench(plan: &Plan) -> String {
     let heartbeat = plan.heartbeat.as_ref().map(|h| h.resource.as_str());
+    let clocks = plan.clocks().filter(|clocks| clocks.outputs.len() > 1);
     let mut out = header_veryl();
     out.push_str("///\n/// Serves the harness window to hio over TCP (`veryl harness sim`).\n");
     out.push_str("#[test(sim)]\nmodule sim_tb {\n");
-    out.push_str("    inst clk: $tb::clock_gen;\n");
-    out.push_str("    inst rst: $tb::reset_gen (clk);\n\n");
+    let window = match clocks {
+        None => {
+            out.push_str("    inst clk: $tb::clock_gen;\n");
+            out.push_str("    inst rst: $tb::reset_gen (clk);\n\n");
+            "clk".to_string()
+        }
+        Some(clocks) => {
+            for output in &clocks.outputs {
+                let period = (1.0e6 / output.freq_mhz).round().max(2.0) as u64;
+                out.push_str(&format!(
+                    "    // {} MHz\n    inst clk_{}: $tb::clock_gen #(\n        period: {period},\n    );\n",
+                    output.freq_mhz, output.ident
+                ));
+            }
+            for ident in sim_reset_idents(clocks) {
+                out.push_str(&format!(
+                    "    inst rst_{ident}: $tb::reset_gen (\n        clk: clk_{ident},\n    );\n"
+                ));
+            }
+            out.push('\n');
+            format!("clk_{}", clocks.window)
+        }
+    };
     for (signal, width, _) in AXI_SIGNALS {
         out.push_str(&format!("    var {signal}: logic<{width}>;\n"));
     }
     if let Some(tx) = heartbeat {
         out.push_str(&format!("    var {tx}: logic;\n"));
     }
-    out.push_str("\n    inst u_sim: sim (\n        i_clk: clk,\n        i_rst: rst,\n");
+    out.push_str("\n    inst u_sim: sim (\n");
+    match clocks {
+        None => out.push_str("        i_clk: clk,\n        i_rst: rst,\n"),
+        Some(clocks) => {
+            for output in &clocks.outputs {
+                let ident = &output.ident;
+                out.push_str(&format!("        i_clk_{ident}: clk_{ident},\n"));
+            }
+            for ident in sim_reset_idents(clocks) {
+                out.push_str(&format!("        i_rst_{ident}: rst_{ident},\n"));
+            }
+        }
+    }
     for (signal, _, from_slave) in AXI_SIGNALS {
         let dir = if from_slave { "o" } else { "i" };
         out.push_str(&format!("        {dir}_{signal}: {signal},\n"));
@@ -1364,14 +1501,48 @@ pub fn sim_testbench(plan: &Plan) -> String {
         out.push_str(&format!("        o_{tx}: {tx},\n"));
     }
     out.push_str("    );\n\n");
+    // The component's ports are matched by name, so `clk` is named when the
+    // window clock is not called that.
+    let link_clk = if window == "clk" {
+        window
+    } else {
+        format!("clk: {window}")
+    };
     out.push_str(&format!(
-        "    inst u_link: $comp::{SIM_LINK_NAME} (\n        clk,\n"
+        "    inst u_link: $comp::{SIM_LINK_NAME} (\n        {link_clk},\n"
     ));
     for (signal, _, _) in AXI_SIGNALS {
         out.push_str(&format!("        {signal},\n"));
     }
     out.push_str("    );\n\n");
-    out.push_str("    initial {\n        rst.assert();\n        clk.next(1000000000000);\n        $finish();\n    }\n}\n");
+    match clocks {
+        None => out.push_str(
+            "    initial {\n        rst.assert();\n        clk.next(1000000000000);\n        $finish();\n    }\n",
+        ),
+        Some(clocks) => {
+            // The window's block ends the run. The others only have to
+            // outlast it, or their clock would stop first.
+            let resets = sim_reset_idents(clocks);
+            for output in &clocks.outputs {
+                let ident = &output.ident;
+                out.push_str("    initial {\n");
+                if resets.contains(&ident.as_str()) {
+                    out.push_str(&format!("        rst_{ident}.assert();\n"));
+                }
+                if *ident == clocks.window {
+                    out.push_str(&format!(
+                        "        clk_{ident}.next(1000000000000);\n        $finish();\n"
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "        clk_{ident}.next(1000000000000000000);\n"
+                    ));
+                }
+                out.push_str("    }\n");
+            }
+        }
+    }
+    out.push_str("}\n");
     out
 }
 
@@ -1382,7 +1553,7 @@ pub fn sim_link_cargo_toml() -> String {
     out.push_str(&format!("\n[package]\nname    = \"{SIM_LINK_NAME}\"\n"));
     out.push_str("version = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n");
     out.push_str("[lib]\ncrate-type = [\"cdylib\"]\n\n");
-    out.push_str("[dependencies]\nveryl-component = \"=0.1.1\"\n\n");
+    out.push_str("[dependencies]\nveryl-component = \"=0.1.2\"\n\n");
     out.push_str("[workspace]\n");
     out
 }
@@ -1408,6 +1579,17 @@ pub fn sim_link_source() -> String {
 /// this means "the window gets a second master".
 pub fn has_pcie(plan: &Plan) -> bool {
     plan.feasibility().is_some_and(|f| f.transport == "pcie")
+}
+
+/// Whether PERST# also resets the DUT (`[pcie] perst_resets_dut`).
+fn perst_resets_dut(plan: &Plan) -> bool {
+    has_pcie(plan)
+        && plan
+            .loaded
+            .manifest
+            .pcie
+            .as_ref()
+            .is_none_or(|pcie| pcie.perst_resets_dut)
 }
 
 /// The clock that the body runs on. The three fields always change together.
@@ -1589,6 +1771,36 @@ fn core_body(
             "    assign t_{}_irq_level = w_{};\n",
             irq.bundle, irq.port
         ));
+    }
+
+    // The host's FLR. `hns::flr_ctl` answers it for the DUT; on PCIe,
+    // `top_module` connects it to the hard block. `hns_sim` has none, so
+    // there the request stays low.
+    for flr in &plan.flrs {
+        out.push_str(&format!("    var w_{}: {domain}logic;\n", flr.port));
+        if let Some(done) = &flr.done {
+            out.push_str(&format!("    var w_{done}: {domain}logic;\n"));
+        }
+        let (req, ack) = if second_master {
+            ("pcie_flr", "pcie_flr_ack")
+        } else {
+            ("0", "_")
+        };
+        let (use_done, done) = match &flr.done {
+            Some(done) => ("true", format!("w_{done}")),
+            None => ("false", "0".to_string()),
+        };
+        out.push_str(&format!(
+            "    inst u_flr_{}: hns::flr_ctl #(\n        USE_DONE: {use_done},\n    ) (\n",
+            flr.bundle
+        ));
+        out.push_str(&format!("        i_clk : {clk},\n"));
+        out.push_str(&format!("        i_rst : {rst},\n"));
+        out.push_str(&format!("        i_req : {req},\n"));
+        out.push_str(&format!("        i_done: {done},\n"));
+        out.push_str(&format!("        o_flr : w_{},\n", flr.port));
+        out.push_str(&format!("        o_ack : {ack},\n"));
+        out.push_str("    );\n\n");
     }
 
     // host_poll_fifo wires: `w_<port>` on the DUT side (the DUT connection
@@ -2166,7 +2378,15 @@ fn core_body(
     // The DUT reset. The harness is not reset. Each AXI4 master gets a fence:
     // close it, reset the DUT, and release only when it is empty. If the DUT
     // stops in the middle of a burst, the arbiter waits for B forever.
-    out.push_str("    // DUT reset from the host (dut_reset). The harness itself is not reset.\n");
+    if second_master && perst_resets_dut(plan) {
+        out.push_str(
+            "    // DUT reset from the host (dut_reset) or PERST#. The harness itself is not reset.\n",
+        );
+    } else {
+        out.push_str(
+            "    // DUT reset from the host (dut_reset). The harness itself is not reset.\n",
+        );
+    }
     for axi_mem in &plan.axi_mems {
         let bundle = &axi_mem.bundle;
         out.push_str(&format!("    var fence_closed_{bundle}: {domain}logic;\n"));
@@ -2194,7 +2414,13 @@ fn core_body(
     out.push_str("    inst u_dut_reset: hns::reset_ctl (\n");
     out.push_str(&format!("        i_clk   : {clk},\n"));
     out.push_str(&format!("        i_rst   : {rst},\n"));
-    out.push_str(&format!("        i_hold  : t_{DUT_RESET},\n"));
+    // PERST# holds the DUT the same way, so the fence closes first.
+    let hold = if second_master && perst_resets_dut(plan) {
+        format!("t_{DUT_RESET} | pcie_perst")
+    } else {
+        format!("t_{DUT_RESET}")
+    };
+    out.push_str(&format!("        i_hold  : {hold},\n"));
     out.push_str("        i_pulse : 0,\n");
     out.push_str(&format!("        i_closed: {closed},\n"));
     out.push_str(&format!("        i_idle  : {idle},\n"));
@@ -3719,6 +3945,18 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
         // The interrupt line, in the window clock. The wrapper brings it into
         // the hard block clock. Declared here because the wrapper comes first.
         out.push_str(&format!("    var pcie_intx: '{} logic;\n", clocks.window));
+        // The FLR request and its answer, in the window clock.
+        if !plan.flrs.is_empty() {
+            out.push_str(&format!("    var pcie_flr: '{} logic;\n", clocks.window));
+            out.push_str(&format!(
+                "    var pcie_flr_ack: '{} logic;\n",
+                clocks.window
+            ));
+        }
+        // PERST#, in the window clock, for the DUT reset.
+        if perst_resets_dut(plan) {
+            out.push_str(&format!("    var pcie_perst: '{} logic;\n", clocks.window));
+        }
         // The requester stream is in the hard block clock; `hns::tlp_cdc`
         // brings it from the harness side. It gets a domain name, or it would
         // look like a crossing with an unknown domain.
@@ -3809,6 +4047,18 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
         // Nothing reads the link state yet.
         out.push_str("        o_link_up: _,\n");
         out.push_str("        i_intx   : pcie_intx,\n");
+        if plan.flrs.is_empty() {
+            out.push_str("        o_flr    : _,\n");
+            out.push_str("        i_flr_ack: 0,\n");
+        } else {
+            out.push_str("        o_flr    : pcie_flr,\n");
+            out.push_str("        i_flr_ack: pcie_flr_ack,\n");
+        }
+        if perst_resets_dut(plan) {
+            out.push_str("        o_perst  : pcie_perst,\n");
+        } else {
+            out.push_str("        o_perst  : _,\n");
+        }
         // Only the DMA engine drives RQ. Without it, RQ is tied to 0; left
         // open, the hard block `tvalid` would be an unconnected input.
         if engine {
@@ -4411,6 +4661,25 @@ pub fn sync_instances(plan: &Plan) -> Vec<(String, String, f64)> {
             ));
         }
     }
+    // The FLR request into the window clock, and the answer back. The
+    // answer comes from a flop in `hns::flr_ctl`.
+    if has_pcie(plan)
+        && !plan.flrs.is_empty()
+        && let Some(target) = plan.target()
+    {
+        let board = hns_targets::pcie(target);
+        let (_, _, _, user_mhz) = board_link(&board);
+        out.push((
+            "u_pcie/flr_meta".to_string(),
+            "*u_pcie/flr_meta_reg".to_string(),
+            1000.0 / host_mhz,
+        ));
+        out.push((
+            "u_pcie/flr_ack_meta".to_string(),
+            "*u_pcie/flr_ack_meta_reg".to_string(),
+            1000.0 / f64::from(user_mhz),
+        ));
+    }
     // The interrupt line, from the window clock into the hard block clock.
     // The wrapper registers it first, so the source is a flop.
     if has_pcie(plan)
@@ -4947,6 +5216,16 @@ fn markdown_table(header: &[&str], rows: &[Vec<String>]) -> String {
 ///
 /// The notes are fixed text chosen by `role`. Hand-written notes per bundle
 /// would make a second source of truth next to the map.
+/// A byte count for people: `8 KB`, `2 GB`, or `48 bytes`.
+fn bytes_text(n: u64) -> String {
+    for (unit, shift) in [("GB", 30), ("MB", 20), ("KB", 10)] {
+        if n >= 1 << shift && n.is_multiple_of(1 << shift) {
+            return format!("{} {unit}", n >> shift);
+        }
+    }
+    format!("{n} bytes")
+}
+
 pub fn regs_md(plan: &Plan) -> String {
     let map = &plan.registers;
     let mut out = format!("<!-- {MARKER} -->\n");
@@ -4988,6 +5267,52 @@ pub fn regs_md(plan: &Plan) -> String {
     }
     out.push_str(&markdown_table(&["", ""], &summary));
     out.push('\n');
+
+    // The regions: memory or a DUT interface at a range of the window, not a
+    // register. In address order, so the gaps and a fixed `base` show.
+    if !map.regions.is_empty() {
+        let mut regions: Vec<_> = map.regions.iter().collect();
+        regions.sort_by_key(|region| region.base);
+        let rows: Vec<Vec<String>> = regions
+            .iter()
+            .map(|region| {
+                let declared = &plan.loaded.manifest.bundle[&region.bundle];
+                let mut notes = Vec::new();
+                if declared.base.is_some() {
+                    notes.push("`base` in Harness.toml".to_string());
+                }
+                notes.push(match region.kind {
+                    crate::regmap::RegionKind::Dut => "DUT slave interface".to_string(),
+                    crate::regmap::RegionKind::Memory => format!("`{}`", declared.backing),
+                });
+                if region.is_aperture() {
+                    notes.push(format!(
+                        "window into {}; moved by `{}_base_*`",
+                        bytes_text(region.total_bytes),
+                        region.bundle
+                    ));
+                }
+                vec![
+                    format!(
+                        "`0x{:04x}`..`0x{:04x}`",
+                        region.base,
+                        region.base + region.size_bytes - 1
+                    ),
+                    format!("`{}`", region.bundle),
+                    region.kind.as_str().to_string(),
+                    bytes_text(region.size_bytes as u64),
+                    notes.join("; "),
+                ]
+            })
+            .collect();
+        out.push_str("Ranges of the window that are memory or a DUT interface, not registers.\n");
+        out.push_str("Addresses inside one count from its start (`hio read <name> <offset>`).\n\n");
+        out.push_str(&markdown_table(
+            &["range", "name", "kind", "size", "notes"],
+            &rows,
+        ));
+        out.push('\n');
+    }
 
     out.push_str("Word `i` of a register holds bits `[32i+31 : 32i]`. A register wider than\n");
     out.push_str("one word occupies consecutive words, low word first.\n\n");

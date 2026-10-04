@@ -2689,3 +2689,220 @@ fn a_host_irq_that_is_not_one_line_is_refused() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("host_irq"), "{stderr}");
 }
+
+/// PERST# holds the DUT in reset, through the same fence as `dut_reset`,
+/// unless `[pcie] perst_resets_dut = false`.
+#[test]
+fn perst_resets_the_dut_unless_the_manifest_says_not() {
+    const OPEN: &str = "[leave_open]\nports = [\"o_irq\", \"o_irqs\"]\n";
+    for target in ["xilinx/vcu118", "xilinx/kcu105:dr"] {
+        let dir = irq_fixture(OPEN);
+        let out = gen_pcie(&dir, target);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{target}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let top = tight(&fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap());
+        assert!(top.contains("o_perst : pcie_perst ,"), "{top}");
+        assert!(top.contains("i_hold : t_dut_reset | pcie_perst,"), "{top}");
+        common::veryl_check(&dir.path().join("hns")).unwrap();
+
+        let off = irq_fixture(&format!("{OPEN}\n[pcie]\nperst_resets_dut = false\n"));
+        let out = gen_pcie(&off, target);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{target}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let top = tight(&fs::read_to_string(off.path().join("hns/src/top.veryl")).unwrap());
+        assert!(top.contains("o_perst : _ ,"), "{top}");
+        assert!(top.contains("i_hold : t_dut_reset,"), "{top}");
+        assert!(!top.contains("pcie_perst"), "{top}");
+    }
+}
+
+const FLR_DUT: &str = r#"
+module dut_top (
+    i_clk      : input  clock   ,
+    i_rst      : input  reset   ,
+    i_csr_wdata: input  logic<8>,
+    o_csr_rdata: output logic<8>,
+    i_flr      : input  logic   ,
+    i_flrs     : input  logic<2>,
+    o_flr_done : output logic   ,
+) {
+    always_ff {
+        if_reset {
+            o_csr_rdata = 0;
+            o_flr_done  = 0;
+        } else {
+            o_csr_rdata = i_csr_wdata ^ {6'b0, i_flrs};
+            o_flr_done  = i_flr;
+        }
+    }
+}
+"#;
+
+fn flr_fixture(bundles: &str) -> tempfile::TempDir {
+    let harness_toml = format!(
+        "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n\
+         [bundle.csr]\ncontract = \"fixed_latency\"\nlatency = 1\nbacking = \"reg\"\nports = [\"i_csr_wdata\", \"o_csr_rdata\"]\n\n{bundles}"
+    );
+    let dir = fixture(&veryl_toml(), &harness_toml);
+    fs::write(dir.path().join("src").join("fixture.veryl"), FLR_DUT).unwrap();
+    dir
+}
+
+/// A `pcie_flr` bundle turns on FLR in the IP and connects the request to
+/// the DUT through `hns::flr_ctl`, with or without the DUT's answer.
+#[test]
+fn a_pcie_flr_reaches_the_dut() {
+    for target in ["xilinx/vcu118", "xilinx/kcu105:dr"] {
+        for (ports, rest, use_done) in [
+            (
+                "[\"i_flr\", \"o_flr_done\"]",
+                "[tie_off]\ni_flrs = 0\n",
+                "true",
+            ),
+            (
+                "[\"i_flr\"]",
+                "[tie_off]\ni_flrs = 0\n\n[leave_open]\nports = [\"o_flr_done\"]\n",
+                "false",
+            ),
+        ] {
+            let dir = flr_fixture(&format!(
+                "[bundle.flr]\nbacking = \"pcie_flr\"\nports = {ports}\n\n{rest}"
+            ));
+            let out = gen_pcie(&dir, target);
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{target}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // The formatter aligns the commas, so drop the padding.
+            let top = tight(&fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap())
+                .replace(" ,", ",");
+            assert!(top.contains("inst u_flr_flr: hns::flr_ctl #("), "{top}");
+            assert!(top.contains(&format!("USE_DONE: {use_done},")), "{top}");
+            assert!(top.contains("o_flr : pcie_flr,"), "{top}");
+            assert!(top.contains("i_flr_ack : pcie_flr_ack,"), "{top}");
+            assert!(top.contains("i_req : pcie_flr,"), "{top}");
+            assert!(top.contains("o_flr : w_i_flr,"), "{top}");
+            let tcl = fs::read_to_string(dir.path().join("hns/syn/pcie.tcl")).unwrap();
+            assert!(
+                tcl.contains("CONFIG.PF0_DEV_CAP_FUNCTION_LEVEL_RESET_CAPABLE {true}"),
+                "{tcl}"
+            );
+            let xdc = fs::read_to_string(dir.path().join("hns/syn/harness.xdc")).unwrap();
+            assert!(xdc.contains("*u_pcie/flr_meta_reg"), "{xdc}");
+            assert!(xdc.contains("*u_pcie/flr_ack_meta_reg"), "{xdc}");
+            common::veryl_check(&dir.path().join("hns")).unwrap();
+        }
+
+        let plain = flr_fixture(
+            "[tie_off]\ni_flr = 0\ni_flrs = 0\n\n[leave_open]\nports = [\"o_flr_done\"]\n",
+        );
+        let out = gen_pcie(&plain, target);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{target}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let tcl = fs::read_to_string(plain.path().join("hns/syn/pcie.tcl")).unwrap();
+        assert!(
+            tcl.contains("CONFIG.PF0_DEV_CAP_FUNCTION_LEVEL_RESET_CAPABLE {false}"),
+            "{tcl}"
+        );
+    }
+}
+
+/// The request is one 1-bit input, the answer at most one 1-bit output, and
+/// there is one function.
+#[test]
+fn a_pcie_flr_of_the_wrong_shape_is_refused() {
+    for (bundles, want) in [
+        (
+            "[bundle.flr]\nbacking = \"pcie_flr\"\nports = [\"i_flrs\"]\n\n[tie_off]\ni_flr = 0\n\n[leave_open]\nports = [\"o_flr_done\"]\n",
+            "`i_flrs` 2 bits wide",
+        ),
+        (
+            "[bundle.flr]\nbacking = \"pcie_flr\"\nports = [\"o_flr_done\"]\n\n[tie_off]\ni_flr = 0\ni_flrs = 0\n",
+            "0 inputs and 1 outputs",
+        ),
+        (
+            "[bundle.flr]\nbacking = \"pcie_flr\"\nports = [\"i_flr\"]\n\n\
+             [bundle.more]\nbacking = \"pcie_flr\"\nports = [\"o_flr_done\"]\n\n[tie_off]\ni_flrs = 0\n",
+            "are both pcie_flr",
+        ),
+    ] {
+        let dir = flr_fixture(bundles);
+        let out = gen_pcie(&dir, "xilinx/vcu118");
+        assert_ne!(out.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(want), "{stderr}");
+    }
+    // Over JTAG no FLR can come.
+    let dir = flr_fixture(
+        "[bundle.flr]\nbacking = \"pcie_flr\"\nports = [\"i_flr\"]\n\n[tie_off]\ni_flrs = 0\n\n[leave_open]\nports = [\"o_flr_done\"]\n",
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+        .args(["gen", "--target", "xilinx/vcu118", "--transport", "jtag"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("pcie_flr"), "{stderr}");
+}
+
+/// An AXI4 memory of one word has no index bits. Veryl rejects the zero-width
+/// index, so gen refuses it first and says what to write.
+#[test]
+fn an_axi4_memory_of_one_word_is_refused() {
+    let dir = dram_fixture();
+    fs::write(dir.path().join("Veryl.toml"), veryl_toml()).unwrap();
+    fs::write(
+        dir.path().join("Harness.toml"),
+        "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 100\n\n[bundle.mem]\nbacking = \"bram\"\ndepth = 1\n",
+    )
+    .unwrap();
+    let out = run_gen(&dir, &[]);
+    assert_ne!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("depth = 1, which is not a power of two of at least 2"),
+        "{stderr}"
+    );
+}
+
+/// regs.md lists the regions too, in address order: they are most of the
+/// window, and a fixed `base` is what a driver writer checks first.
+#[test]
+fn the_markdown_map_lists_the_regions() {
+    let dir = dram_fixture();
+    fs::write(dir.path().join("Veryl.toml"), veryl_toml()).unwrap();
+    let toml = fs::read_to_string(dir.path().join("Harness.toml")).unwrap();
+    fs::write(
+        dir.path().join("Harness.toml"),
+        format!("{toml}base = 0x200\n"),
+    )
+    .unwrap();
+    let out = run_gen(&dir, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let md = tight(&fs::read_to_string(dir.path().join("hns/regs.md")).unwrap());
+    assert!(
+        md.contains("| `0x0200`..`0x02ff` | `mem` | memory | 256 bytes | `base` in Harness.toml; `dram`; window into"),
+        "{md}"
+    );
+    assert!(md.contains("moved by `mem_base_*`"), "{md}");
+}

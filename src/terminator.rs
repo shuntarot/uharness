@@ -310,6 +310,24 @@ pub enum TerminatorError {
     )]
     IrqMoreThanOne { first: String, second: String },
 
+    /// The FLR request is one 1-bit input; the DUT's answer, if any, is one
+    /// 1-bit output.
+    #[error("[bundle.{bundle}] is a pcie_flr with {what}")]
+    #[diagnostic(
+        code(harness::terminator::flr_shape),
+        help(
+            "A pcie_flr bundle is one 1-bit input, high while the host's Function Level Reset is in progress, and optionally one 1-bit output the DUT raises when it has finished:\n\n    [bundle.{bundle}]\n    backing = \"pcie_flr\"\n    ports   = [\"<input>\", \"<done output>\"]\n\nWithout the output, the input is high for 256 cycles of the DUT's clock."
+        )
+    )]
+    FlrShape { bundle: String, what: String },
+
+    #[error("[bundle.{first}] and [bundle.{second}] are both pcie_flr")]
+    #[diagnostic(
+        code(harness::terminator::flr_more_than_one),
+        help("The card has one function, so there is one FLR. Fan the input out inside the DUT.")
+    )]
+    FlrMoreThanOne { first: String, second: String },
+
     /// The window address is 32 bits (AXI-Lite), and the whole slave is mapped
     /// into it.
     #[error(
@@ -742,10 +760,12 @@ pub enum TerminatorError {
 
     /// The stand-in memory decodes with a mask, and its window is aligned to
     /// its size.
-    #[error("[bundle.{bundle}] has depth = {depth}, which is not a power of two")]
+    #[error("[bundle.{bundle}] has depth = {depth}, which is not a power of two of at least 2")]
     #[diagnostic(
         code(harness::terminator::axi_mem_depth_not_power_of_two),
-        help("The stand-in memory needs a power-of-two word count. Round it: 1024, 2048, 4096.")
+        help(
+            "The stand-in memory needs a power-of-two word count of at least 2: one word leaves no address bits, and Veryl rejects a zero-width index. Round it: 1024, 2048, 4096."
+        )
     )]
     AxiMemDepthNotPowerOfTwo { bundle: String, depth: u32 },
 
@@ -1161,6 +1181,78 @@ pub fn resolve_irqs(
         plans.push(IrqPlan {
             bundle: binding.bundle.clone(),
             port: name.clone(),
+        });
+    }
+    Ok(plans)
+}
+
+/// A `pcie_flr` terminator: the host's Function Level Reset, handed to the
+/// DUT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlrPlan {
+    pub bundle: String,
+    /// The DUT input. High while the FLR is in progress.
+    pub port: String,
+    /// The DUT output that says it has finished, if it has one.
+    pub done: Option<String>,
+}
+
+/// Resolves the `pcie_flr` bundle. There is at most one: the card has one
+/// function.
+pub fn resolve_flrs(
+    dut: &Dut,
+    manifest: &Manifest,
+    bindings: &[Binding],
+) -> Result<Vec<FlrPlan>, TerminatorError> {
+    let mut plans: Vec<FlrPlan> = Vec::new();
+    for binding in bindings {
+        if manifest.bundle[&binding.bundle].backing != crate::manifest::Backing::PcieFlr {
+            continue;
+        }
+        if let Some(first) = plans.first() {
+            return Err(TerminatorError::FlrMoreThanOne {
+                first: first.bundle.clone(),
+                second: binding.bundle.clone(),
+            });
+        }
+        let shape = |what: String| TerminatorError::FlrShape {
+            bundle: binding.bundle.clone(),
+            what,
+        };
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        for name in &binding.ports {
+            let port = port_of(dut, name);
+            match port.width() {
+                Some(1) => {}
+                Some(width) => return Err(shape(format!("`{name}` {width} bits wide"))),
+                None => {
+                    return Err(shape(format!(
+                        "`{name}` of a width that could not be resolved"
+                    )));
+                }
+            }
+            match port.direction {
+                PortDirection::Input => inputs.push(name.clone()),
+                PortDirection::Output => outputs.push(name.clone()),
+                other => return Err(shape(format!("`{name}` as a `{}` port", other.as_str()))),
+            }
+        }
+        let (port, done) = match (inputs.as_slice(), outputs.as_slice()) {
+            ([port], []) => (port.clone(), None),
+            ([port], [done]) => (port.clone(), Some(done.clone())),
+            _ => {
+                return Err(shape(format!(
+                    "{} inputs and {} outputs, not one input and at most one output",
+                    inputs.len(),
+                    outputs.len()
+                )));
+            }
+        };
+        plans.push(FlrPlan {
+            bundle: binding.bundle.clone(),
+            port,
+            done,
         });
     }
     Ok(plans)
@@ -2013,7 +2105,7 @@ pub fn resolve_axi_mems(
         };
         // A power-of-two word count only, so decoding is a mask and regions
         // pack without gaps.
-        if !depth.is_power_of_two() {
+        if depth < 2 || !depth.is_power_of_two() {
             return Err(TerminatorError::AxiMemDepthNotPowerOfTwo {
                 bundle: binding.bundle.clone(),
                 depth,
@@ -2126,6 +2218,7 @@ pub fn check_claimed(
     slaves: &[SlavePlan],
     axi_mems: &[AxiMemPlan],
     irqs: &[IrqPlan],
+    flrs: &[FlrPlan],
 ) -> Result<(), TerminatorError> {
     const DEPTH: &str = "depth";
     const ADDRESSING: &str = "addressing";
@@ -2164,6 +2257,11 @@ pub fn check_claimed(
             (
                 irqs.iter().any(|p| p.bundle == name),
                 "a `host_irq`",
+                &[][..],
+            ),
+            (
+                flrs.iter().any(|p| p.bundle == name),
+                "a `pcie_flr`",
                 &[][..],
             ),
         ];

@@ -50,6 +50,9 @@ pub struct Plan {
     /// The `host_irq` bundle, if there is one (INTx has one pin).
     pub irqs: Vec<crate::terminator::IrqPlan>,
 
+    /// The `pcie_flr` bundle, if there is one (the card has one function).
+    pub flrs: Vec<crate::terminator::FlrPlan>,
+
     pub registers: RegisterMap,
 
     /// Present only with `[heartbeat]` and a target.
@@ -235,18 +238,6 @@ pub enum PlanError {
     )]
     TckRateMissing { target: String },
 
-    /// The simulator drives the DUT straight from the testbench clock. With
-    /// more domains, the testbench would have to stand in for the MMCM, and
-    /// the simulator does not carry data across `unsafe (cdc)` anyway.
-    #[error("`--target sim` runs a DUT with one clock, and this one has {clocks}")]
-    #[diagnostic(
-        code(harness::plan::sim_needs_one_clock),
-        help(
-            "The simulator does not carry data between clock domains, so a design with several would look broken where it is not. Run this design on a board instead."
-        )
-    )]
-    SimNeedsOneClock { clocks: usize },
-
     #[error("`--target sim` runs only Veryl, and the DUT instantiates SystemVerilog: {names}")]
     #[diagnostic(
         code(harness::plan::sim_sv_blackbox),
@@ -260,7 +251,7 @@ pub enum PlanError {
     #[diagnostic(
         code(harness::plan::no_terminator),
         help(
-            "The generator can terminate `reg`, `slave`, `host_poll_fifo`, `bram`, `bram_preload`, `dram`, and `host_irq`. `{backing}` is not supported yet.\n\n`check` without `--target` still tells you whether the manifest is feasible."
+            "The generator can terminate `reg`, `slave`, `host_poll_fifo`, `bram`, `bram_preload`, `dram`, `host_irq`, and `pcie_flr`. `{backing}` is not supported yet.\n\n`check` without `--target` still tells you whether the manifest is feasible."
         )
     )]
     NoTerminator { bundle: String, backing: String },
@@ -361,6 +352,7 @@ pub fn build(
     let axi_mems =
         terminator::resolve_axi_mems(&dut, &loaded.manifest, &bindings, target.as_ref())?;
     let irqs = terminator::resolve_irqs(&dut, &loaded.manifest, &bindings)?;
+    let flrs = terminator::resolve_flrs(&dut, &loaded.manifest, &bindings)?;
     terminator::check_claimed(
         &loaded.manifest,
         &bindings,
@@ -370,6 +362,7 @@ pub fn build(
         &slaves,
         &axi_mems,
         &irqs,
+        &flrs,
     )?;
 
     // The clock plan and the feasibility checks need a target.
@@ -443,6 +436,7 @@ pub fn build(
         slaves,
         axi_mems,
         irqs,
+        flrs,
         registers,
         heartbeat,
         board,
@@ -539,11 +533,6 @@ fn generatable(plan: &Plan) -> Result<(), PlanError> {
                 .join(", "),
         });
     }
-    if transport == "sim" && board.clocks.outputs.len() != 1 {
-        return Err(PlanError::SimNeedsOneClock {
-            clocks: board.clocks.outputs.len(),
-        });
-    }
     // A PCIe build keeps JTAG too, so it also needs the TCK limit.
     if transport != "sim" && crate::target::max_tck_mhz(&board.target).is_none() {
         return Err(PlanError::TckRateMissing {
@@ -567,6 +556,7 @@ fn generatable(plan: &Plan) -> Result<(), PlanError> {
                 | Backing::BramPreload
                 | Backing::Dram
                 | Backing::HostIrq
+                | Backing::PcieFlr
         ) {
             return Err(PlanError::NoTerminator {
                 bundle: binding.bundle.clone(),

@@ -14,5 +14,5 @@ license     = "MIT OR Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Its version is not Veryl's. 0.1.1 is what veryl-simulator 0.21.0 loads.
-veryl-component = "=0.1.1"
+# Its version is not Veryl's. 0.1.2 is what veryl-simulator 0.22.0 loads.
+veryl-component = "=0.1.2"

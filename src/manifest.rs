@@ -132,6 +132,8 @@ pub enum Backing {
     Slave,
     /// Interrupt.
     HostIrq,
+    /// A PCIe Function Level Reset, handed to the DUT.
+    PcieFlr,
     /// A FIFO in the FPGA that the host reads by polling.
     HostPollFifo,
     /// Output for observation only.
@@ -147,6 +149,7 @@ const BACKING_VALUES: &[&str] = &[
     "reg",
     "slave",
     "host_irq",
+    "pcie_flr",
     "host_poll_fifo",
     "observe",
 ];
@@ -165,6 +168,7 @@ impl<'de> Deserialize<'de> for Backing {
             "reg" => Ok(Backing::Reg),
             "slave" => Ok(Backing::Slave),
             "host_irq" => Ok(Backing::HostIrq),
+            "pcie_flr" => Ok(Backing::PcieFlr),
             "host_poll_fifo" => Ok(Backing::HostPollFifo),
             "observe" => Ok(Backing::Observe),
             // `host_bar` became `reg` or `slave`. Only the author knows which,
@@ -191,6 +195,7 @@ impl Backing {
             Backing::Reg => "reg",
             Backing::Slave => "slave",
             Backing::HostIrq => "host_irq",
+            Backing::PcieFlr => "pcie_flr",
             Backing::HostPollFifo => "host_poll_fifo",
             Backing::Observe => "observe",
         }
@@ -847,6 +852,12 @@ pub struct Pcie {
     /// is a fixed 4 KiB.
     #[serde(default = "default_bar_bytes", deserialize_with = "size::bar_bytes")]
     pub bar_bytes: u32,
+
+    /// PERST# from the slot also holds the DUT in reset, the same way the
+    /// host's `dut_reset` does. The harness itself is never reset by it, so
+    /// the window stays reachable over JTAG.
+    #[serde(default = "default_perst_resets_dut")]
+    pub perst_resets_dut: bool,
 }
 
 impl Default for Pcie {
@@ -856,6 +867,7 @@ impl Default for Pcie {
             device_id: default_device_id(),
             class_code: default_class_code(),
             bar_bytes: default_bar_bytes(),
+            perst_resets_dut: default_perst_resets_dut(),
         }
     }
 }
@@ -874,6 +886,10 @@ fn default_class_code() -> u32 {
 
 fn default_bar_bytes() -> u32 {
     4 * 1024
+}
+
+fn default_perst_resets_dut() -> bool {
+    true
 }
 
 /// The smallest BAR. The IP (`pcie4_uscale_plus`) accepts BAR sizes only in

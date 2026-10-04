@@ -327,8 +327,9 @@ pub fn run(
             )?);
         }
 
-        // Simulation top, only with one clock domain. With several, the test
-        // bench would have to stand in for the MMCM, which is another design.
+        // Simulation top, only with one clock domain. With several, a board
+        // harness also carries the real memory controller, which the
+        // simulator cannot run; `--target sim` makes its own.
         if clocks.outputs.len() == 1 {
             let sim = emit::format(&emit::sim_module(&plan, &prefixes), &plan.metadata)?;
             written.push(write(

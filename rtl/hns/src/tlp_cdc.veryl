@@ -72,7 +72,8 @@ pub module tlp_cdc #(
     // asserts only the first. If only one side's pointer returns to 0, the
     // counts disagree and a stale entry can come out as a TLP. std has the
     // MERGE_RESET option for this. It assumes active-low resets: std merges
-    // them as `is_rst & id_rst`.
+    // them as `is_rst & id_rst`, so with an active-high `reset_type` the FIFO
+    // never leaves reset.
     inst u_fifo: async_fifo::<$std::synchronizer_basic> #(
         TYPE       : beat_t,
         DEPTH      : DEPTH ,

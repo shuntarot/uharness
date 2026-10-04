@@ -163,6 +163,16 @@ pub fn capability(backing: Backing) -> Capability {
             needs: &[],
         },
 
+        // An FLR comes from the host as a configuration write, so only over
+        // PCIe. The DUT's answer is a level too: nothing to drop.
+        Backing::PcieFlr => Capability {
+            serves_dut_requests: false,
+            deterministic: true,
+            sink: false,
+            needs_pcie: true,
+            needs: &[],
+        },
+
         // Observe-only output. It only holds a sample, so any transport works.
         //
         // Not a `sink`: that would require a drop counter. Whether `observe`
@@ -927,6 +937,7 @@ fn why_pcie(backing: Backing) -> &'static str {
     match backing {
         Backing::HostMem => "it fetches from host memory one request at a time over PCIe",
         Backing::HostIrq => "an interrupt has to reach the host asynchronously, as INTA over PCIe",
+        Backing::PcieFlr => "a Function Level Reset is a PCIe configuration write from the host",
         _ => "it needs a PCIe path to the host",
     }
 }
@@ -950,6 +961,7 @@ fn alternatives_over(transport: &str) -> String {
         Backing::Reg,
         Backing::Slave,
         Backing::HostIrq,
+        Backing::PcieFlr,
         Backing::HostPollFifo,
         Backing::Observe,
     ];

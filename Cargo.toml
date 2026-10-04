@@ -27,11 +27,11 @@ hns-targets = {version = "0.1.0", path = "crates/targets"}
 # Pinned. The `veryl` binary on PATH must be the same version. Otherwise the
 # library sees an IR that the CLI does not produce, and the symptoms are
 # confusing. Change all five pins together.
-veryl           = "=0.21.0"
-veryl-analyzer  = "=0.21.0"
-veryl-formatter = "=0.21.0"
-veryl-metadata  = "=0.21.0"
-veryl-parser    = "=0.21.0"
+veryl           = "=0.22.0"
+veryl-analyzer  = "=0.22.0"
+veryl-formatter = "=0.22.0"
+veryl-metadata  = "=0.22.0"
+veryl-parser    = "=0.22.0"
 # Versions follow the veryl workspace, so that no crate is built twice.
 clap           = {version = "4.6", features = ["derive"]}
 miette         = {version = "7.6", features = ["fancy"]}

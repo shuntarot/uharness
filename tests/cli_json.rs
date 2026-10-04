@@ -783,7 +783,7 @@ module dut_top (
 /// instead of a misleading error about a missing `addr`.
 #[test]
 fn an_axi4_port_whose_widths_are_constants_is_named() {
-    // The package must be in its own file. In the same file, Veryl 0.21.0
+    // The package must be in its own file. In the same file, Veryl (0.21.0, 0.22.0)
     // stops with `cyclic_file_dependency` against std's `axi_if.veryl`
     // (in `veryl check` too).
     let dut = r#"
