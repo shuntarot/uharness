@@ -102,6 +102,7 @@ and `bar_bytes` all take one.
 | `dram` | the board's DRAM | works |
 | `host_mem` | host memory | not yet (needs the PCIe requester) |
 | `host_irq` | the DUT's interrupt line, sent to the host as INTA (PCIe) | works; one 1-bit output, at most one bundle |
+| `pcie_flr` | the host's Function Level Reset, handed to the DUT (PCIe) | works; one 1-bit input, optionally one 1-bit done output |
 | `observe` | | not yet |
 
 #### contract — how refined the port is
@@ -308,8 +309,16 @@ vendor_id  = 0x1234
 device_id  = 0x0001
 class_code = 0xff0000     # base / sub / interface, as `lspci -n` shows; default: no class
 bar_bytes  = 4096
+perst_resets_dut = true   # PERST# holds the DUT in reset (never the harness)
 ```
 
+- `perst_resets_dut = false` keeps the DUT running through a host reboot.
+  Either way the harness is not reset, and JTAG still reaches the window.
+- A `pcie_flr` bundle makes the card FLR-capable. Its input is high during
+  the FLR; what it resets is up to the DUT. With a done output, the input
+  stays high until the DUT raises it (and the next FLR waits for it to fall);
+  without one, the input is high for 256 cycles. A hot reset does not reach
+  the DUT.
 - `class_code` is a warning, not an error, when a host driver binds to that
   class (AHCI, NVMe, USB hosts, a PCI bridge ...): the driver would drive the
   window as that device. `hio -p check` compares it with what the card reports.
@@ -643,8 +652,9 @@ hio run bringup.hio
 - The simulation starts at the first `hio` connection, so nothing after the
   reset release is missed. It then keeps running between commands.
 - `veryl harness sim` builds a small Rust component with **cargo**; the first
-  build fetches `veryl-component` from crates.io. Plain `veryl test` cannot
-  run it: the `veryl` from verylup cannot load native components.
+  build fetches `veryl-component` from crates.io. Plain `veryl test` in the
+  directory runs it too, but leaves `sim.addr` behind after Ctrl-C, and uses
+  whatever `veryl` is on `PATH`.
 - Run inside a generated directory, `veryl harness sim` takes that one;
   elsewhere, `-o <dir>` names it (default `hns/`). A sim harness may sit
   inside a board one (`-o hns/sim`): generating the board one again leaves
@@ -652,8 +662,10 @@ hio run bringup.hio
 - It listens on a free port of `127.0.0.1` and writes the address to
   `hns/sim.addr`, where `hio` finds it. `HNS_SIM_ADDR=<ip:port>` listens
   elsewhere; `HNS_SIM_WATCH=1` prints the simulated clock rate every second.
-- `check` refuses what the simulator cannot run: a DUT with more than one
-  clock, or with a `$sv::` module. `dram`, `pcie` and DMA are board-only.
+- A DUT with several clocks runs with each clock at its `freq_mhz`, so their
+  ratio holds; the DUT reset reaches every domain.
+- `check` refuses what the simulator cannot run: a DUT with a `$sv::` module.
+  `dram`, `pcie` and DMA are board-only.
 
 ## Limits
 

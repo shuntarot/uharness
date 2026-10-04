@@ -64,6 +64,9 @@ module hns_pcie_wrap #(
     input  wire        i_rst_n,        // active low, the window's reset
     output wire        o_link_up,      // synchronised into i_clk
     input  wire        i_intx,         // the interrupt line, in i_clk; sent as INTA
+    output wire        o_perst,        // PERST# is asserted; synchronised into i_clk
+    output wire        o_flr,          // an FLR is in progress; synchronised into i_clk
+    input  wire        i_flr_ack,      // the function is reset; from a flop in i_clk
 
     // --- requester (RQ/RC), in the block's own clock ---
     //
@@ -179,6 +182,43 @@ module hns_pcie_wrap #(
         end else if (intx_sync != intx_out) begin
             intx_out  <= intx_sync;
             intx_wait <= 1'b1;
+        end
+    end
+
+    // PERST#, for the harness to hold the DUT in reset with. Two flops into
+    // i_clk; the pin itself has a false path in the XDC.
+    (* ASYNC_REG = "TRUE", shreg_extract = "no" *) reg perst_meta = 1'b0;
+    (* ASYNC_REG = "TRUE", shreg_extract = "no" *) reg perst_sync = 1'b0;
+    always @(posedge i_clk) begin
+        perst_meta <= ~i_pcie_reset_n;
+        perst_sync <= perst_meta;
+    end
+    assign o_perst = perst_sync;
+
+    // Function Level Reset. The block raises `cfg_flr_in_process` and finishes
+    // the FLR on a one-cycle `cfg_flr_done`. The answer comes from
+    // `hns::flr_ctl` in i_clk as a level; its rising edge is the pulse.
+    wire [3:0] flr_in_process;
+    (* ASYNC_REG = "TRUE", shreg_extract = "no" *) reg flr_meta = 1'b0;
+    (* ASYNC_REG = "TRUE", shreg_extract = "no" *) reg flr_sync = 1'b0;
+    always @(posedge i_clk) begin
+        flr_meta <= flr_in_process[0];
+        flr_sync <= flr_meta;
+    end
+    assign o_flr = flr_sync;
+    (* ASYNC_REG = "TRUE", shreg_extract = "no" *) reg flr_ack_meta = 1'b0;
+    (* ASYNC_REG = "TRUE", shreg_extract = "no" *) reg flr_ack_sync = 1'b0;
+    reg flr_ack_prev = 1'b0;
+    reg flr_done     = 1'b0;
+    always @(posedge pcie_user_clk) begin
+        flr_ack_meta <= i_flr_ack;
+        flr_ack_sync <= flr_ack_meta;
+        if (pcie_user_reset) begin
+            flr_ack_prev <= 1'b0;
+            flr_done     <= 1'b0;
+        end else begin
+            flr_ack_prev <= flr_ack_sync;
+            flr_done     <= flr_ack_sync & ~flr_ack_prev & flr_in_process[0];
         end
     end
 
@@ -321,7 +361,7 @@ module hns_pcie_wrap #(
         .cfg_power_state_change_interrupt(),
         .cfg_err_cor_in(1'b0),
         .cfg_err_uncor_in(1'b0),
-        .cfg_flr_in_process(), .cfg_flr_done(4'd0),
+        .cfg_flr_in_process(flr_in_process), .cfg_flr_done({3'b000, flr_done}),
         .cfg_vf_flr_in_process(), .cfg_vf_flr_done(8'd0),
         // Without this the link never trains.
         .cfg_link_training_enable(1'b1),

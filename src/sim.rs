@@ -1,9 +1,10 @@
 //! `veryl harness sim`: runs a harness made with `gen --target sim`.
 //!
-//! This is `veryl test` on that directory, run from this binary. The `veryl`
-//! that verylup installs is linked statically and cannot load the socket
-//! component (a native library), so plain `veryl test` finds no
-//! `$comp::hns_link`.
+//! This is `veryl test` on that directory, run from this binary. Plain
+//! `veryl test` runs it too. This command adds what that lacks: it finds the
+//! directory and refuses one not made for `sim`, removes `sim.addr` on Ctrl-C
+//! (the component's `on_finish` does not run then), and uses the Veryl this
+//! binary is built with, not the one on `PATH`.
 
 use std::path::{Path, PathBuf};
 

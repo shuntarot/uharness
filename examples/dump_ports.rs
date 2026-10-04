@@ -15,6 +15,7 @@
 use std::env;
 use std::path::PathBuf;
 
+use veryl::incremental::OutputIntent;
 use veryl::pipeline::{self, AnalyzeOptions};
 use veryl_analyzer::ir::Ir;
 use veryl_metadata::Metadata;
@@ -33,7 +34,7 @@ fn main() -> miette::Result<()> {
 
     let options = AnalyzeOptions {
         defines: &[],
-        emit_mode: false,
+        output_intent: OutputIntent::Never,
         incremental: false,
         fail_fast: false,
     };

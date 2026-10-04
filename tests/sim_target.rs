@@ -116,8 +116,11 @@ module dut_top (
     assert!(text.contains("$sv::core"), "{text}");
 }
 
+/// Two clocks: each gets its own `clock_gen` with a period in picoseconds,
+/// so they keep their ratio, and the DUT reset reaches both domains. Only
+/// the generated project is checked here; running it takes a cargo build.
 #[test]
-fn the_simulator_refuses_two_clocks() {
+fn the_simulator_drives_two_clocks() {
     let dut = r#"
 module dut_top (
     i_clk_a    : input  'a clock   ,
@@ -146,10 +149,17 @@ module dut_top (
 "#;
     let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk_a]\nfreq_mhz = 100\n\n[clock.i_clk_b]\nfreq_mhz = 50\n\n[bundle.csr]\ncontract = \"fixed_latency\"\nlatency = 1\nbacking = \"reg\"\nports = [\"i_csr_wdata\", \"o_csr_rdata\"]\n\n[leave_open]\nports = [\"o_b\"]\n";
     let dir = fixture(dut, manifest);
-    let out = harness(dir.path(), &["check", "--target", "sim"]);
-    assert!(!out.status.success());
-    let text = stderr(&out);
-    assert!(text.contains("sim_needs_one_clock"), "{text}");
+    let out = harness(dir.path(), &["gen", "--target", "sim"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let hns = dir.path().join("hns");
+    let tb = fs::read_to_string(hns.join("src/sim_tb.veryl")).unwrap();
+    assert!(tb.contains("period: 10000"), "{tb}");
+    assert!(tb.contains("period: 20000"), "{tb}");
+    let sim = fs::read_to_string(hns.join("src/sim.veryl")).unwrap();
+    for each in ["drst_a", "drst_b"] {
+        assert!(sim.contains(each), "{sim}");
+    }
+    common::veryl_check(&hns).unwrap();
 }
 
 #[test]

@@ -417,6 +417,9 @@ fn print_bundles(plan: &crate::plan::Plan) {
             Some(_) if bundle.backing == crate::manifest::Backing::HostIrq => {
                 "level line".to_string()
             }
+            Some(_) if bundle.backing == crate::manifest::Backing::PcieFlr => {
+                "level line".to_string()
+            }
             Some(resolved) => format!("{} (inferred)", resolved.contract),
             None => "?".to_string(),
         };
@@ -726,6 +729,9 @@ fn print_summary(plan: &plan::Plan, emit_regs: Option<&Path>) {
             Some(resolved) if resolved.declared => value += &format!(", {}", resolved.contract),
             Some(_) if bundle.backing == crate::manifest::Backing::HostIrq => {
                 value += ", level line, sent as INTA";
+            }
+            Some(_) if bundle.backing == crate::manifest::Backing::PcieFlr => {
+                value += ", level line, high during the host's FLR";
             }
             Some(resolved) => value += &format!(", {} (inferred)", resolved.contract),
             None => {}

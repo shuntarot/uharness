@@ -1,0 +1,91 @@
+/// Answers a PCIe Function Level Reset for the DUT.
+///
+/// The hard block raises `i_req` while an FLR is in progress, and does not
+/// finish it until `o_ack`. In between, the DUT sees `o_flr`. What it does
+/// with it is up to the design.
+///
+/// - `USE_DONE`: `o_flr` stays 1 until the DUT raises `i_done`. The next
+///   FLR waits until `i_done` falls again.
+/// - Without `USE_DONE`: `o_flr` is 1 for `MIN_CYCLES`. `i_done` is not used.
+///
+/// `o_ack` comes from a flip-flop: it crosses into the hard block clock.
+pub module flr_ctl #(
+    /// How long `o_flr` stays 1 without `USE_DONE`, in cycles.
+    param MIN_CYCLES: u32   = 256  ,
+    param USE_DONE  : bbool = false,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// An FLR is in progress (the hard block's `cfg_flr_in_process`).
+    i_req: input logic,
+    /// The DUT has finished its own reset. Only with `USE_DONE`.
+    i_done: input logic,
+
+    /// To the DUT.
+    o_flr: output logic,
+    /// To the hard block (`cfg_flr_done`).
+    o_ack: output logic,
+) {
+    enum state_t: logic<2> {
+        IDLE,
+        FLR,
+        ACK,
+    }
+
+    const CW: u32 = $clog2(MIN_CYCLES + 1);
+
+    var state: state_t    ;
+    var count: logic  <CW>;
+    var flr_q: logic      ;
+    var ack_q: logic      ;
+    // The request fell while acked. The hard block may raise the next one
+    // before the DUT drops `i_done`.
+    var gone: logic;
+
+    let finished: logic = if USE_DONE ? i_done : count == MIN_CYCLES;
+    let done_low: logic = if USE_DONE ? !i_done : 1;
+
+    always_ff {
+        if_reset {
+            state = state_t::IDLE;
+            count = 0;
+            flr_q = 0;
+            ack_q = 0;
+            gone  = 0;
+        } else {
+            case state {
+                state_t::IDLE: if i_req && done_low {
+                    state = state_t::FLR;
+                    count = 0;
+                    flr_q = 1;
+                }
+                state_t::FLR : if finished {
+                    state = state_t::ACK;
+                    flr_q = 0;
+                    ack_q = 1;
+                    gone  = 0;
+                } else if count != MIN_CYCLES {
+                    count += 1;
+                }
+                // Until the hard block has seen the answer and dropped the
+                // request.
+                state_t::ACK : {
+                    if !i_req {
+                        gone = 1;
+                    }
+                    if (gone || !i_req) && done_low {
+                        state = state_t::IDLE;
+                        ack_q = 0;
+                    }
+                }
+                default: state = state_t::IDLE;
+            }
+        }
+    }
+
+    always_comb {
+        o_flr = flr_q;
+        o_ack = ack_q;
+    }
+}

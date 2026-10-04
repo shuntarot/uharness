@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use miette::Diagnostic;
 use thiserror::Error;
+use veryl::incremental::OutputIntent;
 use veryl::pipeline::{self, AnalyzeOptions};
 use veryl_analyzer::ir::{Component, Ir, Module as IrModule};
 use veryl_analyzer::namespace::Namespace;
@@ -386,7 +387,8 @@ pub fn analyze(metadata: &mut Metadata) -> miette::Result<Ir> {
 
     let options = AnalyzeOptions {
         defines: &[],
-        emit_mode: false,
+        // Only the IR is read; nothing is written.
+        output_intent: OutputIntent::Never,
         // The generator needs a fresh IR each time.
         incremental: false,
         // Report every error at once, so the user can fix them all in one pass.

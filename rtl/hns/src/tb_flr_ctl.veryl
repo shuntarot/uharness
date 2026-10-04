@@ -1,0 +1,108 @@
+/// `hns::flr_ctl` without the DUT's answer: a fixed width, then the ack, held
+/// until the request falls.
+#[test(flr_ctl_holds_for_a_fixed_width)]
+module test_flr_ctl_fixed {
+    const MIN: u32 = 8;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen (
+        clk: clk,
+    );
+
+    var req: logic;
+    var flr: logic;
+    var ack: logic;
+
+    inst u_ctl: flr_ctl #(
+        MIN_CYCLES: MIN  ,
+        USE_DONE  : false,
+    ) (
+        i_clk : clk,
+        i_rst : rst,
+        i_req : req,
+        i_done: 0  ,
+        o_flr : flr,
+        o_ack : ack,
+    );
+
+    initial {
+        req = 0;
+        rst.assert(4);
+        clk.next(2);
+        $assert(!flr && !ack, "quiet out of reset");
+
+        req = 1;
+        clk.next(2);
+        $assert(flr && !ack, "the DUT did not see the FLR");
+        clk.next(MIN - 4);
+        $assert(flr && !ack, "the FLR ended before the minimum width");
+        clk.next(6);
+        $assert(!flr && ack, "no ack after the minimum width");
+
+        // The ack stays until the hard block drops the request.
+        clk.next(10);
+        $assert(ack, "the ack fell while the request was still up");
+        req = 0;
+        clk.next(2);
+        $assert(!flr && !ack, "the ack did not fall with the request");
+        $finish();
+    }
+}
+
+/// `hns::flr_ctl` with the DUT's answer: `o_flr` until `i_done`, and the next
+/// FLR only after `i_done` falls.
+#[test(flr_ctl_waits_for_the_dut)]
+module test_flr_ctl_done {
+    const MIN: u32 = 8;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen (
+        clk: clk,
+    );
+
+    var req : logic;
+    var done: logic;
+    var flr : logic;
+    var ack : logic;
+
+    inst u_ctl: flr_ctl #(
+        MIN_CYCLES: MIN ,
+        USE_DONE  : true,
+    ) (
+        i_clk : clk ,
+        i_rst : rst ,
+        i_req : req ,
+        i_done: done,
+        o_flr : flr ,
+        o_ack : ack ,
+    );
+
+    initial {
+        req  = 0;
+        done = 0;
+        rst.assert(4);
+        clk.next(2);
+
+        req = 1;
+        clk.next(2);
+        $assert(flr, "the DUT did not see the FLR");
+        clk.next(MIN * 4);
+        $assert(flr && !ack, "the FLR ended without the DUT's answer");
+        done = 1;
+        clk.next(2);
+        $assert(!flr && ack, "no ack after the DUT's answer");
+        req = 0;
+        clk.next(2);
+        $assert(ack, "the ack fell while the DUT still held done");
+
+        // The next request can come before done falls. It waits for that,
+        // and is not lost.
+        req = 1;
+        clk.next(4);
+        $assert(!flr, "a new FLR started while done was still up");
+        done = 0;
+        clk.next(3);
+        $assert(flr && !ack, "the next FLR did not start");
+        $finish();
+    }
+}
