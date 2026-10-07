@@ -23,8 +23,12 @@
 //! `resp` is the AXI response (0 OKAY, 2 SLVERR). `data` is the read value,
 //! or 0.
 //!
-//! This file is copied into the generated output as it is. Keep it to itself
-//! and `veryl-component`.
+//! `$comp::hns_dram` (`dram.rs`) is the memory of `backing = "dram"`.
+//!
+//! These files are copied into the generated output as they are. Keep them
+//! to themselves and `veryl-component`.
+
+mod dram;
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
@@ -395,7 +399,7 @@ impl HnsLink {
     }
 }
 
-veryl_component_export!("hns_link" => HnsLink);
+veryl_component_export!("hns_link" => HnsLink, "hns_dram" => dram::HnsDram);
 
 #[cfg(test)]
 mod tests {

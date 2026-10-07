@@ -98,6 +98,18 @@ pub const DUT_RESET: &str = "dut_reset";
 /// changes.
 pub const DUT_RESET_STATE: &str = "dut_reset_state";
 
+/// TLP counts on PCIe, each paired with the output of `hns::tlp_count` that
+/// drives it. Requests that reached the BAR, and completions sent back.
+pub const PCIE_TLP_COUNTERS: [(&str, &str); 7] = [
+    ("pcie_mrd", "o_mrd_gray"),
+    ("pcie_mwr", "o_mwr_gray"),
+    ("pcie_other", "o_other_gray"),
+    ("pcie_mwr_dropped", "o_mwr_dropped_gray"),
+    ("pcie_cpl_sc", "o_cpl_sc_gray"),
+    ("pcie_cpl_ur", "o_cpl_ur_gray"),
+    ("pcie_cpl_ca", "o_cpl_ca_gray"),
+];
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -965,6 +977,26 @@ pub fn build(
             "jitter",
             None,
         ));
+    }
+
+    // TLP counts, on PCIe only. They show whether a request reached the
+    // card, and what it was answered.
+    if pcie.is_some() {
+        for (name, _) in PCIE_TLP_COUNTERS {
+            registers.push(Register {
+                name: name.to_string(),
+                kind: Kind::Terminator,
+                offset,
+                words: 1,
+                width: WORD_BITS,
+                access: Access::ReadOnly,
+                bundle: None,
+                value: None,
+                self_clearing: None,
+                role: Some(name),
+            });
+            offset += WORD_BITS / 8;
+        }
     }
 
     // The header goes at the end of the window, so the user area starts at 0.
@@ -1903,6 +1935,12 @@ mod tests {
         // Not without a memory.
         let empty = names(Some(&card), &[]);
         assert!(!empty.iter().any(|n| n.starts_with("dma_")), "{empty:?}");
+
+        // The TLP counts need no memory, only PCIe.
+        for (counter, _) in PCIE_TLP_COUNTERS {
+            assert!(empty.iter().any(|n| n == counter), "{empty:?}");
+            assert!(!jtag.iter().any(|n| n == counter), "{jtag:?}");
+        }
 
         // Not behind a `bram`: it is not wide enough for the 256-bit DMA engine.
         let bram = crate::terminator::AxiMemPlan {

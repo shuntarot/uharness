@@ -99,6 +99,20 @@ module hns_pcie_wrap #(
     // so that the harness can bring it over with a plain synchroniser.
     output wire [15:0] o_rq_drops_gray,
 
+    // What the window's completer sees, in o_user_clk, for the harness to
+    // count (hns::tlp_count). The type and the status are the descriptor
+    // fields; they mean something on the first beat of a packet only.
+    // `o_cq_dropped` is one cycle per posted request the completer dropped.
+    output wire        o_cq_tvalid,
+    output wire        o_cq_tready,
+    output wire        o_cq_tlast,
+    output wire [3:0]  o_cq_type,
+    output wire        o_cc_tvalid,
+    output wire        o_cc_tready,
+    output wire        o_cc_tlast,
+    output wire [2:0]  o_cc_status,
+    output wire        o_cq_dropped,
+
     output wire [AXIL_ADDR_WIDTH-1:0] o_awaddr,
     output wire                       o_awvalid,
     input  wire                       i_awready,
@@ -390,6 +404,10 @@ module hns_pcie_wrap #(
     wire                       u_bvalid, u_bready, u_arvalid, u_arready;
     wire                       u_rvalid, u_rready;
 
+    // A posted request the completer dropped: a memory write longer than one
+    // dword, or a message. It has no completion, so this is the only trace.
+    wire cq_dropped;
+
     pcie_us_axil_master #(
         .AXIS_PCIE_DATA_WIDTH(256),
         .AXIS_PCIE_CQ_USER_WIDTH(88),
@@ -434,8 +452,19 @@ module hns_pcie_wrap #(
         .completer_id(16'd0),
         .completer_id_enable(1'b0),
         .status_error_cor(),
-        .status_error_uncor()
+        .status_error_uncor(cq_dropped)
     );
+
+    // --- what reached the window, for the harness to count ---
+    assign o_cq_tvalid  = axis_cq_tvalid;
+    assign o_cq_tready  = axis_cq_tready;
+    assign o_cq_tlast   = axis_cq_tlast;
+    assign o_cq_type    = axis_cq_tdata[78:75];
+    assign o_cc_tvalid  = axis_cc_tvalid;
+    assign o_cc_tready  = axis_cc_tready[0];
+    assign o_cc_tlast   = axis_cc_tlast;
+    assign o_cc_status  = axis_cc_tdata[45:43];
+    assign o_cq_dropped = cq_dropped;
 
     // --- across to the window's clock ---
     axil_cdc #(

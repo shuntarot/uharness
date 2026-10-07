@@ -104,7 +104,7 @@ fn transports_of(name: &str) -> Vec<String> {
 /// For every target and transport, generation passes and the output compiles.
 #[test]
 fn every_shipped_target_generates_a_harness_that_compiles() {
-    let mut maps: Vec<(String, String)> = Vec::new();
+    let mut maps: Vec<(String, String, String)> = Vec::new();
 
     for name in shipped() {
         for transport in transports_of(&name) {
@@ -201,19 +201,21 @@ fn every_shipped_target_generates_a_harness_that_compiles() {
 
             maps.push((
                 format!("{name} ({transport})"),
+                transport.clone(),
                 fs::read_to_string(dir.path().join("hns/regs.json")).unwrap(),
             ));
         }
     }
 
-    // The window does not depend on the target. The host relies on this: the
-    // same DUT gives the same registers on any board.
+    // The window does not depend on the board, only on the transport. The
+    // host relies on this: the same DUT gives the same registers on any board
+    // reached the same way. PCIe adds registers of its own (the TLP counts),
+    // so a PCIe window is compared with other PCIe windows only.
     //
-    // Two fields do depend on it and are removed before comparing. `target`
-    // records the board the bitstream was built for, so the host can omit
-    // `--target`. `pcie` says how to find the card; it exists only in a PCIe
-    // design, and in a JTAG design the host would look for a device that is
-    // not there. The window itself (registers, size, hash) must match.
+    // Two fields do depend on the board and are removed before comparing.
+    // `target` records the board the bitstream was built for, so the host can
+    // omit `--target`. `pcie` says how to find the card; it exists only in a
+    // PCIe design. The window itself (registers, size, hash) must match.
     let strip = |text: &str| {
         let mut v: serde_json::Value = serde_json::from_str(text).expect("regs.json is JSON");
         let object = v.as_object_mut().expect("an object");
@@ -221,27 +223,52 @@ fn every_shipped_target_generates_a_harness_that_compiles() {
         object.remove("pcie");
         v
     };
-    let (first_name, first_map) = &maps[0];
-    for (name, map) in &maps[1..] {
-        assert_eq!(
-            strip(first_map),
-            strip(map),
-            "the window differs between {first_name} and {name}"
-        );
+    for transport in ["jtag", "pcie"] {
+        let group: Vec<_> = maps.iter().filter(|(_, t, _)| t == transport).collect();
+        let Some((first_name, _, first_map)) = group.first() else {
+            continue;
+        };
+        for (name, _, map) in &group[1..] {
+            assert_eq!(
+                strip(first_map),
+                strip(map),
+                "the window differs between {first_name} and {name}"
+            );
+        }
+
+        // The hash matters most. The host uses it to check that its map
+        // matches the loaded bitstream, so it must not change with the board.
+        for (name, _, map) in &group {
+            let v: serde_json::Value = serde_json::from_str(map).unwrap();
+            assert_eq!(
+                v["map_hash"],
+                strip(first_map)["map_hash"],
+                "the map hash differs on {name}"
+            );
+            assert!(
+                v["target"].is_string(),
+                "{name}: regs.json must say which target it was generated for"
+            );
+        }
     }
 
-    // The hash matters most. The host uses it to check that its map matches
-    // the loaded bitstream, so it must not change with the target.
-    for (name, map) in &maps {
-        let v: serde_json::Value = serde_json::from_str(map).unwrap();
+    // The TLP counts are the only difference between the two transports here.
+    let names = |text: &str| -> Vec<String> {
+        strip(text)["registers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .filter(|n| !n.starts_with("pcie_"))
+            .collect()
+    };
+    let jtag = maps.iter().find(|(_, t, _)| t == "jtag");
+    let pcie = maps.iter().find(|(_, t, _)| t == "pcie");
+    if let (Some((jtag_name, _, jtag)), Some((pcie_name, _, pcie))) = (jtag, pcie) {
         assert_eq!(
-            v["map_hash"],
-            strip(first_map)["map_hash"],
-            "the map hash differs on {name}"
-        );
-        assert!(
-            v["target"].is_string(),
-            "{name}: regs.json must say which target it was generated for"
+            names(jtag),
+            names(pcie),
+            "{jtag_name} and {pcie_name} differ in more than the TLP counts"
         );
     }
 }

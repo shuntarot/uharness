@@ -216,15 +216,40 @@ fn sim_inside_a_harness_takes_that_harness() {
     assert!(text.contains("digilent/arty"), "{text}");
 }
 
+/// `veryl harness sim`, killed when dropped. A test that fails before it
+/// finishes the simulation would otherwise leave it running, holding the
+/// test's output open.
+struct Sim(Child);
+
+impl std::ops::Deref for Sim {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Sim {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Sim {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Starts `veryl harness sim` and waits for its address. The first run
 /// builds the component with cargo, so the wait is long.
-fn start(dir: &Path) -> (Child, Link) {
+fn start(dir: &Path) -> (Sim, Link) {
     let addr = dir.join("hns").join("sim.addr");
-    let child = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+    let child = Sim(Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
         .arg("sim")
         .current_dir(dir)
         .spawn()
-        .unwrap();
+        .unwrap());
     let deadline = Instant::now() + Duration::from_secs(600);
     while !addr.is_file() {
         assert!(Instant::now() < deadline, "no sim.addr after 600 s");
@@ -296,4 +321,131 @@ fn the_simulator_serves_the_window_over_tcp() {
     assert!(!child.wait().unwrap().success());
     assert!(!hns.join("sim.addr").exists());
     assert!(matches!(Link::open(&hns), Err(Error::NotRunning { .. })));
+}
+
+/// A DUT whose AXI4 master stays idle, so the host has the memory to itself.
+const DRAM_DUT: &str = r#"
+module dut_top (
+    i_clk: input clock,
+    i_rst: input reset,
+    axi  : modport $std::axi4_if::<$std::axi4_pkg::<28, 4, 4, 1, 1, 1, 1, 1>>::master,
+) {
+    let _unused: logic = i_clk ^ i_rst;
+    always_comb {
+        axi.awvalid  = 0;
+        axi.awaddr   = 0;
+        axi.awsize   = 0;
+        axi.awburst  = 0;
+        axi.awcache  = 0;
+        axi.awprot   = 0;
+        axi.awid     = 0;
+        axi.awlen    = 0;
+        axi.awlock   = 0;
+        axi.awqos    = 0;
+        axi.awregion = 0;
+        axi.awuser   = 0;
+        axi.wvalid   = 0;
+        axi.wlast    = 0;
+        axi.wdata    = 0;
+        axi.wstrb    = 0;
+        axi.wuser    = 0;
+        axi.bready   = 0;
+        axi.arvalid  = 0;
+        axi.araddr   = 0;
+        axi.arsize   = 0;
+        axi.arburst  = 0;
+        axi.arcache  = 0;
+        axi.arprot   = 0;
+        axi.arid     = 0;
+        axi.arlen    = 0;
+        axi.arlock   = 0;
+        axi.arqos    = 0;
+        axi.arregion = 0;
+        axi.aruser   = 0;
+        axi.rready   = 0;
+    }
+}
+"#;
+
+const DRAM_HARNESS_TOML: &str = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 100\n\n[bundle.mem]\nbacking = \"dram\"\naperture = \"1M\"\nports = [\"axi\"]\n";
+
+/// `dram` in the simulator is `$comp::hns_dram`, a sparse memory in the
+/// testbench, not the 4096-entry stand-in a board's `hns_sim` carries. It is
+/// as large as the sim target says (256 MB) and the far end is reachable.
+#[test]
+fn the_simulator_serves_dram_from_a_sparse_memory() {
+    let dir = fixture(DRAM_DUT, DRAM_HARNESS_TOML);
+    let out = harness(dir.path(), &["gen", "--target", "sim"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let hns = dir.path().join("hns");
+    let sim = fs::read_to_string(hns.join("src/sim.veryl")).unwrap();
+    assert!(!sim.contains("hns::axi_mem"), "{sim}");
+    assert!(sim.contains("saxi_mem"), "{sim}");
+    let tb = fs::read_to_string(hns.join("src/sim_tb.veryl")).unwrap();
+    assert!(tb.contains("$comp::hns_dram"), "{tb}");
+    assert!(hns.join("link/src/dram.rs").is_file());
+
+    let regs: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(hns.join("regs.json")).unwrap()).unwrap();
+    let region = &regs["regions"][0];
+    assert_eq!(region["total_bytes"], 256 << 20);
+    let window = region["size_bytes"].as_u64().unwrap() as u32;
+    let base_reg = regs["registers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "mem_base_jtag")
+        .expect("no mem_base_jtag")["offset"]
+        .as_u64()
+        .unwrap() as u32;
+    let last_page = (256 << 20) / window - 1;
+
+    let (mut child, mut link) = start(dir.path());
+    // The first word, and the last word of the last page.
+    let mut batch = hns_host::Batch::new();
+    batch.write(base_reg, 0);
+    batch.write(0, 0x1111_1111);
+    batch.write(base_reg, last_page);
+    batch.write(window - 4, 0x2222_2222);
+    let top = batch.read(window - 4);
+    let bottom_seen_from_top = batch.read(0);
+    batch.write(base_reg, 0);
+    let bottom = batch.read(0);
+    let results = link.run(&batch).unwrap();
+    assert_eq!(results[top], 0x2222_2222);
+    // Memory never written reads as 0, and the top did not land on the
+    // bottom.
+    assert_eq!(results[bottom_seen_from_top], 0);
+    assert_eq!(results[bottom], 0x1111_1111);
+
+    link.finish().unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+/// The size is the sim target's, so a target patch changes it. 4 GB is the
+/// first size whose byte count does not fit in 32 bits.
+#[test]
+fn a_target_patch_sizes_the_simulated_dram() {
+    let dir = fixture(DRAM_DUT, DRAM_HARNESS_TOML);
+    let patch = dir.path().join("sim-4g.toml");
+    fs::write(&patch, "[provides.dram]\naxi_addr_bits = 32\n").unwrap();
+    let out = harness(
+        dir.path(),
+        &[
+            "gen",
+            "--target",
+            "sim",
+            "--target-patch",
+            patch.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let hns = dir.path().join("hns");
+    let regs: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(hns.join("regs.json")).unwrap()).unwrap();
+    assert_eq!(regs["regions"][0]["total_bytes"], 4u64 << 30);
+    // The DUT's 28-bit address is widened to the memory's 32.
+    let sim = fs::read_to_string(hns.join("src/sim.veryl")).unwrap();
+    assert!(sim.contains("hns::axi_aw"), "{sim}");
+    common::veryl_check(&hns).unwrap();
 }
