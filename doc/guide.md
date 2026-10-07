@@ -519,6 +519,21 @@ terminator that would not. Anything but 0 means a value read then was 0 rather
 than data — with `dram`, read `<bundle>_calib` first. Clear it with
 `hio write harness_timeout 1`; writing 0 does not clear it.
 
+A PCIe design also counts the TLPs that reach its BAR, and the completions it
+sends back. Read them with `hio read`, before and after:
+
+| Register | Counts |
+|---|---|
+| `pcie_mrd`, `pcie_mwr`, `pcie_other` | memory reads, memory writes, other requests |
+| `pcie_mwr_dropped` | writes dropped without a trace (longer than one dword) |
+| `pcie_cpl_sc`, `pcie_cpl_ur`, `pcie_cpl_ca` | completions sent, by status |
+
+The BAR takes one dword per request. A longer read is answered with Completer
+Abort, and a longer write is dropped. The counts saturate and survive a link
+reset. A request the PCIe block refuses itself (no BAR hit, memory decoding
+off) never reaches them; `lspci -vvv` shows that one as `UnsupReq+` in the
+card's `DevSta`. Read them over JTAG: a read over PCIe counts itself.
+
 ### Resetting the DUT
 
 ```bash
@@ -664,8 +679,14 @@ hio run bringup.hio
   elsewhere; `HNS_SIM_WATCH=1` prints the simulated clock rate every second.
 - A DUT with several clocks runs with each clock at its `freq_mhz`, so their
   ratio holds; the DUT reset reaches every domain.
+- `dram` is a 256 MB memory that holds only the pages written; unwritten
+  memory reads as 0. Without `depth`, the region is all 256 MB. It answers at
+  once and never needs calibration, so it does not show the timing of a real
+  controller.
+  Another size is a target patch: `[provides.dram]` with `axi_addr_bits = 32`
+  for 4 GB, passed as `--target sim --target-patch <file>`.
 - `check` refuses what the simulator cannot run: a DUT with a `$sv::` module.
-  `dram`, `pcie` and DMA are board-only.
+  `pcie` and DMA are board-only.
 
 ## Limits
 

@@ -552,120 +552,125 @@ pub fn check(
     // cannot convert is refused.
     for plan in axi_mems.iter().filter(|p| p.backing == Backing::Dram) {
         let dram = hns_targets::dram(target).unwrap_or_default();
-        // An incomplete description is refused. Filling a missing key with a
-        // default would let `check` and `gen` pass and only synthesis fail. A
-        // missing key means the board's controller was not measured yet.
-        // `sys_clk_mhz` is not needed when the clock comes from a board pin;
-        // the frequency is then in `[clocks.<name>]`.
-        let from_board = dram.sys_clk.is_some();
-        let mut wanted = vec![
-            ("axi_data_bits", dram.axi_data_bits.is_some()),
-            ("axi_addr_bits", dram.axi_addr_bits.is_some()),
-            ("axi_id_bits", dram.axi_id_bits.is_some()),
-            ("ui_clk_mhz", dram.ui_clk_mhz.is_some()),
-            ("width", dram.width.is_some()),
-            ("row_bits", dram.row_bits.is_some()),
-            ("bank_bits", dram.bank_bits.is_some()),
-        ];
-        if !from_board {
-            wanted.push(("sys_clk_mhz", dram.sys_clk_mhz.is_some()));
-        }
-        // DDR4 also needs the bank group width: its pin list differs from
-        // DDR3 (`emit::dram_pins`). Without `kind`, the pins cannot be chosen.
-        if dram
-            .kind
-            .as_deref()
-            .is_some_and(|kind| kind.starts_with("ddr4"))
-        {
-            wanted.push(("bank_group_bits", dram.bank_group_bits.is_some()));
-        }
-        let mut missing: Vec<&str> = wanted
-            .into_iter()
-            .filter(|(_, present)| !present)
-            .map(|(key, _)| key)
-            .collect();
-        if dram.kind.is_none() {
-            missing.insert(0, "kind");
-        }
-        // A 7-series MIG takes its reference clock from the harness MMCM too.
-        if !dram.is_ddr4_ip() && !from_board && dram.ref_clk_mhz.is_none() {
-            missing.push("ref_clk_mhz");
-        }
-        // The reset polarity differs between controllers; it is not guessed.
-        if !matches!(dram.sys_rst_active.as_deref(), Some("low" | "high")) {
-            missing.push("sys_rst_active (\"low\" or \"high\")");
-        }
-        if !missing.is_empty() {
-            return Err(FeasibilityError::DramNotDescribed {
-                bundle: plan.bundle.clone(),
-                target: target.name.clone(),
-                missing: missing.join(", "),
-            });
-        }
-        // Generation also needs a recipe for the IP, in one of two forms: a
-        // `mig.prj` (7-series), or the controller settings (UltraScale+ DDR4
-        // has no prj).
-        let prj = crate::emit::mig_prj_name(target);
-        if let Some(name) = prj
-            && crate::target::read_beside(target, name).is_none()
-        {
-            return Err(FeasibilityError::MigPrjMissing {
-                target: target.name.clone(),
-                name: name.to_string(),
-                looked: target.source.beside(name),
-            });
-        }
-        let has_prj = prj.is_some();
-        // The settings are either a board-file interface, or the part and
-        // both clock periods.
-        let has_settings = dram.board_interface.is_some()
-            || (dram.part.is_some() && dram.mem_clk_ps.is_some() && dram.sys_clk_ps.is_some());
-        if !has_prj && !has_settings {
-            return Err(FeasibilityError::DramHasNoIpRecipe {
-                bundle: plan.bundle.clone(),
-                target: target.name.clone(),
-            });
-        }
-
-        // A narrower data width is fine: the harness inserts `hns::axi_dw`. It
-        // takes 32 / 64 / 128, by a power-of-two factor of the controller width.
-        let bits = plan.data_bytes * 8;
-        if let Some(want_bits) = dram.axi_data_bits {
-            let (has, want) = (bits, want_bits);
-            let usable = matches!(has, 32 | 64 | 128)
-                && has <= want
-                && want.is_multiple_of(has)
-                && (want / has).is_power_of_two();
-            if !usable {
-                return Err(FeasibilityError::ControllerWidth {
-                    bundle: plan.bundle.clone(),
-                    what: "data",
-                    has,
-                    want,
-                    target: target.name.clone(),
-                });
+        // The simulator's memory is a Rust component (`$comp::hns_dram`). It
+        // has no IP to describe and takes any data width; only its reach
+        // (`axi_addr_bits`) applies, below.
+        if !target.is_sim() {
+            // An incomplete description is refused. Filling a missing key with a
+            // default would let `check` and `gen` pass and only synthesis fail. A
+            // missing key means the board's controller was not measured yet.
+            // `sys_clk_mhz` is not needed when the clock comes from a board pin;
+            // the frequency is then in `[clocks.<name>]`.
+            let from_board = dram.sys_clk.is_some();
+            let mut wanted = vec![
+                ("axi_data_bits", dram.axi_data_bits.is_some()),
+                ("axi_addr_bits", dram.axi_addr_bits.is_some()),
+                ("axi_id_bits", dram.axi_id_bits.is_some()),
+                ("ui_clk_mhz", dram.ui_clk_mhz.is_some()),
+                ("width", dram.width.is_some()),
+                ("row_bits", dram.row_bits.is_some()),
+                ("bank_bits", dram.bank_bits.is_some()),
+            ];
+            if !from_board {
+                wanted.push(("sys_clk_mhz", dram.sys_clk_mhz.is_some()));
             }
-            // The DMA engine master is fixed at 256 bits and cannot drive a
-            // narrower controller. Refuse here, so no registers are made for
-            // an engine that cannot be built.
-            if transport == "pcie" && want < 256 {
-                return Err(FeasibilityError::RequesterNeedsWideMemory {
-                    target: target.name.clone(),
-                    has: want,
-                });
-            }
-            // Equal widths insert no converter, so the id goes through as is.
-            if has == want
-                && let Some(want_id) = dram.axi_id_bits
-                && want_id != plan.id_width
+            // DDR4 also needs the bank group width: its pin list differs from
+            // DDR3 (`emit::dram_pins`). Without `kind`, the pins cannot be chosen.
+            if dram
+                .kind
+                .as_deref()
+                .is_some_and(|kind| kind.starts_with("ddr4"))
             {
-                return Err(FeasibilityError::ControllerWidth {
+                wanted.push(("bank_group_bits", dram.bank_group_bits.is_some()));
+            }
+            let mut missing: Vec<&str> = wanted
+                .into_iter()
+                .filter(|(_, present)| !present)
+                .map(|(key, _)| key)
+                .collect();
+            if dram.kind.is_none() {
+                missing.insert(0, "kind");
+            }
+            // A 7-series MIG takes its reference clock from the harness MMCM too.
+            if !dram.is_ddr4_ip() && !from_board && dram.ref_clk_mhz.is_none() {
+                missing.push("ref_clk_mhz");
+            }
+            // The reset polarity differs between controllers; it is not guessed.
+            if !matches!(dram.sys_rst_active.as_deref(), Some("low" | "high")) {
+                missing.push("sys_rst_active (\"low\" or \"high\")");
+            }
+            if !missing.is_empty() {
+                return Err(FeasibilityError::DramNotDescribed {
                     bundle: plan.bundle.clone(),
-                    what: "id",
-                    has: plan.id_width,
-                    want: want_id,
+                    target: target.name.clone(),
+                    missing: missing.join(", "),
+                });
+            }
+            // Generation also needs a recipe for the IP, in one of two forms: a
+            // `mig.prj` (7-series), or the controller settings (UltraScale+ DDR4
+            // has no prj).
+            let prj = crate::emit::mig_prj_name(target);
+            if let Some(name) = prj
+                && crate::target::read_beside(target, name).is_none()
+            {
+                return Err(FeasibilityError::MigPrjMissing {
+                    target: target.name.clone(),
+                    name: name.to_string(),
+                    looked: target.source.beside(name),
+                });
+            }
+            let has_prj = prj.is_some();
+            // The settings are either a board-file interface, or the part and
+            // both clock periods.
+            let has_settings = dram.board_interface.is_some()
+                || (dram.part.is_some() && dram.mem_clk_ps.is_some() && dram.sys_clk_ps.is_some());
+            if !has_prj && !has_settings {
+                return Err(FeasibilityError::DramHasNoIpRecipe {
+                    bundle: plan.bundle.clone(),
                     target: target.name.clone(),
                 });
+            }
+
+            // A narrower data width is fine: the harness inserts `hns::axi_dw`. It
+            // takes 32 / 64 / 128, by a power-of-two factor of the controller width.
+            let bits = plan.data_bytes * 8;
+            if let Some(want_bits) = dram.axi_data_bits {
+                let (has, want) = (bits, want_bits);
+                let usable = matches!(has, 32 | 64 | 128)
+                    && has <= want
+                    && want.is_multiple_of(has)
+                    && (want / has).is_power_of_two();
+                if !usable {
+                    return Err(FeasibilityError::ControllerWidth {
+                        bundle: plan.bundle.clone(),
+                        what: "data",
+                        has,
+                        want,
+                        target: target.name.clone(),
+                    });
+                }
+                // The DMA engine master is fixed at 256 bits and cannot drive a
+                // narrower controller. Refuse here, so no registers are made for
+                // an engine that cannot be built.
+                if transport == "pcie" && want < 256 {
+                    return Err(FeasibilityError::RequesterNeedsWideMemory {
+                        target: target.name.clone(),
+                        has: want,
+                    });
+                }
+                // Equal widths insert no converter, so the id goes through as is.
+                if has == want
+                    && let Some(want_id) = dram.axi_id_bits
+                    && want_id != plan.id_width
+                {
+                    return Err(FeasibilityError::ControllerWidth {
+                        bundle: plan.bundle.clone(),
+                        what: "id",
+                        has: plan.id_width,
+                        want: want_id,
+                        target: target.name.clone(),
+                    });
+                }
             }
         }
         // A narrower address only reaches less. A wider one is refused:

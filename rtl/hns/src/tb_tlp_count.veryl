@@ -1,0 +1,153 @@
+/// `hns::tlp_count` counts each packet once, on its first beat, by the
+/// descriptor's type or status; it keeps the counts through a reset, and
+/// saturates. The counts are 4 bits wide here, so saturation is reached.
+#[test(tlp_count_counts_each_packet_once)]
+module test_tlp_count {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen (
+        clk: clk,
+    );
+
+    var cq_tvalid: logic   ;
+    var cq_tready: logic   ;
+    var cq_tlast : logic   ;
+    var cq_type  : logic<4>;
+    var cc_tvalid: logic   ;
+    var cc_tready: logic   ;
+    var cc_tlast : logic   ;
+    var cc_status: logic<3>;
+    var dropped  : logic   ;
+
+    var mrd_g        : logic<4>;
+    var mwr_g        : logic<4>;
+    var other_g      : logic<4>;
+    var mwr_dropped_g: logic<4>;
+    var cpl_sc_g     : logic<4>;
+    var cpl_ur_g     : logic<4>;
+    var cpl_ca_g     : logic<4>;
+
+    inst u_count: tlp_count #(
+        W: 4,
+    ) (
+        i_clk             : clk          ,
+        i_rst             : rst          ,
+        i_cq_tvalid       : cq_tvalid    ,
+        i_cq_tready       : cq_tready    ,
+        i_cq_tlast        : cq_tlast     ,
+        i_cq_type         : cq_type      ,
+        i_cc_tvalid       : cc_tvalid    ,
+        i_cc_tready       : cc_tready    ,
+        i_cc_tlast        : cc_tlast     ,
+        i_cc_status       : cc_status    ,
+        i_cq_dropped      : dropped      ,
+        o_mrd_gray        : mrd_g        ,
+        o_mwr_gray        : mwr_g        ,
+        o_other_gray      : other_g      ,
+        o_mwr_dropped_gray: mwr_dropped_g,
+        o_cpl_sc_gray     : cpl_sc_g     ,
+        o_cpl_ur_gray     : cpl_ur_g     ,
+        o_cpl_ca_gray     : cpl_ca_g     ,
+    );
+
+    /// Gray code of a small count, to compare with the outputs.
+    function gray (
+        n: input logic<4>,
+    ) -> logic<4> {
+        return n ^ (n >> 1);
+    }
+
+    initial {
+        cq_tvalid = 0;
+        cq_tready = 1;
+        cq_tlast  = 0;
+        cq_type   = 0;
+        cc_tvalid = 0;
+        cc_tready = 1;
+        cc_tlast  = 0;
+        cc_status = 0;
+        dropped   = 0;
+        rst.assert(4);
+        clk.next(2);
+        $assert(mrd_g == 0 && cpl_sc_g == 0, "counts start at 0");
+
+        // A one-beat read, then a three-beat read. The later beats carry
+        // payload, which must not be read as a type.
+        cq_tvalid = 1;
+        cq_tlast  = 1;
+        cq_type   = 4'b0000;
+        clk.next(1);
+        cq_tlast = 0;
+        clk.next(1);
+        cq_type = 4'b0001;
+        clk.next(1);
+        cq_tlast = 1;
+        clk.next(1);
+        cq_tvalid = 0;
+        clk.next(2);
+        $assert(mrd_g == gray(2), "two reads, each once");
+        $assert(mwr_g == 0, "a payload beat was taken for a write");
+
+        // A beat held by `tready` counts once.
+        cq_tvalid = 1;
+        cq_tready = 0;
+        cq_tlast  = 1;
+        cq_type   = 4'b0001;
+        clk.next(3);
+        cq_tready = 1;
+        clk.next(1);
+        cq_tvalid = 0;
+        clk.next(2);
+        $assert(mwr_g == gray(1), "a stalled write counted more than once");
+
+        // An I/O read and a message are "other".
+        cq_tvalid = 1;
+        cq_type   = 4'b0010;
+        clk.next(1);
+        cq_type = 4'b1100;
+        clk.next(1);
+        cq_tvalid = 0;
+        clk.next(2);
+        $assert(other_g == gray(2), "other requests");
+
+        // Completions by status. CRS is not counted.
+        cc_tvalid = 1;
+        cc_tlast  = 0;
+        cc_status = 3'b000;
+        clk.next(1);
+        cc_tlast  = 1;
+        cc_status = 3'b001;
+        clk.next(1);
+        cc_status = 3'b001;
+        clk.next(1);
+        cc_status = 3'b100;
+        clk.next(1);
+        cc_status = 3'b010;
+        clk.next(1);
+        cc_tvalid = 0;
+        clk.next(2);
+        $assert(cpl_sc_g == gray(1), "successful completions");
+        $assert(cpl_ur_g == gray(1), "unsupported request completions");
+        $assert(cpl_ca_g == gray(1), "completer abort completions");
+
+        dropped = 1;
+        clk.next(2);
+        dropped = 0;
+        clk.next(2);
+        $assert(mwr_dropped_g == gray(2), "dropped writes");
+
+        // A reset keeps the counts.
+        rst.assert(4);
+        clk.next(2);
+        $assert(mrd_g == gray(2), "a reset cleared a count");
+
+        // Saturation: 20 more reads stop at 15.
+        cq_tvalid = 1;
+        cq_tlast  = 1;
+        cq_type   = 4'b0000;
+        clk.next(20);
+        cq_tvalid = 0;
+        clk.next(2);
+        $assert(mrd_g == gray(15), "the count did not saturate");
+        $finish();
+    }
+}

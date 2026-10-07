@@ -1943,7 +1943,12 @@ module dut_top (
     assert!(names.iter().any(|n| n == "dma_rq_drops"), "{names:?}");
     assert!(names.iter().any(|n| n == "dma_rc_cor"), "{names:?}");
     assert!(names.iter().any(|n| n == "dma_rc_uncor"), "{names:?}");
-    assert!(top.contains("o_rq_drops_gray: pcie_rq_drops_gray"), "{top}");
+    assert!(
+        top.split_whitespace()
+            .collect::<String>()
+            .contains("o_rq_drops_gray:pcie_rq_drops_gray"),
+        "{top}"
+    );
     assert!(
         top.contains("inst u_rqdrop_sync: $std::synchronizer_basic"),
         "{top}"
@@ -2722,6 +2727,103 @@ fn perst_resets_the_dut_unless_the_manifest_says_not() {
         assert!(top.contains("i_hold : t_dut_reset,"), "{top}");
         assert!(!top.contains("pcie_perst"), "{top}");
     }
+}
+
+/// On PCIe the window counts the TLPs that reach it and the completions it
+/// sends, and the host reads the counts like any register. `hns_sim` has no
+/// PCIe, so its counts read 0.
+#[test]
+fn the_pcie_window_counts_its_tlps() {
+    const OPEN: &str = "[leave_open]\nports = [\"o_irq\", \"o_irqs\"]\n";
+    let flat = |text: &str| text.split_whitespace().collect::<String>();
+    for target in ["xilinx/vcu118", "xilinx/kcu105:dr"] {
+        let dir = irq_fixture(OPEN);
+        let out = gen_pcie(&dir, target);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{target}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let hns = dir.path().join("hns");
+        let regs: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(hns.join("regs.json")).unwrap()).unwrap();
+        let top = flat(&fs::read_to_string(hns.join("src/top.veryl")).unwrap());
+        let sim = flat(&fs::read_to_string(hns.join("src/sim.veryl")).unwrap());
+        for (name, port) in [
+            ("pcie_mrd", "o_mrd_gray"),
+            ("pcie_mwr", "o_mwr_gray"),
+            ("pcie_other", "o_other_gray"),
+            ("pcie_mwr_dropped", "o_mwr_dropped_gray"),
+            ("pcie_cpl_sc", "o_cpl_sc_gray"),
+            ("pcie_cpl_ur", "o_cpl_ur_gray"),
+            ("pcie_cpl_ca", "o_cpl_ca_gray"),
+        ] {
+            let reg = regs["registers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == name)
+                .unwrap_or_else(|| panic!("{target}: no {name}\n{regs}"));
+            assert_eq!(reg["access"], "ro", "{target}: {name}");
+            assert_eq!(reg["width"], 32, "{target}: {name}");
+            // Counted by `hns::tlp_count`, then to the window clock.
+            assert!(
+                top.contains(&format!("{port}:tlp_{name}_gray,")),
+                "{target}: {top}"
+            );
+            assert!(
+                top.contains(&format!("i_d:tlp_{name}_gray,o_d:tlp_{name}_sync,")),
+                "{target}: {top}"
+            );
+            assert!(
+                top.contains(&format!("assignt_{name}=tlp_{name};")),
+                "{target}: {top}"
+            );
+            assert!(
+                sim.contains(&format!("assignt_{name}=0;")),
+                "{target}: {sim}"
+            );
+        }
+        assert!(
+            top.contains("instu_tlp_count:hns::tlp_count("),
+            "{target}: {top}"
+        );
+        assert!(top.contains("o_cq_type:pcie_cq_type,"), "{target}: {top}");
+        assert!(top.contains("i_cq_type:pcie_cq_type,"), "{target}: {top}");
+        // Each crossing into the window clock is bounded, not cut.
+        let xdc = fs::read_to_string(hns.join("syn/harness.xdc")).unwrap();
+        for sync in ["u_tlp_mrd_sync", "u_tlp_cpl_ca_sync"] {
+            assert!(
+                xdc.contains(&format!("*{sync}/*rg_reg*")),
+                "{target}: {xdc}"
+            );
+        }
+        let md = fs::read_to_string(hns.join("regs.md")).unwrap();
+        assert!(
+            md.contains("a read longer than one dword gets one"),
+            "{target}: {md}"
+        );
+        common::veryl_check(&hns).unwrap();
+    }
+
+    // Not on JTAG: there is no PCIe block to count at.
+    let dir = irq_fixture(OPEN);
+    let out = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+        .args(["gen", "--target", "xilinx/vcu118"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let regs = fs::read_to_string(dir.path().join("hns/regs.json")).unwrap();
+    assert!(!regs.contains("pcie_mrd"), "{regs}");
+    let top = fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap();
+    assert!(!top.contains("tlp_count"), "{top}");
 }
 
 const FLR_DUT: &str = r#"

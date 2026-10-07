@@ -831,6 +831,25 @@ const DMA_BUS_BYTES: u32 = 32;
 /// The domain of the hard block's user clock. It is not the harness clock.
 const PCIE_DOMAIN: &str = "pcie";
 
+/// What the PCIe wrapper shows of the completer streams, for
+/// `hns::tlp_count`: `o_<name>` on the wrapper, `i_<name>` on the counter.
+const TLP_TAP: [(&str, usize); 9] = [
+    ("cq_tvalid", 1),
+    ("cq_tready", 1),
+    ("cq_tlast", 1),
+    ("cq_type", 4),
+    ("cc_tvalid", 1),
+    ("cc_tready", 1),
+    ("cc_tlast", 1),
+    ("cc_status", 3),
+    ("cq_dropped", 1),
+];
+
+/// The synchronizer that brings one TLP count to the window clock.
+fn tlp_sync_instance(name: &str) -> String {
+    format!("u_tlp_{}_sync", name.trim_start_matches("pcie_"))
+}
+
 /// Requester stream signals and widths (256-bit setup). They match
 /// `i_rq_*` / `o_rq_tready` of `hns_pcie_wrap` one to one.
 const RQ_STREAM: [(&str, usize); 6] = [
@@ -1265,6 +1284,22 @@ const AXI_SIGNALS: [(&str, usize, bool); 17] = [
 /// million words) as an array would not fit in the simulator.
 const SIM_DRAM_ENTRIES: u32 = 4096;
 
+/// The `dram` memories that `--target sim` serves from the testbench.
+///
+/// A Veryl array cannot hold a whole chip, so `$comp::hns_dram` (a sparse
+/// memory in Rust) serves them. A component lives only in a test module, so
+/// `hns_sim` takes the bus as a port (`saxi_<bundle>`), and the testbench
+/// connects the component to it.
+fn sim_drams(plan: &Plan) -> Vec<&crate::terminator::AxiMemPlan> {
+    if !plan.target().is_some_and(|target| target.is_sim()) {
+        return Vec::new();
+    }
+    plan.axi_mems
+        .iter()
+        .filter(|m| m.backing == crate::manifest::Backing::Dram)
+        .collect()
+}
+
 /// `hns/src/hns_sim.veryl`: the top level for simulation.
 ///
 /// It is `hns_top` without the transport and the clock generation. The MMCM
@@ -1310,6 +1345,13 @@ pub fn sim_module(plan: &Plan, prefixes: &DirectionPrefixes) -> String {
         out.push_str(&format!(
             "    {}_{signal}: {dir} {tag}logic<{width}>,\n",
             if from_slave { "o" } else { "i" }
+        ));
+    }
+    for axi_mem in sim_drams(plan) {
+        out.push_str(&format!(
+            "    saxi_{}: modport {tag}$std::axi4_if::<{}>::master,\n",
+            axi_mem.bundle,
+            host_pkg(plan, axi_mem).0
         ));
     }
     // The heartbeat is visible in simulation too, so the liveness circuit
@@ -1436,6 +1478,12 @@ const SIM_LINK: &str = include_str!("../crates/sim-link/src/lib.rs");
 /// The export name of the component, as `$comp::<name>`.
 const SIM_LINK_NAME: &str = "hns_link";
 
+/// The export name of the sparse memory behind `dram`.
+const SIM_DRAM_NAME: &str = "hns_dram";
+
+/// The source of `$comp::hns_dram`, a module of the same package.
+const SIM_DRAM: &str = include_str!("../crates/sim-link/src/dram.rs");
+
 /// The directory of the component package, under the output.
 pub const SIM_LINK_DIR: &str = "link";
 
@@ -1480,6 +1528,14 @@ pub fn sim_testbench(plan: &Plan) -> String {
     if let Some(tx) = heartbeat {
         out.push_str(&format!("    var {tx}: logic;\n"));
     }
+    let drams = sim_drams(plan);
+    for axi_mem in &drams {
+        out.push_str(&format!(
+            "    inst dram_{}: $std::axi4_if::<{}>;\n",
+            axi_mem.bundle,
+            host_pkg(plan, axi_mem).0
+        ));
+    }
     out.push_str("\n    inst u_sim: sim (\n");
     match clocks {
         None => out.push_str("        i_clk: clk,\n        i_rst: rst,\n"),
@@ -1500,6 +1556,10 @@ pub fn sim_testbench(plan: &Plan) -> String {
     if let Some(tx) = heartbeat {
         out.push_str(&format!("        o_{tx}: {tx},\n"));
     }
+    for axi_mem in &drams {
+        let bundle = &axi_mem.bundle;
+        out.push_str(&format!("        saxi_{bundle}: dram_{bundle},\n"));
+    }
     out.push_str("    );\n\n");
     // The component's ports are matched by name, so `clk` is named when the
     // window clock is not called that.
@@ -1515,6 +1575,13 @@ pub fn sim_testbench(plan: &Plan) -> String {
         out.push_str(&format!("        {signal},\n"));
     }
     out.push_str("    );\n\n");
+    // The memory of each `dram`, on the window clock as the stand-in is.
+    for axi_mem in &drams {
+        let bundle = &axi_mem.bundle;
+        out.push_str(&format!(
+            "    inst u_dram_{bundle}: $comp::{SIM_DRAM_NAME} (\n        {link_clk},\n        axi: dram_{bundle}.slave,\n    );\n\n"
+        ));
+    }
     match clocks {
         None => out.push_str(
             "    initial {\n        rst.assert();\n        clk.next(1000000000000);\n        $finish();\n    }\n",
@@ -1570,8 +1637,17 @@ pub fn sim_link_manifest() -> String {
 /// `link/src/lib.rs`: the component source, behind the marker so that `gen`
 /// may rewrite and remove it.
 pub fn sim_link_source() -> String {
+    copied_source(SIM_LINK)
+}
+
+/// `link/src/dram.rs`: the module of `$comp::hns_dram`, as `sim_link_source`.
+pub fn sim_dram_source() -> String {
+    copied_source(SIM_DRAM)
+}
+
+fn copied_source(source: &str) -> String {
     format!(
-        "// {MARKER}\n//\n// Copied by veryl-harness. DO NOT EDIT -- `veryl harness gen` rewrites this file.\n\n{SIM_LINK}"
+        "// {MARKER}\n//\n// Copied by veryl-harness. DO NOT EDIT -- `veryl harness gen` rewrites this file.\n\n{source}"
     )
 }
 
@@ -1933,9 +2009,12 @@ fn core_body(
         out.push_str(&format!(
             "    inst haxi_{bundle}: {domain}$std::axi4_if::<{hpkg}>;\n"
         ));
-        out.push_str(&format!(
-            "    inst saxi_{bundle}: {domain}$std::axi4_if::<{hpkg}>;\n"
-        ));
+        // A port of `hns_sim` for a `dram` served by the testbench.
+        if !sim_drams(plan).iter().any(|m| m.bundle == *bundle) {
+            out.push_str(&format!(
+                "    inst saxi_{bundle}: {domain}$std::axi4_if::<{hpkg}>;\n"
+            ));
+        }
     }
     if !plan.axi_mems.is_empty() {
         out.push('\n');
@@ -1960,6 +2039,27 @@ fn core_body(
         ));
     }
     if !dma_registers(map).is_empty() {
+        out.push('\n');
+    }
+
+    // The TLP counts, from the PCIe wrapper to the CSR.
+    let tlp_counts = map
+        .registers
+        .iter()
+        .filter(|r| {
+            crate::regmap::PCIE_TLP_COUNTERS
+                .iter()
+                .any(|(name, _)| r.role == Some(*name))
+        })
+        .collect::<Vec<_>>();
+    for register in &tlp_counts {
+        out.push_str(&format!(
+            "    var t_{}: {domain}{};\n",
+            register.name,
+            logic(register.width)
+        ));
+    }
+    if !tlp_counts.is_empty() {
         out.push('\n');
     }
 
@@ -2548,6 +2648,23 @@ fn core_body(
         }
     }
 
+    // The TLP counts, from the wrapper in `top_module`. `hns_sim` has no PCIe
+    // to count, so they read 0 there.
+    if map
+        .registers
+        .iter()
+        .any(|r| r.role == Some(crate::regmap::PCIE_TLP_COUNTERS[0].0))
+    {
+        for (name, _) in crate::regmap::PCIE_TLP_COUNTERS {
+            if second_master {
+                out.push_str(&format!("    assign t_{name} = tlp_{name};\n"));
+            } else {
+                out.push_str(&format!("    assign t_{name} = 0;\n"));
+            }
+        }
+        out.push('\n');
+    }
+
     // host_poll_fifo terminators: one module, with depth and width as parameters.
     for fifo in &plan.fifos {
         let bundle = &fifo.bundle;
@@ -2735,6 +2852,13 @@ fn core_body(
         out.push_str(&format!("        m1: haxi_{bundle},\n"));
         out.push_str(&format!("        s: saxi_{bundle},\n"));
         out.push_str("    );\n\n");
+
+        if sim_drams(plan).iter().any(|m| m.bundle == *bundle) {
+            out.push_str(&format!(
+                "    // `saxi_{bundle}` goes to `$comp::hns_dram` in the testbench, which\n    // has nothing to calibrate.\n    assign t_{bundle}_calib = 1;\n\n"
+            ));
+            continue;
+        }
 
         // `dram` goes to the real controller. Only this differs from the
         // stand-in.
@@ -3957,17 +4081,46 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
         if perst_resets_dut(plan) {
             out.push_str(&format!("    var pcie_perst: '{} logic;\n", clocks.window));
         }
+        // The hard block clock. It gets a domain name, or what runs in it
+        // would look like a crossing with an unknown domain. `user_reset` is
+        // synchronous and active high, like the MIG `ui_clk_sync_rst`; it is
+        // converted to the project polarity.
+        out.push_str(&format!("    var pcie_user_clk: '{PCIE_DOMAIN} clock;\n"));
+        out.push_str(&format!("    var pcie_user_srst: '{PCIE_DOMAIN} logic;\n"));
+        out.push_str(&format!(
+            "    var pcie_user_rst: '{PCIE_DOMAIN} {};\n",
+            reset_type_name(reset)
+        ));
+        let released = if asserted(reset) == 0 { "~" } else { "" };
+        out.push_str(&format!(
+            "    assign pcie_user_rst = {released}pcie_user_srst as {};\n",
+            reset_type_name(reset)
+        ));
+        // What the completer sees, counted by `hns::tlp_count` in the hard
+        // block clock. Each count crosses to the window clock in Gray code.
+        for (signal, width) in TLP_TAP {
+            out.push_str(&format!(
+                "    var pcie_{signal}: '{PCIE_DOMAIN} {};\n",
+                logic(width)
+            ));
+        }
+        for (name, _) in crate::regmap::PCIE_TLP_COUNTERS {
+            out.push_str(&format!(
+                "    var tlp_{name}_gray: '{PCIE_DOMAIN} logic<{WORD_BITS}>;\n"
+            ));
+            out.push_str(&format!(
+                "    var tlp_{name}_sync: '{} logic<{WORD_BITS}>;\n",
+                clocks.window
+            ));
+            out.push_str(&format!(
+                "    var tlp_{name}: '{} logic<{WORD_BITS}>;\n",
+                clocks.window
+            ));
+        }
         // The requester stream is in the hard block clock; `hns::tlp_cdc`
-        // brings it from the harness side. It gets a domain name, or it would
-        // look like a crossing with an unknown domain.
+        // brings it from the harness side.
         let engine = !dma_registers(&plan.registers).is_empty();
         if engine {
-            out.push_str(&format!("    var pcie_user_clk: '{PCIE_DOMAIN} clock;\n"));
-            out.push_str(&format!("    var pcie_user_srst: '{PCIE_DOMAIN} logic;\n"));
-            out.push_str(&format!(
-                "    var pcie_user_rst: '{PCIE_DOMAIN} {};\n",
-                reset_type_name(reset)
-            ));
             // In the window clock; the wrapper synchronizes them.
             out.push_str(&format!(
                 "    var pcie_max_payload: '{} logic<3>;\n",
@@ -4012,13 +4165,6 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
                     logic(width)
                 ));
             }
-            // `user_reset` is synchronous and active high, like the MIG
-            // `ui_clk_sync_rst`. Convert it to the project polarity.
-            let released = if asserted(reset) == 0 { "~" } else { "" };
-            out.push_str(&format!(
-                "    assign pcie_user_rst = {released}pcie_user_srst as {};\n",
-                reset_type_name(reset)
-            ));
         }
         out.push('\n');
         out.push_str("    inst u_pcie: $sv::hns_pcie_wrap #(\n");
@@ -4059,11 +4205,14 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
         } else {
             out.push_str("        o_perst  : _,\n");
         }
+        out.push_str("        o_user_clk  : pcie_user_clk,\n");
+        out.push_str("        o_user_reset: pcie_user_srst,\n");
+        for (signal, _width) in TLP_TAP {
+            out.push_str(&format!("        o_{signal}: pcie_{signal},\n"));
+        }
         // Only the DMA engine drives RQ. Without it, RQ is tied to 0; left
         // open, the hard block `tvalid` would be an unconnected input.
         if engine {
-            out.push_str("        o_user_clk  : pcie_user_clk,\n");
-            out.push_str("        o_user_reset: pcie_user_srst,\n");
             for (signal, _width) in RQ_STREAM {
                 let d = if signal == "tready" { "o" } else { "i" };
                 out.push_str(&format!("        {d}_rq_{signal}: rq_{signal},\n"));
@@ -4079,8 +4228,6 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
             out.push_str("        o_max_read_req: pcie_max_read_req,\n");
             out.push_str("        o_rq_drops_gray: pcie_rq_drops_gray,\n");
         } else {
-            out.push_str("        o_user_clk  : _,\n");
-            out.push_str("        o_user_reset: _,\n");
             out.push_str("        i_rq_tdata  : 0,\n");
             out.push_str("        i_rq_tkeep  : 0,\n");
             out.push_str("        i_rq_tlast  : 0,\n");
@@ -4107,6 +4254,40 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
             out.push_str(&format!("        {d}_{signal}: bar_{signal},\n"));
         }
         out.push_str("    );\n    }\n\n");
+
+        // The TLP counts. Counted in the hard block clock, then each one to
+        // the window clock: Gray code from a flop, so two stages per bit are
+        // enough.
+        out.push_str("    inst u_tlp_count: hns::tlp_count (\n");
+        out.push_str("        i_clk: pcie_user_clk,\n");
+        out.push_str("        i_rst: pcie_user_rst,\n");
+        for (signal, _width) in TLP_TAP {
+            out.push_str(&format!("        i_{signal}: pcie_{signal},\n"));
+        }
+        for (name, port) in crate::regmap::PCIE_TLP_COUNTERS {
+            out.push_str(&format!("        {port}: tlp_{name}_gray,\n"));
+        }
+        out.push_str("    );\n");
+        for (name, _) in crate::regmap::PCIE_TLP_COUNTERS {
+            out.push_str("    unsafe (cdc) {\n");
+            out.push_str(&format!(
+                "        inst {}: $std::synchronizer_basic #(\n            WIDTH: {WORD_BITS},\n        ) (\n",
+                tlp_sync_instance(name)
+            ));
+            out.push_str(&format!("            i_clk: clk_{ident},\n"));
+            out.push_str(&format!("            i_rst: rst_{ident},\n"));
+            out.push_str(&format!("            i_d: tlp_{name}_gray,\n"));
+            out.push_str(&format!("            o_d: tlp_{name}_sync,\n"));
+            out.push_str("        );\n    }\n");
+            out.push_str(&format!(
+                "    inst u_tlp_{}_bin: $std::gray_decoder #(\n        WIDTH: {WORD_BITS},\n    ) (\n",
+                name.trim_start_matches("pcie_")
+            ));
+            out.push_str(&format!("        i_gray: tlp_{name}_sync,\n"));
+            out.push_str(&format!("        o_bin : tlp_{name},\n"));
+            out.push_str("    );\n");
+        }
+        out.push('\n');
         if engine {
             // The count of RQ TLPs dropped by the hard block, to the window
             // clock. It is Gray coded, so a two-stage synchronizer per bit is
@@ -4679,6 +4860,12 @@ pub fn sync_instances(plan: &Plan) -> Vec<(String, String, f64)> {
             "*u_pcie/flr_ack_meta_reg".to_string(),
             1000.0 / f64::from(user_mhz),
         ));
+    }
+    // The TLP counts (`hns::tlp_count`, Gray coded), to the window clock.
+    if has_pcie(plan) && plan.target().is_some() {
+        for (name, _) in crate::regmap::PCIE_TLP_COUNTERS {
+            out.push(std_sync(tlp_sync_instance(name), 1000.0 / host_mhz));
+        }
     }
     // The interrupt line, from the window clock into the hard block clock.
     // The wrapper registers it first, so the source is a flop.
@@ -5358,6 +5545,27 @@ pub fn regs_md(plan: &Plan) -> String {
 
 /// The notes column. It is derived from `role`, so it cannot disagree with
 /// the map.
+/// What one TLP count counts, for regs.md.
+fn tlp_counter_note(role: &str) -> &'static str {
+    match role {
+        "pcie_mrd" => "memory reads that reached the BAR, of any length",
+        "pcie_mwr" => "memory writes that reached the BAR, of any length",
+        "pcie_other" => "other requests that reached the BAR (I/O, atomics, messages)",
+        "pcie_mwr_dropped" => {
+            "posted requests the completer dropped without a trace: memory writes longer than one dword, and messages"
+        }
+        "pcie_cpl_sc" => "completions sent with Successful Completion",
+        "pcie_cpl_ur" => "completions sent with Unsupported Request",
+        "pcie_cpl_ca" => {
+            "completions sent with Completer Abort; a read longer than one dword gets one"
+        }
+        _ => unreachable!("not a TLP count: {role}"),
+    }
+}
+
+/// What all the TLP counts share, for regs.md.
+const TLP_COUNTER_NOTE: &str = "All `pcie_*` counts saturate, and a link reset does not clear them. A request the PCIe block refuses itself (no BAR hit, Memory Space off) never reaches them: see the function's Device Status. A read over PCIe counts itself; read over JTAG to leave them alone";
+
 fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
     let mut notes: Vec<String> = Vec::new();
 
@@ -5447,6 +5655,21 @@ fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
             "cycles to hold each answer back, to make the DUT wait on purpose. 0 by default".to_string(),
         ),
         Some("jitter") => notes.push("1 varies the hold-back from answer to answer".to_string()),
+        Some(role) if crate::regmap::PCIE_TLP_COUNTERS
+            .iter()
+            .any(|(name, _)| *name == role) =>
+        {
+            // The shared text once, on the first count.
+            if role == crate::regmap::PCIE_TLP_COUNTERS[0].0 {
+                notes.push(format!("{}. {TLP_COUNTER_NOTE}", tlp_counter_note(role)));
+            } else {
+                notes.push(format!(
+                    "{}. Counted like `{}`",
+                    tlp_counter_note(role),
+                    crate::regmap::PCIE_TLP_COUNTERS[0].0
+                ));
+            }
+        }
         Some(DUT_RESET) => notes.push(
             "1 holds the DUT in reset. The harness, memory contents and `reg` registers are not reset. Use `hio reset`".to_string(),
         ),

@@ -544,6 +544,11 @@ fn sim_files(plan: &plan::Plan, out: &Path) -> miette::Result<Vec<Pending>> {
         &emit::sim_link_source(),
         "socket component (Rust)",
     )?);
+    written.push(write(
+        &link.join("src").join("dram.rs"),
+        &emit::sim_dram_source(),
+        "dram component (Rust)",
+    )?);
     Ok(written)
 }
 

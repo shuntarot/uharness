@@ -1,0 +1,109 @@
+/// Counts the TLPs on the window's side of the PCIe hard block: the requests
+/// that reached the BAR (CQ), and the completions sent back (CC).
+///
+/// It tells whether a request reached the card. A request the hard block
+/// refuses itself (no BAR hit, Memory Space off) never reaches CQ, so it is
+/// not counted here; the host sees that one in the function's Device Status.
+///
+/// Each count saturates, so it never wraps back to looking clean. **The counts
+/// are not reset**: a link reset is exactly when they are worth keeping. Only
+/// the packet framing is reset.
+///
+/// It sits in the hard block clock domain. Each count leaves in Gray code from
+/// a flip-flop, so another clock domain can take it through a 2-stage per-bit
+/// synchronizer. It has one clock, so the native simulator runs it
+/// (`tb_tlp_count.veryl`).
+pub module tlp_count #(
+    /// Width of each count. Narrow only in tests, to reach saturation.
+    param W: u32 = 32,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// CQ, the requests from the host. The type is the descriptor's
+    /// (`tdata[78:75]`); it is read on the first beat only.
+    i_cq_tvalid: input logic   ,
+    i_cq_tready: input logic   ,
+    i_cq_tlast : input logic   ,
+    i_cq_type  : input logic<4>,
+
+    /// CC, the completions to the host. The status is the descriptor's
+    /// (`tdata[45:43]`); it is read on the first beat only.
+    i_cc_tvalid: input logic   ,
+    i_cc_tready: input logic   ,
+    i_cc_tlast : input logic   ,
+    i_cc_status: input logic<3>,
+
+    /// The completer dropped a posted request: a memory write it cannot do
+    /// (more than one dword) or a message. One cycle per request.
+    i_cq_dropped: input logic,
+
+    /// The counts, in Gray code.
+    o_mrd_gray        : output logic<W>, // memory reads received
+    o_mwr_gray        : output logic<W>, // memory writes received
+    o_other_gray      : output logic<W>, // other requests received
+    o_mwr_dropped_gray: output logic<W>, // posted requests dropped
+    o_cpl_sc_gray     : output logic<W>, // completions: successful
+    o_cpl_ur_gray     : output logic<W>, // completions: unsupported request
+    o_cpl_ca_gray     : output logic<W>, // completions: completer abort
+) {
+    const N: u32 = 7;
+
+    const REQ_MEM_READ : logic<4> = 4'b0000;
+    const REQ_MEM_WRITE: logic<4> = 4'b0001;
+    const CPL_SC       : logic<3> = 3'b000;
+    const CPL_UR       : logic<3> = 3'b001;
+    const CPL_CA       : logic<3> = 3'b100;
+
+    /// A packet spans several beats; only its first one carries the
+    /// descriptor.
+    var cq_first: logic;
+    var cc_first: logic;
+    always_ff {
+        if_reset {
+            cq_first = 1;
+            cc_first = 1;
+        } else {
+            if i_cq_tvalid && i_cq_tready {
+                cq_first = i_cq_tlast;
+            }
+            if i_cc_tvalid && i_cc_tready {
+                cc_first = i_cc_tlast;
+            }
+        }
+    }
+
+    let cq_start: logic = i_cq_tvalid && i_cq_tready && cq_first;
+    let cc_start: logic = i_cc_tvalid && i_cc_tready && cc_first;
+
+    var inc: logic<N>;
+    always_comb {
+        inc[0] = cq_start && i_cq_type == REQ_MEM_READ;
+        inc[1] = cq_start && i_cq_type == REQ_MEM_WRITE;
+        inc[2] = cq_start && i_cq_type != REQ_MEM_READ && i_cq_type != REQ_MEM_WRITE;
+        inc[3] = i_cq_dropped;
+        inc[4] = cc_start && i_cc_status == CPL_SC;
+        inc[5] = cc_start && i_cc_status == CPL_UR;
+        inc[6] = cc_start && i_cc_status == CPL_CA;
+    }
+
+    var cnt : logic<N, W>;
+    var gray: logic<N, W>;
+    for i in 0..N :g_count {
+        let next: logic<W> = cnt[i] + 1;
+        always_ff {
+            if inc[i] && cnt[i] != '1 {
+                cnt[i]  = next;
+                gray[i] = next ^ (next >> 1);
+            }
+        }
+    }
+
+    assign o_mrd_gray         = gray[0];
+    assign o_mwr_gray         = gray[1];
+    assign o_other_gray       = gray[2];
+    assign o_mwr_dropped_gray = gray[3];
+    assign o_cpl_sc_gray      = gray[4];
+    assign o_cpl_ur_gray      = gray[5];
+    assign o_cpl_ca_gray      = gray[6];
+}

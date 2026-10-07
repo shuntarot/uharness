@@ -74,6 +74,13 @@ transport = ["sim"]
 # stops evaluating one above 67108864 elements.
 bram_kb = 4096
 
+# A choice, not a device: 256 MB, as on the Arty. The memory is a Rust
+# component that keeps only the pages written, so the size costs nothing
+# until it is used. Nothing here describes a controller: there is none.
+[provides.dram]
+channels      = 1
+axi_addr_bits = 28
+
 [clocks.sys]
 freq_mhz = 100
 diff     = false
