@@ -882,7 +882,7 @@ fn targets() -> Result<(), String> {
         if j.jprogram_ir.is_some()
             && j.jstart_ir.is_some()
             && j.bypass_ir.is_some()
-            && (j.cfg_in_ir.is_some() || !j.slr.is_empty())
+            && (j.cfg_in_ir.is_some() || !j.slr_cfg_in_ir.is_empty())
         {
             can.push("program");
         }
@@ -1250,76 +1250,52 @@ fn after_config_map(cli: &Cli, what: &str) -> Option<RegisterMap> {
 
 /// Decides which part of the `.bit` goes to which `CFG_IN`.
 ///
-/// One SLR gets everything in one go. With several, the chunk starts come
-/// from the bitstream, and the lengths and destinations from the target.
-///
-/// The chunks and skipped bytes must add up to the file length exactly.
-/// Otherwise the target and the bitstream disagree, and no SLR would get a
-/// complete sub-bitstream.
+/// One SLR gets everything in one go. With several, the `.bit` says where
+/// each part starts and ends, and the target says which `CFG_IN` reaches
+/// each SLR, in file order.
 fn split(
     bit: &hns_host::bitstream::Bitstream,
     jtag: &hns_targets::Jtag,
 ) -> Result<Vec<hns_host::config::Chunk>, String> {
-    let starts = bit.slr_starts();
-    if jtag.slr.is_empty() {
-        if starts.len() > 1 {
+    let pieces = bit.slr_pieces().map_err(|e| e.to_string())?;
+    let slrs = pieces.iter().map(|p| p.slr + 1).max().unwrap_or(1);
+    if slrs == 1 {
+        if jtag.slr_cfg_in_ir.len() > 1 {
             return Err(format!(
-                "the bitstream holds {} sub-bitstreams (one per SLR), but the target does \
-                 not say how to split it.\n\
-                 The split is not marked in the .bit. Add a `[[jtag.slr]]` table to the \
-                 target, or program with an SVF (`hio program <file>.svf`).",
-                starts.len()
+                "the target names {} SLRs, but the bitstream holds one.\n\
+                 It was probably built for another device.",
+                jtag.slr_cfg_in_ir.len()
             ));
         }
+        let cfg_in = jtag
+            .cfg_in_ir
+            .or(jtag.slr_cfg_in_ir.first().copied())
+            .ok_or("the target does not say which IR value selects CFG_IN.".to_string())?;
         return Ok(vec![hns_host::config::Chunk {
             at: 0,
             bytes: bit.data.len(),
-            cfg_in: jtag
-                .cfg_in_ir
-                .ok_or("the target does not say which IR value selects CFG_IN.".to_string())?,
+            cfg_in,
             sync: false,
         }]);
     }
-
-    let mut out = Vec::new();
-    let mut at = 0usize;
-    for (i, c) in jtag.slr.iter().enumerate() {
-        // A chunk that starts a sub-bitstream must sit where the bitstream
-        // says one starts.
-        if let Some(&want) = starts.get(i)
-            && !c.sync
-            && want != at
-        {
-            return Err(format!(
-                "the target puts SLR chunk {i} at byte {at}, but the bitstream has a \
-                 sub-bitstream starting at {want}.\n\
-                 The SLR table does not fit this device. Check the chunk sizes against a \
-                 Vivado SVF for this part."
-            ));
-        }
-        if at + c.bytes > bit.data.len() {
-            return Err(format!(
-                "the target's SLR table runs past the end of the bitstream ({} bytes).",
-                bit.data.len()
-            ));
-        }
-        out.push(hns_host::config::Chunk {
-            at,
-            bytes: c.bytes,
-            cfg_in: c.cfg_in_ir,
-            sync: c.sync,
-        });
-        at += c.bytes + c.skip;
-    }
-    if at != bit.data.len() {
+    if jtag.slr_cfg_in_ir.len() != slrs {
         return Err(format!(
-            "the target's SLR table covers {at} bytes, but the bitstream has {}.\n\
-             The rest would never reach the device. The table is probably for a \
-             different part.",
-            bit.data.len()
+            "the bitstream holds {slrs} sub-bitstreams (one per SLR), but the target names \
+             {} `slr_cfg_in_ir` values.\n\
+             List the CFG_IN of each SLR in the order its sub-bitstream appears in the .bit \
+             (the master SLR first). The BSDL file has one CFG_IN per SLR.",
+            jtag.slr_cfg_in_ir.len()
         ));
     }
-    Ok(out)
+    Ok(pieces
+        .iter()
+        .map(|p| hns_host::config::Chunk {
+            at: p.at,
+            bytes: p.bytes,
+            cfg_in: jtag.slr_cfg_in_ir[p.slr],
+            sync: p.tail,
+        })
+        .collect())
 }
 
 /// Replays an SVF as it is.

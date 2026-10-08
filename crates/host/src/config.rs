@@ -85,10 +85,10 @@ impl<E: std::fmt::Debug> std::fmt::Display for Error<E> {
                 f,
                 "the bitstream was sent, but DONE did not go high \
                  (IR capture {got:#x}, wanted {expect:#x} under mask {mask:#x}).\n\
-                 The device is not configured. On a device with several SLRs, the .bit was \
-                 probably split wrongly: the sizes in the target's [[jtag.slr]] are for \
-                 another part. `hio program <file>.svf` replays Vivado's own sequence and \
-                 shows whether the board itself is fine."
+                 The device is not configured. On a device with several SLRs, the parts may \
+                 have gone to the wrong SLRs: check the order of the target's `slr_cfg_in_ir`. \
+                 `hio program <file>.svf` replays Vivado's own sequence and shows whether the \
+                 board itself is fine."
             ),
         }
     }

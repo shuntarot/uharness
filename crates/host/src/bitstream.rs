@@ -174,7 +174,137 @@ pub fn parse(bytes: &[u8]) -> Result<Bitstream, Error> {
 /// Bus width detect pattern. Each SLR's sub-bitstream starts with it.
 const BUS_WIDTH_DETECT: [u8; 8] = [0x00, 0x00, 0x00, 0xbb, 0x11, 0x22, 0x00, 0x44];
 
+/// A Type 1 write of no words to BOUT (register 0x1e). Right before each
+/// sub-bitstream after the first, followed by a Type 2 write header whose
+/// word count is how much of the file goes on to the next SLR.
+const BOUT: [u8; 4] = [0x30, 0x03, 0xc0, 0x00];
+
+/// A run of the configuration data, and the SLR it goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Piece {
+    pub at: usize,
+    pub bytes: usize,
+    /// The sub-bitstream it belongs to, counted in file order.
+    pub slr: usize,
+    /// The end of a sub-bitstream that resumes after the later ones.
+    pub tail: bool,
+}
+
+/// Why a multi-SLR `.bit` cannot be split.
+#[derive(Debug)]
+pub struct SplitError {
+    pub at: usize,
+    pub why: String,
+}
+
+impl std::fmt::Display for SplitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the .bit cannot be split per SLR: {} (at byte {}).\n\
+             Program with an SVF instead: `make svf` writes one next to the .bit, and \
+             `hio program <file>.svf` replays it.",
+            self.why, self.at
+        )
+    }
+}
+
+impl std::error::Error for SplitError {}
+
 impl Bitstream {
+    /// Splits the data into the runs each SLR receives, in file order.
+    ///
+    /// Sub-bitstreams nest. Each one after the first is wrapped in a BOUT
+    /// write whose length covers it and every later one, so the file reads
+    ///
+    /// ```text
+    ///   SLR a head | BOUT(n) [ SLR b head | BOUT(m) [ SLR c ] SLR b tail ] SLR a tail
+    /// ```
+    ///
+    /// The BOUT words themselves are not sent. The lengths differ between
+    /// designs on the same device, so they are read here, never written down.
+    ///
+    /// A single-SLR device gives one piece that covers the whole file.
+    pub fn slr_pieces(&self) -> Result<Vec<Piece>, SplitError> {
+        let d = &self.data;
+        let starts = self.slr_starts();
+        if starts.len() <= 1 {
+            return Ok(vec![Piece {
+                at: 0,
+                bytes: d.len(),
+                slr: 0,
+                tail: false,
+            }]);
+        }
+        if starts[0] != 0 {
+            return Err(SplitError {
+                at: 0,
+                why: "the first sub-bitstream does not start the file".into(),
+            });
+        }
+
+        // ends[k]: where the BOUT write that wraps sub-bitstream k ends.
+        let mut ends = vec![d.len()];
+        for (k, &s) in starts.iter().enumerate().skip(1) {
+            if s < 8 || d[s - 8..s - 4] != BOUT {
+                return Err(SplitError {
+                    at: s,
+                    why: format!("sub-bitstream {k} is not preceded by a BOUT write"),
+                });
+            }
+            let word = u32::from_be_bytes([d[s - 4], d[s - 3], d[s - 2], d[s - 1]]);
+            // Type 2 (`010`), write (`10`).
+            if word >> 27 != 0b01010 {
+                return Err(SplitError {
+                    at: s - 4,
+                    why: format!("the BOUT write before sub-bitstream {k} has no Type 2 length"),
+                });
+            }
+            let end = s + (word & 0x07ff_ffff) as usize * 4;
+            let outer = ends[k - 1];
+            if end > outer || s <= starts[k - 1] {
+                return Err(SplitError {
+                    at: s,
+                    why: format!("sub-bitstream {k} does not sit inside the one before it"),
+                });
+            }
+            ends.push(end);
+        }
+
+        let n = starts.len();
+        let mut out = Vec::new();
+        for k in 0..n {
+            let end = if k + 1 < n {
+                starts[k + 1] - 8
+            } else {
+                ends[k]
+            };
+            if end <= starts[k] {
+                return Err(SplitError {
+                    at: starts[k],
+                    why: format!("sub-bitstream {k} is empty"),
+                });
+            }
+            out.push(Piece {
+                at: starts[k],
+                bytes: end - starts[k],
+                slr: k,
+                tail: false,
+            });
+        }
+        for k in (0..n - 1).rev() {
+            if ends[k] > ends[k + 1] {
+                out.push(Piece {
+                    at: ends[k + 1],
+                    bytes: ends[k] - ends[k + 1],
+                    slr: k,
+                    tail: true,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// Finds where each SLR's sub-bitstream starts.
     ///
     /// On a device with several SLRs (such as VU9P) the `.bit` is the SLR
@@ -300,6 +430,100 @@ mod tests {
         let raw = build_with("top", "7a35ticsg324", &data);
         let b = parse(&raw).unwrap();
         assert_eq!(b.slr_starts(), vec![0, 60, 120]);
+    }
+
+    /// One sub-bitstream: dummy words, the pattern, sync, then `words` NOOPs.
+    fn sub(words: usize) -> Vec<u8> {
+        let mut v = [0xff; 8].to_vec();
+        v.extend_from_slice(&BUS_WIDTH_DETECT);
+        v.extend_from_slice(&[0xaa, 0x99, 0x55, 0x66]);
+        v.extend_from_slice(&[0x20u8, 0x00, 0x00, 0x00].repeat(words));
+        v
+    }
+
+    /// Wraps `inner` in a BOUT write of its own length.
+    fn bout(inner: &[u8]) -> Vec<u8> {
+        let mut v = BOUT.to_vec();
+        v.extend_from_slice(&(0x5000_0000u32 | (inner.len() / 4) as u32).to_be_bytes());
+        v.extend_from_slice(inner);
+        v
+    }
+
+    /// Three SLRs nested the way Vivado writes them for VU9P and VU440.
+    fn three(head_words: [usize; 3], tail_words: [usize; 2]) -> Vec<u8> {
+        let nop = |n: usize| [0x20u8, 0x00, 0x00, 0x00].repeat(n);
+        let mut b = sub(head_words[1]);
+        b.extend_from_slice(&bout(&sub(head_words[2])));
+        b.extend_from_slice(&nop(tail_words[1]));
+        let mut a = sub(head_words[0]);
+        a.extend_from_slice(&bout(&b));
+        a.extend_from_slice(&nop(tail_words[0]));
+        a
+    }
+
+    #[test]
+    fn the_bout_lengths_split_the_slrs_with_their_tails() {
+        let data = three([10, 8, 6], [411, 15]);
+        let b = parse(&build("top", "xcvu440", &data)).unwrap();
+        let p = b.slr_pieces().unwrap();
+        let head = |n: usize| 20 + n * 4;
+        let piece = |at, bytes, slr, tail| Piece {
+            at,
+            bytes,
+            slr,
+            tail,
+        };
+        let a1 = head(10) + 8;
+        let a2 = a1 + head(8) + 8;
+        let t1 = a2 + head(6);
+        let t0 = t1 + 15 * 4;
+        assert_eq!(
+            p,
+            vec![
+                piece(0, head(10), 0, false),
+                piece(a1, head(8), 1, false),
+                piece(a2, head(6), 2, false),
+                piece(t1, 15 * 4, 1, true),
+                piece(t0, 411 * 4, 0, true),
+            ]
+        );
+        // Everything but the two BOUT pairs is sent.
+        let sent: usize = p.iter().map(|p| p.bytes).sum();
+        assert_eq!(sent + 16, data.len());
+    }
+
+    /// The same device with a different design: the lengths move, and are
+    /// still read from the file.
+    #[test]
+    fn a_different_design_moves_the_boundaries() {
+        let a = parse(&build("top", "xcvu440", &three([10, 10, 10], [411, 15]))).unwrap();
+        let b = parse(&build("top", "xcvu440", &three([10, 8, 8], [411, 15]))).unwrap();
+        assert_ne!(a.slr_pieces().unwrap(), b.slr_pieces().unwrap());
+    }
+
+    /// A second pattern with no BOUT write before it is refused, not guessed at.
+    #[test]
+    fn a_boundary_without_bout_is_refused() {
+        let mut data = sub(4);
+        data.extend_from_slice(&sub(4));
+        let b = parse(&build("top", "xcvu440", &data)).unwrap();
+        let e = b.slr_pieces().unwrap_err().to_string();
+        assert!(e.contains("BOUT") && e.contains(".svf"), "{e}");
+    }
+
+    #[test]
+    fn one_slr_is_one_piece() {
+        let data = sub(4);
+        let b = parse(&build("top", "7a35ticsg324", &data)).unwrap();
+        assert_eq!(
+            b.slr_pieces().unwrap(),
+            vec![Piece {
+                at: 0,
+                bytes: data.len(),
+                slr: 0,
+                tail: false
+            }]
+        );
     }
 
     /// The spelling differs per family. Both strings come from real files.
