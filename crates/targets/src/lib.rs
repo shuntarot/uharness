@@ -657,12 +657,11 @@ pub struct Jtag {
     /// Reads DONE. Without it, the host does not check that programming
     /// worked.
     pub done: Option<Check>,
-    /// How a `.bit` splits on a device with several SLRs.
-    ///
-    /// A `.bit` is one sub-bitstream per SLR, end to end, and the file does
-    /// not mark the boundaries. Lengths and destinations are device
-    /// constants, so they are written here. Empty for a single SLR.
-    pub slr: Vec<SlrChunk>,
+    /// On a device with several SLRs: the `CFG_IN` of each SLR, in the order
+    /// their sub-bitstreams appear in a `.bit`. The order is a property of
+    /// the device; the lengths are not, so `hio` reads those from the file.
+    /// Empty for a single SLR.
+    pub slr_cfg_in_ir: Vec<u32>,
 }
 
 /// One check that reads the IR capture.
@@ -671,18 +670,6 @@ pub struct Check {
     pub ir: u32,
     pub expect: u32,
     pub mask: u32,
-}
-
-/// A part of a `.bit`, and where it goes.
-#[derive(Debug, Clone, Copy)]
-pub struct SlrChunk {
-    pub bytes: usize,
-    /// The `CFG_IN` that receives it.
-    pub cfg_in_ir: u32,
-    /// Bytes to skip after it (the CRC word at an SLR boundary).
-    pub skip: usize,
-    /// Whether a sync word goes before it (the last chunk has one).
-    pub sync: bool,
 }
 
 /// `[pcie]` of a target description: facts about the board only.
@@ -878,21 +865,12 @@ pub fn jtag(target: &Target) -> Jtag {
         idcode: int("idcode").map(|v| v as u32),
         ready: check(t, "ready"),
         done: check(t, "done"),
-        slr: t
-            .get("slr")
+        slr_cfg_in_ir: t
+            .get("slr_cfg_in_ir")
             .and_then(|v| v.as_array())
             .map(|a| {
                 a.iter()
-                    .filter_map(|e| {
-                        let e = e.as_table()?;
-                        let n = |k: &str| e.get(k).and_then(|v| v.as_integer());
-                        Some(SlrChunk {
-                            bytes: n("bytes")? as usize,
-                            cfg_in_ir: n("cfg_in_ir")? as u32,
-                            skip: n("skip").unwrap_or(0) as usize,
-                            sync: e.get("sync").and_then(|v| v.as_bool()).unwrap_or(false),
-                        })
-                    })
+                    .filter_map(|v| v.as_integer().map(|i| i as u32))
                     .collect()
             })
             .unwrap_or_default(),
@@ -1357,7 +1335,7 @@ mod jtag_tests {
             assert!(j.jstart_ir.is_some(), "{name}: jstart_ir");
             assert!(j.bypass_ir.is_some(), "{name}: bypass_ir");
             assert!(
-                j.cfg_in_ir.is_some() || !j.slr.is_empty(),
+                j.cfg_in_ir.is_some() || !j.slr_cfg_in_ir.is_empty(),
                 "{name}: nothing says where the bitstream goes"
             );
             // Programming is checked by reading back, not only by waiting.
@@ -1366,15 +1344,11 @@ mod jtag_tests {
         }
     }
 
-    /// Chunks plus skipped bytes must add up to the whole bitstream.
+    /// VU9P has three SLRs, and the master (SLR1) comes first in a `.bit`.
     #[test]
-    fn the_slr_table_has_no_empty_chunks() {
+    fn the_vcu118_names_a_cfg_in_per_slr() {
         let t = resolve("xilinx/vcu118", &[]).unwrap();
-        let j = jtag(&t);
-        assert_eq!(j.slr.len(), 5);
-        assert!(j.slr.iter().all(|c| c.bytes > 0));
-        let total: usize = j.slr.iter().map(|c| c.bytes + c.skip).sum();
-        assert_eq!(total, 80_159_108, "must account for the whole bitstream");
+        assert_eq!(jtag(&t).slr_cfg_in_ir, [0x05924, 0x24164, 0x24905]);
     }
 }
 

@@ -227,6 +227,22 @@ jprogram_ir = 0x0b2cb
 jstart_ir   = 0x0c30c
 bypass_ir   = 0x3ffff
 
+# **Where each part of the `.bit` goes.** With three SLRs, a `.bit` is three
+# sub-bitstreams, nested: each one after the first is wrapped in a BOUT write
+# (`3003c000` and a Type 2 length) that covers it and every later one, and the
+# outer ones resume with a short tail after it. `hio` reads the boundaries from
+# those lengths, because they **change with the design**: two VU440 designs
+# differed by 8 bytes per SLR. Only the destinations are a property of the
+# device, so only they are written here, in file order (master first).
+#
+# The order was found by comparing Vivado's SVF (`create_hw_target`, no board
+# needed) with the `.bit` byte for byte (2026-09-03).
+slr_cfg_in_ir = [
+    0x05924,   # CFG_IN_SLR1 (master)
+    0x24164,   # CFG_IN_SLR0
+    0x24905,   # CFG_IN_SLR2
+]
+
 # **Read back rather than just waited for** (from Vivado's SVF, 2026-09-03):
 #
 #   SIR 18 TDI (014514) TDO (011000) MASK (031000)   the erase finished
@@ -244,43 +260,6 @@ mask   = 0x11000
 # `0x31000` but agrees once masked (both `0x11000`). **That is what the mask is
 # for**: split into six-bit fields it is `110101` three times, one per SLR — the
 # same shape as the Arty's `0x35`. An exact comparison would never pass.
-
-# **How the `.bit` is divided.** With three SLRs, a `.bit` is three
-# sub-bitstreams end to end, and **the boundaries are not marked in the file**,
-# so they are recorded here.
-#
-# Where these came from (2026-09-03): Vivado was asked for an SVF
-# (`create_hw_target`, so no board needed) and each `SDR` payload was **compared
-# byte for byte** against the `.bit`.
-#
-# **They do not depend on the design.** Two unrelated designs produce identical
-# SLR boundaries — it is a property of the device.
-#
-# `skip` is the CRC word at an SLR boundary (`3003c000` plus a value); **Vivado
-# does not send it either**. Chunks marked `sync` are prefixed with the sync word
-# `aa995566`.
-#
-# The chunks plus the skipped bytes must add up to the file length exactly; `hio`
-# checks and refuses to program if they do not.
-[[jtag.slr]]
-bytes     = 26719136
-cfg_in_ir = 0x05924   # CFG_IN_SLR1 (master)
-skip      = 8
-[[jtag.slr]]
-bytes     = 26719136
-cfg_in_ir = 0x24164   # CFG_IN_SLR0
-skip      = 8
-[[jtag.slr]]
-bytes     = 26719116
-cfg_in_ir = 0x24905   # CFG_IN_SLR2
-[[jtag.slr]]
-bytes     = 1644
-cfg_in_ir = 0x05924   # tail for SLR1
-sync      = true
-[[jtag.slr]]
-bytes     = 60
-cfg_in_ir = 0x24164   # tail for SLR0
-sync      = true
 
 # **Erase wait.** The default 200 ms was measured on an XC7A35T, and the VU9P is
 # far larger, so it may not be enough: try `hio program --erase-wait-ms 2000`.
