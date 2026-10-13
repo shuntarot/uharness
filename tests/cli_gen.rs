@@ -1784,18 +1784,20 @@ fn the_simulation_stand_in_for_dram_does_not_carry_the_whole_chip() {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    // The formatter aligns parameter lists, so compare without spaces.
+    let squeeze = |s: &str| s.replace(' ', "");
     let sim = fs::read_to_string(dir.path().join("hns").join("src").join("sim.veryl")).unwrap();
     // The stand-in covers only the start, and the output says how much of it.
-    assert!(sim.contains("DEPTH: 4096"), "{sim}");
+    assert!(squeeze(&sim).contains("DEPTH:4096"), "{sim}");
     assert!(
         sim.contains("stands in for the controller: the first 4096 entries of 67108864"),
         "{sim}"
     );
-    assert!(!sim.contains("DEPTH: 67108864"), "{sim}");
+    assert!(!squeeze(&sim).contains("DEPTH:67108864"), "{sim}");
 
     // Synthesis uses the real controller, so the stand-in size does not appear.
     let top = fs::read_to_string(dir.path().join("hns").join("src").join("top.veryl")).unwrap();
-    assert!(!top.contains("DEPTH: 4096"), "{top}");
+    assert!(!squeeze(&top).contains("DEPTH:4096"), "{top}");
     assert!(top.contains("c0_ddr4_adr"), "{top}");
 
     // Only the pins of the controller clock are set here. The DDR4 IP sets the
