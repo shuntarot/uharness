@@ -21,7 +21,11 @@ pub module mem #(
     /// is complete, but a region has nowhere to hold them.
     param HSTRB_W  : u32   = 1    ,
     param HAS_HSTRB: bbool = false,
-    param HAS_EN  : bbool = false,
+    param HAS_EN   : bbool = false,
+    /// Port B exists. A user without a host side leaves it out: tied off,
+    /// Vivado can refuse the RAM ("Unsupported RAM template"; seen with byte
+    /// strobes on both ports from 1024 entries up).
+    param HAS_HOST: bbool = true,
 ) (
     i_clk   : input  clock                ,
     i_rst   : input  reset                ,
@@ -132,7 +136,9 @@ pub module mem #(
     // words until the entry is complete and then write all of it; a region has
     // nowhere to hold them, so it names the bytes it is writing.
     var hrdata: logic<ENTRY>;
-    if HAS_HSTRB :g_hbytes {
+    if !HAS_HOST :g_nohost {
+        assign hrdata = 0;
+    } else if HAS_HSTRB :g_hbytes {
         always_ff {
             // A byte the strobe does not name keeps its old value.
             if i_hwe {

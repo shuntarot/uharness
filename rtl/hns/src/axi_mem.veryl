@@ -4,13 +4,16 @@
 /// The port stays the same, so only the place where data lives changes when
 /// the real memory is used.
 ///
-/// The host reaches the memory directly through the back door of `hns::mem`
-/// (`i_haddr` / `i_hwdata`).
+/// The host can reach the memory directly through the back door of `hns::mem`
+/// (`i_haddr` / `i_hwdata`). Set `BACKDOOR` to false when it does not: the
+/// back door is then left out rather than tied off, which Vivado cannot map
+/// to BRAM.
 ///
 /// It accepts one transfer at a time. AXI4 allows a slave to do this. Several
 /// outstanding transfers would only add ordering rules to a stand-in.
 pub module axi_mem::<PKG: $std::axi4_prototype> #(
-    param DEPTH: u32 = 256,
+    param DEPTH   : u32   = 256 ,
+    param BACKDOOR: bbool = true,
 ) (
     i_clk: input clock,
     i_rst: input reset,
@@ -130,6 +133,7 @@ pub module axi_mem::<PKG: $std::axi4_prototype> #(
         HSTRB_W  : SW      ,
         HAS_HSTRB: true    ,
         HAS_EN   : false   ,
+        HAS_HOST : BACKDOOR,
     ) (
         i_clk               ,
         i_rst               ,

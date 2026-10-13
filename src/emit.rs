@@ -2886,12 +2886,13 @@ fn core_body(
             "    inst u_axi_mem_{bundle}: hns::axi_mem::<{hpkg}> #(\n"
         ));
         out.push_str(&format!("        DEPTH: {depth},\n"));
+        // The back door is not used. A real controller has none, so the host
+        // would lose access when the stand-in is replaced.
+        out.push_str("        BACKDOOR: false,\n");
         out.push_str("    ) (\n");
         out.push_str(&format!("        i_clk: {clk},\n"));
         out.push_str(&format!("        i_rst: {rst},\n"));
         out.push_str(&format!("        axi: saxi_{bundle},\n"));
-        // The back door is not used. A real controller has none, so the host
-        // would lose access when the stand-in is replaced.
         out.push_str("        i_haddr: '0,\n");
         out.push_str("        i_hwdata: '0,\n");
         out.push_str("        i_hwstrb: '0,\n");
