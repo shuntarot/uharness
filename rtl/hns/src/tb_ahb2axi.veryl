@@ -1,0 +1,151 @@
+/// `hns::ahb2axi` in front of `hns::axi_mem`: AHB writes of each size land in
+/// the right bytes, and a read that is issued during a write's data phase sees
+/// that write.
+///
+/// The second check is the AHB pipeline. The next address phase overlaps the
+/// data phase of the one before, and the bridge must not start the next
+/// transfer until the first one is done.
+#[test(ahb2axi_sizes_and_pipeline)]
+module test_ahb2axi {
+    const BASE: bit<32> = 32'h2000_0000;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    inst bus: $std::axi4_if::<$std::axi4_pkg::<32, 4, 1, 1, 1, 1, 1, 1>>;
+
+    var haddr : logic<32>;
+    var hwrite: logic    ;
+    var htrans: logic<2> ;
+    var hsize : logic<3> ;
+    var hwdata: logic<32>;
+    var hready: logic    ;
+    var hrdata: logic<32>;
+    var rdata : logic<32>;
+
+    inst u: ahb2axi::<$std::axi4_pkg::<32, 4, 1, 1, 1, 1, 1, 1>> #(
+        BASE: BASE,
+    ) (
+        i_clk   : clk   ,
+        i_rst   : rst   ,
+        i_haddr : haddr ,
+        i_hwrite: hwrite,
+        i_htrans: htrans,
+        i_hsize : hsize ,
+        i_hwdata: hwdata,
+        o_hready: hready,
+        o_hrdata: hrdata,
+        axi     : bus   ,
+    );
+
+    inst m: axi_mem::<$std::axi4_pkg::<32, 4, 1, 1, 1, 1, 1, 1>> #(
+        DEPTH   : 16   ,
+        BACKDOOR: false,
+    ) (
+        i_clk   : clk,
+        i_rst   : rst,
+        axi     : bus,
+        i_haddr : 0  ,
+        i_hwdata: 0  ,
+        i_hwstrb: 0  ,
+        i_hwe   : 0  ,
+        o_hrdata: _  ,
+    );
+
+    /// Waits until `hready` is high, then lets the clock edge pass. Whatever
+    /// is on the AHB inputs is taken at that edge.
+    function advance () {
+        for _i in 0..32 {
+            if hready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+    }
+
+    /// Waits through a data phase and returns `hrdata` at its end.
+    function finish () -> logic<32> {
+        var got: logic<32>;
+        for _i in 0..32 {
+            if hready {
+                break;
+            }
+            clk.next(1);
+        }
+        got = hrdata;
+        clk.next(1);
+        return got;
+    }
+
+    /// One write with nothing behind it. `data` goes on the byte lanes of
+    /// `addr`, as an AHB manager puts it.
+    function put (
+        size: input logic<3> ,
+        addr: input logic<32>,
+        data: input logic<32>,
+    ) {
+        var unused: logic<32>;
+        hwrite = 1;
+        hsize  = size;
+        haddr  = addr;
+        htrans = 2'b10;
+        advance();
+        htrans = 2'b00;
+        hwdata = data;
+        unused = finish();
+    }
+
+    /// One word read with nothing behind it.
+    function get (
+        addr: input logic<32>,
+    ) -> logic<32> {
+        hwrite = 0;
+        hsize  = 3'd2;
+        haddr  = addr;
+        htrans = 2'b10;
+        advance();
+        htrans = 2'b00;
+        return finish();
+    }
+
+    initial {
+        htrans = 2'b00;
+        hwrite = 0;
+        hsize  = 3'd2;
+        haddr  = 0;
+        hwdata = 0;
+        rst.assert(4);
+        clk.next(4);
+
+        // A word, then a byte and a halfword over it.
+        put(3'd2, BASE + 32'h10, 32'h1122_3344);
+        put(3'd0, BASE + 32'h11, 32'h0000_aa00);
+        put(3'd1, BASE + 32'h12, 32'hbeef_0000);
+        rdata = get(BASE + 32'h10);
+        $display("after sizes: %h", rdata);
+        $assert(rdata == 32'hbeef_aa44);
+
+        // A write, with a read of the same word in its data phase.
+        hwrite = 1;
+        hsize  = 3'd2;
+        haddr  = BASE + 32'h14;
+        htrans = 2'b10;
+        advance();
+        hwdata = 32'hcafe_0005;
+        hwrite = 0;
+        haddr  = BASE + 32'h14;
+        htrans = 2'b10;
+        advance();
+        htrans = 2'b00;
+        rdata  = finish();
+        $display("pipelined read: %h", rdata);
+        $assert(rdata == 32'hcafe_0005);
+
+        // The word before was not touched by the pipelined pair.
+        $assert(get(BASE + 32'h10) == 32'hbeef_aa44);
+
+        clk.next(4);
+        $finish();
+    }
+}

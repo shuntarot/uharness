@@ -1,0 +1,129 @@
+/// AHB-Lite subordinate to AXI4 manager, one transfer at a time. Both sides
+/// are 32 bits wide: `PKG` must have 4-byte data.
+///
+/// It is for a core whose bus Veryl's std has no interface for: the core
+/// talks AHB-Lite to this part, and the harness sees an AXI4 port.
+///
+/// It sits point to point on one AHB manager. There is no `HSEL` and no
+/// `HREADY` input; with a single subordinate both are always 1. `HBURST`,
+/// `HPROT` and `HMASTLOCK` are not needed: a burst is a run of single
+/// transfers here.
+///
+/// Every AHB transfer becomes one single-beat AXI4 transfer of a whole word:
+/// the address is aligned down to the word, and a write sends
+/// only the bytes of `hsize` in `wstrb`. A read returns the whole word; the
+/// AHB manager takes its byte lanes from it, as AHB requires.
+///
+/// The data phase holds `hready` low until R or B comes back, so only one
+/// transfer is ever outstanding and the AXI side needs no ID handling.
+/// `hready` comes straight from `rvalid` / `bvalid`, which saves a cycle per
+/// access.
+///
+/// The AXI address is `haddr - BASE`, cut to the width of `PKG`. An AXI error
+/// response is not passed on: there is no `HRESP`, and the transfer completes
+/// as OKAY.
+pub module ahb2axi::<PKG: $std::axi4_prototype> #(
+    param BASE: bit<32> = 0,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    i_haddr : input  logic<32>,
+    i_hwrite: input  logic    ,
+    i_htrans: input  logic<2> ,
+    i_hsize : input  logic<3> ,
+    i_hwdata: input  logic<32>,
+    o_hready: output logic    ,
+    o_hrdata: output logic<32>,
+
+    axi: modport $std::axi4_if::<PKG>::master,
+) {
+    var busy  : logic    ; // a data phase is open
+    var write : logic    ;
+    var addr  : logic<32>;
+    var strb  : logic<4> ;
+    var a_sent: logic    ; // AW or AR accepted
+    var w_sent: logic    ; // W accepted
+    var accept: logic    ;
+
+    always_comb {
+        o_hready = !busy || (if write ? axi.bresp_ack() : axi.rdata_ack());
+        o_hrdata = axi.rdata;
+        accept   = o_hready && i_htrans[1];
+    }
+
+    always_ff {
+        if_reset {
+            busy   = 0;
+            write  = 0;
+            addr   = 0;
+            strb   = 0;
+            a_sent = 0;
+            w_sent = 0;
+        } else if o_hready {
+            busy   = accept;
+            write  = i_hwrite;
+            addr   = (i_haddr - BASE) & ~32'h3;
+            strb   = strobe(i_hsize, i_haddr[1:0]);
+            a_sent = 0;
+            w_sent = 0;
+        } else {
+            if axi.awaddr_ack() || axi.araddr_ack() {
+                a_sent = 1;
+            }
+            if axi.wdata_ack() {
+                w_sent = 1;
+            }
+        }
+    }
+
+    always_comb {
+        axi.awvalid  = busy && write && !a_sent;
+        axi.awaddr   = addr[PKG::ADDRESS_WIDTH - 1:0];
+        axi.awsize   = $std::axi4_config::axsize_variants::BYTES_PER_TRANSFER_4;
+        axi.awburst  = $std::axi4_config::axburst_variants::INCREMENTING_BURST;
+        axi.awcache  = 0;
+        axi.awprot   = 0;
+        axi.awid     = 0;
+        axi.awlen    = 0;
+        axi.awlock   = 0;
+        axi.awqos    = 0;
+        axi.awregion = 0;
+        axi.awuser   = 0;
+
+        // AHB holds hwdata for the whole data phase, so W can go out with AW.
+        axi.wvalid = busy && write && !w_sent;
+        axi.wlast  = 1;
+        axi.wdata  = i_hwdata;
+        axi.wstrb  = strb;
+        axi.wuser  = 0;
+
+        axi.bready = 1;
+
+        axi.arvalid  = busy && !write && !a_sent;
+        axi.araddr   = addr[PKG::ADDRESS_WIDTH - 1:0];
+        axi.arsize   = $std::axi4_config::axsize_variants::BYTES_PER_TRANSFER_4;
+        axi.arburst  = $std::axi4_config::axburst_variants::INCREMENTING_BURST;
+        axi.arcache  = 0;
+        axi.arprot   = 0;
+        axi.arid     = 0;
+        axi.arlen    = 0;
+        axi.arlock   = 0;
+        axi.arqos    = 0;
+        axi.arregion = 0;
+        axi.aruser   = 0;
+
+        axi.rready = 1;
+    }
+
+    function strobe (
+        size: input logic<3>,
+        addr: input logic<2>,
+    ) -> logic<4> {
+        case size {
+            0      : return 4'b0001 << addr;
+            1      : return 4'b0011 << {addr[1], 1'b0};
+            default: return 4'b1111;
+        }
+    }
+}

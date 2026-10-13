@@ -211,6 +211,10 @@ wider than the controller's. Accesses are held off until calibration finishes
 (tens of ms); `<bundle>_calib` says when. The memory controller's settings
 ship with the target, so no Vivado board files are needed.
 
+A core with another bus converts it to AXI4 inside the DUT, with a bridge from
+the `hns` package. `hns::ahb2axi` takes an AHB-Lite manager (32 bits, one
+transfer at a time); add `hns` to your `Veryl.toml` to use it.
+
 **A transfer-level port.** "Read N bytes from A", data comes back as beats, no
 latency assumed.
 
