@@ -1,5 +1,4 @@
-# Fixed-shape RTL parts that the harness uses. A user depends on this package
-# with one line.
+# Fixed-shape RTL parts that the harness uses.
 #
 # It holds only parts whose shape does not depend on the manifest; only their
 # parameters change: terminators (fifo / mem), the window slave (axil), and the
@@ -7,15 +6,19 @@
 # project, so the generator emits them.
 #
 # The parts are a separate package so that hand-verified CDC logic is not
-# rewritten per project. The user's Veryl.toml needs the dependency; the
-# generator reports a missing one with an error that prints the line to add.
+# rewritten per project. The generated harness depends on it on its own; a
+# user names it only to pick a version or a local checkout.
+#
+# It also carries bridges for the DUT side (ahb2axi): a core with a bus that
+# Veryl's std has no interface for converts it to AXI4 with one of these. The
+# DUT project then depends on this package itself.
 #
 # The directory name is free, but the project name is not. Veryl prefixes
 # generated SV module names with the project name, and those names share one
 # flat namespace with vendor IP.
 [project]
 name    = "hns"
-version = "0.2.1"
+version = "0.3.0"
 
 [build]
 clock_type = "posedge"
