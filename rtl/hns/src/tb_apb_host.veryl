@@ -65,12 +65,18 @@ module test_apb_host {
             }
             if psel && penable && pready {
                 if pwrite {
-                    mem[paddr[8:2]] = pwdata;
-                    writes          = writes + 1;
+                    writes = writes + 1;
                 } else {
                     reads = reads + 1;
                 }
             }
+        }
+    }
+
+    // Storage has no reset, as in a real register file.
+    always_ff (clk) {
+        if psel && penable && pready && pwrite {
+            mem[paddr[8:2]] = pwdata;
         }
     }
 
