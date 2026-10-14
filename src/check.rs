@@ -459,7 +459,12 @@ fn print_bundles(plan: &crate::plan::Plan) {
                 } else {
                     format!("entry={} word={}", mem.entry_width, mem.width)
                 };
-                format!(" depth={}{source} {width}{oor}", mem.depth)
+                let dut_base = if mem.dut_base == 0 {
+                    String::new()
+                } else {
+                    format!(" dut_base={:#x}", mem.dut_base)
+                };
+                format!(" depth={}{source} {width}{dut_base}{oor}", mem.depth)
             }
             None => String::new(),
         };
@@ -501,8 +506,13 @@ fn print_bundles(plan: &crate::plan::Plan) {
                 (true, _) => " (defaulted)",
                 _ => "",
             };
+            let dut_base = if mem.dut_base == 0 {
+                String::new()
+            } else {
+                format!(" dut_base={:#x}", mem.dut_base)
+            };
             format!(
-                " depth={}{source} axi4 data={} bytes{aperture}",
+                " depth={}{source} axi4 data={} bytes{aperture}{dut_base}",
                 mem.depth, mem.data_bytes
             )
         } else {

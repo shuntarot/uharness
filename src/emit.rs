@@ -1983,6 +1983,11 @@ fn core_body(
         if axi_mem.backing == crate::manifest::Backing::Dram {
             out.push_str(&format!("    var t_{bundle}_calib: {domain}logic;\n"));
         }
+        if axi_mem.dut_base != 0 {
+            out.push_str(&format!(
+                "    var t_{bundle}_oor: {domain}logic<{WORD_BITS}>;\n"
+            ));
+        }
     }
     for axi_mem in &plan.axi_mems {
         // State the clock domain. An interface instance has no domain of its
@@ -2004,6 +2009,12 @@ fn core_body(
         if widen {
             out.push_str(&format!(
                 "    inst xaxi_{bundle}: {domain}$std::axi4_if::<{hpkg}>;\n"
+            ));
+        }
+        // The output of `hns::axi_range`: inside the memory, base taken off.
+        if axi_mem.dut_base != 0 {
+            out.push_str(&format!(
+                "    inst raxi_{bundle}: {domain}$std::axi4_if::<{hpkg}>;\n"
             ));
         }
         out.push_str(&format!(
@@ -2223,7 +2234,7 @@ fn core_body(
                 // The region is the whole window; there are no upper bits.
                 out.push_str(&format!("    assign sel_{bundle} = 1'b1;\n"));
             } else {
-                let top = region.base >> inside;
+                let top = region.window_base >> inside;
                 out.push_str(&format!(
                     "    assign sel_{bundle} = bus_addr[{hi}:{inside}] == {}'d{top};\n",
                     hi - inside + 1
@@ -2739,8 +2750,16 @@ fn core_body(
         out.push_str(&format!("        i_clk: {clk},\n"));
         out.push_str(&format!("        i_rst: {rst},\n"));
         // The address does not wrap. The terminator returns 0 for an
-        // out-of-range address and counts it.
-        out.push_str(&format!("        i_addr: w_{},\n", mem.addr));
+        // out-of-range address and counts it. Below `dut_base`, the
+        // subtraction wraps past the end, which the plan made sure of.
+        if mem.base_steps == 0 {
+            out.push_str(&format!("        i_addr: w_{},\n", mem.addr));
+        } else {
+            out.push_str(&format!(
+                "        i_addr: w_{} - {}'h{:x},\n",
+                mem.addr, mem.addr_width, mem.base_steps
+            ));
+        }
         out.push_str(&format!("        o_rdata: w_{},\n", mem.rdata));
         match &mem.write {
             Some(write) => {
@@ -2809,6 +2828,28 @@ fn core_body(
 
         let (hpkg, widen) = host_pkg(plan, axi_mem);
 
+        // With `dut_base`, only what is inside the memory goes on, with the
+        // base taken off. The rest is answered with DECERR and counted. It
+        // also sets the address width, so no `hns::axi_aw` is needed.
+        if axi_mem.dut_base != 0 {
+            out.push_str(&format!(
+                "    inst u_range_{bundle}: hns::axi_range::<\n        {},\n        {hpkg},\n    > #(\n",
+                axi_mem.pkg
+            ));
+            out.push_str(&format!("        BASE: 64'h{:x},\n", axi_mem.dut_base));
+            out.push_str(&format!(
+                "        SPAN: 64'h{:x},\n",
+                u64::from(axi_mem.depth) * u64::from(axi_mem.data_bytes)
+            ));
+            out.push_str("    ) (\n");
+            out.push_str(&format!("        i_clk: {clk},\n"));
+            out.push_str(&format!("        i_rst: {rst},\n"));
+            out.push_str(&format!("        o_oor: t_{bundle}_oor,\n"));
+            out.push_str(&format!("        s_axi: faxi_{bundle},\n"));
+            out.push_str(&format!("        m_axi: raxi_{bundle},\n"));
+            out.push_str("    );\n\n");
+        }
+
         // Widen the DUT address. It is wiring only (`hns::axi_aw`), so it adds
         // no latency to the DUT under test.
         if widen {
@@ -2847,7 +2888,13 @@ fn core_body(
         out.push_str(&format!("        i_rst: {rst},\n"));
         out.push_str(&format!(
             "        m0: {}_{bundle},\n",
-            if widen { "xaxi" } else { "faxi" }
+            if axi_mem.dut_base != 0 {
+                "raxi"
+            } else if widen {
+                "xaxi"
+            } else {
+                "faxi"
+            }
         ));
         out.push_str(&format!("        m1: haxi_{bundle},\n"));
         out.push_str(&format!("        s: saxi_{bundle},\n"));
@@ -3830,6 +3877,19 @@ fn host_pkg(plan: &Plan, axi_mem: &crate::terminator::AxiMemPlan) -> (String, bo
     if axi_mem.backing != crate::manifest::Backing::Dram {
         return (axi_mem.pkg.clone(), false);
     }
+    // `hns::axi_range` sets the width itself, wider or narrower: what passes
+    // it is inside the memory.
+    if axi_mem.dut_base != 0
+        && let Some(addr) = target_dram(plan).and_then(|d| d.axi_addr_bits)
+    {
+        return (
+            format!(
+                "$std::axi4_pkg::<{addr}, {}, {}, 1, 1, 1, 1, 1>",
+                axi_mem.data_bytes, axi_mem.id_width
+            ),
+            false,
+        );
+    }
     match target_dram(plan).and_then(|d| d.axi_addr_bits) {
         Some(addr) if addr > axi_mem.addr_width => (
             format!(
@@ -3868,7 +3928,11 @@ fn controller_axi(plan: &Plan, axi_mem: &crate::terminator::AxiMemPlan) -> Contr
     };
     // Compare the arbiter type, not the DUT: what leaves the arbiter must
     // match the controller.
-    let widened = addr.max(axi_mem.addr_width);
+    let widened = if axi_mem.dut_base != 0 {
+        addr
+    } else {
+        addr.max(axi_mem.addr_width)
+    };
     let needs_dw = !(bits == axi_mem.data_bytes * 8 && widened == addr && id == axi_mem.id_width);
     let data_bytes = if needs_dw {
         bits / 8
@@ -5457,17 +5521,17 @@ pub fn regs_md(plan: &Plan) -> String {
     out.push('\n');
 
     // The regions: memory or a DUT interface at a range of the window, not a
-    // register. In address order, so the gaps and a fixed `base` show.
+    // register. In address order, so the gaps and a fixed `window_base` show.
     if !map.regions.is_empty() {
         let mut regions: Vec<_> = map.regions.iter().collect();
-        regions.sort_by_key(|region| region.base);
+        regions.sort_by_key(|region| region.window_base);
         let rows: Vec<Vec<String>> = regions
             .iter()
             .map(|region| {
                 let declared = &plan.loaded.manifest.bundle[&region.bundle];
                 let mut notes = Vec::new();
-                if declared.base.is_some() {
-                    notes.push("`base` in Harness.toml".to_string());
+                if declared.window_base.is_some() {
+                    notes.push("`window_base` in Harness.toml".to_string());
                 }
                 notes.push(match region.kind {
                     crate::regmap::RegionKind::Dut => "DUT slave interface".to_string(),
@@ -5483,8 +5547,8 @@ pub fn regs_md(plan: &Plan) -> String {
                 vec![
                     format!(
                         "`0x{:04x}`..`0x{:04x}`",
-                        region.base,
-                        region.base + region.size_bytes - 1
+                        region.window_base,
+                        region.window_base + region.size_bytes - 1
                     ),
                     format!("`{}`", region.bundle),
                     region.kind.as_str().to_string(),
@@ -5622,6 +5686,16 @@ fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
             } else {
                 notes.push(format!("writing it stores the entry and advances `{bundle}_maddr`"));
             }
+        }
+        Some("oor")
+            if plan
+                .axi_mems
+                .iter()
+                .any(|mem| Some(mem.bundle.as_str()) == register.bundle.as_deref()) =>
+        {
+            notes.push(
+                "AXI4 transfers the DUT made outside the memory (below `dut_base` or past the end); they were answered with DECERR".to_string(),
+            )
         }
         // Not a fixed-latency memory: do not talk about cycles holding an
         // address. A transfer-level port counts per command.

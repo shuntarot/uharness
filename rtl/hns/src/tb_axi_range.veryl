@@ -1,0 +1,184 @@
+/// `hns::axi_range` in front of `hns::axi_mem`: what is inside the memory
+/// reaches it with the base taken off, and what is not gets DECERR, never
+/// a wrapped address inside the memory.
+#[test(axi_range_passes_inside_and_refuses_outside)]
+module test_axi_range {
+    const BASE: bit<64> = 64'h8000_0000;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    inst dut_bus: $std::axi4_if::<$std::axi4_pkg::<32, 4, 2, 1, 1, 1, 1, 1>>;
+    inst mem_bus: $std::axi4_if::<$std::axi4_pkg::<8, 4, 2, 1, 1, 1, 1, 1>>;
+
+    var oor: logic<32>;
+
+    inst u: axi_range::<$std::axi4_pkg::<32, 4, 2, 1, 1, 1, 1, 1>, $std::axi4_pkg::<8, 4, 2, 1, 1, 1, 1, 1>> #(
+        BASE: BASE,
+        SPAN: 64  ,
+    ) (
+        i_clk: clk    ,
+        i_rst: rst    ,
+        o_oor: oor    ,
+        s_axi: dut_bus,
+        m_axi: mem_bus,
+    );
+
+    // 16 entries of 4 bytes: 64 bytes, as SPAN says.
+    inst m: axi_mem::<$std::axi4_pkg::<8, 4, 2, 1, 1, 1, 1, 1>> #(
+        DEPTH   : 16   ,
+        BACKDOOR: false,
+    ) (
+        i_clk   : clk    ,
+        i_rst   : rst    ,
+        axi     : mem_bus,
+        i_haddr : 0      ,
+        i_hwdata: 0      ,
+        i_hwstrb: 0      ,
+        i_hwe   : 0      ,
+        o_hrdata: _      ,
+    );
+
+    var got  : logic<32>;
+    var resp : logic<2> ;
+    var beats: logic<8> ;
+    var last : logic    ;
+
+    /// Writes one beat and returns BRESP. Each valid drops right after its
+    /// ready, or AXI4 would count a second transfer.
+    function put (
+        addr: input logic<32>,
+        data: input logic<32>,
+    ) -> logic<2> {
+        dut_bus.awaddr  = addr;
+        dut_bus.awlen   = 0;
+        dut_bus.awvalid = 1;
+        for _i in 0..64 {
+            if dut_bus.awready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        dut_bus.awvalid = 0;
+        dut_bus.wdata   = data;
+        dut_bus.wlast   = 1;
+        dut_bus.wvalid  = 1;
+        for _i in 0..64 {
+            if dut_bus.wready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        dut_bus.wvalid = 0;
+        for _i in 0..64 {
+            if dut_bus.bvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        resp = dut_bus.bresp;
+        clk.next(1);
+        return resp;
+    }
+
+    /// Reads `len + 1` beats from `addr`. Leaves the first beat in `got`, the
+    /// response in `resp`, the count in `beats`, and RLAST of the last beat in
+    /// `last`.
+    function get (
+        addr: input logic<32>,
+        len : input logic<8> ,
+    ) {
+        dut_bus.araddr  = addr;
+        dut_bus.arlen   = len;
+        dut_bus.arvalid = 1;
+        for _i in 0..64 {
+            if dut_bus.arready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        dut_bus.arvalid = 0;
+        beats           = 0;
+        last            = 0;
+        for _i in 0..256 {
+            if dut_bus.rvalid {
+                if beats == 0 {
+                    got  = dut_bus.rdata;
+                    resp = dut_bus.rresp;
+                }
+                beats = beats + 1;
+                last  = dut_bus.rlast;
+                if dut_bus.rlast {
+                    clk.next(1);
+                    break;
+                }
+            }
+            clk.next(1);
+        }
+    }
+
+    always_comb {
+        dut_bus.awsize   = 3'd2;
+        dut_bus.awburst  = 2'b01;
+        dut_bus.awid     = 1;
+        dut_bus.awcache  = 0;
+        dut_bus.awprot   = 0;
+        dut_bus.awlock   = 0;
+        dut_bus.awqos    = 0;
+        dut_bus.awregion = 0;
+        dut_bus.awuser   = 0;
+        dut_bus.wstrb    = 4'hf;
+        dut_bus.wuser    = 0;
+        dut_bus.arsize   = 3'd2;
+        dut_bus.arburst  = 2'b01;
+        dut_bus.arid     = 2;
+        dut_bus.arcache  = 0;
+        dut_bus.arprot   = 0;
+        dut_bus.arlock   = 0;
+        dut_bus.arqos    = 0;
+        dut_bus.arregion = 0;
+        dut_bus.aruser   = 0;
+    }
+
+    initial {
+        dut_bus.awvalid = 0;
+        dut_bus.wvalid  = 0;
+        dut_bus.arvalid = 0;
+        dut_bus.bready  = 1;
+        dut_bus.rready  = 1;
+        rst.assert(4);
+        clk.next(4);
+
+        // Inside: the base is entry 0.
+        $assert(put(32'h8000_0000, 32'haaaa_0000) == 2'b00);
+        $assert(put(32'h8000_003c, 32'haaaa_000f) == 2'b00);
+        get(32'h8000_003c, 0);
+        $display("last word: %h resp %b", got, resp);
+        $assert(got == 32'haaaa_000f && resp == 2'b00);
+        $assert(oor == 0);
+
+        // Past the end. Cut to 6 bits, 0x8000_0040 would be entry 0.
+        $assert(put(32'h8000_0040, 32'hdead_0000) == 2'b11);
+        get(32'h8000_0000, 0);
+        $display("entry 0 after the refused write: %h", got);
+        $assert(got == 32'haaaa_0000);
+
+        // Below the base: DECERR and zeros, one beat per beat asked.
+        get(32'h7fff_fffc, 3);
+        $display("below the base: %h resp %b beats %d last %b", got, resp, beats, last);
+        $assert(got == 0 && resp == 2'b11 && beats == 4 && last);
+
+        // A burst that starts inside and ends outside is refused whole.
+        get(32'h8000_003c, 1);
+        $assert(resp == 2'b11 && beats == 2);
+
+        $display("refused: %d", oor);
+        $assert(oor == 3);
+
+        clk.next(4);
+        $finish();
+    }
+}

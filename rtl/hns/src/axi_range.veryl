@@ -1,0 +1,223 @@
+/// Lets through only the AXI4 transfers that fall inside one memory, with the
+/// memory's DUT address subtracted. The others are answered here with DECERR
+/// and counted.
+///
+/// Without it, a DUT address is cut to the memory's width, so an address
+/// below the base or past the end lands inside the memory. That looks
+/// connected and reads the wrong data.
+///
+/// A burst passes only when all of its bytes are inside. A refused write takes
+/// its W beats and drops them; a refused read returns `arlen + 1` beats of 0.
+///
+/// AXI4 keeps responses with the same ID in order, so a refused transfer is
+/// answered only after everything sent downstream has come back. The DUT sees
+/// this as a slow error, which is fine for an error.
+///
+/// One write is open at a time: the next AW waits until the W beats of the
+/// last one are through, so each W beat is known to go down or be dropped.
+/// AXI4 lets a slave wait for AW before W, and the downstream parts do.
+pub module axi_range::<SPKG: $std::axi4_prototype, MPKG: $std::axi4_prototype> #(
+    /// DUT byte address of the first byte of the memory.
+    param BASE: bit<64> = 0,
+    /// Bytes in the memory.
+    param SPAN: bit<64> = 0,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// Transfers refused so far. It stops at the top.
+    o_oor: output logic<32>,
+
+    /// DUT side.
+    s_axi: modport $std::axi4_if::<SPKG>::slave,
+    /// Memory side. The address is an offset into the memory.
+    m_axi: modport $std::axi4_if::<MPKG>::master,
+) {
+    /// Wide enough for any address plus a whole burst.
+    const XW: u32 = 66;
+
+    /// Whether every byte of a burst is inside the memory.
+    function fits (
+        addr : input logic<SPKG::ADDRESS_WIDTH> ,
+        len  : input logic<SPKG::NUM_BURSTS_LEN>,
+        size : input logic<3>                   ,
+        burst: input logic<2>                   ,
+    ) -> logic {
+        var start: logic<XW>;
+        var total: logic<XW>;
+        var lo   : logic<XW>;
+        var hi   : logic<XW>;
+        var word : logic<XW>;
+        start = addr;
+        total = (len + 1) << size;
+        // A beat covers its whole aligned word, even from an unaligned start.
+        word = 1 << size;
+        if burst == 2'b00 {
+            // FIXED: every beat is the same word.
+            lo = start;
+            hi = (start & ~(word - 1)) + word;
+        } else if burst == 2'b10 {
+            // WRAP: the aligned block of the whole burst.
+            lo = start & ~(total - 1);
+            hi = lo + total;
+        } else {
+            lo = start;
+            hi = (start & ~(word - 1)) + total;
+        }
+        return lo >= BASE && hi <= BASE + SPAN;
+    }
+
+    let aw_in: logic = fits(s_axi.awaddr, s_axi.awlen, s_axi.awsize, s_axi.awburst);
+    let ar_in: logic = fits(s_axi.araddr, s_axi.arlen, s_axi.arsize, s_axi.arburst);
+
+    // --- Writes ---
+    var w_open : logic        ; // an AW is taken and its W is not through
+    var w_drop : logic        ; // ... and it was refused
+    var b_owed : logic        ; // a refused write waits for its B
+    var b_id   : SPKG::id_t   ;
+    var wr_down: logic     <8>; // writes downstream without their B
+
+    let aw_free: logic = !w_open && !b_owed;
+    // A refused B goes out only when nothing is left downstream.
+    let b_here: logic = b_owed && wr_down == 0;
+
+    // --- Reads ---
+    var r_owed : logic                           ; // a refused read is being answered
+    var r_id   : SPKG::id_t                      ;
+    var r_left : logic     <SPKG::NUM_BURSTS_LEN>;
+    var rd_down: logic     <8>                   ; // reads downstream without their last R
+
+    let r_here: logic = r_owed && rd_down == 0;
+
+    always_comb {
+        // --- Write address ---
+        m_axi.awaddr   = (s_axi.awaddr - BASE) as MPKG::addr_t;
+        m_axi.awsize   = s_axi.awsize;
+        m_axi.awburst  = s_axi.awburst;
+        m_axi.awcache  = s_axi.awcache;
+        m_axi.awprot   = s_axi.awprot;
+        m_axi.awid     = s_axi.awid;
+        m_axi.awlen    = s_axi.awlen;
+        m_axi.awlock   = s_axi.awlock;
+        m_axi.awqos    = s_axi.awqos;
+        m_axi.awregion = s_axi.awregion;
+        m_axi.awuser   = s_axi.awuser;
+        m_axi.awvalid  = s_axi.awvalid && aw_free && aw_in;
+        s_axi.awready  = aw_free && (if aw_in ? m_axi.awready : 1'b1);
+
+        // --- Write data ---
+        m_axi.wdata  = s_axi.wdata;
+        m_axi.wstrb  = s_axi.wstrb;
+        m_axi.wlast  = s_axi.wlast;
+        m_axi.wuser  = s_axi.wuser;
+        m_axi.wvalid = s_axi.wvalid && w_open && !w_drop;
+        s_axi.wready = w_open && (if w_drop ? 1'b1 : m_axi.wready);
+
+        // --- Write response ---
+        if b_here {
+            s_axi.bvalid = 1;
+            s_axi.bid    = b_id;
+            s_axi.bresp  = $std::axi4_config::resp_variants::DECERR;
+            s_axi.buser  = 0;
+            m_axi.bready = 0;
+        } else {
+            s_axi.bvalid = m_axi.bvalid;
+            s_axi.bid    = m_axi.bid;
+            s_axi.bresp  = m_axi.bresp;
+            s_axi.buser  = m_axi.buser;
+            m_axi.bready = s_axi.bready;
+        }
+
+        // --- Read address ---
+        m_axi.araddr   = (s_axi.araddr - BASE) as MPKG::addr_t;
+        m_axi.arsize   = s_axi.arsize;
+        m_axi.arburst  = s_axi.arburst;
+        m_axi.arcache  = s_axi.arcache;
+        m_axi.arprot   = s_axi.arprot;
+        m_axi.arid     = s_axi.arid;
+        m_axi.arlen    = s_axi.arlen;
+        m_axi.arlock   = s_axi.arlock;
+        m_axi.arqos    = s_axi.arqos;
+        m_axi.arregion = s_axi.arregion;
+        m_axi.aruser   = s_axi.aruser;
+        m_axi.arvalid  = s_axi.arvalid && !r_owed && ar_in;
+        s_axi.arready  = !r_owed && (if ar_in ? m_axi.arready : 1'b1);
+
+        // --- Read data ---
+        if r_here {
+            s_axi.rvalid = 1;
+            s_axi.rid    = r_id;
+            s_axi.rdata  = 0;
+            s_axi.rresp  = $std::axi4_config::resp_variants::DECERR;
+            s_axi.rlast  = r_left == 0;
+            s_axi.ruser  = 0;
+            m_axi.rready = 0;
+        } else {
+            s_axi.rvalid = m_axi.rvalid;
+            s_axi.rid    = m_axi.rid;
+            s_axi.rdata  = m_axi.rdata;
+            s_axi.rresp  = m_axi.rresp;
+            s_axi.rlast  = m_axi.rlast;
+            s_axi.ruser  = m_axi.ruser;
+            m_axi.rready = s_axi.rready;
+        }
+    }
+
+    let aw_take: logic    = s_axi.awvalid && s_axi.awready;
+    let ar_take: logic    = s_axi.arvalid && s_axi.arready;
+    let aw_down: logic    = m_axi.awvalid && m_axi.awready;
+    let b_down : logic    = m_axi.bvalid && m_axi.bready;
+    let ar_down: logic    = m_axi.arvalid && m_axi.arready;
+    let r_down : logic    = m_axi.rvalid && m_axi.rready && m_axi.rlast;
+    let w_end  : logic    = s_axi.wvalid && s_axi.wready && s_axi.wlast;
+    let refused: logic<2> = {1'b0, aw_take && !aw_in} + {1'b0, ar_take && !ar_in};
+
+    always_ff {
+        if_reset {
+            w_open  = 0;
+            w_drop  = 0;
+            b_owed  = 0;
+            b_id    = 0;
+            wr_down = 0;
+            r_owed  = 0;
+            r_id    = 0;
+            r_left  = 0;
+            rd_down = 0;
+            o_oor   = 0;
+        } else {
+            if aw_take {
+                w_open = 1;
+                w_drop = !aw_in;
+                b_id   = s_axi.awid;
+            } else if w_end {
+                w_open = 0;
+                if w_drop {
+                    b_owed = 1;
+                }
+            }
+            if b_here && s_axi.bready {
+                b_owed = 0;
+            }
+            wr_down = wr_down + aw_down - b_down;
+
+            if ar_take && !ar_in {
+                r_owed = 1;
+                r_id   = s_axi.arid;
+                r_left = s_axi.arlen;
+            } else if r_here && s_axi.rready {
+                if r_left == 0 {
+                    r_owed = 0;
+                } else {
+                    r_left = r_left - 1;
+                }
+            }
+            rd_down = rd_down + ar_down - r_down;
+
+            if o_oor <= 32'hffff_fffd {
+                o_oor = o_oor + refused;
+            } else if refused != 0 {
+                o_oor = 32'hffff_ffff;
+            }
+        }
+    }
+}

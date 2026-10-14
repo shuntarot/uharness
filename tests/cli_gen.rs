@@ -686,7 +686,7 @@ fn a_region_takes_the_low_end_of_the_window_and_drops_the_indirect_ports() {
     let regions = map["regions"].as_array().unwrap();
     assert_eq!(regions.len(), 1, "{regions:#?}");
     assert_eq!(regions[0]["name"], "ram");
-    assert_eq!(regions[0]["base"], 0);
+    assert_eq!(regions[0]["window_base"], 0);
     assert_eq!(regions[0]["depth"], 256);
     // 256 entries x 4 bytes. Already a power of two.
     assert_eq!(regions[0]["size_bytes"], 1024);
@@ -778,6 +778,121 @@ fn a_bram_bundle_becomes_a_memory_and_its_window() {
 
     let mut metadata = veryl_metadata::Metadata::load(dir.path().join("Veryl.toml")).unwrap();
     harness::dut::analyze(&mut metadata).expect("the generated harness must compile");
+}
+
+/// `dut_base` is subtracted from the DUT address in its own steps, and the
+/// host finds it in the map. What would wrap is refused.
+#[test]
+fn a_dut_base_is_subtracted_only_where_it_cannot_wrap() {
+    // A 10-bit word index of 4-byte words: 0x400 bytes is 0x100 words.
+    let dir = mem_fixture(&format!(
+        "{MEM_HARNESS_TOML}depth = 256\ndut_base = 0x400\n"
+    ));
+    let output = run_gen(&dir, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let top = fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap();
+    let squashed: String = top.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(squashed.contains("i_addr:w_o_ram_addr-10'h100,"), "{top}");
+    let map: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("hns/regs.json")).unwrap())
+            .unwrap();
+    assert_eq!(map["dut_base"]["ram"], 0x400, "{map:#}");
+    // An address below the base is out of range, so there is a counter.
+    assert!(
+        map["registers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == "ram_oor"),
+        "{map:#}"
+    );
+
+    let refused = |extra: &str, code: &str| {
+        let dir = mem_fixture(&format!("{MEM_HARNESS_TOML}{extra}"));
+        let output = run_gen(&dir, &["--json"]);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{extra}: {value}");
+        assert_eq!(value["error"]["code"], code, "{extra}: {value}");
+    };
+    // Not on a word.
+    refused(
+        "depth = 256\ndut_base = 0x402\n",
+        "harness::terminator::dut_base_not_aligned",
+    );
+    // The default depth fills the 10-bit address, so any base pushes the top
+    // of the memory past it.
+    refused(
+        "dut_base = 0x400\n",
+        "harness::terminator::dut_base_past_address",
+    );
+}
+
+/// On AXI4, `dut_base` puts `hns::axi_range` behind the fence: it takes the
+/// base off and refuses what is outside, so a DUT address wider than the
+/// controller's is fine. The base must keep bursts inside 4 KB.
+#[test]
+fn a_dut_base_on_an_axi4_port_goes_through_a_range_check() {
+    let dir = dram_fixture();
+    // A 32-bit DUT; Arty's controller has 28 bits.
+    let src = dir.path().join("src").join("fixture.veryl");
+    let dut = fs::read_to_string(&src)
+        .unwrap()
+        .replace("axi4_pkg::<28,", "axi4_pkg::<32,");
+    fs::write(&src, dut).unwrap();
+    let manifest = fs::read_to_string(dir.path().join("Harness.toml")).unwrap();
+    let with = |base: &str| {
+        fs::write(
+            dir.path().join("Harness.toml"),
+            format!("{manifest}dut_base = {base}\n"),
+        )
+        .unwrap();
+        run_gen(&dir, &["--json"])
+    };
+
+    let output = with("0x8000_0000");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let top = fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap();
+    let squashed: String = top.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        squashed.contains("instu_range_mem:hns::axi_range::<"),
+        "{top}"
+    );
+    assert!(squashed.contains("BASE:64'h80000000,"), "{top}");
+    // 64M words of 4 bytes.
+    assert!(squashed.contains("SPAN:64'h10000000,"), "{top}");
+    assert!(squashed.contains("m0:raxi_mem,"), "{top}");
+    // The range check sets the width, so no widening.
+    assert!(!squashed.contains("hns::axi_aw"), "{top}");
+    let map: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("hns/regs.json")).unwrap())
+            .unwrap();
+    assert_eq!(map["dut_base"]["mem"], 0x8000_0000_u64, "{map:#}");
+    assert!(
+        map["registers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == "mem_oor"),
+        "{map:#}"
+    );
+
+    let output = with("0x8000_0800");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{value}");
+    assert_eq!(
+        value["error"]["code"], "harness::terminator::dut_base_not_4k",
+        "{value}"
+    );
 }
 
 /// The DUT cannot write a `bram_preload`. A write port is an error.
@@ -2985,7 +3100,7 @@ fn an_axi4_memory_of_one_word_is_refused() {
 }
 
 /// regs.md lists the regions too, in address order: they are most of the
-/// window, and a fixed `base` is what a driver writer checks first.
+/// window, and a fixed `window_base` is what a driver writer checks first.
 #[test]
 fn the_markdown_map_lists_the_regions() {
     let dir = dram_fixture();
@@ -2993,7 +3108,7 @@ fn the_markdown_map_lists_the_regions() {
     let toml = fs::read_to_string(dir.path().join("Harness.toml")).unwrap();
     fs::write(
         dir.path().join("Harness.toml"),
-        format!("{toml}base = 0x200\n"),
+        format!("{toml}window_base = 0x200\n"),
     )
     .unwrap();
     let out = run_gen(&dir, &[]);
@@ -3005,7 +3120,7 @@ fn the_markdown_map_lists_the_regions() {
     );
     let md = tight(&fs::read_to_string(dir.path().join("hns/regs.md")).unwrap());
     assert!(
-        md.contains("| `0x0200`..`0x02ff` | `mem` | memory | 256 bytes | `base` in Harness.toml; `dram`; window into"),
+        md.contains("| `0x0200`..`0x02ff` | `mem` | memory | 256 bytes | `window_base` in Harness.toml; `dram`; window into"),
         "{md}"
     );
     assert!(md.contains("moved by `mem_base_*`"), "{md}");

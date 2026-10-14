@@ -610,7 +610,21 @@ pub struct Bundle {
     /// reads its registers from BAR offset 0. It must be a multiple of the
     /// region size.
     #[serde(default, deserialize_with = "size::option_u32")]
-    pub base: Option<u32>,
+    pub window_base: Option<u32>,
+
+    /// The DUT address of entry 0, in bytes (`bram` / `bram_preload`).
+    ///
+    /// The harness subtracts it from the DUT's address, so the DUT can use its
+    /// real addresses: a core that boots from `0x8000_0000` needs no
+    /// subtraction of its own. The host reads it from `regs.json` to place an
+    /// ELF and to find its symbols, so `hio load` needs no `--base`.
+    ///
+    /// An address below it is out of range, like one past the end.
+    ///
+    /// Two bundles on different ports may cover the same addresses. A CPU
+    /// with separate fetch and data ports does that.
+    #[serde(default)]
+    pub dut_base: Option<u64>,
 }
 
 /// Sizes may also be written like `4k` or `256M`.

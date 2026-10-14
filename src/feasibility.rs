@@ -321,7 +321,7 @@ pub enum FeasibilityError {
     #[diagnostic(
         code(harness::feasibility::controller_address),
         help(
-            "A narrower address is fine. A wider one is not, because the extra bits would be dropped and the address would wrap.\n\nDeclare the port with {want} address bits:\n\n    axi: modport $std::axi4_if::<$std::axi4_pkg::<{want}, .., ..>>::master"
+            "A narrower address is fine. A wider one is not, because the extra bits would be dropped and the address would wrap.\n\nDeclare the port with {want} address bits:\n\n    axi: modport $std::axi4_if::<$std::axi4_pkg::<{want}, .., ..>>::master\n\nOr set `dut_base` on the bundle: the harness then refuses what falls outside the memory before cutting the address."
         )
     )]
     ControllerAddress {
@@ -674,9 +674,12 @@ pub fn check(
             }
         }
         // A narrower address only reaches less. A wider one is refused:
-        // cutting the top bits makes addresses wrap silently.
+        // cutting the top bits makes addresses wrap silently. With
+        // `dut_base`, `hns::axi_range` refuses what is outside first, so what
+        // is left fits.
         if let Some(want) = dram.axi_addr_bits
             && plan.addr_width > want
+            && plan.dut_base == 0
         {
             return Err(FeasibilityError::ControllerAddress {
                 bundle: plan.bundle.clone(),
@@ -1159,6 +1162,7 @@ mod tests {
             depth: 256,
             depth_defaulted: false,
             aperture_bytes: Some(256),
+            dut_base: 0,
         }];
         let err = check(
             &manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n"),
@@ -1204,6 +1208,7 @@ mod tests {
             depth: 256,
             depth_defaulted: false,
             aperture_bytes: Some(256),
+            dut_base: 0,
         }];
         let manifest = manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n");
         let err = check(&manifest, &[], &[], &plans, &target, Some("pcie")).unwrap_err();
@@ -1242,6 +1247,7 @@ mod tests {
             depth: 256,
             depth_defaulted: false,
             aperture_bytes: Some(256),
+            dut_base: 0,
         }];
         let manifest = manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n");
         let err = check(&manifest, &[], &[], &plans, &target, Some("jtag")).unwrap_err();
@@ -1276,6 +1282,7 @@ mod tests {
             depth,
             depth_defaulted: false,
             aperture_bytes: Some(256),
+            dut_base: 0,
         };
         let m = manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n");
 
@@ -1363,6 +1370,7 @@ mod tests {
             depth: 1024,
             depth_defaulted: true,
             aperture_bytes: None,
+            dut_base: 0,
         };
         let run = |p: AxiMemPlan| {
             check(
@@ -1563,6 +1571,7 @@ mod tests {
             depth: 35 * 1024,
             depth_defaulted: false,
             aperture_bytes: None,
+            dut_base: 0,
         };
         let one = [mem("a")];
         assert!(check_capacity(&arty(), &[], &one, &[], &[]).is_ok());

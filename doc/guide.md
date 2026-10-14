@@ -83,12 +83,13 @@ data lives (`backing`); the shape of the port is read from the DUT.**
 | `addressing` | `"byte"` / `"word"` | fixed-latency memory port only; required when a word is wider than 8 bits |
 | `access` | `"indirect"` / `"region"` | fixed-latency memory port only; default `region` |
 | `aperture` | size, power of two | a region or an AXI4 port; default is the whole memory. Required for `dram` |
-| `base` | byte offset in the window | a region only (`region` memory, `dram`, `slave`); default is the first free place |
+| `window_base` | byte offset in the window | a region only (`region` memory, `dram`, `slave`); default is the first free place |
+| `dut_base` | byte address | a memory; the DUT address of its first byte, default 0. A multiple of 4 KB on AXI4 |
 
 A key the bundle's shape does not use is an error, not ignored.
 
-Sizes accept a suffix: `4k`, `256M` (1024-based). `depth`, `aperture`, `base`
-and `bar_bytes` all take one.
+Sizes accept a suffix: `4k`, `256M` (1024-based). `depth`, `aperture`,
+`window_base` and `bar_bytes` all take one.
 
 #### backing — where the data lives
 
@@ -196,6 +197,10 @@ ports      = { addr = "o_addr", re = "o_en", rdata = "i_rdata",
 - **Accesses past the end do not wrap**: reads answer 0, writes are dropped, and
   `<bundle>_oor` counts them.
 - `bram_preload` must not have `wdata` / `we`.
+- `dut_base = 0x8000_0000` lets the DUT use its own addresses: the harness
+  subtracts it, and an address below it is out of range. `hio load` reads it
+  from `regs.json`. Two memories on different ports may share addresses, as a
+  CPU's fetch and data ports do.
 
 **An AXI4 master.** Name the interface and nothing else; only `::master`.
 
@@ -280,13 +285,13 @@ hio read  imem 0x0 2
 ```
 
 A region goes in the first free place that is a multiple of its size. Set
-`base` when software expects it at a fixed offset, such as a driver reading its
+`window_base` when software expects it at a fixed offset, such as a driver reading its
 registers at BAR offset 0; `check` refuses one that is unaligned or overlaps.
 
 ```toml
 [bundle.nvme_regs]
-backing = "slave"
-base    = 0
+backing     = "slave"
+window_base = 0
 ```
 
 Addresses count from 0 within the region. Anything past the end is refused
@@ -588,10 +593,11 @@ board is touched**, and the first error stops it with the line and its number.
 ### Loading a memory
 
 ```bash
-hio load dmem prog.elf --base 0x80000000 --verify
+hio load dmem prog.elf --verify
 ```
 
-`--base` says which DUT address entry 0 is, and there is **no default**: get it
+An ELF needs the DUT address of entry 0. It comes from the bundle's `dut_base`,
+or from `--base 0x80000000`, which wins. Without either, `load` stops: get it
 wrong and the program lands somewhere else. The computed addresses are printed
 so you can check them against the linker script. ELF segments are placed by
 `p_paddr`. For a raw `.bin`, give `--at <entry>` instead.
@@ -627,6 +633,31 @@ needs what `check` reports (root, huge pages, and the IOMMU passing this
 card's addresses through); without it the window is used instead, and the output
 says which it was. Only the memory the card is wired to (the `dram` bundle) goes
 this way. `--pio` and `--dma` force one or the other, for telling them apart.
+
+### Running firmware
+
+`hio boot` loads an ELF, runs it, and connects to its RTT console. It is meant
+as a cargo runner:
+
+```toml
+# .cargo/config.toml of the firmware
+[target.riscv32imac-unknown-none-elf]
+runner = "hio boot"
+
+[env]
+HIO_REGS = { value = "../hns/regs.json", relative = true }
+```
+
+It holds the DUT in reset, puts each segment into every memory that covers its
+address (`dut_base`), clears the `_SEGGER_RTT` block, and releases the DUT. Up
+channel 0 goes to the terminal and keys go to down channel 0; Ctrl-A x
+leaves. `hio console <elf>` connects without loading.
+
+The exit status is the program's: from `tohost` (1 passes, `(code << 1) | 1`
+fails with `code`), or from the first byte on an up channel named `hio-exit`.
+
+The host reads memory from outside the CPU. With a write-back data cache, put
+the RTT block where the CPU does not cache, or the host never sees it.
 
 ### Programming
 

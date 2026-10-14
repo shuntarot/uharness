@@ -119,6 +119,13 @@ pub struct MemPlan {
     /// The bytes shown in the window. Smaller than the memory means a moving
     /// window. Only with `access = "region"`.
     pub aperture_bytes: Option<usize>,
+
+    /// The DUT address of entry 0, in bytes. 0 without `dut_base`.
+    pub dut_base: u64,
+
+    /// `dut_base` in steps of the DUT address: bytes for a byte address, read
+    /// words for a word index. The RTL subtracts this.
+    pub base_steps: u64,
 }
 
 impl MemPlan {
@@ -146,6 +153,10 @@ impl MemPlan {
     /// addresses are 64 bits, and a plain shift overflows and panics. In that
     /// case some addresses are always unreachable, so it always counts.
     pub fn counts_out_of_range(&self) -> bool {
+        // Below the base is out of range too.
+        if self.base_steps != 0 {
+            return true;
+        }
         match self.reach() {
             Some(reach) => self.depth < reach,
             None => true,
@@ -701,6 +712,74 @@ pub enum TerminatorError {
         depth: u64,
         bits: usize,
         reach: u64,
+    },
+
+    /// The RTL subtracts the base in address steps, so it must be whole steps.
+    #[error(
+        "[bundle.{bundle}] has dut_base = {base:#x}, which is not a multiple of its {step}-byte word"
+    )]
+    #[diagnostic(
+        code(harness::terminator::dut_base_not_aligned),
+        help(
+            "`{port}` counts {step}-byte words, so entry 0 must start on a word. The nearest values that work are {below:#x} and {above:#x}."
+        )
+    )]
+    DutBaseNotAligned {
+        bundle: String,
+        port: String,
+        base: u64,
+        step: u64,
+        below: u64,
+        above: u64,
+    },
+
+    /// A word index of a width that is not whole bytes has no byte address.
+    #[error(
+        "[bundle.{bundle}] has `dut_base`, and `{port}` counts {width}-bit words, which are not whole bytes"
+    )]
+    #[diagnostic(
+        code(harness::terminator::dut_base_needs_whole_bytes),
+        help(
+            "`dut_base` is a byte address, and a {width}-bit word does not start on a byte. Remove `dut_base` and subtract the base in the DUT."
+        )
+    )]
+    DutBaseNeedsWholeBytes {
+        bundle: String,
+        port: String,
+        width: usize,
+    },
+
+    /// Above the address space, the subtraction would wrap into the memory.
+    #[error(
+        "[bundle.{bundle}] ends at {end:#x} (dut_base = {base:#x} plus the memory), past the {bits}-bit address of `{port}`"
+    )]
+    #[diagnostic(
+        code(harness::terminator::dut_base_past_address),
+        help(
+            "The DUT cannot reach the top of this memory. Lower `dut_base`, set a smaller `depth`, or widen the address port."
+        )
+    )]
+    DutBasePastAddress {
+        bundle: String,
+        port: String,
+        base: u64,
+        end: u128,
+        bits: usize,
+    },
+
+    /// A burst must not cross 4 KB, before or after the base comes off.
+    #[error("[bundle.{bundle}] has dut_base = {base:#x}, which is not a multiple of 4 KB")]
+    #[diagnostic(
+        code(harness::terminator::dut_base_not_4k),
+        help(
+            "An AXI4 burst never crosses a 4 KB boundary. Taking off a base that is not a multiple of 4 KB would make some bursts cross one in the memory. The nearest values that work are {below:#x} and {above:#x}."
+        )
+    )]
+    DutBaseNot4k {
+        bundle: String,
+        base: u64,
+        below: u64,
+        above: u64,
     },
 
     /// Ignoring it silently would make the manifest disagree with the hardware.
@@ -1721,6 +1800,50 @@ pub fn resolve_memories(
             });
         }
 
+        let dut_base = declared.dut_base.unwrap_or(0);
+        let base_steps = if dut_base == 0 {
+            0
+        } else {
+            // Bytes per step of the DUT address.
+            let step = match declared.addressing {
+                Some(Addressing::Word) if width % 8 != 0 => {
+                    return Err(TerminatorError::DutBaseNeedsWholeBytes {
+                        bundle: binding.bundle.clone(),
+                        port: addr.port.clone(),
+                        width,
+                    });
+                }
+                Some(Addressing::Word) => (width / 8) as u64,
+                _ => 1,
+            };
+            if !dut_base.is_multiple_of(step) {
+                return Err(TerminatorError::DutBaseNotAligned {
+                    bundle: binding.bundle.clone(),
+                    port: addr.port.clone(),
+                    base: dut_base,
+                    step,
+                    below: dut_base - dut_base % step,
+                    above: dut_base - dut_base % step + step,
+                });
+            }
+            let base_steps = dut_base / step;
+            // The subtraction is done in the DUT's address width. Below the
+            // base, the result wraps to a large number and is out of range,
+            // as long as the whole memory fits under the top of the address
+            // space. Then no comparator is needed.
+            let end = u128::from(base_steps) + (u128::from(depth) << addr_shift);
+            if end > 1u128 << addr_width.min(127) {
+                return Err(TerminatorError::DutBasePastAddress {
+                    bundle: binding.bundle.clone(),
+                    port: addr.port.clone(),
+                    base: dut_base,
+                    end: end * u128::from(step),
+                    bits: addr_width,
+                });
+            }
+            base_steps
+        };
+
         let access = declared.access.unwrap_or_default();
         // A moving window only makes sense for a region. An indirect port
         // reaches the whole memory with two registers, so there is no window
@@ -1760,6 +1883,8 @@ pub fn resolve_memories(
             depth_from_addr: declared.depth.is_none(),
             access,
             aperture_bytes,
+            dut_base,
+            base_steps,
         });
     }
 
@@ -1953,6 +2078,10 @@ pub struct AxiMemPlan {
     /// The bytes shown in the window. Smaller than the memory means a moving
     /// window.
     pub aperture_bytes: Option<usize>,
+
+    /// The DUT address of the first byte, 0 without `dut_base`. With one,
+    /// `hns::axi_range` takes it off and answers the rest with DECERR.
+    pub dut_base: u64,
 }
 
 impl AxiMemPlan {
@@ -2138,6 +2267,29 @@ pub fn resolve_axi_mems(
             4,
         )?;
 
+        let dut_base = declared.dut_base.unwrap_or(0);
+        if dut_base != 0 {
+            const PAGE: u64 = 4096;
+            if !dut_base.is_multiple_of(PAGE) {
+                return Err(TerminatorError::DutBaseNot4k {
+                    bundle: binding.bundle.clone(),
+                    base: dut_base,
+                    below: dut_base - dut_base % PAGE,
+                    above: dut_base - dut_base % PAGE + PAGE,
+                });
+            }
+            let end = u128::from(dut_base) + depth as u128 * axi4.data_bytes() as u128;
+            if end > 1u128 << axi4.addr_width().min(127) {
+                return Err(TerminatorError::DutBasePastAddress {
+                    bundle: binding.bundle.clone(),
+                    port: port.name.clone(),
+                    base: dut_base,
+                    end,
+                    bits: axi4.addr_width() as usize,
+                });
+            }
+        }
+
         plans.push(AxiMemPlan {
             bundle: binding.bundle.clone(),
             backing: declared.backing,
@@ -2149,6 +2301,7 @@ pub fn resolve_axi_mems(
             depth,
             depth_defaulted: declared.depth.is_none(),
             aperture_bytes,
+            dut_base,
         });
     }
 
@@ -2224,6 +2377,7 @@ pub fn check_claimed(
     const ADDRESSING: &str = "addressing";
     const ACCESS: &str = "access";
     const APERTURE: &str = "aperture";
+    const DUT_BASE: &str = "dut_base";
 
     for binding in bindings {
         let name = binding.bundle.as_str();
@@ -2237,7 +2391,7 @@ pub fn check_claimed(
             (
                 memories.iter().any(|p| p.bundle == name),
                 "a memory port with a fixed latency",
-                &[DEPTH, ADDRESSING, ACCESS, APERTURE][..],
+                &[DEPTH, ADDRESSING, ACCESS, APERTURE, DUT_BASE][..],
             ),
             (
                 host_mems.iter().any(|p| p.bundle == name),
@@ -2252,7 +2406,7 @@ pub fn check_claimed(
             (
                 axi_mems.iter().any(|p| p.bundle == name),
                 "an AXI4 memory port",
-                &[DEPTH, APERTURE][..],
+                &[DEPTH, APERTURE, DUT_BASE][..],
             ),
             (
                 irqs.iter().any(|p| p.bundle == name),
@@ -2289,6 +2443,7 @@ pub fn check_claimed(
             (ADDRESSING, declared.addressing.is_some()),
             (ACCESS, declared.access.is_some()),
             (APERTURE, declared.aperture.is_some()),
+            (DUT_BASE, declared.dut_base.is_some()),
         ] {
             if set && !takes.contains(&key) {
                 return Err(TerminatorError::KeyNotApplicable {
@@ -2296,7 +2451,8 @@ pub fn check_claimed(
                     key,
                     shape,
                     takes: if takes.is_empty() {
-                        "none of `depth`, `addressing`, `access`, `aperture`".to_string()
+                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`"
+                            .to_string()
                     } else {
                         takes
                             .iter()

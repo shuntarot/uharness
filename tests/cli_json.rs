@@ -72,7 +72,7 @@ fn a_successful_check_is_one_json_document() {
 
     assert_eq!(code, Some(0));
     assert_eq!(value["status"], "ok");
-    assert_eq!(value["format_version"], 14);
+    assert_eq!(value["format_version"], 15);
     assert_eq!(value["dut"]["module"], "dut_top");
     assert_eq!(value["bundles"][0]["name"], "csr");
     assert_eq!(value["bundles"][0]["matched_by"], "naming");
