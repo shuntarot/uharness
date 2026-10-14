@@ -140,6 +140,16 @@ pub fn capability(backing: Backing) -> Capability {
             needs: &[],
         },
 
+        // A Debug Module inside the DUT. Like `slave`, the harness only maps
+        // it into the window.
+        Backing::Dmi => Capability {
+            serves_dut_requests: false,
+            deterministic: true,
+            sink: false,
+            needs_pcie: false,
+            needs: &[],
+        },
+
         // An on-chip FIFO that the host polls. No PCIe requester, so it works
         // over `transport = jtag`. It can overflow at its depth.
         Backing::HostPollFifo => Capability {
@@ -194,7 +204,8 @@ fn can_stall_the_dut(contract: Contract) -> bool {
     match contract {
         // AXI4 has a ready on each channel.
         Contract::ValidReady | Contract::Axi => true,
-        Contract::FixedLatency | Contract::ValidOnly => false,
+        // The DUT is the APB slave; it is never the one kept waiting.
+        Contract::FixedLatency | Contract::ValidOnly | Contract::Apb => false,
     }
 }
 

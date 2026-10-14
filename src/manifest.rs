@@ -63,10 +63,13 @@ pub enum Contract {
     ///
     /// The port type already decides it. It can be written only to state it.
     Axi,
+    /// AMBA APB, as a RISC-V Debug Module offers its DMI. The `p*` roles
+    /// decide it.
+    Apb,
 }
 
 /// The values `contract` accepts. Errors list them in this order.
-const CONTRACT_VALUES: &[&str] = &["fixed_latency", "valid_ready", "valid_only", "axi"];
+const CONTRACT_VALUES: &[&str] = &["fixed_latency", "valid_ready", "valid_only", "axi", "apb"];
 
 impl<'de> Deserialize<'de> for Contract {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -79,6 +82,7 @@ impl<'de> Deserialize<'de> for Contract {
             "valid_ready" => Ok(Contract::ValidReady),
             "valid_only" => Ok(Contract::ValidOnly),
             "axi" => Ok(Contract::Axi),
+            "apb" => Ok(Contract::Apb),
             // Removed names: say what replaces them.
             "req_ack" => Err(serde::de::Error::custom(
                 "`req_ack` is gone. A request/response pair with one outstanding transfer is `valid_ready`. Rename it",
@@ -98,6 +102,7 @@ impl Contract {
             Contract::ValidReady => "valid_ready",
             Contract::ValidOnly => "valid_only",
             Contract::Axi => "axi",
+            Contract::Apb => "apb",
         }
     }
 }
@@ -136,6 +141,9 @@ pub enum Backing {
     PcieFlr,
     /// A FIFO in the FPGA that the host reads by polling.
     HostPollFifo,
+    /// The DMI of a RISC-V Debug Module inside the DUT, as an APB slave. The
+    /// host reaches it through the window, and `hio cpu` finds it by kind.
+    Dmi,
     /// Output for observation only.
     Observe,
 }
@@ -151,6 +159,7 @@ const BACKING_VALUES: &[&str] = &[
     "host_irq",
     "pcie_flr",
     "host_poll_fifo",
+    "dmi",
     "observe",
 ];
 
@@ -170,6 +179,7 @@ impl<'de> Deserialize<'de> for Backing {
             "host_irq" => Ok(Backing::HostIrq),
             "pcie_flr" => Ok(Backing::PcieFlr),
             "host_poll_fifo" => Ok(Backing::HostPollFifo),
+            "dmi" => Ok(Backing::Dmi),
             "observe" => Ok(Backing::Observe),
             // `host_bar` became `reg` or `slave`. Only the author knows which,
             // so it cannot be mapped automatically.
@@ -197,6 +207,7 @@ impl Backing {
             Backing::HostIrq => "host_irq",
             Backing::PcieFlr => "pcie_flr",
             Backing::HostPollFifo => "host_poll_fifo",
+            Backing::Dmi => "dmi",
             Backing::Observe => "observe",
         }
     }
@@ -293,6 +304,18 @@ pub enum Role {
     /// not need to be in `ports`. It can be written to state it explicitly.
     Axi4,
 
+    // --- APB, for `dmi`. The DUT is the slave: `psel` to `pwdata` are DUT
+    //     inputs, `prdata` and `pready` DUT outputs.
+    Psel,
+    Penable,
+    Pwrite,
+    /// Byte address.
+    Paddr,
+    Pwdata,
+    Prdata,
+    /// Optional. Without it the slave always answers in the access phase.
+    Pready,
+
     /// A payload that is none of the above.
     Data,
 }
@@ -347,6 +370,13 @@ impl Role {
             Role::WrDoneTag => "wr_done_tag",
             Role::WrDoneError => "wr_done_error",
             Role::Axi4 => "axi4",
+            Role::Psel => "psel",
+            Role::Penable => "penable",
+            Role::Pwrite => "pwrite",
+            Role::Paddr => "paddr",
+            Role::Pwdata => "pwdata",
+            Role::Prdata => "prdata",
+            Role::Pready => "pready",
             Role::Data => "data",
         }
     }
@@ -355,6 +385,20 @@ impl Role {
         matches!(
             self,
             Role::Addr | Role::RData | Role::WData | Role::We | Role::Wstrb | Role::Re
+        )
+    }
+
+    /// An APB role (`dmi`).
+    pub fn is_apb(&self) -> bool {
+        matches!(
+            self,
+            Role::Psel
+                | Role::Penable
+                | Role::Pwrite
+                | Role::Paddr
+                | Role::Pwdata
+                | Role::Prdata
+                | Role::Pready
         )
     }
 
@@ -625,6 +669,15 @@ pub struct Bundle {
     /// with separate fetch and data ports does that.
     #[serde(default)]
     pub dut_base: Option<u64>,
+
+    /// The Debug Module's reset port (`dmi` only).
+    ///
+    /// It gets the harness reset, not the DUT reset, so `hio reset` leaves
+    /// the debugger's state alone: a halted hart, triggers, and a request to
+    /// halt at the first instruction. The core inside the DUT still takes the
+    /// DUT reset, and the Debug Module's own reset requests.
+    #[serde(default)]
+    pub reset: Option<String>,
 }
 
 /// Sizes may also be written like `4k` or `256M`.

@@ -425,6 +425,44 @@ pub enum TerminatorError {
         width: usize,
     },
 
+    #[error("[bundle.{bundle}] addresses {addr_width} bits of bytes on `{port}`, which {what}")]
+    #[diagnostic(
+        code(harness::terminator::dmi_address_width),
+        help(
+            "`paddr` is a byte address, and the Debug Module registers end at 0x7f, byte 0x1fc, so it needs at least {min} bits. The harness maps the whole range into the host window, so it takes at most {max}.\n\nGive the port {min} to {max} bits in a wrapper around the DUT."
+        )
+    )]
+    DmiAddressWidth {
+        bundle: String,
+        port: String,
+        addr_width: usize,
+        what: &'static str,
+        min: usize,
+        max: usize,
+    },
+
+    #[error("[bundle.{bundle}] says `reset = \"{port}\"`, but {what}")]
+    #[diagnostic(
+        code(harness::terminator::dmi_reset_port),
+        help(
+            "`reset` names the Debug Module's reset input, a port of type `reset` on the DUT. The harness drives it with its own reset, so `hio reset` does not clear the debugger's state.\n\nName that port, or remove the line to leave the Debug Module on the DUT reset."
+        )
+    )]
+    DmiResetPort {
+        bundle: String,
+        port: String,
+        what: &'static str,
+    },
+
+    #[error("[bundle.{bundle}] is `dmi` and also carries `{port}`, which is no APB port")]
+    #[diagnostic(
+        code(harness::terminator::dmi_stray_port),
+        help(
+            "A `dmi` bundle holds the APB slave and nothing else: `psel`, `penable`, `pwrite`, `paddr`, `pwdata`, `prdata` and optionally `pready`. `pslverr` is not taken: the Debug Module reports its errors in its own registers.\n\nMove `{port}` to another bundle, or tie it off with `[tie_off]` / `[leave_open]`."
+        )
+    )]
+    DmiStrayPort { bundle: String, port: String },
+
     #[error("[bundle.{bundle}] names one of `wdata` / `we` but not the other")]
     #[diagnostic(
         code(harness::terminator::slave_half_write),
@@ -1477,6 +1515,194 @@ pub fn resolve_slaves(
     Ok(plans)
 }
 
+/// A `dmi` bundle: the APB slave of a RISC-V Debug Module, mapped whole into
+/// the window. The harness is the APB master (`hns::apb_host`).
+#[derive(Debug, Clone)]
+pub struct DmiPlan {
+    pub bundle: String,
+    pub psel: String,
+    pub penable: String,
+    pub pwrite: String,
+    /// The byte address (a DUT input).
+    pub paddr: String,
+    pub addr_width: usize,
+    pub pwdata: String,
+    pub prdata: String,
+    /// None when the slave always answers in the access phase.
+    pub pready: Option<String>,
+    /// The Debug Module's reset port, which gets the harness reset. None:
+    /// the Debug Module is on the DUT reset, and `hio reset` resets it too.
+    pub reset: Option<String>,
+}
+
+impl DmiPlan {
+    /// The bytes it takes in the window: the whole address range.
+    pub fn size_bytes(&self) -> usize {
+        1 << self.addr_width
+    }
+}
+
+/// `paddr` bits: up to `0x7f` words (byte `0x1fc`) is what the Debug Spec
+/// defines, so 9 bits at least.
+pub const DMI_MIN_ADDR_BITS: usize = 9;
+/// Far more than one Debug Module, and still a small part of the window.
+pub const DMI_MAX_ADDR_BITS: usize = 16;
+
+/// Resolves the `dmi` bundles, in bundle name order.
+pub fn resolve_dmis(
+    dut: &Dut,
+    manifest: &Manifest,
+    bindings: &[Binding],
+    contracts: &[BundleContract],
+) -> Result<Vec<DmiPlan>, TerminatorError> {
+    let mut plans = Vec::new();
+    for binding in bindings {
+        if manifest.bundle[&binding.bundle].backing != crate::manifest::Backing::Dmi {
+            continue;
+        }
+        let contract = contracts
+            .iter()
+            .find(|contract| contract.bundle == binding.bundle)
+            .expect("every bundle gets a contract");
+        if let Some(stray) = contract.roles.iter().find(|r| !r.role.is_apb()) {
+            return Err(TerminatorError::DmiStrayPort {
+                bundle: binding.bundle.clone(),
+                port: stray.port.clone(),
+            });
+        }
+        // `contract::check_apb` made sure the needed roles are there.
+        let role_port = |role: Role| {
+            contract
+                .roles
+                .iter()
+                .find(|r| r.role == role)
+                .map(|r| r.port.clone())
+        };
+        let needed = |role: Role| role_port(role).expect("checked by contract::check_apb");
+
+        let inputs = [
+            Role::Psel,
+            Role::Penable,
+            Role::Pwrite,
+            Role::Paddr,
+            Role::Pwdata,
+        ];
+        for role in inputs {
+            let port = port_of(dut, &needed(role));
+            expect_direction(
+                Shape::Dmi,
+                &binding.bundle,
+                port,
+                role.as_str(),
+                PortDirection::Input,
+            )?;
+        }
+        let pready = role_port(Role::Pready);
+        for (role, name) in [
+            (Role::Prdata, Some(needed(Role::Prdata))),
+            (Role::Pready, pready.clone()),
+        ] {
+            if let Some(name) = name {
+                let port = port_of(dut, &name);
+                expect_direction(
+                    Shape::Dmi,
+                    &binding.bundle,
+                    port,
+                    role.as_str(),
+                    PortDirection::Output,
+                )?;
+            }
+        }
+        for role in [Role::Psel, Role::Penable, Role::Pwrite] {
+            expect_single_bit(&binding.bundle, port_of(dut, &needed(role)), role.as_str())?;
+        }
+        if let Some(pready) = &pready {
+            expect_single_bit(&binding.bundle, port_of(dut, pready), Role::Pready.as_str())?;
+        }
+        // The window is 32 bits, and the Debug Module registers are too.
+        for role in [Role::Pwdata, Role::Prdata] {
+            let name = needed(role);
+            let width =
+                port_of(dut, &name)
+                    .width()
+                    .ok_or_else(|| TerminatorError::UnresolvedWidth {
+                        bundle: binding.bundle.clone(),
+                        port: name.clone(),
+                    })?;
+            if width != crate::regmap::WORD_BITS {
+                return Err(TerminatorError::SlaveWidthNotAWord {
+                    bundle: binding.bundle.clone(),
+                    port: name,
+                    width,
+                });
+            }
+        }
+        let paddr = needed(Role::Paddr);
+        let addr_width =
+            port_of(dut, &paddr)
+                .width()
+                .ok_or_else(|| TerminatorError::UnresolvedWidth {
+                    bundle: binding.bundle.clone(),
+                    port: paddr.clone(),
+                })?;
+        let what = if addr_width < DMI_MIN_ADDR_BITS {
+            Some("is too few to reach every Debug Module register")
+        } else if addr_width > DMI_MAX_ADDR_BITS {
+            Some("is more than the window gives one Debug Module")
+        } else {
+            None
+        };
+        if let Some(what) = what {
+            return Err(TerminatorError::DmiAddressWidth {
+                bundle: binding.bundle.clone(),
+                port: paddr,
+                addr_width,
+                what,
+                min: DMI_MIN_ADDR_BITS,
+                max: DMI_MAX_ADDR_BITS,
+            });
+        }
+
+        let reset = manifest.bundle[&binding.bundle].reset.clone();
+        if let Some(name) = &reset {
+            let what = match dut.ports.iter().find(|port| &port.name == name) {
+                None => Some("the DUT has no such port"),
+                Some(port) if port.direction != PortDirection::Input => Some("it is not an input"),
+                Some(port)
+                    if !port
+                        .signals
+                        .iter()
+                        .any(|signal| signal.role == crate::dut::SignalRole::Reset) =>
+                {
+                    Some("it is not of type `reset`")
+                }
+                Some(_) => None,
+            };
+            if let Some(what) = what {
+                return Err(TerminatorError::DmiResetPort {
+                    bundle: binding.bundle.clone(),
+                    port: name.clone(),
+                    what,
+                });
+            }
+        }
+
+        plans.push(DmiPlan {
+            bundle: binding.bundle.clone(),
+            psel: needed(Role::Psel),
+            penable: needed(Role::Penable),
+            pwrite: needed(Role::Pwrite),
+            paddr,
+            addr_width,
+            pwdata: needed(Role::Pwdata),
+            prdata: needed(Role::Prdata),
+            pready,
+            reset,
+        });
+    }
+    Ok(plans)
+}
+
 /// Resolves the `bram` / `bram_preload` bundles, in bundle name order.
 pub fn resolve_memories(
     dut: &Dut,
@@ -2369,6 +2595,7 @@ pub fn check_claimed(
     memories: &[MemPlan],
     host_mems: &[HostMemPlan],
     slaves: &[SlavePlan],
+    dmis: &[DmiPlan],
     axi_mems: &[AxiMemPlan],
     irqs: &[IrqPlan],
     flrs: &[FlrPlan],
@@ -2378,6 +2605,7 @@ pub fn check_claimed(
     const ACCESS: &str = "access";
     const APERTURE: &str = "aperture";
     const DUT_BASE: &str = "dut_base";
+    const RESET: &str = "reset";
 
     for binding in bindings {
         let name = binding.bundle.as_str();
@@ -2402,6 +2630,11 @@ pub fn check_claimed(
                 slaves.iter().any(|p| p.bundle == name),
                 "a `slave`",
                 &[][..],
+            ),
+            (
+                dmis.iter().any(|p| p.bundle == name),
+                "a `dmi`",
+                &[RESET][..],
             ),
             (
                 axi_mems.iter().any(|p| p.bundle == name),
@@ -2444,6 +2677,7 @@ pub fn check_claimed(
             (ACCESS, declared.access.is_some()),
             (APERTURE, declared.aperture.is_some()),
             (DUT_BASE, declared.dut_base.is_some()),
+            (RESET, declared.reset.is_some()),
         ] {
             if set && !takes.contains(&key) {
                 return Err(TerminatorError::KeyNotApplicable {
@@ -2451,7 +2685,7 @@ pub fn check_claimed(
                     key,
                     shape,
                     takes: if takes.is_empty() {
-                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`"
+                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`, `reset`"
                             .to_string()
                     } else {
                         takes
@@ -2498,6 +2732,7 @@ enum Shape {
     Memory,
     TransferLevel,
     Slave,
+    Dmi,
 }
 
 impl Shape {
@@ -2518,6 +2753,11 @@ impl Shape {
                 "a transfer-level memory port",
                 "In a transfer-level port, the DUT drives the commands (`*_cmd_valid`, `*_cmd_addr`, `*_cmd_size`), the write data (`wr_valid`, `wr_data`, `wr_strb`, `wr_last`) and `rd_ready`. The memory drives `*_cmd_ready`, the read data (`rd_valid`, `rd_data`, `rd_last`), `wr_ready` and `wr_done_valid`.",
                 "Check the role of the port in `ports`. The usual cause is a read and a write role swapped.",
+            ),
+            Shape::Dmi => (
+                "a `dmi`",
+                "In a `dmi` bundle the harness is the APB master: it drives `psel`, `penable`, `pwrite`, `paddr` and `pwdata`, and the Debug Module answers on `prdata` and `pready`.",
+                "Check the role of the port in `ports`, or use the Debug Module's own APB ports.",
             ),
             Shape::Slave => (
                 "a `slave`",

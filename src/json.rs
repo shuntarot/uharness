@@ -47,7 +47,7 @@ use crate::unconnected::Kind;
 /// - 15: renamed `registers.regions[].base` to `window_base`; added
 ///   `registers.dut_base`, `registers.dut_read_only`,
 ///   `bundles[].memory.dut_base` and `bundles[].axi_mem.dut_base`
-pub const FORMAT_VERSION: u32 = 15;
+pub const FORMAT_VERSION: u32 = 16;
 
 /// How deep `related` is followed. Veryl diagnostics can nest.
 const MAX_RELATED_DEPTH: usize = 3;
@@ -255,6 +255,10 @@ pub struct BundleOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slave: Option<SlaveOutput>,
 
+    /// A Debug Module's DMI (`dmi`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dmi: Option<DmiOutput>,
+
     /// The memory a DUT AXI4 master reaches (`bram` / `dram`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub axi_mem: Option<AxiMemOutput>,
@@ -284,6 +288,22 @@ pub struct SlaveOutput {
     pub latency: u32,
     /// Its size in the window, in bytes.
     pub size_bytes: usize,
+}
+
+/// A Debug Module's DMI (`dmi`), an APB slave the harness drives.
+#[derive(Debug, Serialize)]
+pub struct DmiOutput {
+    /// Bits of the byte address.
+    pub addr_width: usize,
+    /// Whether the slave has `pready`. Without it, it answers in the access
+    /// phase.
+    pub pready: bool,
+    /// Its size in the window, in bytes.
+    pub size_bytes: usize,
+    /// The Debug Module's reset port, on the harness reset. Absent: it is on
+    /// the DUT reset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset: Option<String>,
 }
 
 /// An AXI4 memory.
@@ -855,6 +875,16 @@ pub fn ok(
                         writable: slave.wdata.is_some(),
                         latency: slave.latency,
                         size_bytes: slave.size_bytes(),
+                    }),
+                dmi: plan
+                    .dmis
+                    .iter()
+                    .find(|dmi| dmi.bundle == binding.bundle)
+                    .map(|dmi| DmiOutput {
+                        addr_width: dmi.addr_width,
+                        pready: dmi.pready.is_some(),
+                        size_bytes: dmi.size_bytes(),
+                        reset: dmi.reset.clone(),
                     }),
                 axi_mem: plan
                     .axi_mems

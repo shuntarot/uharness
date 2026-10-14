@@ -496,6 +496,20 @@ fn print_bundles(plan: &crate::plan::Plan) {
                     " read-only"
                 }
             )
+        } else if let Some(dmi) = plan.dmis.iter().find(|d| d.bundle == binding.bundle) {
+            format!(
+                " paddr={} bits APB{} reset={}",
+                dmi.addr_width,
+                if dmi.pready.is_some() {
+                    ""
+                } else {
+                    " (no pready)"
+                },
+                match &dmi.reset {
+                    Some(port) => format!("{port} (harness)"),
+                    None => "DUT (hio reset clears it)".to_string(),
+                }
+            )
         } else if let Some(mem) = plan.axi_mems.iter().find(|m| m.bundle == binding.bundle) {
             let aperture = mem
                 .aperture_bytes

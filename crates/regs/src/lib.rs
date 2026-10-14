@@ -170,8 +170,8 @@ pub struct Region {
     /// Bundle name. The host looks regions up by it.
     pub name: String,
 
-    /// What is behind the range: `memory` (harness memory) or `dut` (a DUT
-    /// slave interface).
+    /// What is behind the range: `memory` (harness memory), `dut` (a DUT
+    /// slave interface) or `dmi` (a Debug Module, which `hio cpu` looks for).
     ///
     /// This decides whether a batch may be sent again. `memory` gives the
     /// same result twice, so a batch the bridge dropped can be resent. A read

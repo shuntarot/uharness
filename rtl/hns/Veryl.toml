@@ -1,9 +1,10 @@
 # Fixed-shape RTL parts that the harness uses.
 #
 # It holds only parts whose shape does not depend on the manifest; only their
-# parameters change: terminators (fifo / mem), the window slave (axil), and the
-# JTAG bridge (dr / bscan). Wiring and register decode change shape per
-# project, so the generator emits them.
+# parameters change: terminators (fifo / mem), the window slave (axil), the
+# JTAG bridge (dr / bscan), and the APB master for a Debug Module (apb_host).
+# Wiring and register decode change shape per project, so the generator emits
+# them.
 #
 # The parts are a separate package so that hand-verified CDC logic is not
 # rewritten per project. The generated harness depends on it on its own; a
@@ -18,7 +19,7 @@
 # flat namespace with vendor IP.
 [project]
 name    = "hns"
-version = "0.4.0"
+version = "0.5.0"
 
 [build]
 clock_type = "posedge"

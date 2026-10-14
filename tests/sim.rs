@@ -1778,6 +1778,198 @@ module slave_window {{
     );
 }
 
+/// A Debug Module's DMI, an APB slave the harness drives (`dmi`).
+///
+/// The stand-in counts the reads it answers and stretches each access phase
+/// with `pready`. Three checks: a write and a read reach it, each window read
+/// is exactly one APB read (a Debug Module read can change state), and the
+/// region is marked `dmi` in regs.json so `hio cpu` can find it.
+#[test]
+fn a_dmi_is_driven_one_apb_transfer_per_window_access() {
+    let dut = r#"
+module dut_top (
+    i_clk        : input  clock    ,
+    i_rst        : input  reset    ,
+    i_dmi_psel   : input  logic    ,
+    i_dmi_penable: input  logic    ,
+    i_dmi_pwrite : input  logic    ,
+    i_dmi_paddr  : input  logic<9> ,
+    i_dmi_pwdata : input  logic<32>,
+    o_dmi_prdata : output logic<32>,
+    o_dmi_pready : output logic    ,
+) {
+    var regs : logic<32> [128];
+    var reads: logic<32>      ;
+    var stall: logic<2>       ;
+    let word : logic<7>       = i_dmi_paddr[8:2];
+    let done : logic          = i_dmi_psel && i_dmi_penable && o_dmi_pready;
+
+    assign o_dmi_pready = stall == 2;
+    // The last word counts the reads before this one.
+    assign o_dmi_prdata = if word == 7'h7f ? reads : regs[word];
+
+    always_ff {
+        if_reset {
+            reads = 0;
+            stall = 0;
+        } else {
+            if i_dmi_psel && i_dmi_penable {
+                stall = if o_dmi_pready ? 0 : stall + 1;
+            }
+            if done && !i_dmi_pwrite {
+                reads = reads + 1;
+            }
+        }
+    }
+    always_ff {
+        if done && i_dmi_pwrite {
+            regs[word] = i_dmi_pwdata;
+        }
+    }
+}
+"#;
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.dmi]\nbacking = \"dmi\"\n";
+
+    let dir = fixture(manifest, dut, "");
+    let map = offsets(dir.path());
+    let region = map["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|region| region["name"] == "dmi")
+        .unwrap();
+    assert_eq!(region["kind"], "dmi", "{map:#?}");
+    assert_eq!(region["size_bytes"], 512, "{map:#?}");
+    let (base, magic) = (region_base(&map, "dmi"), offset_of(&map, "harness_magic"));
+    let (reg4, reg64, count) = (base + 4 * 4, base + 0x40 * 4, base + 0x7f * 4);
+
+    let tb = format!(
+        r#"
+#[test(dmi_window)]
+module dmi_window {{
+{BUS}
+    var first : logic<32>;
+    var second: logic<32>;
+
+    initial {{
+        start();
+
+        wr({reg4}, 32'h1234_5678);
+        wr({reg64}, 32'h9abc_def0);
+        $assert(rd({reg4}) == 32'h1234_5678);
+        $assert(rd({reg64}) == 32'h9abc_def0);
+
+        // One window read, one APB read: the count moves by exactly one.
+        first  = rd({count});
+        second = rd({count});
+        $display("reads counted: %0d then %0d", first, second);
+        $assert(second == first + 1);
+
+        $assert(rd({magic}) == 32'h5648524e);
+
+        $finish();
+    }}
+}}
+"#
+    );
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
+/// `reset` on a `dmi` bundle: the Debug Module takes the harness reset, so a
+/// `dut_reset` clears the rest of the DUT and leaves the Debug Module's state.
+#[test]
+fn a_debug_module_on_its_own_reset_keeps_its_state_through_a_dut_reset() {
+    let dut = r#"
+module dut_top (
+    i_clk        : input  clock    ,
+    i_rst        : input  reset    ,
+    i_dm_rst     : input  reset    ,
+    i_dmi_psel   : input  logic    ,
+    i_dmi_penable: input  logic    ,
+    i_dmi_pwrite : input  logic    ,
+    i_dmi_paddr  : input  logic<9> ,
+    i_dmi_pwdata : input  logic<32>,
+    o_dmi_prdata : output logic<32>,
+    o_core       : output logic<32>,
+) {
+    // Word 0 is Debug Module state, on its own reset. The core counts on
+    // the DUT reset.
+    var kept : logic<32>;
+    var count: logic<32>;
+    assign o_dmi_prdata = kept;
+    assign o_core       = count;
+
+    always_ff (i_clk, i_dm_rst) {
+        if_reset {
+            kept = 0;
+        } else if i_dmi_psel && i_dmi_penable && i_dmi_pwrite {
+            kept = i_dmi_pwdata;
+        }
+    }
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            count = 0;
+        } else {
+            count = count + 1;
+        }
+    }
+}
+"#;
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.dmi]\nbacking = \"dmi\"\nreset = \"i_dm_rst\"\n\n[bundle.core]\nbacking = \"reg\"\nports = [\"o_core\"]\n";
+
+    let dir = fixture(manifest, dut, "");
+    let map = offsets(dir.path());
+    let (base, core, reset, state) = (
+        region_base(&map, "dmi"),
+        offset_of(&map, "o_core"),
+        offset_of(&map, "dut_reset"),
+        offset_of(&map, "dut_reset_state"),
+    );
+
+    let tb = format!(
+        r#"
+#[test(dm_reset)]
+module dm_reset {{
+{BUS}
+    var held: logic;
+
+    initial {{
+        start();
+        clk.next(50);
+        wr({base}, 32'hcafe_f00d);
+        $assert(rd({base}) == 32'hcafe_f00d);
+        $assert(rd({core}) != 0);
+
+        // Hold the DUT in reset: the core count clears, the Debug Module
+        // keeps its word.
+        wr({reset}, 1);
+        held = 0;
+        for _i in 0..64 {{
+            if rd({state}) == 1 {{
+                held = 1;
+                break;
+            }}
+        }}
+        $assert(held, "dut_reset_state never rose");
+        $assert(rd({core}) == 0, "the core was not reset");
+        $assert(rd({base}) == 32'hcafe_f00d, "the Debug Module was reset");
+        wr({reset}, 0);
+        $finish();
+    }}
+}}
+"#
+    );
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
 /// A DUT AXI4 master is terminated by FPGA memory. The host reaches the same
 /// memory through an arbiter. With `backing = "dram"`, the shape stays and a
 /// controller sits below it.

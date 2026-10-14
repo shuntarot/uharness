@@ -17,7 +17,7 @@ use crate::heartbeat;
 use crate::manifest::{self, Loaded};
 use crate::regmap::{self, RegisterMap};
 use crate::target::Target;
-use crate::terminator::{self, AxiMemPlan, FifoPlan, HostMemPlan, MemPlan, SlavePlan};
+use crate::terminator::{self, AxiMemPlan, DmiPlan, FifoPlan, HostMemPlan, MemPlan, SlavePlan};
 use crate::unconnected::{self, Unconnected};
 
 pub struct Plan {
@@ -43,6 +43,9 @@ pub struct Plan {
 
     /// Addressable slave interfaces of the DUT, sorted by bundle name.
     pub slaves: Vec<SlavePlan>,
+
+    /// Debug Modules of the DUT, reached on their DMI, sorted by bundle name.
+    pub dmis: Vec<DmiPlan>,
 
     /// Memories the DUT reaches as an AXI4 master, sorted by bundle name.
     pub axi_mems: Vec<AxiMemPlan>,
@@ -349,6 +352,7 @@ pub fn build(
     let memories = terminator::resolve_memories(&dut, &loaded.manifest, &bindings, &contracts)?;
     let host_mems = terminator::resolve_host_mem(&dut, &loaded.manifest, &bindings, &contracts)?;
     let slaves = terminator::resolve_slaves(&dut, &loaded.manifest, &bindings, &contracts)?;
+    let dmis = terminator::resolve_dmis(&dut, &loaded.manifest, &bindings, &contracts)?;
     let axi_mems =
         terminator::resolve_axi_mems(&dut, &loaded.manifest, &bindings, target.as_ref())?;
     let irqs = terminator::resolve_irqs(&dut, &loaded.manifest, &bindings)?;
@@ -360,6 +364,7 @@ pub fn build(
         &memories,
         &host_mems,
         &slaves,
+        &dmis,
         &axi_mems,
         &irqs,
         &flrs,
@@ -404,6 +409,7 @@ pub fn build(
         &memories,
         &host_mems,
         &slaves,
+        &dmis,
         &axi_mems,
         pcie.as_ref(),
     )?;
@@ -434,6 +440,7 @@ pub fn build(
         memories,
         host_mems,
         slaves,
+        dmis,
         axi_mems,
         irqs,
         flrs,
@@ -551,6 +558,7 @@ fn generatable(plan: &Plan) -> Result<(), PlanError> {
             backing,
             Backing::Reg
                 | Backing::Slave
+                | Backing::Dmi
                 | Backing::HostPollFifo
                 | Backing::Bram
                 | Backing::BramPreload
