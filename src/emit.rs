@@ -2158,6 +2158,63 @@ fn core_body(
     }
     out.push('\n');
 
+    // A Debug Module's DMI: the window drives it as an APB master. Like
+    // axi_mem, it says itself when it answers and when it takes a write.
+    for dmi in &plan.dmis {
+        let bundle = &dmi.bundle;
+        let aw = dmi.addr_width;
+        out.push_str(&format!("    var t_{bundle}_maddr: {domain}logic<{aw}>;\n"));
+        out.push_str(&format!(
+            "    var t_{bundle}_mdata: {domain}logic<{WORD_BITS}>;\n"
+        ));
+        out.push_str(&format!("    var t_{bundle}_mwe: {domain}logic;\n"));
+        out.push_str(&format!("    var t_{bundle}_mre: {domain}logic;\n"));
+        out.push_str(&format!(
+            "    var t_{bundle}_mrdata: {domain}logic<{WORD_BITS}>;\n"
+        ));
+        out.push_str(&format!("    var t_{bundle}_mrvalid: {domain}logic;\n"));
+        out.push_str(&format!("    var t_{bundle}_mwready: {domain}logic;\n"));
+        for (port, width) in [
+            (&dmi.psel, 1),
+            (&dmi.penable, 1),
+            (&dmi.pwrite, 1),
+            (&dmi.paddr, aw),
+            (&dmi.pwdata, WORD_BITS),
+            (&dmi.prdata, WORD_BITS),
+        ] {
+            out.push_str(&format!("    var w_{port}: {domain}logic<{width}>;\n"));
+        }
+        if let Some(pready) = &dmi.pready {
+            out.push_str(&format!("    var w_{pready}: {domain}logic;\n"));
+        }
+        out.push_str(&format!(
+            "\n    inst u_apb_{bundle}: hns::apb_host #(\n        ADDR_BITS: {aw},\n    ) (\n"
+        ));
+        out.push_str(&format!("        i_clk    : {clk},\n"));
+        out.push_str(&format!("        i_rst    : {rst},\n"));
+        out.push_str(&format!("        i_addr   : t_{bundle}_maddr,\n"));
+        out.push_str(&format!("        i_wdata  : t_{bundle}_mdata,\n"));
+        out.push_str(&format!("        i_we     : t_{bundle}_mwe,\n"));
+        out.push_str(&format!("        i_re     : t_{bundle}_mre,\n"));
+        out.push_str(&format!("        o_rdata  : t_{bundle}_mrdata,\n"));
+        out.push_str(&format!("        o_rvalid : t_{bundle}_mrvalid,\n"));
+        out.push_str(&format!("        o_wready : t_{bundle}_mwready,\n"));
+        out.push_str(&format!("        o_psel   : w_{},\n", dmi.psel));
+        out.push_str(&format!("        o_penable: w_{},\n", dmi.penable));
+        out.push_str(&format!("        o_pwrite : w_{},\n", dmi.pwrite));
+        out.push_str(&format!("        o_paddr  : w_{},\n", dmi.paddr));
+        out.push_str(&format!("        o_pwdata : w_{},\n", dmi.pwdata));
+        out.push_str(&format!("        i_prdata : w_{},\n", dmi.prdata));
+        // Without `pready` the slave answers in the access phase.
+        let pready = dmi
+            .pready
+            .as_ref()
+            .map(|port| format!("w_{port}"))
+            .unwrap_or_else(|| "1'b1".to_string());
+        out.push_str(&format!("        i_pready : {pready},\n"));
+        out.push_str("    );\n\n");
+    }
+
     // Window decode, only when there are regions.
     //
     // Each region is aligned to its own size, so matching the upper address
@@ -2166,6 +2223,13 @@ fn core_body(
     // `o_rvalid` values are ORed, and the data is picked by which region took
     // the request. The window takes one request at a time, so this is enough.
     if !map.regions.is_empty() {
+        // axi_mem and a DMI say themselves when they answer and when they
+        // take a write. Their latency is not fixed, so a delayed `re` is not
+        // enough.
+        let answers_itself = |bundle: &str| {
+            plan.axi_mems.iter().any(|d| d.bundle == bundle)
+                || plan.dmis.iter().any(|d| d.bundle == bundle)
+        };
         let word = WORD_BITS / 8;
         out.push_str(&format!("    var csr_addr: {domain}logic<{addr_bits}>;\n"));
         out.push_str(&format!("    var csr_wdata: {domain}logic<{WORD_BITS}>;\n"));
@@ -2188,10 +2252,7 @@ fn core_body(
                 }
                 out.push_str(&format!("    var page_{bundle}: {domain}logic<{bits}>;\n"));
             }
-            // axi_mem says itself when it answers (`t_*_mrvalid`). Its latency
-            // through AXI4 and the arbiter is not fixed, so a delayed `re` is
-            // not enough.
-            if plan.axi_mems.iter().any(|d| d.bundle == *bundle) {
+            if answers_itself(bundle) {
                 continue;
             }
             out.push_str(&format!("    var ans_{bundle}: {domain}logic;\n"));
@@ -2274,6 +2335,20 @@ fn core_body(
                     inner
                 }
             };
+            // A DMI takes the byte address as it is.
+            if plan.dmis.iter().any(|d| d.bundle == *bundle) {
+                out.push_str(&format!(
+                    "    assign t_{bundle}_maddr = bus_addr[{entry_hi}:0];\n"
+                ));
+                out.push_str(&format!("    assign t_{bundle}_mdata = bus_wdata;\n"));
+                out.push_str(&format!(
+                    "    assign t_{bundle}_mwe   = bus_we & sel_{bundle};\n"
+                ));
+                out.push_str(&format!(
+                    "    assign t_{bundle}_mre   = bus_re & sel_{bundle};\n"
+                ));
+                continue;
+            }
             if plan.axi_mems.iter().any(|d| d.bundle == *bundle) {
                 out.push_str(&format!(
                     "    assign t_{bundle}_maddr = {};\n",
@@ -2347,7 +2422,7 @@ fn core_body(
         ));
         for region in &map.regions {
             let bundle = &region.bundle;
-            if plan.axi_mems.iter().any(|d| d.bundle == *bundle) {
+            if answers_itself(bundle) {
                 continue;
             }
             out.push_str(&format!("            ans_{bundle} = 0;\n"));
@@ -2362,7 +2437,7 @@ fn core_body(
         out.push_str("        } else {\n");
         for region in &map.regions {
             let bundle = &region.bundle;
-            if plan.axi_mems.iter().any(|d| d.bundle == *bundle) {
+            if answers_itself(bundle) {
                 continue;
             }
             out.push_str(&format!(
@@ -2379,9 +2454,9 @@ fn core_body(
         out.push_str("        }\n    }\n\n");
 
         // "This region answers": a delayed `re` for memories, the terminator's
-        // own signal for axi_mem.
+        // own signal for axi_mem and a DMI.
         let answering = |bundle: &str| {
-            if plan.axi_mems.iter().any(|d| d.bundle == bundle) {
+            if answers_itself(bundle) {
                 format!("t_{bundle}_mrvalid")
             } else {
                 format!("ans_{bundle}")
@@ -2414,7 +2489,7 @@ fn core_body(
         let wready = std::iter::once(format!("(~({any}) & csr_wready)"))
             .chain(map.regions.iter().map(|region| {
                 let bundle = &region.bundle;
-                if plan.axi_mems.iter().any(|d| d.bundle == *bundle) {
+                if answers_itself(bundle) {
                     format!("(sel_{bundle} & t_{bundle}_mwready)")
                 } else {
                     // Region memories and DUT slave interfaces always accept.
@@ -3121,7 +3196,7 @@ fn core_body(
         plan.metadata.project.name, plan.dut.name
     ));
     for port in &plan.dut.ports {
-        let value = connection(plan, clocks, clk, port);
+        let value = connection(plan, clocks, clk, rst, port);
         out.push_str(&format!("        {}: {value},\n", port.name));
     }
     out.push_str("    );\n");
@@ -4478,6 +4553,7 @@ fn connection(
     plan: &Plan,
     clocks: Option<&ClockPlan>,
     clk: &str,
+    rst: &str,
     port: &crate::dut::Port,
 ) -> String {
     use crate::dut::SignalRole;
@@ -4505,10 +4581,16 @@ fn connection(
         .iter()
         .any(|signal| signal.role == SignalRole::Reset)
     {
+        // A Debug Module's reset gets the harness reset, which `hio reset`
+        // does not touch, so the debugger keeps its state.
+        let debug_module = plan
+            .dmis
+            .iter()
+            .any(|dmi| dmi.reset.as_deref() == Some(port.name.as_str()));
         // The DUT gets the DUT reset. Unlike the harness `rst_*`, the host
         // `dut_reset` also asserts it.
         let Some(clocks) = clocks else {
-            return "dut_rst".to_string();
+            return if debug_module { rst } else { "dut_rst" }.to_string();
         };
         let ident = clocks
             .resets
@@ -4516,7 +4598,7 @@ fn connection(
             .find(|(name, _)| name == &port.name)
             .map(|(_, ident)| ident.as_str())
             .unwrap_or("c0");
-        return format!("drst_{ident}");
+        return format!("{}_{ident}", if debug_module { "rst" } else { "drst" });
     }
 
     // [tie_off] / [leave_open].
@@ -5535,6 +5617,9 @@ pub fn regs_md(plan: &Plan) -> String {
                 }
                 notes.push(match region.kind {
                     crate::regmap::RegionKind::Dut => "DUT slave interface".to_string(),
+                    crate::regmap::RegionKind::Dmi => {
+                        "Debug Module (DMI); one word per register, `hio cpu`".to_string()
+                    }
                     crate::regmap::RegionKind::Memory => format!("`{}`", declared.backing),
                 });
                 if region.is_aperture() {

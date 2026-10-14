@@ -1,0 +1,154 @@
+/// `hns::apb_host` against an APB slave that counts its reads and stretches
+/// the access phase: each window access is one APB transfer, and a read that
+/// comes during a write waits for it.
+#[test(apb_host_makes_one_transfer_per_access)]
+module test_apb_host {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var addr  : logic<9> ;
+    var wdata : logic<32>;
+    var we    : logic    ;
+    var re    : logic    ;
+    var rdata : logic<32>;
+    var rvalid: logic    ;
+    var wready: logic    ;
+
+    var psel   : logic    ;
+    var penable: logic    ;
+    var pwrite : logic    ;
+    var paddr  : logic<9> ;
+    var pwdata : logic<32>;
+    var prdata : logic<32>;
+    var pready : logic    ;
+
+    inst u: apb_host #(
+        ADDR_BITS: 9,
+    ) (
+        i_clk    : clk    ,
+        i_rst    : rst    ,
+        i_addr   : addr   ,
+        i_wdata  : wdata  ,
+        i_we     : we     ,
+        i_re     : re     ,
+        o_rdata  : rdata  ,
+        o_rvalid : rvalid ,
+        o_wready : wready ,
+        o_psel   : psel   ,
+        o_penable: penable,
+        o_pwrite : pwrite ,
+        o_paddr  : paddr  ,
+        o_pwdata : pwdata ,
+        i_prdata : prdata ,
+        i_pready : pready ,
+    );
+
+    // The slave: 128 words, and a count of the reads it answered. The access
+    // phase lasts `waits + 1` cycles.
+    var mem    : logic<32> [128];
+    var reads  : logic<32>      ;
+    var writes : logic<32>      ;
+    var stretch: logic<2>       ;
+    var waits  : logic<2>       ;
+
+    assign pready = stretch == waits;
+    assign prdata = mem[paddr[8:2]] + reads;
+
+    always_ff (clk, rst) {
+        if_reset {
+            reads   = 0;
+            writes  = 0;
+            stretch = 0;
+        } else {
+            if psel && penable {
+                stretch = if pready ? 0 : stretch + 1;
+            }
+            if psel && penable && pready {
+                if pwrite {
+                    mem[paddr[8:2]] = pwdata;
+                    writes          = writes + 1;
+                } else {
+                    reads = reads + 1;
+                }
+            }
+        }
+    }
+
+    var got: logic<32>;
+
+    /// Writes one word through the window.
+    function put (
+        a: input logic<9> ,
+        d: input logic<32>,
+    ) {
+        for _i in 0..64 {
+            if wready {
+                break;
+            }
+            clk.next(1);
+        }
+        addr  = a;
+        wdata = d;
+        we    = 1;
+        clk.next(1);
+        we = 0;
+    }
+
+    /// Reads one word through the window into `got`.
+    function get (
+        a: input logic<9>,
+    ) {
+        addr = a;
+        re   = 1;
+        clk.next(1);
+        re = 0;
+        for _i in 0..64 {
+            if rvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        got = rdata;
+        clk.next(1);
+    }
+
+    initial {
+        we    = 0;
+        re    = 0;
+        waits = 0;
+        rst.assert(4);
+        clk.next(4);
+
+        put(9'h010, 32'h1111_0000);
+        put(9'h1fc, 32'h2222_0000);
+        clk.next(4);
+        $assert(writes == 2);
+
+        // The slave adds its read count, so a second APB read shows.
+        get(9'h010);
+        $display("first read: %h", got);
+        $assert(got == 32'h1111_0000 && reads == 1);
+        get(9'h1fc);
+        $assert(got == 32'h2222_0001 && reads == 2);
+
+        // A slow slave: still one transfer per read.
+        waits = 3;
+        get(9'h010);
+        $assert(got == 32'h1111_0002 && reads == 3);
+
+        // A read while a write is on the bus waits for it, then reads what
+        // was written.
+        addr  = 9'h020;
+        wdata = 32'h3333_0000;
+        we    = 1;
+        clk.next(1);
+        we = 0;
+        get(9'h020);
+        $display("read behind a write: %h", got);
+        $assert(got == 32'h3333_0003 && reads == 4 && writes == 3);
+
+        clk.next(8);
+        $assert(reads == 4 && writes == 3);
+        $finish();
+    }
+}

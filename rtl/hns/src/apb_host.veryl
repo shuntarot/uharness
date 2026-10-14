@@ -1,0 +1,90 @@
+/// The window bus as an APB master, for the DMI of a RISC-V Debug Module.
+///
+/// One window access is one APB transfer, never more. A Debug Module read can
+/// change state (reading `data0` runs the next command under `abstractauto`),
+/// so nothing is read ahead and nothing is read again.
+///
+/// The window has one read open at a time. A read that comes while a write is
+/// on the bus waits for it; a write waits until the bus is free (`o_wready`).
+pub module apb_host #(
+    /// Bits of the slave's byte address.
+    param ADDR_BITS: u32 = 9,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    // --- the window side: `i_re` and `i_we` last one cycle ---
+    i_addr : input logic<ADDR_BITS>,
+    i_wdata: input logic<32>       ,
+    i_we   : input logic           ,
+    i_re   : input logic           ,
+    /// Valid with `o_rvalid`.
+    o_rdata: output logic<32>,
+    /// One cycle, when a read is done.
+    o_rvalid: output logic,
+    /// The bus is free, so a write can be taken.
+    o_wready: output logic,
+
+    // --- the APB side ---
+    o_psel   : output logic           ,
+    o_penable: output logic           ,
+    o_pwrite : output logic           ,
+    o_paddr  : output logic<ADDR_BITS>,
+    o_pwdata : output logic<32>       ,
+    i_prdata : input  logic<32>       ,
+    /// Tie to 1 for a slave that always answers in the access phase.
+    i_pready: input logic,
+) {
+    // A read that came while the bus was busy.
+    var rd_wait: logic           ;
+    var rd_addr: logic<ADDR_BITS>;
+
+    let idle: logic = !o_psel;
+    let done: logic = o_psel && o_penable && i_pready;
+    // A read starts now: one just asked for, or one that waited.
+    let rd_now: logic = idle && (i_re || rd_wait);
+
+    assign o_wready = idle && !rd_wait && !i_re;
+
+    always_ff {
+        if_reset {
+            rd_wait   = 0;
+            rd_addr   = 0;
+            o_psel    = 0;
+            o_penable = 0;
+            o_pwrite  = 0;
+            o_paddr   = 0;
+            o_pwdata  = 0;
+            o_rdata   = 0;
+            o_rvalid  = 0;
+        } else {
+            o_rvalid = 0;
+            if i_re && !idle {
+                rd_wait = 1;
+                rd_addr = i_addr;
+            }
+            if rd_now {
+                // Setup phase.
+                rd_wait  = 0;
+                o_psel   = 1;
+                o_pwrite = 0;
+                o_paddr  = if rd_wait ? rd_addr : i_addr;
+            } else if idle && i_we {
+                o_psel   = 1;
+                o_pwrite = 1;
+                o_paddr  = i_addr;
+                o_pwdata = i_wdata;
+            } else if o_psel && !o_penable {
+                // Access phase.
+                o_penable = 1;
+            } else if done {
+                o_psel    = 0;
+                o_penable = 0;
+                if !o_pwrite {
+                    o_rdata  = i_prdata;
+                    o_rvalid = 1;
+                }
+            }
+        }
+    }
+}

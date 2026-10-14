@@ -14,6 +14,7 @@
 pub mod bitstream;
 pub mod bridge;
 pub mod config;
+pub mod dm;
 pub mod dma;
 pub mod elf;
 pub mod frame;

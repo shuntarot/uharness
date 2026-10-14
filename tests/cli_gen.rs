@@ -832,6 +832,139 @@ fn a_dut_base_is_subtracted_only_where_it_cannot_wrap() {
     );
 }
 
+/// A DUT with a Debug Module's DMI. `addr` is the `paddr` width, and `extra`
+/// is added to the port list.
+fn dmi_fixture(harness_toml: &str, addr: u32, extra: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("Veryl.toml"), veryl_toml()).unwrap();
+    fs::write(dir.path().join("Harness.toml"), harness_toml).unwrap();
+    fs::create_dir(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src").join("fixture.veryl"),
+        format!(
+            r#"
+module dut_top (
+    i_clk        : input  clock       ,
+    i_rst        : input  reset       ,
+    i_dmi_psel   : input  logic       ,
+    i_dmi_penable: input  logic       ,
+    i_dmi_pwrite : input  logic       ,
+    i_dmi_paddr  : input  logic<{addr}>,
+    i_dmi_pwdata : input  logic<32>   ,
+    o_dmi_prdata : output logic<32>   ,
+    {extra}
+) {{
+    assign o_dmi_prdata = {{i_dmi_pwdata[31:1], i_dmi_psel & i_dmi_penable & i_dmi_pwrite}};
+}}
+"#
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+const DMI_HARNESS_TOML: &str = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.dmi]\nbacking = \"dmi\"\n";
+
+/// `dmi` finds the APB ports by name, drives them from `hns::apb_host`, and
+/// marks the region so that `hio cpu` can find it. A slave without `pready`
+/// answers in the access phase.
+#[test]
+fn a_dmi_becomes_an_apb_master_in_a_region_of_its_own() {
+    let dir = dmi_fixture(DMI_HARNESS_TOML, 9, "");
+    let output = run_gen(&dir, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let top = fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap();
+    let squashed: String = top.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        squashed.contains("instu_apb_dmi:hns::apb_host#(ADDR_BITS:9,)"),
+        "{top}"
+    );
+    assert!(squashed.contains("i_pready:1'b1,"), "{top}");
+    let map: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("hns/regs.json")).unwrap())
+            .unwrap();
+    let region = &map["regions"][0];
+    assert_eq!(region["name"], "dmi", "{map:#}");
+    assert_eq!(region["kind"], "dmi", "{map:#}");
+    assert_eq!(region["size_bytes"], 512, "{map:#}");
+    // Without `reset` the Debug Module is on the DUT reset.
+    assert!(squashed.contains("i_rst:drst_"), "{top}");
+
+    // With it, that port takes the harness reset.
+    let dir = dmi_fixture(&format!("{DMI_HARNESS_TOML}reset = \"i_rst\"\n"), 9, "");
+    let output = run_gen(&dir, &[]);
+    assert_eq!(output.status.code(), Some(0));
+    let top = fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap();
+    let squashed: String = top.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(squashed.contains("i_rst:rst_"), "{top}");
+}
+
+/// What `dmi` refuses, each with its own code.
+#[test]
+fn a_dmi_that_is_not_a_whole_apb_slave_is_refused() {
+    let refused = |harness: &str, addr: u32, extra: &str, code: &str| {
+        let dir = dmi_fixture(harness, addr, extra);
+        let output = run_gen(&dir, &["--json"]);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{extra}: {value}");
+        assert_eq!(value["error"]["code"], code, "{extra}: {value}");
+    };
+    // `paddr` cannot reach the last Debug Module register.
+    refused(
+        DMI_HARNESS_TOML,
+        8,
+        "",
+        "harness::terminator::dmi_address_width",
+    );
+    // `pslverr` is not taken.
+    refused(
+        DMI_HARNESS_TOML,
+        9,
+        "o_dmi_pslverr: output logic,",
+        "harness::terminator::dmi_stray_port",
+    );
+    // `pready` the DUT receives.
+    refused(
+        DMI_HARNESS_TOML,
+        9,
+        "i_dmi_pready: input logic,",
+        "harness::terminator::wrong_direction",
+    );
+    // An APB role on another backing.
+    refused(
+        "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.dmi]\nbacking = \"reg\"\nports = { psel = \"i_dmi_psel\", penable = \"i_dmi_penable\", pwrite = \"i_dmi_pwrite\", paddr = \"i_dmi_paddr\", pwdata = \"i_dmi_pwdata\", prdata = \"o_dmi_prdata\" }\n",
+        9,
+        "",
+        "harness::contract::apb_role_on_other",
+    );
+    // A missing role, named in `ports`.
+    refused(
+        "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.dmi]\nbacking = \"dmi\"\nports = [\"i_dmi_psel\", \"i_dmi_penable\", \"i_dmi_paddr\", \"i_dmi_pwdata\", \"o_dmi_prdata\"]\n\n[tie_off]\ni_dmi_pwrite = 0\n",
+        9,
+        "",
+        "harness::contract::apb_incomplete",
+    );
+    // `reset` names a port that is not a reset.
+    refused(
+        &format!("{DMI_HARNESS_TOML}reset = \"i_dmi_psel\"\n"),
+        9,
+        "",
+        "harness::terminator::dmi_reset_port",
+    );
+    // `reset` is for `dmi` only.
+    refused(
+        "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.dmi]\nbacking = \"reg\"\nreset = \"i_rst\"\n",
+        9,
+        "",
+        "harness::terminator::key_not_applicable",
+    );
+}
+
 /// On AXI4, `dut_base` puts `hns::axi_range` behind the fence: it takes the
 /// base off and refuses what is outside, so a DUT address wider than the
 /// controller's is fine. The base must keep bursts inside 4 KB.

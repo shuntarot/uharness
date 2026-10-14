@@ -205,6 +205,42 @@ Without `{missing}` the terminator cannot tell {why}."
         why: &'static str,
     },
 
+    #[error("[bundle.{bundle}] gives `{port}` the `{role}` role, which `{backing}` has no use for")]
+    #[diagnostic(
+        code(harness::contract::apb_role_on_other),
+        help(
+            "`psel` / `penable` / `pwrite` / `paddr` / `pwdata` / `prdata` / `pready` describe an APB slave, and only `dmi` takes one: the DMI of a RISC-V Debug Module.\n\nUse `backing = \"dmi\"`, or the roles this backing knows."
+        )
+    )]
+    ApbRoleOnOther {
+        bundle: String,
+        port: String,
+        role: &'static str,
+        backing: String,
+    },
+
+    #[error("[bundle.{bundle}] is `dmi` but has no `{missing}`")]
+    #[diagnostic(
+        code(harness::contract::apb_incomplete),
+        help(
+            "A `dmi` bundle is the APB slave of a Debug Module: `psel`, `penable`, `pwrite`, `paddr`, `pwdata` and `prdata`, and `pready` if it has one. Without `{missing}` the harness cannot tell {why}.\n\nPorts are found by these suffixes, after the bundle prefix. If yours are named otherwise, name them:\n\n    ports = {{ psel = \"..\", penable = \"..\", .. }}"
+        )
+    )]
+    ApbIncomplete {
+        bundle: String,
+        missing: &'static str,
+        why: &'static str,
+    },
+
+    #[error("[bundle.{bundle}] inverts `{port}`, an APB port")]
+    #[diagnostic(
+        code(harness::contract::apb_inverted),
+        help(
+            "APB signals are active high, so the harness drives and reads them as they are. Remove the `!`; if the DUT really has an inverted one, invert it in the DUT."
+        )
+    )]
+    ApbInverted { bundle: String, port: String },
+
     /// A completion carries only "written". Per-tag completion and error
     /// reports need several requests in flight, which is not generated.
     #[error("[bundle.{bundle}] uses `{role}`, which is not generated yet")]
@@ -305,9 +341,11 @@ fn resolve_one(
     let declared = bundle.contract;
     let spec = bundle.ports.as_ref();
     let backing = bundle.backing;
-    // The dictionary has memory names only for memory terminators.
+    // The dictionary has memory names only for memory terminators, and APB
+    // names only for `dmi`.
     let memory = backing.is_memory();
-    let mut roles = assign_roles(dut, binding, spec, prefixes, memory);
+    let apb = backing == Backing::Dmi;
+    let mut roles = assign_roles(dut, binding, spec, prefixes, memory, apb);
     // AXI4 comes from the type, not from a name or `ports`: a modport of
     // `std::axi4_if` is the role. Without this, it would become payload.
     for assignment in &mut roles {
@@ -362,6 +400,38 @@ fn resolve_one(
             port: found.port.clone(),
             role: found.role.as_str(),
             backing: backing.to_string(),
+        });
+    }
+
+    // APB roles were written explicitly on another backing.
+    if !apb && let Some(found) = roles.iter().find(|r| r.role.is_apb()) {
+        return Err(ContractError::ApbRoleOnOther {
+            bundle: binding.bundle.clone(),
+            port: found.port.clone(),
+            role: found.role.as_str(),
+            backing: backing.to_string(),
+        });
+    }
+
+    // APB has its own handshake (`psel` / `penable` / `pready`), so the
+    // valid/ready check does not apply. Check that the roles are complete.
+    if apb {
+        check_apb(&binding.bundle, &roles)?;
+        if let Some(declared) = declared
+            && declared != Contract::Apb
+        {
+            return Err(ContractError::ContractNotYours {
+                bundle: binding.bundle.clone(),
+                declared: declared.as_str(),
+                inferred: Contract::Apb.as_str(),
+                why: "`dmi` takes an APB slave",
+            });
+        }
+        return Ok(BundleContract {
+            bundle: binding.bundle.clone(),
+            contract: Contract::Apb,
+            declared: declared.is_some(),
+            roles,
         });
     }
 
@@ -464,6 +534,50 @@ fn resolve_one(
     })
 }
 
+/// Checks that a `dmi` bundle is a whole APB slave and nothing else.
+///
+/// Directions and widths are checked with the ports, in
+/// `terminator::resolve_dmis`.
+fn check_apb(bundle: &str, roles: &[RoleAssignment]) -> Result<(), ContractError> {
+    const NEEDED: &[(Role, &str, &str)] = &[
+        (Role::Psel, "psel", "when a transfer starts"),
+        (Role::Penable, "penable", "when the access phase is"),
+        (Role::Pwrite, "pwrite", "a read from a write"),
+        (Role::Paddr, "paddr", "which register is meant"),
+        (Role::Pwdata, "pwdata", "what to write"),
+        (Role::Prdata, "prdata", "what was read"),
+    ];
+    let has = |role: Role| roles.iter().any(|r| r.role == role);
+    if let Some((_, missing, why)) = NEEDED.iter().find(|(role, ..)| !has(*role)) {
+        return Err(ContractError::ApbIncomplete {
+            bundle: bundle.to_string(),
+            missing,
+            why,
+        });
+    }
+    for role in NEEDED.iter().map(|(role, ..)| *role).chain([Role::Pready]) {
+        let ports: Vec<&str> = roles
+            .iter()
+            .filter(|r| r.role == role)
+            .map(|r| r.port.as_str())
+            .collect();
+        if ports.len() > 1 {
+            return Err(ContractError::DuplicateRole {
+                bundle: bundle.to_string(),
+                role,
+                ports: ports.join(", "),
+            });
+        }
+    }
+    if let Some(inverted) = roles.iter().find(|r| r.role.is_apb() && r.invert) {
+        return Err(ContractError::ApbInverted {
+            bundle: bundle.to_string(),
+            port: inverted.port.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Checks that a transfer-level bundle has all the roles it needs.
 ///
 /// The contract check does not apply: there are two valid/ready pairs
@@ -556,6 +670,7 @@ fn assign_roles(
     spec: Option<&PortSpec>,
     prefixes: &DirectionPrefixes,
     memory: bool,
+    apb: bool,
 ) -> Vec<RoleAssignment> {
     // Explicit roles: port name -> (role, inverted).
     let explicit: BTreeMap<&str, (Role, bool)> = match spec {
@@ -583,7 +698,7 @@ fn assign_roles(
                 .ports
                 .iter()
                 .find(|port| &port.name == name)
-                .and_then(|port| role_from_name(&port.name, port.direction, prefixes, memory))
+                .and_then(|port| role_from_name(&port.name, port.direction, prefixes, memory, apb))
             {
                 Some(role) => (role, RoleSource::Dictionary),
                 // Payload. If a role the contract needs is missing, a later
@@ -611,9 +726,25 @@ fn role_from_name(
     direction: PortDirection,
     prefixes: &DirectionPrefixes,
     memory: bool,
+    apb: bool,
 ) -> Option<Role> {
     let stripped = prefixes.strip(name, direction);
     let last = stripped.rsplit('_').next()?;
+    if apb {
+        // Only for `dmi`. The APB names are distinct, so nothing else is
+        // guessed there: a stray `valid` in a DMI bundle is payload and is
+        // refused later.
+        return match last {
+            "psel" => Some(Role::Psel),
+            "penable" => Some(Role::Penable),
+            "pwrite" => Some(Role::Pwrite),
+            "paddr" => Some(Role::Paddr),
+            "pwdata" => Some(Role::Pwdata),
+            "prdata" => Some(Role::Prdata),
+            "pready" => Some(Role::Pready),
+            _ => None,
+        };
+    }
     if memory {
         // Only for memory terminators. Elsewhere `rdata` is payload; a name
         // alone must not turn a port into a memory port.

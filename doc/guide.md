@@ -97,6 +97,7 @@ Sizes accept a suffix: `4k`, `256M` (1024-based). `depth`, `aperture`,
 |---|---|---|
 | `reg` | a harness register per port | works |
 | `slave` | **inside the DUT**: it offers an addressable interface, the host drives it | works |
+| `dmi` | **inside the DUT**: a RISC-V Debug Module's DMI, an APB slave the host drives | works |
 | `host_poll_fifo` | a harness FIFO the host polls | works |
 | `bram` | FPGA memory | works |
 | `bram_preload` | FPGA memory the host fills and the DUT only reads | works |
@@ -117,6 +118,7 @@ means "check that this is what I think", and a mismatch is an error.
 | `valid_ready` | `valid` + `ready` | `rd_cmd_*` / `rd_*`, `wr_*` — transfer level |
 | `valid_only` | `valid` alone; **beats can be dropped** | — |
 | `axi` | — | `modport $std::axi4_if::<..>::master` |
+| `apb` | — | `psel` `penable` `pwrite` `paddr` `pwdata` `prdata` (`pready`) — `dmi` only |
 
 A `valid_only` sink cannot be stalled, so the harness counts what it drops in
 `<bundle>_drops`.
@@ -246,6 +248,28 @@ ports   = { addr = "i_csr_addr", wdata = "i_csr_wdata",
 
 The window it occupies follows from the width of `addr` (`2^width` words), and
 the address arrives as a word index.
+
+**A RISC-V Debug Module.** Its DMI, as the APB slave the Debug Module offers
+(Hazard3's `hazard3_dm` does). Ports are found by their `p*` suffix.
+
+```toml
+[bundle.dmi]
+backing = "dmi"       # i_dmi_psel, i_dmi_penable, i_dmi_pwrite, i_dmi_paddr,
+                      # i_dmi_pwdata, o_dmi_prdata, o_dmi_pready
+reset   = "i_dm_rst"  # the Debug Module's own reset port
+```
+
+- `paddr` is a byte address, 9 to 16 bits; the window gives it `2^width`
+  bytes. Without `pready` the slave answers in the access phase. `pslverr` is
+  not taken: a Debug Module reports errors in its own registers.
+- One host access is one APB transfer. Nothing is read ahead or twice, because
+  reading a Debug Module register can change its state.
+- The region is marked `dmi` in `regs.json`, which is how `hio cpu` finds it.
+- `reset` names the Debug Module's reset port. It gets the harness reset, not
+  the DUT reset, so `hio reset` leaves a halted hart, triggers and a
+  halt-on-reset request in place. Without it the Debug Module is on the DUT
+  reset and `hio reset` clears it. Inside the DUT, reset the core with the DUT
+  reset *or* the Debug Module's `ndmreset` / hart reset.
 
 ### How the host sees a memory
 
@@ -658,6 +682,25 @@ fails with `code`), or from the first byte on an up channel named `hio-exit`.
 
 The host reads memory from outside the CPU. With a write-back data cache, put
 the RTT block where the CPU does not cache, or the host never sees it.
+
+### Debugging the CPU
+
+With a `dmi` bundle, `hio cpu` also drives the Debug Module:
+
+```bash
+hio cpu info              # the Debug Module, the hart, and (halted) its ISA and triggers
+hio cpu halt              # halt and show the PC and why it stopped
+hio cpu step 3            # three instructions, one PC per line
+hio cpu regs              # GPRs and the usual CSRs; `regs a0`, `regs pc 0x80000000`
+hio cpu resume
+hio cpu reset --halt      # reset through the Debug Module, stop at the first instruction
+hio cpu dmi dmstatus      # one DMI register, raw; give a value to write it
+```
+
+`--hart N` selects a hart. These work in a procedure file too; `cpu boot` and
+`cpu console` do not, because they take over the terminal. A halt also makes
+`ebreak` in the program halt into the debugger. CSRs the Debug Module cannot
+reach directly go through its program buffer, with `s0` saved and put back.
 
 ### Programming
 

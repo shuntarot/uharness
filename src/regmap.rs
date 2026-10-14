@@ -176,6 +176,8 @@ pub enum RegionKind {
     /// An addressable slave interface of the DUT. Even a read can change the
     /// DUT state.
     Dut,
+    /// The DMI of a Debug Module in the DUT. Reads change state, as for `Dut`.
+    Dmi,
 }
 
 impl RegionKind {
@@ -183,6 +185,7 @@ impl RegionKind {
         match self {
             RegionKind::Memory => "memory",
             RegionKind::Dut => "dut",
+            RegionKind::Dmi => "dmi",
         }
     }
 }
@@ -480,6 +483,7 @@ pub fn build(
     memories: &[crate::terminator::MemPlan],
     host_mems: &[crate::terminator::HostMemPlan],
     slaves: &[crate::terminator::SlavePlan],
+    dmis: &[crate::terminator::DmiPlan],
     axi_mems: &[crate::terminator::AxiMemPlan],
     // With PCIe: the IDs and the BAR (`plan::pcie_identity`, from the resolved
     // transport). The `dma` registers exist only on PCIe, because JTAG has no
@@ -527,6 +531,17 @@ pub fn build(
             RegionKind::Dut,
             WORD_BITS / 8,
             1u64 << slave.addr_width,
+            None,
+        ));
+    }
+    // A Debug Module the same way, one word per DMI register. Its kind tells
+    // `hio cpu` where it is.
+    for dmi in dmis {
+        wanted.push(Wanted::new(
+            &dmi.bundle,
+            RegionKind::Dmi,
+            WORD_BITS / 8,
+            dmi.size_bytes() as u64 / (WORD_BITS / 8) as u64,
             None,
         ));
     }
@@ -1295,7 +1310,9 @@ fn clear_on(
     let (request, acknowledge) = match resolved.contract {
         Contract::ValidReady => (Role::Valid, Role::Ready),
         // These contracts have no handshake pair to clear on.
-        Contract::FixedLatency | Contract::ValidOnly | Contract::Axi => return None,
+        Contract::FixedLatency | Contract::ValidOnly | Contract::Axi | Contract::Apb => {
+            return None;
+        }
     };
 
     let driven = resolved
@@ -1431,6 +1448,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 pcie,
             )
         };
@@ -1509,6 +1527,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1564,6 +1583,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1583,6 +1603,7 @@ mod tests {
             &dut,
             &manifest(CSR),
             &[binding("csr", &["i_en"])],
+            &[],
             &[],
             &[],
             &[],
@@ -1616,6 +1637,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1642,6 +1664,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1655,6 +1678,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1662,6 +1686,7 @@ mod tests {
             &b,
             &manifest(CSR),
             &[binding("csr", &["i_csr_addr"])],
+            &[],
             &[],
             &[],
             &[],
@@ -1697,6 +1722,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1724,6 +1750,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap_err();
@@ -1738,6 +1765,7 @@ mod tests {
             &dut,
             &manifest(CSR),
             &[binding("csr", &["b_pad"])],
+            &[],
             &[],
             &[],
             &[],
@@ -1764,6 +1792,7 @@ mod tests {
             &dut,
             &manifest(CSR),
             &[binding("csr", &["i_x"])],
+            &[],
             &[],
             &[],
             &[],
@@ -1820,6 +1849,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1859,6 +1889,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1882,6 +1913,7 @@ mod tests {
             &dut,
             &manifest(CSR),
             &bindings,
+            &[],
             &[],
             &[],
             &[],
@@ -1914,6 +1946,7 @@ mod tests {
                     },
                 ],
             }],
+            &[],
             &[],
             &[],
             &[],
@@ -1952,6 +1985,7 @@ mod tests {
                 &dut,
                 &manifest(CSR),
                 &bindings,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -2054,6 +2088,7 @@ mod tests {
                 &[],
                 &slaves,
                 &[],
+                &[],
                 None,
             )
         };
@@ -2115,6 +2150,7 @@ mod tests {
             &dut,
             &manifest(&format!("{CSR}window_base = 0\n")),
             &[binding("csr", &["i_csr_addr"])],
+            &[],
             &[],
             &[],
             &[],

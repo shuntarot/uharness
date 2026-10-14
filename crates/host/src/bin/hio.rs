@@ -491,6 +491,87 @@ enum CpuCmd {
         #[command(flatten)]
         attach: AttachArgs,
     },
+
+    /// Describe the Debug Module and the hart.
+    ///
+    /// Reads the Debug Module's own registers and leaves the hart as it is.
+    /// A halted hart also shows its ISA and its triggers.
+    Info {
+        #[command(flatten)]
+        hart: HartArgs,
+    },
+
+    /// Read a DMI register, or write one.
+    ///
+    /// The register is a name (`dmstatus`) or a number (`0x11`). This goes
+    /// past the debugger: a read or a write can change what the Debug Module
+    /// does next.
+    Dmi {
+        /// Register name or number.
+        reg: String,
+        /// The value to write. Without it, the register is read.
+        #[arg(value_parser = parse_u32)]
+        value: Option<u32>,
+        #[command(flatten)]
+        hart: HartArgs,
+    },
+
+    /// Halt the hart and show where it stopped.
+    Halt {
+        #[command(flatten)]
+        hart: HartArgs,
+    },
+
+    /// Let a halted hart run.
+    Resume {
+        #[command(flatten)]
+        hart: HartArgs,
+    },
+
+    /// Run one instruction, or `count`, and show the PC after each.
+    Step {
+        /// How many instructions.
+        #[arg(default_value_t = 1)]
+        count: u32,
+        #[command(flatten)]
+        hart: HartArgs,
+    },
+
+    /// Show the registers of a halted hart, or read or write one.
+    ///
+    /// A name is `pc`, a GPR (`a0`, `x10`) or a CSR (`mstatus`, `0x300`).
+    Regs {
+        /// One register.
+        name: Option<String>,
+        /// The value to write to it.
+        #[arg(value_parser = parse_u64)]
+        value: Option<u64>,
+        #[command(flatten)]
+        hart: HartArgs,
+    },
+
+    /// Reset the hart through the Debug Module (`ndmreset`).
+    ///
+    /// The Debug Module stays up, and so do the harness memories. What else
+    /// `ndmreset` resets is up to the design.
+    Reset {
+        /// Stop before the first instruction.
+        #[arg(long)]
+        halt: bool,
+        #[command(flatten)]
+        hart: HartArgs,
+    },
+}
+
+/// Which Debug Module and which hart a `cpu` debug command means.
+#[derive(clap::Args, Debug, Clone)]
+struct HartArgs {
+    /// The hart to select.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    hart: u32,
+    /// The `dmi` bundle, when the design has more than one.
+    #[arg(long, value_name = "BUNDLE")]
+    dmi: Option<String>,
 }
 
 /// How `cpu boot` and `cpu console` find the RTT control block.
@@ -824,7 +905,7 @@ fn parse_step(line: &str) -> Result<Step, String> {
         Cmd::Run { .. } => Err("a script cannot run another script".to_string()),
         // They take over the terminal and end the process with the
         // program's status.
-        Cmd::Cpu(_) => Err(
+        Cmd::Cpu(CpuCmd::Boot { .. } | CpuCmd::Console { .. }) => Err(
             "`cpu boot` and `cpu console` take over the terminal; run them on their own."
                 .to_string(),
         ),
@@ -852,12 +933,13 @@ fn run_step(cli: &Cli, bus: &mut Bus, map: &RegisterMap, step: Step) -> Result<(
         Cmd::Program { .. }
         | Cmd::Erase
         | Cmd::Run { .. }
-        | Cmd::Cpu(_)
+        | Cmd::Cpu(CpuCmd::Boot { .. } | CpuCmd::Console { .. })
         | Cmd::Probe
         | Cmd::Targets
         | Cmd::Completions { .. } => {
             unreachable!("refused when the script was read")
         }
+        Cmd::Cpu(cmd) => cpu_debug(bus, map, &cmd),
         Cmd::Id => id(bus, map),
         Cmd::Read { who, at, words } => do_read(bus, map, &who, at, words),
         Cmd::Write { who, values } => do_write(bus, map, &who, &values),
@@ -1896,6 +1978,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             let code = boot(&mut bus, &map, elf, attach, false)?;
             exit_with(code)
         }
+        Cmd::Cpu(ref cmd) => cpu_debug(&mut bus, &map, cmd),
         Cmd::DmaFire {
             ref bundle,
             at,
@@ -5544,6 +5627,224 @@ fn console(
     }
 }
 
+/// The DMI registers of a `dmi` region, reached through the window.
+struct WindowDmi<'a> {
+    bus: &'a mut Bus,
+    base: u32,
+}
+
+impl hns_host::dm::Dmi for WindowDmi<'_> {
+    fn run(&mut self, ops: &[hns_host::dm::Op]) -> Result<Vec<u32>, String> {
+        use hns_host::dm::Op;
+        // Not replayable: a Debug Module read can change state.
+        let mut b = Batch::new();
+        let mut reads = Vec::new();
+        for op in ops {
+            match *op {
+                Op::Read(reg) => reads.push(b.read(self.base + reg * 4)),
+                Op::Write(reg, value) => {
+                    b.write(self.base + reg * 4, value);
+                }
+            }
+        }
+        let got = self.bus.run(&b)?;
+        Ok(reads.into_iter().map(|h| got[h]).collect())
+    }
+}
+
+/// Where the Debug Module is: the region of kind `dmi`.
+fn dmi_base(map: &RegisterMap, bundle: Option<&str>) -> Result<u32, String> {
+    let found: Vec<_> = map
+        .regions
+        .iter()
+        .filter(|r| r.kind.as_deref() == Some("dmi"))
+        .collect();
+    let names = || {
+        found
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let region = match (bundle, found.as_slice()) {
+        (_, []) => {
+            return Err(
+                "this design has no Debug Module: regs.json has no region of kind `dmi`.\n\
+                 Give the DUT's DMI a bundle with `backing = \"dmi\"`, then generate and \
+                 synthesize again."
+                    .to_string(),
+            );
+        }
+        (None, [only]) => *only,
+        (None, _) => {
+            return Err(format!(
+                "this design has several Debug Modules ({}). Name one with --dmi.",
+                names()
+            ));
+        }
+        (Some(name), _) => *found
+            .iter()
+            .find(|r| r.name == name)
+            .ok_or_else(|| format!("no Debug Module is called `{name}`. There is: {}.", names()))?,
+    };
+    Ok(region.window_base as u32)
+}
+
+/// The `cpu` commands that talk to the Debug Module.
+fn cpu_debug(bus: &mut Bus, map: &RegisterMap, cmd: &CpuCmd) -> Result<(), String> {
+    use hns_host::dm::{Debug, Reg, reg};
+
+    let args = match cmd {
+        CpuCmd::Boot { .. } | CpuCmd::Console { .. } => {
+            unreachable!("boot and console are run elsewhere")
+        }
+        CpuCmd::Info { hart }
+        | CpuCmd::Dmi { hart, .. }
+        | CpuCmd::Halt { hart }
+        | CpuCmd::Resume { hart }
+        | CpuCmd::Step { hart, .. }
+        | CpuCmd::Regs { hart, .. }
+        | CpuCmd::Reset { hart, .. } => hart,
+    };
+    let base = dmi_base(map, args.dmi.as_deref())?;
+    let window = WindowDmi { bus, base };
+
+    // Raw access needs no attach: it is for when the debugger cannot.
+    if let CpuCmd::Dmi {
+        reg: name, value, ..
+    } = cmd
+    {
+        let mut window = window;
+        let n = reg::parse(name).ok_or_else(|| {
+            let names: Vec<&str> = reg::NAMES.iter().map(|(n, _)| *n).collect();
+            format!(
+                "`{name}` is not a DMI register. Give a number below 0x80, or one of: {}.",
+                names.join(", ")
+            )
+        })?;
+        use hns_host::dm::{Dmi, Op};
+        match value {
+            Some(v) => {
+                window.run(&[Op::Write(n, *v)])?;
+                println!("{name} ({n:#04x}) <- {v:#010x}");
+            }
+            None => {
+                let v = window.run(&[Op::Read(n)])?[0];
+                println!("{name} ({n:#04x}) = {v:#010x}");
+            }
+        }
+        return Ok(());
+    }
+
+    let mut dm = Debug::attach(window, args.hart)?;
+    let hart = dm.hart();
+    // "pc 0x... (cause)" for a halted hart.
+    let stopped = |dm: &mut Debug<WindowDmi>| -> Result<String, String> {
+        let pc = dm.read_reg(Reg::parse("pc").expect("pc is a name"))?;
+        let cause = hns_host::dm::cause_text(dm.cause()?);
+        Ok(format!("pc {} ({cause})", word(pc, dm.xlen()?)))
+    };
+    match cmd {
+        CpuCmd::Info { .. } => {
+            println!("{}", dm.info()?);
+            if dm.is_halted()? {
+                let misa = dm.read_reg(Reg::parse("misa").expect("misa is a name"))?;
+                let xlen = dm.xlen()?;
+                let letters: String = ('A'..='Z')
+                    .filter(|c| misa & (1 << (*c as u32 - 'A' as u32)) != 0)
+                    .collect();
+                println!(
+                    "isa           RV{xlen}{letters} (misa {})",
+                    word(misa, xlen)
+                );
+                let triggers = dm.triggers()?;
+                if triggers.is_empty() {
+                    println!("triggers      none");
+                }
+                for t in triggers {
+                    println!("trigger {:<5} {}", t.index, t.type_names().join(", "));
+                }
+            } else {
+                println!("(halt the hart to see its ISA and triggers: `hio cpu halt`)");
+            }
+        }
+        CpuCmd::Halt { .. } => {
+            dm.halt()?;
+            println!("hart {hart} halted at {}", stopped(&mut dm)?);
+        }
+        CpuCmd::Resume { .. } => {
+            dm.resume()?;
+            println!("hart {hart} running");
+        }
+        CpuCmd::Step { count, .. } => {
+            for _ in 0..*count {
+                dm.step()?;
+                println!("{}", stopped(&mut dm)?);
+            }
+        }
+        CpuCmd::Regs { name: None, .. } => {
+            let xlen = dm.xlen()?;
+            let mut line = String::new();
+            for n in 0..32 {
+                let v = dm.read_reg(Reg::Gpr(n))?;
+                line.push_str(&format!(
+                    "{:>4} {:<4} {}  ",
+                    format!("x{n}"),
+                    hns_host::dm::GPR_NAMES[n as usize],
+                    word(v, xlen)
+                ));
+                if n % 4 == 3 {
+                    println!("{}", line.trim_end());
+                    line.clear();
+                }
+            }
+            for (name, csr) in hns_host::dm::CSR_NAMES {
+                match dm.read_reg(Reg::Csr(*csr)) {
+                    Ok(v) => println!("{name:<9} {}", word(v, xlen)),
+                    Err(e) => println!("{name:<9} -  ({e})"),
+                }
+            }
+            println!("halted at {}", stopped(&mut dm)?);
+        }
+        CpuCmd::Regs {
+            name: Some(name),
+            value,
+            ..
+        } => {
+            let r = Reg::parse(name).ok_or_else(|| {
+                format!(
+                    "`{name}` is not a register. Give `pc`, a GPR (`a0`, `x10`), \
+                     or a CSR by name (`mstatus`) or number (`0x300`)."
+                )
+            })?;
+            if let Some(v) = value {
+                dm.write_reg(r, *v)?;
+            }
+            let v = dm.read_reg(r)?;
+            println!("{r} = {}", word(v, dm.xlen()?));
+        }
+        CpuCmd::Reset { halt, .. } => {
+            dm.reset(*halt)?;
+            if *halt {
+                println!("hart {hart} reset and halted at {}", stopped(&mut dm)?);
+            } else {
+                println!("hart {hart} reset and running");
+            }
+        }
+        CpuCmd::Boot { .. } | CpuCmd::Console { .. } | CpuCmd::Dmi { .. } => unreachable!(),
+    }
+    Ok(())
+}
+
+/// A register value at the hart's width.
+fn word(value: u64, xlen: u32) -> String {
+    if xlen == 64 {
+        format!("{value:#018x}")
+    } else {
+        format!("{value:#010x}")
+    }
+}
+
 /// The terminal in raw mode while it lives: keys arrive one at a time and are
 /// not echoed. Without a terminal (a pipe, a test), it does nothing and reads
 /// stdin as it comes.
@@ -5814,6 +6115,63 @@ mod tests {
             region("scratch", 2048),
         ))
         .unwrap()
+    }
+
+    /// A map with regions `(name, kind, base)`.
+    fn region_map(regions: &[(&str, &str, usize)]) -> RegisterMap {
+        let regions: Vec<String> = regions
+            .iter()
+            .map(|(name, kind, base)| {
+                format!(
+                    r#"{{"name":"{name}","kind":"{kind}","window_base":{base},"size_bytes":512,
+                        "entry_bytes":4,"depth":128}}"#
+                )
+            })
+            .collect();
+        RegisterMap::from_json(&format!(
+            r#"{{"marker":"m","format_version":{},"generator":"g","dut":"d","word_bits":32,
+                "size_bytes":4096,"magic":1,"map_hash":2,"registers":[],"regions":[{}]}}"#,
+            hns_regs::FORMAT_VERSION,
+            regions.join(",")
+        ))
+        .unwrap()
+    }
+
+    /// `hio cpu` finds the Debug Module by the region kind, not by its name,
+    /// and asks when there is more than one.
+    #[test]
+    fn the_debug_module_is_the_region_of_kind_dmi() {
+        let one = region_map(&[("ram", "memory", 0), ("dbg", "dmi", 1024)]);
+        assert_eq!(dmi_base(&one, None).unwrap(), 1024);
+
+        let none = region_map(&[("ram", "memory", 0)]);
+        let err = dmi_base(&none, None).unwrap_err();
+        assert!(err.contains("backing = \"dmi\""), "{err}");
+
+        let two = region_map(&[("dm0", "dmi", 0), ("dm1", "dmi", 512)]);
+        let err = dmi_base(&two, None).unwrap_err();
+        assert!(err.contains("--dmi") && err.contains("dm0, dm1"), "{err}");
+        assert_eq!(dmi_base(&two, Some("dm1")).unwrap(), 512);
+        let err = dmi_base(&two, Some("dm2")).unwrap_err();
+        assert!(err.contains("dm0, dm1"), "{err}");
+    }
+
+    /// A procedure file may halt and read registers, but not take over the
+    /// terminal.
+    #[test]
+    fn a_procedure_file_takes_the_debug_commands_but_not_boot() {
+        assert!(matches!(
+            parse_step("cpu halt --hart 1"),
+            Ok(Step::Window(Cmd::Cpu(CpuCmd::Halt { .. })))
+        ));
+        assert!(matches!(
+            parse_step("cpu regs pc 0x80000000"),
+            Ok(Step::Window(Cmd::Cpu(CpuCmd::Regs { .. })))
+        ));
+        let Err(err) = parse_step("cpu boot a.elf") else {
+            panic!("boot was taken in a procedure file");
+        };
+        assert!(err.contains("take over the terminal"), "{err}");
     }
 
     /// The DMA engine is used only on the memory it is wired to.
