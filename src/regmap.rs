@@ -41,11 +41,14 @@ use crate::manifest::{Backing, Manifest};
 ///   `self_clearing.from`
 /// - 5: adds `target`, so the host can omit `--target`
 /// - 6: adds contiguous ranges in the window (`regions`)
+/// - 7: renames `regions[].base` to `window_base`, to tell it from
+///   `dut_base` (where the memory sits in the DUT's address space), and adds
+///   `dut_base` and `dut_read_only`
 ///
 /// Later fields (`pcie`, `target_source`, `window_clock_mhz` / `window_cycles`)
 /// did not raise it. Readers ignore unknown fields and use defaults for missing
 /// ones, so old and new readers both keep working.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 pub const WORD_BITS: usize = 32;
 
@@ -136,6 +139,18 @@ pub struct RegisterMap {
     /// the register layout does not change, so the check against the bitstream
     /// stays valid.
     pub requester: Option<String>,
+
+    /// `dut_base` of each memory that has one, in bundle order: the DUT
+    /// address of entry 0, in bytes. The host uses it to place an ELF and to
+    /// find its symbols. In the hash, because the RTL subtracts it: the same
+    /// image lands elsewhere with another value.
+    pub dut_bases: Vec<(String, u64)>,
+
+    /// Memories the DUT only reads (`bram_preload`). Where two memories cover
+    /// the same address, the host reads the one the DUT writes: the other
+    /// does not see what the program stored. Not in the hash: it follows from
+    /// the backing, which shapes the registers anyway.
+    pub dut_read_only: Vec<String>,
 }
 
 impl RegisterMap {
@@ -173,7 +188,7 @@ impl RegionKind {
 }
 
 /// A contiguous range in the window. Addresses count from 0 inside it; the host
-/// adds `base`.
+/// adds `window_base`.
 ///
 /// Unlike an indirect port, it has no shared state, so two window masters (JTAG
 /// and BAR) cannot break each other.
@@ -185,7 +200,7 @@ pub struct Region {
 
     /// The offset from the start of the window. It is aligned to the region
     /// size, so the RTL decodes it with a mask instead of a comparison.
-    pub base: usize,
+    pub window_base: usize,
 
     /// The number of bytes it takes. A power of two.
     pub size_bytes: usize,
@@ -399,12 +414,12 @@ pub enum RegMapError {
 
     /// The RTL decodes a region by its upper address bits only.
     #[error(
-        "[bundle.{bundle}] has base = {base:#x}, which is not a multiple of its {size:#x}-byte size"
+        "[bundle.{bundle}] has window_base = {base:#x}, which is not a multiple of its {size:#x}-byte size"
     )]
     #[diagnostic(
-        code(harness::regmap::base_not_aligned),
+        code(harness::regmap::window_base_not_aligned),
         help(
-            "A region must start at a multiple of its size, because the window finds it by its upper address bits. The nearest bases that work are {below:#x} and {above:#x}."
+            "A region must start at a multiple of its size, because the window finds it by its upper address bits. The nearest values that work are {below:#x} and {above:#x}."
         )
     )]
     BaseNotAligned {
@@ -416,12 +431,12 @@ pub enum RegMapError {
     },
 
     #[error(
-        "[bundle.{bundle}] at base = {base:#x} overlaps `{other}` ({other_base:#x}..{other_end:#x})"
+        "[bundle.{bundle}] at window_base = {base:#x} overlaps `{other}` ({other_base:#x}..{other_end:#x})"
     )]
     #[diagnostic(
-        code(harness::regmap::base_overlaps),
+        code(harness::regmap::window_base_overlaps),
         help(
-            "Two regions cannot share an address. Move one of them: `{bundle}` takes {size:#x} bytes from its base."
+            "Two regions cannot share an address. Move one of them: `{bundle}` takes {size:#x} bytes from its window_base."
         )
     )]
     BaseOverlaps {
@@ -433,11 +448,11 @@ pub enum RegMapError {
         other_end: usize,
     },
 
-    #[error("[bundle.{bundle}] has `base`, but it has no region in the window")]
+    #[error("[bundle.{bundle}] has `window_base`, but it has no region in the window")]
     #[diagnostic(
-        code(harness::regmap::base_without_region),
+        code(harness::regmap::window_base_without_region),
         help(
-            "`base` places a region: `bram` or `bram_preload` with access = \"region\", `dram`, or `slave`. Remove `base` from this bundle."
+            "`window_base` places a region: `bram` or `bram_preload` with access = \"region\", `dram`, or `slave`. Remove `window_base` from this bundle."
         )
     )]
     BaseWithoutRegion { bundle: String },
@@ -518,7 +533,7 @@ pub fn build(
     let regions = place_regions(manifest, wanted)?;
     let mut offset = regions
         .iter()
-        .map(|region| region.base + region.size_bytes)
+        .map(|region| region.window_base + region.size_bytes)
         .max()
         .unwrap_or(0);
 
@@ -805,6 +820,22 @@ pub fn build(
             role: Some("depth"),
         });
         offset += WORD_BITS / 8;
+        // With `dut_base`, `hns::axi_range` counts the transfers it refuses.
+        if dram.dut_base != 0 {
+            registers.push(Register {
+                name: format!("{}_oor", dram.bundle),
+                kind: Kind::Terminator,
+                offset,
+                words: 1,
+                width: WORD_BITS,
+                access: Access::ReadOnly,
+                bundle: Some(dram.bundle.clone()),
+                value: None,
+                self_clearing: None,
+                role: Some("oor"),
+            });
+            offset += WORD_BITS / 8;
+        }
     }
 
     // DUT reset, in every design. The host writes 1 and polls until `state` is
@@ -1006,7 +1037,11 @@ pub fn build(
     let used = registers
         .iter()
         .map(|register| register.offset + register.words * (WORD_BITS / 8))
-        .chain(regions.iter().map(|region| region.base + region.size_bytes))
+        .chain(
+            regions
+                .iter()
+                .map(|region| region.window_base + region.size_bytes),
+        )
         .max()
         .unwrap_or(0);
     let header_bytes = 3 * (WORD_BITS / 8);
@@ -1085,7 +1120,18 @@ pub fn build(
         }
     }
 
-    let map_hash = hash(&registers, &regions);
+    let mut dut_bases: Vec<(String, u64)> = memories
+        .iter()
+        .map(|mem| (mem.bundle.clone(), mem.dut_base))
+        .chain(
+            axi_mems
+                .iter()
+                .map(|mem| (mem.bundle.clone(), mem.dut_base)),
+        )
+        .filter(|(_, base)| *base != 0)
+        .collect();
+    dut_bases.sort();
+    let map_hash = hash(&registers, &regions, &dut_bases);
     if let Some(register) = registers
         .iter_mut()
         .find(|register| register.name == MAP_HASH_NAME)
@@ -1099,6 +1145,12 @@ pub fn build(
         regions,
         map_hash,
         requester,
+        dut_bases,
+        dut_read_only: memories
+            .iter()
+            .filter(|mem| mem.read_only)
+            .map(|mem| mem.bundle.clone())
+            .collect(),
     })
 }
 
@@ -1137,7 +1189,7 @@ impl Wanted {
         Region {
             bundle: self.bundle,
             kind: self.kind,
-            base,
+            window_base: base,
             size_bytes: self.size_bytes,
             entry_bytes: self.entry_bytes,
             depth: self.depth,
@@ -1147,20 +1199,20 @@ impl Wanted {
 }
 
 /// Gives each region its base, aligned to its size so the RTL decodes it with
-/// a mask. Those with `base` in Harness.toml go exactly there. The others, in
+/// a mask. Those with `window_base` in Harness.toml go exactly there. The others, in
 /// the order of `wanted` (memory, dram, slave; by bundle name within a kind),
-/// each take the first aligned gap, so adding a bundle without `base` does not
+/// each take the first aligned gap, so adding a bundle without `window_base` does not
 /// move an existing one. The result keeps the order of `wanted`.
 fn place_regions(manifest: &Manifest, wanted: Vec<Wanted>) -> Result<Vec<Region>, RegMapError> {
     let pinned = |bundle: &str| {
         manifest
             .bundle
             .get(bundle)
-            .and_then(|declared| declared.base)
+            .and_then(|declared| declared.window_base)
             .map(|base| base as usize)
     };
     for (name, declared) in &manifest.bundle {
-        if declared.base.is_some() && !wanted.iter().any(|w| &w.bundle == name) {
+        if declared.window_base.is_some() && !wanted.iter().any(|w| &w.bundle == name) {
             return Err(RegMapError::BaseWithoutRegion {
                 bundle: name.clone(),
             });
@@ -1284,13 +1336,15 @@ fn direction_of(dut: &Dut, name: &str) -> Option<PortDirection> {
 ///
 /// The input is `name|kind|offset|width|words|access|clear` for each register
 /// (`clear` is the other side of self-clearing, or `-`), then
-/// `region|bundle|kind|base|size|entry|total` for each region, joined with
+/// `region|bundle|kind|base|size|entry|total` for each region, then
+/// `dut_base|bundle|base` for each memory with a `dut_base`, joined with
 /// `\n`. `value` is not included: the hash is itself a value, so it would
 /// refer to itself.
 ///
-/// Regions are in it because `base` can move one without moving any register.
-pub fn hash(registers: &[Register], regions: &[Region]) -> u32 {
-    let canonical = canonical_text(registers, regions);
+/// Regions are in it because `window_base` can move one without moving any register.
+/// A map without `dut_base` hashes as it did before `dut_base` existed.
+pub fn hash(registers: &[Register], regions: &[Region], dut_bases: &[(String, u64)]) -> u32 {
+    let canonical = canonical_text(registers, regions, dut_bases);
 
     let mut hash: u32 = 0x811c_9dc5;
     for byte in canonical.as_bytes() {
@@ -1302,13 +1356,17 @@ pub fn hash(registers: &[Register], regions: &[Region]) -> u32 {
 
 /// The canonical text that is hashed. Its exact form is documented: a hash that
 /// clients cannot reimplement is useless for checking.
-pub fn canonical_text(registers: &[Register], regions: &[Region]) -> String {
+pub fn canonical_text(
+    registers: &[Register],
+    regions: &[Region],
+    dut_bases: &[(String, u64)],
+) -> String {
     let regions = regions.iter().map(|region| {
         format!(
             "region|{}|{}|{}|{}|{}|{}",
             region.bundle,
             region.kind.as_str(),
-            region.base,
+            region.window_base,
             region.size_bytes,
             region.entry_bytes,
             region.total_bytes,
@@ -1332,6 +1390,11 @@ pub fn canonical_text(registers: &[Register], regions: &[Region]) -> String {
             )
         })
         .chain(regions)
+        .chain(
+            dut_bases
+                .iter()
+                .map(|(bundle, base)| format!("dut_base|{bundle}|{base}")),
+        )
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1640,7 +1703,7 @@ mod tests {
 
         // User ports first, header last. The window covers 4 (port) + 8 (DUT
         // reset) + 12 (header), so it is 32 bytes: magic at 24, hash at 28.
-        let text = canonical_text(&map.registers, &map.regions);
+        let text = canonical_text(&map.registers, &map.regions, &map.dut_bases);
         assert!(text.starts_with("i_csr_addr|port|0|32|1|rw|-\n"), "{text}");
         assert!(
             text.ends_with("harness_map_hash|header|28|32|1|ro|-"),
@@ -1881,6 +1944,7 @@ mod tests {
             depth: 64,
             depth_defaulted: false,
             aperture_bytes: None,
+            dut_base: 0,
         };
         let card = crate::manifest::Pcie::default();
         let map = |pcie: Option<&crate::manifest::Pcie>, mems: &[crate::terminator::AxiMemPlan]| {
@@ -1998,24 +2062,24 @@ mod tests {
                 .unwrap()
                 .regions
                 .iter()
-                .map(|region| (region.bundle.clone(), region.base))
+                .map(|region| (region.bundle.clone(), region.window_base))
                 .collect::<Vec<_>>()
         };
         let at = |big, small| vec![("big".to_string(), big), ("small".to_string(), small)];
 
         assert_eq!(bases("", ""), at(0, 0x1000));
-        assert_eq!(bases("", "base = 0"), at(0x1000, 0));
+        assert_eq!(bases("", "window_base = 0"), at(0x1000, 0));
         // `small` fills the gap below `big`.
-        assert_eq!(bases("base = \"8k\"", ""), at(0x2000, 0));
+        assert_eq!(bases("window_base = \"8k\"", ""), at(0x2000, 0));
         // The registers sit above the highest region.
-        let high = map("base = 0x10000", "").unwrap();
+        let high = map("window_base = 0x10000", "").unwrap();
         assert!(high.registers.iter().all(|r| r.offset >= 0x11000));
 
         // These two move no register, but the hash still changes, so `id`
         // catches a map that does not match the bitstream.
         // Both end at 0x2000.
-        let swap_a = map("base = 0", "base = 0x1fc0").unwrap();
-        let swap_b = map("base = 0x1000", "base = 0").unwrap();
+        let swap_a = map("window_base = 0", "window_base = 0x1fc0").unwrap();
+        let swap_b = map("window_base = 0x1000", "window_base = 0").unwrap();
         assert_eq!(
             swap_a
                 .registers
@@ -2031,7 +2095,7 @@ mod tests {
         assert_ne!(swap_a.map_hash, swap_b.map_hash);
 
         assert!(matches!(
-            map("base = 0x800", ""),
+            map("window_base = 0x800", ""),
             Err(RegMapError::BaseNotAligned {
                 below: 0,
                 above: 0x1000,
@@ -2039,17 +2103,17 @@ mod tests {
             })
         ));
         assert!(matches!(
-            map("base = 0", "base = 0x40"),
+            map("window_base = 0", "window_base = 0x40"),
             Err(RegMapError::BaseOverlaps { .. })
         ));
     }
 
     #[test]
-    fn a_base_on_a_bundle_without_a_region_is_refused() {
+    fn a_window_base_on_a_bundle_without_a_region_is_refused() {
         let dut = dut(vec![port("i_csr_addr", PortDirection::Input, 32)]);
         let result = build(
             &dut,
-            &manifest(&format!("{CSR}base = 0\n")),
+            &manifest(&format!("{CSR}window_base = 0\n")),
             &[binding("csr", &["i_csr_addr"])],
             &[],
             &[],

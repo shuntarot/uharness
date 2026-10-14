@@ -15,10 +15,12 @@ pub mod bitstream;
 pub mod bridge;
 pub mod config;
 pub mod dma;
+pub mod elf;
 pub mod frame;
 pub mod ftdi;
 pub mod mpsse;
 pub mod pcie;
+pub mod rtt;
 pub mod sim;
 pub mod svf;
 

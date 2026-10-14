@@ -28,7 +28,10 @@ struct Cli {
     ///
     /// Names, widths and the window size come from it. Without it: ./regs.json if
     /// there is one, else hns/regs.json, else the only hns/*/regs.json.
-    #[arg(long, value_name = "PATH")]
+    ///
+    /// Also read from HIO_REGS, so a cargo runner can point at it from
+    /// `[env]` in .cargo/config.toml.
+    #[arg(long, value_name = "PATH", env = "HIO_REGS")]
     regs: Option<String>,
 
     /// Board target, e.g. digilent/arty-a7-35.
@@ -320,9 +323,10 @@ enum Cmd {
         /// Address that entry 0 of this memory has in the DUT's address space.
         ///
         /// An ELF segment at address A goes to entry (A - base) / entry-bytes, so this is
-        /// what places the program. Guessing it wrong puts the program somewhere else, so
-        /// it has no clever default; the addresses it worked out are printed, to check
-        /// against the linker script.
+        /// what places the program. The default is the bundle's `dut_base` from
+        /// regs.json; give it here when the DUT moves addresses itself. Guessing it
+        /// wrong puts the program somewhere else, so there is no other default; the
+        /// addresses it worked out are printed, to check against the linker script.
         #[arg(long, value_name = "ADDR", value_parser = parse_u64)]
         base: Option<u64>,
         /// Read it back and compare.
@@ -342,6 +346,37 @@ enum Cmd {
         /// why (`check` reports the same things).
         #[arg(long)]
         dma: bool,
+    },
+
+    /// Load an ELF, run it, and connect to its RTT console.
+    ///
+    /// Made to be a cargo runner (`runner = "hio boot"`). It holds the DUT in
+    /// reset, places each segment in every memory that covers its address
+    /// (`dut_base` in regs.json), clears the RTT control block, and releases
+    /// the DUT. With `_SEGGER_RTT` it then shows up channel 0 and sends keys to
+    /// down channel 0; Ctrl-A x leaves. The exit status is the program's, from
+    /// `tohost` or from an up channel named `hio-exit`.
+    Boot {
+        /// The ELF to run.
+        elf: PathBuf,
+        #[command(flatten)]
+        attach: AttachArgs,
+        /// Arguments after the ELF, which are ignored.
+        ///
+        /// cargo passes the program's arguments here; the firmware has no way
+        /// to receive them.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        args: Vec<String>,
+    },
+
+    /// Connect to the RTT console of a program that is already running.
+    ///
+    /// Like `boot`, but it loads nothing and does not touch the reset.
+    Console {
+        /// The ELF the program was built from. Only its symbols are used.
+        elf: PathBuf,
+        #[command(flatten)]
+        attach: AttachArgs,
     },
 
     /// Write a pattern to a memory bundle and read it back.
@@ -448,6 +483,32 @@ enum Cmd {
         /// bash, zsh, fish, elvish or powershell.
         shell: Shell,
     },
+}
+
+/// How `boot` and `console` find the RTT control block.
+#[derive(clap::Args, Debug, Clone)]
+struct AttachArgs {
+    /// Address of the RTT control block, instead of `_SEGGER_RTT`.
+    ///
+    /// For an image whose symbols are not physical addresses, such as a kernel
+    /// behind an MMU.
+    #[arg(long, value_name = "ADDR", value_parser = parse_u64)]
+    rtt: Option<u64>,
+    /// The field widths of the control block, when they cannot be told apart.
+    ///
+    /// `rtt-target` makes every field as wide as a pointer; SEGGER's C code
+    /// keeps the numbers at 32 bits.
+    #[arg(long, value_name = "LAYOUT")]
+    rtt_layout: Option<RttLayout>,
+    /// How long to wait for the program to set up RTT, in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 3000)]
+    wait_ms: u64,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+enum RttLayout {
+    RttTarget,
+    Segger,
 }
 
 fn parse_u32(s: &str) -> Result<u32, String> {
@@ -753,6 +814,11 @@ fn parse_step(line: &str) -> Result<Step, String> {
                 .to_string(),
         ),
         Cmd::Run { .. } => Err("a script cannot run another script".to_string()),
+        // They take over the terminal and end the process with the
+        // program's status.
+        Cmd::Boot { .. } | Cmd::Console { .. } => {
+            Err("`boot` and `console` take over the terminal; run them on their own.".to_string())
+        }
         Cmd::Probe | Cmd::Targets | Cmd::Check | Cmd::Completions { .. } => {
             Err("that only makes sense before the link is open; run it on its own.".to_string())
         }
@@ -777,6 +843,8 @@ fn run_step(cli: &Cli, bus: &mut Bus, map: &RegisterMap, step: Step) -> Result<(
         Cmd::Program { .. }
         | Cmd::Erase
         | Cmd::Run { .. }
+        | Cmd::Boot { .. }
+        | Cmd::Console { .. }
         | Cmd::Probe
         | Cmd::Targets
         | Cmd::Completions { .. } => {
@@ -1777,6 +1845,27 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             size,
             threads,
         ),
+        Cmd::Boot {
+            ref elf,
+            ref attach,
+            ref args,
+        } => {
+            if !args.is_empty() {
+                eprintln!(
+                    "warning: the firmware cannot receive arguments; ignoring {}",
+                    args.join(" ")
+                );
+            }
+            let code = boot(&mut bus, &map, elf, attach, true)?;
+            exit_with(code)
+        }
+        Cmd::Console {
+            ref elf,
+            ref attach,
+        } => {
+            let code = boot(&mut bus, &map, elf, attach, false)?;
+            exit_with(code)
+        }
         Cmd::DmaFire {
             ref bundle,
             at,
@@ -3562,7 +3651,7 @@ fn region_pages(
         let page = at / span;
         let off = at % span;
         let here = (((span - off) / 4) as usize).min(left);
-        out.push((page, (region.base as u64 + off) as u32, here));
+        out.push((page, (region.window_base as u64 + off) as u32, here));
         at += 4 * here as u64;
         left -= here;
     }
@@ -3609,7 +3698,7 @@ fn region_span(region: &hns_regs::Region, at: u64, words: usize) -> Result<u32, 
             region.name, region.depth, region.entry_bytes, region.name
         ));
     }
-    Ok((region.base + at as usize) as u32)
+    Ok((region.window_base + at as usize) as u32)
 }
 
 /// A batch for a region.
@@ -3924,7 +4013,7 @@ fn bench_region(
             region.name, region.size_bytes
         ));
     }
-    let base = (region.base + (at as usize % region.size_bytes)) as u32;
+    let base = (region.window_base + (at as usize % region.size_bytes)) as u32;
     let value = |i: usize| 0xbe11_0000u32 | i as u32;
 
     // Discard one run, so the first-time USB and driver cost is not measured.
@@ -4447,84 +4536,22 @@ fn alias_of(
 ///
 /// It uses `p_paddr`, where a loader really places a segment; `p_vaddr` is the
 /// view through the MMU. The harness window is physical memory.
-///
-/// To avoid a dependency, it reads only the fields it needs: type
-/// (`PT_LOAD`), file offset and size, and destination.
 fn elf_pieces(raw: &[u8], base: Option<u64>, entry_bytes: usize) -> Result<Vec<Piece>, String> {
     let Some(base) = base else {
         return Err(
             "an ELF says where its segments go, but not where this memory starts in the \
              DUT's address space.\n\
-             Pass --base with that address (for example --base 0x80000000). There is no \
-             default: a wrong guess puts the program in the wrong place."
+             Set `dut_base` on the bundle in Harness.toml and generate again, or pass --base \
+             with that address (for example --base 0x80000000). There is no other default: \
+             a wrong guess puts the program in the wrong place."
                 .to_string(),
         );
     };
-    let bad = |what: &str| format!("this ELF cannot be read: {what}");
-
-    let class = *raw.get(4).ok_or_else(|| bad("truncated header"))?;
-    if *raw.get(5).ok_or_else(|| bad("truncated header"))? != 1 {
-        return Err(bad("only little-endian ELFs are handled"));
-    }
-    let wide = match class {
-        1 => false,
-        2 => true,
-        _ => return Err(bad("neither 32-bit nor 64-bit")),
-    };
-
-    let u16at = |at: usize| -> Result<usize, String> {
-        Ok(u16::from_le_bytes(
-            raw.get(at..at + 2)
-                .ok_or_else(|| bad("truncated header"))?
-                .try_into()
-                .unwrap(),
-        ) as usize)
-    };
-    let u32at = |at: usize| -> Result<u64, String> {
-        Ok(u32::from_le_bytes(
-            raw.get(at..at + 4)
-                .ok_or_else(|| bad("truncated header"))?
-                .try_into()
-                .unwrap(),
-        ) as u64)
-    };
-    let u64at = |at: usize| -> Result<u64, String> {
-        Ok(u64::from_le_bytes(
-            raw.get(at..at + 8)
-                .ok_or_else(|| bad("truncated header"))?
-                .try_into()
-                .unwrap(),
-        ))
-    };
-
-    let (phoff, phentsize, phnum) = if wide {
-        (u64at(0x20)? as usize, u16at(0x36)?, u16at(0x38)?)
-    } else {
-        (u32at(0x1c)? as usize, u16at(0x2a)?, u16at(0x2c)?)
-    };
+    let elf = hns_host::elf::Elf::parse(raw)?;
 
     let mut out = Vec::new();
-    for i in 0..phnum {
-        let ph = phoff + i * phentsize;
-        if u32at(ph)? != 1 {
-            continue; // not PT_LOAD
-        }
-        let (offset, paddr, filesz) = if wide {
-            (
-                u64at(ph + 8)? as usize,
-                u64at(ph + 0x18)?,
-                u64at(ph + 0x20)? as usize,
-            )
-        } else {
-            (
-                u32at(ph + 4)? as usize,
-                u32at(ph + 0xc)?,
-                u32at(ph + 0x10)? as usize,
-            )
-        };
-        if filesz == 0 {
-            continue;
-        }
+    for segment in elf.segments.into_iter().filter(|s| !s.bytes.is_empty()) {
+        let paddr = segment.paddr;
         if paddr < base {
             return Err(format!(
                 "a segment goes to {paddr:#x}, which is below the memory's base {base:#x}.\n\
@@ -4540,18 +4567,14 @@ fn elf_pieces(raw: &[u8], base: Option<u64>, entry_bytes: usize) -> Result<Vec<P
                 off % entry_bytes
             ));
         }
-        let bytes = raw
-            .get(offset..offset + filesz)
-            .ok_or_else(|| bad("a segment runs past the end of the file"))?
-            .to_vec();
         out.push(Piece {
             entry: off / entry_bytes,
             addr: Some(paddr),
-            bytes,
+            bytes: segment.bytes,
         });
     }
     if out.is_empty() {
-        return Err(bad("it has no loadable segments"));
+        return Err("this ELF cannot be read: it has no loadable segments".to_string());
     }
     Ok(out)
 }
@@ -4592,7 +4615,9 @@ fn load(
     let entry_bytes = port.entry_bytes();
     let raw = std::fs::read(file).map_err(|e| read_error(file, e))?;
 
-    let pieces = if raw.starts_with(&[0x7f, b'E', b'L', b'F']) {
+    let pieces = if hns_host::elf::Elf::looks_like(&raw) {
+        // `--base` wins: it is there for a DUT that moves addresses itself.
+        let base = base.or_else(|| map.dut_base.get(bundle).copied());
         elf_pieces(&raw, base, entry_bytes)?
     } else {
         if base.is_some() {
@@ -4872,7 +4897,7 @@ fn word_at(port: &MemPort, e: usize, w: usize) -> u32 {
         // A moving window shows only one page. `entry_page` names the page,
         // and the batch sets `base` first.
         MemPort::Region(region) => {
-            (region.base + (e * region.entry_bytes) % region.size_bytes + 4 * w) as u32
+            (region.window_base + (e * region.entry_bytes) % region.size_bytes + 4 * w) as u32
         }
     }
 }
@@ -5005,7 +5030,7 @@ fn check_entries(
                     .collect()
             }
             MemPort::Region(region) => {
-                let at = (region.base + (p.entry + i) * entry_bytes) as u32;
+                let at = (region.window_base + (p.entry + i) * entry_bytes) as u32;
                 (0..words).map(|w| b.read(at + 4 * w as u32)).collect()
             }
         };
@@ -5024,6 +5049,536 @@ fn check_entries(
         }
     }
     Ok(())
+}
+
+/// A memory bundle at its place in the DUT's address space.
+struct Span {
+    bundle: String,
+    /// The DUT address of entry 0 (`dut_base`, else 0).
+    base: u64,
+    /// Bytes the host can reach.
+    bytes: u64,
+    /// The DUT writes it. Only such a memory shows what the program stored.
+    dut_writes: bool,
+}
+
+impl Span {
+    fn covers(&self, addr: u64, len: u64) -> bool {
+        addr >= self.base && addr - self.base + len <= self.bytes
+    }
+}
+
+/// Every memory bundle in the map, with its DUT address.
+fn spans(map: &RegisterMap) -> Result<Vec<Span>, String> {
+    let mut names: Vec<String> = map
+        .regions
+        .iter()
+        .filter(|r| r.kind.as_deref() == Some("memory"))
+        .map(|r| r.name.clone())
+        .collect();
+    for r in &map.registers {
+        if r.role.as_deref() == Some("maddr")
+            && let Some(bundle) = &r.bundle
+            && !names.contains(bundle)
+        {
+            names.push(bundle.clone());
+        }
+    }
+    names
+        .into_iter()
+        .map(|bundle| {
+            let port = mem_port(map, &bundle)?;
+            let bytes = match &port {
+                MemPort::Region(region) => region.reach_bytes(),
+                _ => (port.depth() * port.entry_bytes()) as u64,
+            };
+            Ok(Span {
+                base: map.dut_base.get(&bundle).copied().unwrap_or(0),
+                bytes,
+                dut_writes: !map.dut_read_only.contains(&bundle),
+                bundle,
+            })
+        })
+        .collect()
+}
+
+/// Says where the memories are, for an address none of them covers.
+fn span_list(spans: &[Span]) -> String {
+    spans
+        .iter()
+        .map(|s| {
+            format!(
+                "  {:<12} {:#x}..{:#x}{}",
+                s.bundle,
+                s.base,
+                s.base + s.bytes,
+                if s.dut_writes {
+                    ""
+                } else {
+                    " (the DUT only reads it)"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// DUT memory through the window, by DUT byte address.
+///
+/// The window moves whole 32-bit words and whole entries, so a write of part
+/// of an entry reads the entry first. That is safe for RTT: the DUT only
+/// reads the bytes the host writes (the down buffer and the read offset of
+/// an up channel), and the other half of the word is the host's too.
+struct WindowMem<'a> {
+    bus: &'a mut Bus,
+    map: &'a RegisterMap,
+    spans: Vec<Span>,
+}
+
+impl WindowMem<'_> {
+    /// Entries `from..to` of a memory, as bytes.
+    fn read_entries(&mut self, bundle: &str, from: usize, to: usize) -> Result<Vec<u8>, String> {
+        let port = mem_port(self.map, bundle)?;
+        let master = self.bus.master();
+        let words = port.words();
+        let mut out = Vec::with_capacity((to - from) * port.entry_bytes());
+        for (start, end) in entry_groups(&port, from, to) {
+            let mut b = mem_batch(&port);
+            set_mem_page(&mut b, self.map, &port, start, master)?;
+            let mut hs = Vec::new();
+            for e in start..end {
+                if let MemPort::Indirect { maddr, .. } = &port {
+                    b.write(maddr.offset as u32, e as u32);
+                }
+                for w in 0..words {
+                    hs.push(b.read(word_at(&port, e, w)));
+                }
+            }
+            let got = self.bus.run(&b)?;
+            for h in hs {
+                out.extend_from_slice(&got[h].to_le_bytes());
+            }
+        }
+        Ok(out)
+    }
+
+    /// The entries that hold `addr..addr + len` in `span`, and where the
+    /// range starts inside the first.
+    fn entries_of(
+        &self,
+        span: &Span,
+        addr: u64,
+        len: usize,
+    ) -> Result<(usize, usize, usize), String> {
+        let entry_bytes = mem_port(self.map, &span.bundle)?.entry_bytes();
+        let off = (addr - span.base) as usize;
+        Ok((
+            off / entry_bytes,
+            (off + len).div_ceil(entry_bytes),
+            off % entry_bytes,
+        ))
+    }
+}
+
+impl hns_host::rtt::Memory for WindowMem<'_> {
+    fn read(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), String> {
+        let len = buf.len() as u64;
+        // A memory the DUT writes first: a preloaded copy of the same address
+        // does not see what the program stored.
+        let span = self
+            .spans
+            .iter()
+            .filter(|s| s.covers(addr, len))
+            .max_by_key(|s| s.dut_writes)
+            .ok_or_else(|| {
+                format!(
+                    "no memory holds {addr:#x}..{:#x}. The memories are at:\n{}",
+                    addr + len,
+                    span_list(&self.spans)
+                )
+            })?;
+        let (bundle, (from, to, skip)) =
+            (span.bundle.clone(), self.entries_of(span, addr, buf.len())?);
+        let bytes = self.read_entries(&bundle, from, to)?;
+        buf.copy_from_slice(&bytes[skip..skip + buf.len()]);
+        Ok(())
+    }
+
+    fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), String> {
+        let len = data.len() as u64;
+        let targets: Vec<(String, (usize, usize, usize))> = self
+            .spans
+            .iter()
+            .filter(|s| s.covers(addr, len))
+            .map(|s| Ok((s.bundle.clone(), self.entries_of(s, addr, data.len())?)))
+            .collect::<Result<_, String>>()?;
+        if targets.is_empty() {
+            return Err(format!(
+                "no memory holds {addr:#x}..{:#x}. The memories are at:\n{}",
+                addr + len,
+                span_list(&self.spans)
+            ));
+        }
+        // Every copy, as `boot` loads every copy.
+        for (bundle, (from, to, skip)) in targets {
+            let port = mem_port(self.map, &bundle)?;
+            let mut bytes = if skip == 0 && data.len().is_multiple_of(port.entry_bytes()) {
+                vec![0; data.len()]
+            } else {
+                self.read_entries(&bundle, from, to)?
+            };
+            bytes[skip..skip + data.len()].copy_from_slice(data);
+            let piece = Piece {
+                entry: from,
+                addr: None,
+                bytes,
+            };
+            write_entries(self.bus, self.map, &port, &piece)?;
+        }
+        Ok(())
+    }
+}
+
+/// Exits with the program's status. 0 returns, so the caller ends normally.
+fn exit_with(code: i32) -> Result<(), String> {
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// What `tohost` says, riscv-tests style: 1 is a pass, `(code << 1) | 1` a
+/// failure with `code`. An even value is an HTIF system call, which needs a
+/// host model this tool does not have.
+fn tohost_status(value: u64) -> Result<Option<i32>, String> {
+    match value {
+        0 => Ok(None),
+        v if v & 1 == 1 => Ok(Some(((v >> 1) as i32).min(255))),
+        v => Err(format!(
+            "the program wrote {v:#x} to `tohost`, an HTIF system call.\n\
+             Only the exit values are handled: 1 for a pass, (code << 1) | 1 for a failure."
+        )),
+    }
+}
+
+/// The RTT block of an ELF: its address and, from the symbol, its size.
+fn rtt_place(elf: &hns_host::elf::Elf, attach: &AttachArgs) -> Option<(u64, Option<u64>)> {
+    match attach.rtt {
+        Some(addr) => Some((addr, None)),
+        None => elf.symbol("_SEGGER_RTT").map(|s| (s.value, Some(s.size))),
+    }
+}
+
+/// Loads (when `load`) and runs an ELF, then stays on its console. Returns
+/// the program's exit status.
+fn boot(
+    bus: &mut Bus,
+    map: &RegisterMap,
+    path: &PathBuf,
+    attach: &AttachArgs,
+    load: bool,
+) -> Result<i32, String> {
+    // Everything that can be wrong with the file is found before the board
+    // is touched.
+    let raw = std::fs::read(path).map_err(|e| read_error(path, e))?;
+    let elf = hns_host::elf::Elf::parse(&raw)?;
+    let ptr = if elf.wide { 8 } else { 4 };
+    let rtt_at = rtt_place(&elf, attach);
+    let tohost = elf.symbol("tohost").map(|s| s.value);
+    let spans = spans(map)?;
+
+    // (segment, memories it goes to)
+    let mut plan = Vec::new();
+    if load {
+        for segment in elf.segments.iter().filter(|s| !s.bytes.is_empty()) {
+            let len = segment.bytes.len() as u64;
+            let into: Vec<&Span> = spans
+                .iter()
+                .filter(|s| s.covers(segment.paddr, len))
+                .collect();
+            if into.is_empty() {
+                return Err(format!(
+                    "a segment goes to {:#x}..{:#x}, and no memory holds all of it. \
+                     The memories are at:\n{}\n\
+                     Set `dut_base` on the memory in Harness.toml, or link the program \
+                     for these addresses.",
+                    segment.paddr,
+                    segment.paddr + len,
+                    span_list(&spans)
+                ));
+            }
+            // `.bss` and the stack need room too, but a generous stack in the
+            // linker script is common, so this only warns.
+            for s in &into {
+                if !s.covers(segment.paddr, segment.memsz) {
+                    eprintln!(
+                        "warning: the segment at {:#x} needs {:#x} bytes in memory, past the end \
+                         of `{}`. Its zero-filled part (.bss, the stack) has no memory there.",
+                        segment.paddr, segment.memsz, s.bundle
+                    );
+                }
+            }
+            plan.push((
+                segment,
+                into.iter().map(|s| s.bundle.clone()).collect::<Vec<_>>(),
+            ));
+        }
+        if plan.is_empty() {
+            return Err("this ELF has nothing to load".to_string());
+        }
+    }
+
+    let mut mem = WindowMem { bus, map, spans };
+    if load {
+        reset(mem.bus, map, true, false)?;
+        for (segment, names) in &plan {
+            hns_host::rtt::Memory::write(&mut mem, segment.paddr, &segment.bytes)?;
+            println!(
+                "  {:#012x} -> {}  {} bytes",
+                segment.paddr,
+                names.join(", "),
+                segment.bytes.len()
+            );
+        }
+        // A control block left by the last program would be taken for a live
+        // one before the new program sets up its own. Clearing just the block
+        // is enough; zeroing all of .bss and the stack takes long over JTAG.
+        if let Some((addr, size)) = rtt_at {
+            let size = size.unwrap_or(hns_host::rtt::MAGIC.len() as u64);
+            hns_host::rtt::Memory::write(&mut mem, addr, &vec![0; size as usize])?;
+        }
+        if let Some(addr) = tohost {
+            hns_host::rtt::Memory::write(&mut mem, addr, &[0; 8][..ptr as usize])?;
+        }
+        reset(mem.bus, map, false, true)?;
+    }
+
+    let Some((rtt_addr, rtt_size)) = rtt_at else {
+        return match tohost {
+            Some(addr) => wait_tohost(&mut mem, addr, ptr),
+            None => {
+                println!("no `_SEGGER_RTT` and no `tohost` in the ELF: nothing to wait for");
+                Ok(0)
+            }
+        };
+    };
+    let rtt = wait_rtt(&mut mem, rtt_addr, ptr, rtt_size, attach)?;
+    console(&mut mem, &rtt, tohost, ptr)
+}
+
+/// Polls `tohost` until the program reports.
+fn wait_tohost(mem: &mut WindowMem, addr: u64, ptr: u64) -> Result<i32, String> {
+    loop {
+        if let Some(code) = read_tohost(mem, addr, ptr)? {
+            return Ok(code);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn read_tohost(mem: &mut WindowMem, addr: u64, ptr: u64) -> Result<Option<i32>, String> {
+    let mut raw = [0u8; 8];
+    hns_host::rtt::Memory::read(mem, addr, &mut raw[..ptr as usize])?;
+    tohost_status(u64::from_le_bytes(raw))
+}
+
+/// Waits for the program to set up its control block.
+fn wait_rtt(
+    mem: &mut WindowMem,
+    addr: u64,
+    ptr: u64,
+    size: Option<u64>,
+    attach: &AttachArgs,
+) -> Result<hns_host::rtt::Rtt, String> {
+    use hns_host::rtt::{AttachError, Layout, Rtt};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(attach.wait_ms);
+    loop {
+        let found = match attach.rtt_layout {
+            Some(RttLayout::RttTarget) => Rtt::attach_as(mem, addr, Layout { ptr, field: ptr }),
+            Some(RttLayout::Segger) => Rtt::attach_as(mem, addr, Layout { ptr, field: 4 }),
+            None => Rtt::attach(mem, addr, ptr, size),
+        };
+        match found {
+            Ok(rtt) => return Ok(rtt),
+            Err(AttachError::Broken(e)) => return Err(e),
+            Err(AttachError::NotReady) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(AttachError::NotReady) => {
+                return Err(format!(
+                    "the RTT control block at {addr:#x} did not appear within {} ms.\n\
+                     Either the program has not reached its RTT setup, or the host cannot \
+                     see it: a write-back data cache holds the block where the window does \
+                     not look. Put RTT in memory the CPU does not cache, or wait longer \
+                     with --wait-ms.",
+                    attach.wait_ms
+                ));
+            }
+        }
+    }
+}
+
+/// Up channel 0 to the terminal, keys to down channel 0, until Ctrl-A x or
+/// until the program reports an exit status.
+fn console(
+    mem: &mut WindowMem,
+    rtt: &hns_host::rtt::Rtt,
+    tohost: Option<u64>,
+    ptr: u64,
+) -> Result<i32, String> {
+    use hns_host::rtt::Dir;
+    use std::io::Write;
+
+    let exit_channel = rtt.find(mem, Dir::Up, "hio-exit")?;
+    let can_type = rtt.down > 0;
+    eprintln!("hio: connected to RTT at {:#x}; Ctrl-A x leaves", rtt.addr);
+
+    let raw = RawTerminal::enter();
+    let mut out = std::io::stdout();
+    let mut ctrl_a = false;
+    let mut idle = 0u32;
+    loop {
+        let mut worked = false;
+
+        // Keys first, so typing is not held up behind a busy output.
+        for key in raw.keys() {
+            worked = true;
+            if ctrl_a {
+                ctrl_a = false;
+                if key == b'x' {
+                    drop(raw);
+                    eprintln!();
+                    return Ok(0);
+                }
+            } else if key == 0x01 {
+                ctrl_a = true;
+                continue;
+            }
+            if can_type {
+                // A key that does not fit is dropped; the target is not reading.
+                rtt.write_down(mem, 0, &[key])?;
+            }
+        }
+
+        let text = rtt.read_up(mem, 0, 4096)?;
+        if !text.is_empty() {
+            worked = true;
+            // The terminal is raw, so a bare LF would not return the carriage.
+            let text = if raw.active() {
+                text.iter()
+                    .flat_map(|&b| {
+                        if b == b'\n' {
+                            vec![b'\r', b'\n']
+                        } else {
+                            vec![b]
+                        }
+                    })
+                    .collect()
+            } else {
+                text
+            };
+            out.write_all(&text)
+                .and_then(|_| out.flush())
+                .map_err(|e| e.to_string())?;
+        }
+
+        // The end of the program, after its last output is shown.
+        if !worked {
+            if let Some(n) = exit_channel {
+                let code = rtt.read_up(mem, n, 1)?;
+                if let Some(&code) = code.first() {
+                    drop(raw);
+                    return Ok(code as i32);
+                }
+            }
+            if let Some(addr) = tohost
+                && let Some(code) = read_tohost(mem, addr, ptr)?
+            {
+                drop(raw);
+                return Ok(code);
+            }
+            idle += 1;
+            // The magic costs a round trip, so it is looked at only when idle.
+            if idle.is_multiple_of(16) && !rtt.alive(mem)? {
+                drop(raw);
+                return Err(format!(
+                    "the RTT control block at {:#x} is gone: the target was reset or \
+                     reloaded under the console.",
+                    rtt.addr
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        } else {
+            idle = 0;
+        }
+    }
+}
+
+/// The terminal in raw mode while it lives: keys arrive one at a time and are
+/// not echoed. Without a terminal (a pipe, a test), it does nothing and reads
+/// stdin as it comes.
+struct RawTerminal {
+    saved: Option<libc::termios>,
+}
+
+impl RawTerminal {
+    fn enter() -> RawTerminal {
+        // SAFETY: plain calls on fd 0 with a zeroed termios they fill in.
+        unsafe {
+            if libc::isatty(0) == 0 {
+                return RawTerminal { saved: None };
+            }
+            let mut saved: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut saved) != 0 {
+                return RawTerminal { saved: None };
+            }
+            let mut raw = saved;
+            libc::cfmakeraw(&mut raw);
+            if libc::tcsetattr(0, libc::TCSAFLUSH, &raw) != 0 {
+                return RawTerminal { saved: None };
+            }
+            RawTerminal { saved: Some(saved) }
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.saved.is_some()
+    }
+
+    /// The bytes waiting on stdin, without blocking.
+    fn keys(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut fds = libc::pollfd {
+                fd: 0,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd, no timeout.
+            let ready = unsafe { libc::poll(&mut fds, 1, 0) };
+            if ready <= 0 || fds.revents & libc::POLLIN == 0 {
+                return out;
+            }
+            let mut buf = [0u8; 64];
+            // SAFETY: reads into a local buffer of the given length.
+            let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                return out;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+    }
+}
+
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        if let Some(saved) = &self.saved {
+            // SAFETY: restores what `enter` read from the same fd.
+            unsafe {
+                libc::tcsetattr(0, libc::TCSAFLUSH, saved);
+            }
+        }
+    }
 }
 
 /// Takes entries out of a `host_poll_fifo`, oldest first.
@@ -5107,7 +5662,7 @@ fn dump(bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
     for region in &map.regions {
         println!(
             "{:#06x}  {:<width$}  region, {} ({} x {} bytes) -- `hio read {} 0x0 {}`",
-            region.base,
+            region.window_base,
             region.name,
             size_str(region.depth * region.entry_bytes as u64),
             size_str(region.depth),
@@ -5180,11 +5735,21 @@ mod tests {
         assert_eq!(wide_words(0x1234, 1), vec![0x1234]);
     }
 
+    /// riscv-tests' convention: 1 passes, an odd value fails with value >> 1,
+    /// and an even one is a system call this tool cannot serve.
+    #[test]
+    fn tohost_says_pass_or_the_failing_code() {
+        assert_eq!(tohost_status(0), Ok(None));
+        assert_eq!(tohost_status(1), Ok(Some(0)));
+        assert_eq!(tohost_status((5 << 1) | 1), Ok(Some(5)));
+        assert!(tohost_status(0x8000_1000).unwrap_err().contains("HTIF"));
+    }
+
     /// A map without a requester is refused, and the error names the fix.
     #[test]
     fn a_design_without_a_requester_says_what_it_would_take() {
         let map = RegisterMap::from_json(
-            r#"{"marker":"m","format_version":6,"generator":"g","dut":"d","word_bits":32,
+            r#"{"marker":"m","format_version":7,"generator":"g","dut":"d","word_bits":32,
                 "size_bytes":8,"magic":1,"map_hash":2,"registers":[],"regions":[]}"#,
         )
         .unwrap();
@@ -5204,7 +5769,7 @@ mod tests {
         };
         let region = |name: &str, base: usize| {
             format!(
-                r#"{{"name":"{name}","kind":"memory","base":{base},"size_bytes":1024,
+                r#"{{"name":"{name}","kind":"memory","window_base":{base},"size_bytes":1024,
                     "entry_bytes":4,"depth":256}}"#
             )
         };
@@ -5625,13 +6190,13 @@ mod tests {
             kind: Some("memory".to_string()),
             total_bytes: None,
             name: "imem".to_string(),
-            base: 0x200,
+            window_base: 0x200,
             size_bytes: 512,
             entry_bytes: 4,
             depth: 100,
         };
 
-        // Inside, it passes, with `base` added.
+        // Inside, it passes, with `window_base` added.
         assert_eq!(region_span(&region, 0, 1).unwrap(), 0x200);
         assert_eq!(region_span(&region, 8, 2).unwrap(), 0x208);
         assert_eq!(region_span(&region, 396, 1).unwrap(), 0x200 + 396);

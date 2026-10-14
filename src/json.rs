@@ -44,7 +44,10 @@ use crate::unconnected::Kind;
 /// - 12: added `registers.window_clock_mhz` / `window_cycles`
 /// - 13: removed `checked[].reference` / `not_checked[].reference`
 /// - 14: added `warnings` and `registers.pcie.class_code`
-pub const FORMAT_VERSION: u32 = 14;
+/// - 15: renamed `registers.regions[].base` to `window_base`; added
+///   `registers.dut_base`, `registers.dut_read_only`,
+///   `bundles[].memory.dut_base` and `bundles[].axi_mem.dut_base`
+pub const FORMAT_VERSION: u32 = 15;
 
 /// How deep `related` is followed. Veryl diagnostics can nest.
 const MAX_RELATED_DEPTH: usize = 3;
@@ -297,6 +300,9 @@ pub struct AxiMemOutput {
     /// The size shown in the host window. `None` means the whole memory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aperture_bytes: Option<usize>,
+    /// The DUT address of the first byte. Absent without `dut_base`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dut_base: Option<u64>,
 }
 
 /// The heartbeat UART.
@@ -321,8 +327,12 @@ pub struct MemoryOutput {
     pub latency: u32,
     /// The DUT only reads (`bram_preload`).
     pub read_only: bool,
-    /// Out-of-range accesses are counted (`depth < 2^addr`).
+    /// Out-of-range accesses are counted (`depth < 2^addr`, or a
+    /// `dut_base`).
     pub out_of_range_counter: bool,
+    /// The DUT address of entry 0, in bytes. Absent without `dut_base`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dut_base: Option<u64>,
 }
 
 /// What a `host_poll_fifo` contains. A default depth is shown, not hidden.
@@ -481,6 +491,16 @@ pub struct RegisterMapOutput {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub regions: Vec<RegionOutput>,
 
+    /// The DUT address of entry 0 of each memory with `dut_base`, by bundle
+    /// name, in bytes. The host places an ELF and finds its symbols with it.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub dut_base: std::collections::BTreeMap<String, u64>,
+
+    /// Memories the DUT only reads. Where memories share an address, the
+    /// host reads one the DUT writes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dut_read_only: Vec<String>,
+
     /// Only for a PCIe design. The host needs it to find the card.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pcie: Option<PcieOutput>,
@@ -548,14 +568,14 @@ pub struct SelfClearingOutput {
 }
 
 /// A contiguous range in the window. Addresses count from 0 inside it; the
-/// host adds `base`.
+/// host adds `window_base`.
 #[derive(Debug, Serialize)]
 pub struct RegionOutput {
     pub name: String,
     /// `memory` (harness storage; accesses are idempotent) or `dut` (a DUT
     /// slave port).
     pub kind: &'static str,
-    pub base: usize,
+    pub window_base: usize,
     pub size_bytes: usize,
     pub entry_bytes: usize,
     pub depth: u64,
@@ -623,13 +643,15 @@ pub fn register_map(
             .map(|region| RegionOutput {
                 name: region.bundle.clone(),
                 kind: region.kind.as_str(),
-                base: region.base,
+                window_base: region.window_base,
                 size_bytes: region.size_bytes,
                 entry_bytes: region.entry_bytes,
                 depth: region.depth,
                 total_bytes: region.total_bytes,
             })
             .collect(),
+        dut_base: map.dut_bases.iter().cloned().collect(),
+        dut_read_only: map.dut_read_only.clone(),
     }
 }
 
@@ -810,6 +832,7 @@ pub fn ok(
                         latency: mem.latency,
                         read_only: mem.read_only,
                         out_of_range_counter: mem.counts_out_of_range(),
+                        dut_base: (mem.dut_base != 0).then_some(mem.dut_base),
                     }),
                 host_mem: plan
                     .host_mems
@@ -845,6 +868,7 @@ pub fn ok(
                         depth: mem.depth,
                         depth_declared: !mem.depth_defaulted,
                         aperture_bytes: mem.aperture_bytes,
+                        dut_base: (mem.dut_base != 0).then_some(mem.dut_base),
                     }),
             }
         })

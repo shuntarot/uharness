@@ -371,7 +371,7 @@ fn region_base(map: &serde_json::Value, name: &str) -> u64 {
         .unwrap()
         .iter()
         .find(|region| region["name"] == name)
-        .unwrap_or_else(|| panic!("{name} is not a region"))["base"]
+        .unwrap_or_else(|| panic!("{name} is not a region"))["window_base"]
         .as_u64()
         .unwrap()
 }
@@ -722,6 +722,92 @@ module byte_addressed_memory {{
         clk.next(4);
         $assert(rd({last}) == 0);
         $assert(rd({oor}) >: 0);
+
+        $finish();
+    }}
+}}
+"#
+    );
+    write_tb(dir.path(), tb);
+
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
+/// `dut_base` lets the DUT use its own addresses: the harness subtracts the
+/// base, and an address below it is out of range, like one past the end.
+#[test]
+fn a_memory_with_a_dut_base_answers_from_its_base_up() {
+    let dut = r#"
+module dut_top (
+    i_clk       : input  clock    ,
+    i_rst       : input  reset    ,
+    i_addr      : input  logic<16>,
+    o_imem_addr : output logic<16>,
+    i_imem_rdata: input  logic<32>,
+    o_last      : output logic<32>,
+) {
+    always_ff {
+        if_reset {
+            o_last = 0;
+        } else {
+            o_last = i_imem_rdata;
+        }
+    }
+    assign o_imem_addr = i_addr;
+}
+"#;
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.addr]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"i_addr\"]\n\n[bundle.last]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"o_last\"]\n\n[bundle.imem]\ncontract = \"fixed_latency\"\nlatency = 1\nbacking = \"bram_preload\"\naddressing = \"byte\"\ndepth = 16\ndut_base = 0x8000\nports = { addr = \"o_imem_addr\", rdata = \"i_imem_rdata\" }\naccess = \"indirect\"\n";
+
+    let dir = fixture(manifest, dut, "");
+    let map = offsets(dir.path());
+    // The host learns the base from the map.
+    assert_eq!(map["dut_base"]["imem"], 0x8000, "{map:#}");
+    // A preload memory is not where the program's stores show.
+    assert_eq!(map["dut_read_only"][0], "imem", "{map:#}");
+    let (addr, last, maddr, mdata, oor) = (
+        offset_of(&map, "i_addr"),
+        offset_of(&map, "o_last"),
+        offset_of(&map, "imem_maddr"),
+        offset_of(&map, "imem_mdata"),
+        offset_of(&map, "imem_oor"),
+    );
+
+    let tb = format!(
+        r#"
+#[test(memory_with_a_dut_base)]
+module memory_with_a_dut_base {{
+{BUS}
+    var counted: logic<32>;
+
+    initial {{
+        start();
+
+        // Entry k gets k + 1, so entry 0 is not 0.
+        wr({maddr}, 0);
+        for i in 0..16 {{
+            wr({mdata}, i + 1);
+        }}
+
+        // The base is entry 0. Until now the DUT drove address 0, which is
+        // below the base, so the counter has already counted those cycles.
+        wr({addr}, 32'h8000);
+        clk.next(4);
+        $assert(rd({last}) == 1);
+        counted = rd({oor});
+
+        wr({addr}, 32'h8008);
+        clk.next(4);
+        $assert(rd({last}) == 3);
+        $assert(rd({oor}) == counted);
+
+        // Just below the base: out of range, not the top of the memory.
+        wr({addr}, 32'h7ffc);
+        clk.next(4);
+        $assert(rd({last}) == 0);
+        $assert(rd({oor}) >: counted);
 
         $finish();
     }}
@@ -1824,6 +1910,186 @@ module axi_mem_region {{
         $assert(rd({base} + 8) == 0);
         $assert(rd({base} + 4) == 32'ha5a5_0001);
 
+        $finish();
+    }}
+}}
+"#
+    );
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
+/// With `dut_base` on an AXI4 memory, the DUT uses its own addresses, and
+/// what falls outside gets DECERR instead of a wrapped address inside.
+#[test]
+fn an_axi4_memory_with_a_dut_base_refuses_what_is_outside() {
+    let dut = r#"
+module dut_top (
+    i_clk  : input  clock                                                              ,
+    i_rst  : input  reset                                                              ,
+    i_run  : input  logic                                                              ,
+    i_write: input  logic                                                              ,
+    i_addr : input  logic<32>                                                          ,
+    o_last : output logic<32>                                                          ,
+    o_resp : output logic<2>                                                           ,
+    o_done : output logic                                                              ,
+    axi    : modport $std::axi4_if::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>>::master,
+) {
+    // On a rising i_run: one beat to i_addr, a write of 0xbeef_0003 or a
+    // read. The response lands in o_resp, read data in o_last.
+    var phase: logic<3>;
+    var run_q: logic   ;
+
+    always_ff {
+        if_reset {
+            phase       = 0;
+            run_q       = 0;
+            o_last      = 0;
+            o_resp      = 0;
+            o_done      = 0;
+            axi.awvalid = 0;
+            axi.wvalid  = 0;
+            axi.arvalid = 0;
+        } else {
+            run_q = i_run;
+            case phase {
+                0: if i_run && !run_q {
+                    o_done = 0;
+                    if i_write {
+                        axi.awvalid = 1;
+                        axi.wvalid  = 1;
+                        phase       = 1;
+                    } else {
+                        axi.arvalid = 1;
+                        phase       = 4;
+                    }
+                }
+                1: if axi.awready {
+                    axi.awvalid = 0;
+                    phase       = 2;
+                }
+                2: if axi.wready {
+                    axi.wvalid = 0;
+                    phase      = 3;
+                }
+                3: if axi.bvalid {
+                    o_resp = axi.bresp;
+                    o_done = 1;
+                    phase  = 0;
+                }
+                4: if axi.arready {
+                    axi.arvalid = 0;
+                    phase       = 5;
+                }
+                5: if axi.rvalid {
+                    o_last = axi.rdata;
+                    o_resp = axi.rresp;
+                    o_done = 1;
+                    phase  = 0;
+                }
+                default: {}
+            }
+        }
+    }
+
+    assign axi.awaddr   = i_addr;
+    assign axi.awsize   = 3'd2;
+    assign axi.awburst  = 2'b01;
+    assign axi.awcache  = 0;
+    assign axi.awprot   = 0;
+    assign axi.awid     = 0;
+    assign axi.awlen    = 0;
+    assign axi.awlock   = 0;
+    assign axi.awqos    = 0;
+    assign axi.awregion = 0;
+    assign axi.awuser   = 0;
+    assign axi.wlast    = 1;
+    assign axi.wdata    = 32'hbeef_0003;
+    assign axi.wstrb    = 4'hf;
+    assign axi.wuser    = 0;
+    assign axi.bready   = 1;
+    assign axi.araddr   = i_addr;
+    assign axi.arsize   = 3'd2;
+    assign axi.arburst  = 2'b01;
+    assign axi.arcache  = 0;
+    assign axi.arprot   = 0;
+    assign axi.arid     = 0;
+    assign axi.arlen    = 0;
+    assign axi.arlock   = 0;
+    assign axi.arqos    = 0;
+    assign axi.arregion = 0;
+    assign axi.aruser   = 0;
+    assign axi.rready   = 1;
+}
+"#;
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.ctl]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"i_run\", \"i_write\", \"i_addr\", \"o_last\", \"o_resp\", \"o_done\"]\n\n[bundle.ddr]\nbacking = \"bram\"\ndepth = 64\ndut_base = 0x8000_0000\nports = [\"axi\"]\n";
+
+    let dir = fixture(manifest, dut, "");
+    let map = offsets(dir.path());
+    assert_eq!(map["dut_base"]["ddr"], 0x8000_0000_u64, "{map:#}");
+    let (base, run, write, addr, last, resp, done, oor) = (
+        region_base(&map, "ddr"),
+        offset_of(&map, "i_run"),
+        offset_of(&map, "i_write"),
+        offset_of(&map, "i_addr"),
+        offset_of(&map, "o_last"),
+        offset_of(&map, "o_resp"),
+        offset_of(&map, "o_done"),
+        offset_of(&map, "ddr_oor"),
+    );
+
+    let tb = format!(
+        r#"
+#[test(axi_mem_dut_base)]
+module axi_mem_dut_base {{
+{BUS}
+    /// One DUT access, then waits for it.
+    function access (
+        is_write: input logic    ,
+        at      : input logic<32>,
+    ) {{
+        wr({write}, is_write);
+        wr({addr}, at);
+        wr({run}, 1);
+        wr({run}, 0);
+        for _i in 0..64 {{
+            if rd({done}) == 1 {{
+                break;
+            }}
+        }}
+    }}
+
+    initial {{
+        start();
+
+        // The host puts a word at entry 1; the DUT reads it at base + 4.
+        wr({base} + 4, 32'ha5a5_0001);
+        wr({base} + 0, 32'h1111_0000);
+        access(0, 32'h8000_0004);
+        $assert(rd({last}) == 32'ha5a5_0001 && rd({resp}) == 0);
+
+        // The DUT writes base + 12; the host finds it at entry 3.
+        access(1, 32'h8000_000c);
+        $assert(rd({resp}) == 0);
+        $assert(rd({base} + 12) == 32'hbeef_0003);
+        $assert(rd({oor}) == 0);
+
+        // Below the base: DECERR and 0.
+        access(0, 32'h7fff_fffc);
+        $display("below: %h resp %d", rd({last}), rd({resp}));
+        $assert(rd({last}) == 0 && rd({resp}) == 3);
+
+        // Past the end (64 words). Cut to the memory, it would be entry 0.
+        access(1, 32'h8000_0100);
+        $assert(rd({resp}) == 3);
+        $display("entry 0 after: %h", rd({base}));
+        $assert(rd({base}) == 32'h1111_0000);
+
+        $display("refused: %d", rd({oor}));
+        $assert(rd({oor}) == 2);
         $finish();
     }}
 }}

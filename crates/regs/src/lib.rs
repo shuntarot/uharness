@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 /// The `regs.json` format this crate reads. It must equal the generator's
 /// `regmap::FORMAT_VERSION`; change both together.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 /// The constant in the first window word ("VHRN").
 pub const MAGIC: u32 = 0x5648_524e;
@@ -123,6 +123,17 @@ pub struct RegisterMap {
     #[serde(default)]
     pub regions: Vec<Region>,
 
+    /// The DUT address of entry 0, in bytes, for each memory that sets
+    /// `dut_base`, by bundle name. The host places an ELF and finds its
+    /// symbols with it. A memory not listed starts at 0.
+    #[serde(default)]
+    pub dut_base: std::collections::BTreeMap<String, u64>,
+
+    /// Memories the DUT only reads (`bram_preload`). Where two memories cover
+    /// the same address, the host reads the one the DUT writes.
+    #[serde(default)]
+    pub dut_read_only: Vec<String>,
+
     /// Present only for a PCIe design; the host needs it to find the card.
     ///
     /// Absent means the design has no PCIe port. On a JTAG design, it would
@@ -153,7 +164,7 @@ pub struct Pcie {
 }
 
 /// A contiguous range in the window. Addresses start at 0 inside it; the host
-/// adds `base`.
+/// adds `window_base`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Region {
     /// Bundle name. The host looks regions up by it.
@@ -173,7 +184,7 @@ pub struct Region {
 
     /// Byte offset from the start of the window. It is aligned to the region
     /// size, so the RTL decodes it with a mask.
-    pub base: usize,
+    pub window_base: usize,
 
     /// Size in the window, in bytes. A power of two.
     pub size_bytes: usize,
