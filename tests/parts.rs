@@ -28,6 +28,31 @@ fn veryl_test(dir: &Path) -> bool {
 /// SV into `rtl/hns/src` while other tests read the package as a dependency.
 #[test]
 fn every_part_passes_its_test_bench() {
+    let dir = copy_of_hns();
+    // The simulator logs nothing here, so the message says where to look.
+    assert!(
+        veryl_test(dir.path()),
+        "a part failed its test bench; run `veryl test` in rtl/hns to see which"
+    );
+}
+
+/// `veryl publish` runs `veryl check`, which fails on a warning, even one in
+/// a test bench. `veryl test` lets warnings pass, so check here too, or the
+/// package is found unpublishable only at release.
+#[test]
+fn the_package_passes_the_check_publish_runs() {
+    let dir = copy_of_hns();
+    let mut metadata = veryl_metadata::Metadata::load(dir.path().join("Veryl.toml")).unwrap();
+    let result =
+        veryl::cmd_check::CmdCheck::new(veryl::OptCheck { files: Vec::new() }).exec(&mut metadata);
+    assert!(
+        result.is_ok(),
+        "rtl/hns does not pass `veryl check`, so it cannot be published: {result:?}"
+    );
+}
+
+/// A copy of `rtl/hns` in a temporary directory.
+fn copy_of_hns() -> tempfile::TempDir {
     let hns = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("rtl")
         .join("hns");
@@ -48,10 +73,5 @@ fn every_part_passes_its_test_bench() {
     }
     // A wrong path would find nothing and pass.
     assert!(benches > 0, "no test bench found in {}", hns.display());
-
-    // The simulator logs nothing here, so the message says where to look.
-    assert!(
-        veryl_test(dir.path()),
-        "a part failed its test bench; run `veryl test` in rtl/hns to see which"
-    );
+    dir
 }
