@@ -636,13 +636,13 @@ this way. `--pio` and `--dma` force one or the other, for telling them apart.
 
 ### Running firmware
 
-`hio boot` loads an ELF, runs it, and connects to its RTT console. It is meant
-as a cargo runner:
+`hio cpu boot` loads an ELF, runs it, and connects to its RTT console. It is
+meant as a cargo runner:
 
 ```toml
 # .cargo/config.toml of the firmware
 [target.riscv32imac-unknown-none-elf]
-runner = "hio boot"
+runner = "hio cpu boot"
 
 [env]
 HIO_REGS = { value = "../hns/regs.json", relative = true }
@@ -651,7 +651,7 @@ HIO_REGS = { value = "../hns/regs.json", relative = true }
 It holds the DUT in reset, puts each segment into every memory that covers its
 address (`dut_base`), clears the `_SEGGER_RTT` block, and releases the DUT. Up
 channel 0 goes to the terminal and keys go to down channel 0; Ctrl-A x
-leaves. `hio console <elf>` connects without loading.
+leaves. `hio cpu console <elf>` connects without loading.
 
 The exit status is the program's: from `tohost` (1 passes, `(code << 1) | 1`
 fails with `code`), or from the first byte on an up channel named `hio-exit`.

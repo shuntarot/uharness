@@ -348,36 +348,9 @@ enum Cmd {
         dma: bool,
     },
 
-    /// Load an ELF, run it, and connect to its RTT console.
-    ///
-    /// Made to be a cargo runner (`runner = "hio boot"`). It holds the DUT in
-    /// reset, places each segment in every memory that covers its address
-    /// (`dut_base` in regs.json), clears the RTT control block, and releases
-    /// the DUT. With `_SEGGER_RTT` it then shows up channel 0 and sends keys to
-    /// down channel 0; Ctrl-A x leaves. The exit status is the program's, from
-    /// `tohost` or from an up channel named `hio-exit`.
-    Boot {
-        /// The ELF to run.
-        elf: PathBuf,
-        #[command(flatten)]
-        attach: AttachArgs,
-        /// Arguments after the ELF, which are ignored.
-        ///
-        /// cargo passes the program's arguments here; the firmware has no way
-        /// to receive them.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-        args: Vec<String>,
-    },
-
-    /// Connect to the RTT console of a program that is already running.
-    ///
-    /// Like `boot`, but it loads nothing and does not touch the reset.
-    Console {
-        /// The ELF the program was built from. Only its symbols are used.
-        elf: PathBuf,
-        #[command(flatten)]
-        attach: AttachArgs,
-    },
+    /// Run firmware on a CPU in the DUT and talk to it.
+    #[command(subcommand)]
+    Cpu(CpuCmd),
 
     /// Write a pattern to a memory bundle and read it back.
     ///
@@ -485,7 +458,42 @@ enum Cmd {
     },
 }
 
-/// How `boot` and `console` find the RTT control block.
+/// `hio cpu`: what needs a CPU in the DUT and an ELF for it.
+#[derive(Subcommand)]
+enum CpuCmd {
+    /// Load an ELF, run it, and connect to its RTT console.
+    ///
+    /// Made to be a cargo runner (`runner = "hio cpu boot"`). It holds the DUT in
+    /// reset, places each segment in every memory that covers its address
+    /// (`dut_base` in regs.json), clears the RTT control block, and releases
+    /// the DUT. With `_SEGGER_RTT` it then shows up channel 0 and sends keys to
+    /// down channel 0; Ctrl-A x leaves. The exit status is the program's, from
+    /// `tohost` or from an up channel named `hio-exit`.
+    Boot {
+        /// The ELF to run.
+        elf: PathBuf,
+        #[command(flatten)]
+        attach: AttachArgs,
+        /// Arguments after the ELF, which are ignored.
+        ///
+        /// cargo passes the program's arguments here; the firmware has no way
+        /// to receive them.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        args: Vec<String>,
+    },
+
+    /// Connect to the RTT console of a program that is already running.
+    ///
+    /// Like `cpu boot`, but it loads nothing and does not touch the reset.
+    Console {
+        /// The ELF the program was built from. Only its symbols are used.
+        elf: PathBuf,
+        #[command(flatten)]
+        attach: AttachArgs,
+    },
+}
+
+/// How `cpu boot` and `cpu console` find the RTT control block.
 #[derive(clap::Args, Debug, Clone)]
 struct AttachArgs {
     /// Address of the RTT control block, instead of `_SEGGER_RTT`.
@@ -816,9 +824,10 @@ fn parse_step(line: &str) -> Result<Step, String> {
         Cmd::Run { .. } => Err("a script cannot run another script".to_string()),
         // They take over the terminal and end the process with the
         // program's status.
-        Cmd::Boot { .. } | Cmd::Console { .. } => {
-            Err("`boot` and `console` take over the terminal; run them on their own.".to_string())
-        }
+        Cmd::Cpu(_) => Err(
+            "`cpu boot` and `cpu console` take over the terminal; run them on their own."
+                .to_string(),
+        ),
         Cmd::Probe | Cmd::Targets | Cmd::Check | Cmd::Completions { .. } => {
             Err("that only makes sense before the link is open; run it on its own.".to_string())
         }
@@ -843,8 +852,7 @@ fn run_step(cli: &Cli, bus: &mut Bus, map: &RegisterMap, step: Step) -> Result<(
         Cmd::Program { .. }
         | Cmd::Erase
         | Cmd::Run { .. }
-        | Cmd::Boot { .. }
-        | Cmd::Console { .. }
+        | Cmd::Cpu(_)
         | Cmd::Probe
         | Cmd::Targets
         | Cmd::Completions { .. } => {
@@ -1596,7 +1604,7 @@ fn completions(shell: Shell) -> Result<(), String> {
     // (`hio completions zsh | head`) panics inside clap_complete (`expect`).
     // A closed pipe is not an error.
     let mut out = Vec::new();
-    let mut cmd = <Cli as clap::CommandFactory>::command();
+    let mut cmd = with_help_flags(<Cli as clap::CommandFactory>::command());
     let name = cmd.get_name().to_string();
     clap_complete::generate(shell, &mut cmd, name, &mut out);
 
@@ -1641,6 +1649,7 @@ fn short_help_command() -> clap::Command {
     for name in RARE_COMMANDS {
         cmd = cmd.mut_subcommand(*name, |s| s.hide(true));
     }
+    cmd = with_help_flags(cmd);
     let width = cmd
         .get_subcommands()
         .filter(|s| !s.is_hide_set())
@@ -1657,6 +1666,27 @@ fn short_help_command() -> clap::Command {
         heading("Options:"),
     );
     cmd.help_template(template)
+}
+
+/// Gives every command under `hio` its own `-h` / `--help`. Turning the help
+/// flag off on `hio` turns it off below too. There `--help` is the long help,
+/// the same as `hio help <command>`; only `hio --help` stays short.
+fn with_help_flags(cmd: clap::Command) -> clap::Command {
+    let names: Vec<String> = cmd
+        .get_subcommands()
+        .map(|s| s.get_name().to_string())
+        .collect();
+    names.iter().fold(cmd, |cmd, name| {
+        cmd.mut_subcommand(name, |sub| {
+            with_help_flags(sub).arg(
+                clap::Arg::new("help")
+                    .short('h')
+                    .long("help")
+                    .action(clap::ArgAction::Help)
+                    .help("Print help"),
+            )
+        })
+    })
 }
 
 /// `hio --list`: every command, one line each.
@@ -1845,11 +1875,11 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             size,
             threads,
         ),
-        Cmd::Boot {
+        Cmd::Cpu(CpuCmd::Boot {
             ref elf,
             ref attach,
             ref args,
-        } => {
+        }) => {
             if !args.is_empty() {
                 eprintln!(
                     "warning: the firmware cannot receive arguments; ignoring {}",
@@ -1859,10 +1889,10 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             let code = boot(&mut bus, &map, elf, attach, true)?;
             exit_with(code)
         }
-        Cmd::Console {
+        Cmd::Cpu(CpuCmd::Console {
             ref elf,
             ref attach,
-        } => {
+        }) => {
             let code = boot(&mut bus, &map, elf, attach, false)?;
             exit_with(code)
         }
@@ -5219,7 +5249,7 @@ impl hns_host::rtt::Memory for WindowMem<'_> {
                 span_list(&self.spans)
             ));
         }
-        // Every copy, as `boot` loads every copy.
+        // Every copy, as `cpu boot` loads every copy.
         for (bundle, (from, to, skip)) in targets {
             let port = mem_port(self.map, &bundle)?;
             let mut bytes = if skip == 0 && data.len().is_multiple_of(port.entry_bytes()) {
@@ -6422,6 +6452,23 @@ mod tests {
             .render_help()
             .to_string();
         assert_eq!(help, short, "`hio help` prints the same as `hio --help`");
+
+        // Below `hio`, -h is short and --help is long, as clap has it.
+        let help_of = |args: &[&str]| {
+            let err = short_help_command()
+                .color(clap::ColorChoice::Never)
+                .try_get_matches_from(args)
+                .unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp, "{args:?}");
+            err.to_string()
+        };
+        let long = help_of(&["hio", "cpu", "boot", "--help"]);
+        assert!(long.contains("Made to be a cargo runner"), "{long}");
+        let brief = help_of(&["hio", "cpu", "boot", "-h"]);
+        assert!(!brief.contains("Made to be a cargo runner"), "{brief}");
+        assert!(brief.contains("--wait-ms"), "{brief}");
+        assert!(help_of(&["hio", "cpu", "--help"]).contains("  console "));
+        assert!(help_of(&["hio", "read", "--help"]).contains("<WHO>"));
 
         assert!(command_list().contains("  dma-fire "));
         let options = options_help();
