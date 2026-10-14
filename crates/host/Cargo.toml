@@ -13,7 +13,7 @@ license     = "MIT OR Apache-2.0"
 hns-regs    = {version = "0.1.0", path = "../regs"}
 hns-targets = {version = "0.1.0", path = "../targets"}
 nusb = "0.2.7"
-# mmap of a BAR (`pcie.rs`), and the raw terminal of `hio boot`.
+# mmap of a BAR (`pcie.rs`), and the raw terminal of `hio cpu boot`.
 libc = "0.2"
 clap   = {version = "4.6", features = ["derive", "env"]}
 clap_complete = "4.6"
