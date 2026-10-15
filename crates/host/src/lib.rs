@@ -22,6 +22,7 @@ pub mod ftdi;
 pub mod mpsse;
 pub mod pcie;
 pub mod rtt;
+pub mod semihosting;
 pub mod sim;
 pub mod svf;
 

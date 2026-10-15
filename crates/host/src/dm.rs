@@ -102,7 +102,83 @@ const DCSR: u32 = 0x7b0;
 const DPC: u32 = 0x7b1;
 const TSELECT: u32 = 0x7a0;
 const TDATA1: u32 = 0x7a1;
+const TDATA2: u32 = 0x7a2;
 const TINFO: u32 = 0x7a4;
+
+// `tdata1` bits that `mcontrol` (type 2) and `mcontrol6` (type 6) share.
+const T_LOAD: u64 = 1 << 0;
+const T_STORE: u64 = 1 << 1;
+const T_EXECUTE: u64 = 1 << 2;
+const T_U: u64 = 1 << 3;
+const T_S: u64 = 1 << 4;
+const T_M: u64 = 1 << 6;
+/// `action = 1`: enter debug mode.
+const T_ACTION_DEBUG: u64 = 1 << 12;
+
+// `tdata1` of an exception trigger (`etrigger`, type 5).
+const E_ACTION_DEBUG: u64 = 1;
+const E_U: u64 = 1 << 6;
+const E_S: u64 = 1 << 7;
+const E_M: u64 = 1 << 9;
+
+const MCAUSE: u32 = 0x342;
+const MEPC: u32 = 0x341;
+const MTVAL: u32 = 0x343;
+
+/// Exceptions a program does not mean to raise: faults and misalignment.
+/// Not `ecall` (8, 9, 11) or `ebreak` (3), which programs use on purpose.
+pub const FAULTS: u64 = (1 << 0)
+    | (1 << 1)
+    | (1 << 2)
+    | (1 << 4)
+    | (1 << 5)
+    | (1 << 6)
+    | (1 << 7)
+    | (1 << 12)
+    | (1 << 13)
+    | (1 << 15);
+
+/// The name of an exception cause (`mcause` without the interrupt bit).
+pub fn exception_text(cause: u64) -> &'static str {
+    match cause {
+        0 => "instruction address misaligned",
+        1 => "instruction access fault",
+        2 => "illegal instruction",
+        3 => "breakpoint",
+        4 => "load address misaligned",
+        5 => "load access fault",
+        6 => "store address misaligned",
+        7 => "store access fault",
+        8 => "ecall from U-mode",
+        9 => "ecall from S-mode",
+        11 => "ecall from M-mode",
+        12 => "instruction page fault",
+        13 => "load page fault",
+        15 => "store page fault",
+        _ => "unknown exception",
+    }
+}
+
+/// Why a hart is halted, read from `dcsr.cause` and, for a trigger, which
+/// trigger it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stop {
+    /// `halt`, or a halt-on-reset (Hazard3 reports both as a request).
+    Request,
+    Step,
+    Ebreak,
+    Reset,
+    Breakpoint,
+    /// An exception the trigger catches: the hart is at the handler.
+    Trap {
+        cause: u64,
+        mepc: u64,
+        mtval: u64,
+    },
+    /// Another trigger.
+    Trigger,
+    Other(u64),
+}
 
 // dcsr
 const DCSR_STEP: u64 = 1 << 2;
@@ -195,6 +271,11 @@ impl fmt::Display for Reg {
             },
         }
     }
+}
+
+/// Whether a `dmstatus` value says the selected harts are all halted.
+pub fn all_halted(dmstatus: u32) -> bool {
+    dmstatus & ALLHALTED != 0
 }
 
 /// Why the hart is halted, from `dcsr.cause`.
@@ -336,6 +417,13 @@ impl fmt::Display for Info {
     }
 }
 
+/// A breakpoint: an address trigger that halts into the debugger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Breakpoint {
+    pub index: u32,
+    pub addr: u64,
+}
+
 /// One trigger, as `tinfo` lists the types it takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Trigger {
@@ -345,6 +433,16 @@ pub struct Trigger {
 }
 
 impl Trigger {
+    /// Takes an exception match (`etrigger`).
+    pub fn matches_exceptions(&self) -> bool {
+        self.types & (1 << 5) != 0
+    }
+
+    /// Takes an address match (`mcontrol` or `mcontrol6`).
+    pub fn matches_addresses(&self) -> bool {
+        self.types & ((1 << 2) | (1 << 6)) != 0
+    }
+
     pub fn type_names(&self) -> Vec<&'static str> {
         const NAMES: [(u32, &str); 7] = [
             (2, "mcontrol (address/data)"),
@@ -523,8 +621,16 @@ impl<D: Dmi> Debug<D> {
         Ok(())
     }
 
-    /// Lets the hart run.
+    /// Lets the hart run. Halted on a breakpoint, it first steps past it:
+    /// the trigger fires before the instruction runs, so it would fire again.
     pub fn resume(&mut self) -> Result<(), String> {
+        if self.is_halted()? && self.cause()? == 2 {
+            self.step()?;
+        }
+        self.run()
+    }
+
+    fn run(&mut self) -> Result<(), String> {
         self.write(reg::DMCONTROL, self.control(RESUMEREQ))?;
         let waited = self.wait("the hart to resume", |dm| {
             Ok(dm.status()? & (ALLRESUMEACK | ALLRUNNING) != 0)
@@ -534,8 +640,31 @@ impl<D: Dmi> Debug<D> {
     }
 
     /// Runs one instruction and halts again. The hart must be halted.
+    ///
+    /// Halted on a breakpoint, the trigger at the PC is off for the step, or
+    /// it would fire before the instruction runs.
     pub fn step(&mut self) -> Result<(), String> {
         self.need_halted("step")?;
+        if self.cause()? != 2 {
+            return self.step_once();
+        }
+        let pc = self.read_reg(Reg::Csr(DPC))?;
+        let here: Vec<Breakpoint> = self
+            .breakpoints()?
+            .into_iter()
+            .filter(|b| b.addr == pc)
+            .collect();
+        for b in &here {
+            self.arm(b.index, None)?;
+        }
+        let stepped = self.step_once();
+        for b in &here {
+            self.arm(b.index, Some(b.addr))?;
+        }
+        stepped
+    }
+
+    fn step_once(&mut self) -> Result<(), String> {
         let dcsr = self.read_reg(Reg::Csr(DCSR))?;
         self.write_reg(Reg::Csr(DCSR), dcsr | DCSR_STEP)?;
         self.write(reg::DMCONTROL, self.control(RESUMEREQ))?;
@@ -586,6 +715,30 @@ impl<D: Dmi> Debug<D> {
             self.catch_ebreak()?;
         }
         Ok(())
+    }
+
+    /// Asks the hart to halt at its next reset, whatever resets it, or stops
+    /// asking.
+    pub fn halt_on_reset(&mut self, on: bool) -> Result<(), String> {
+        if on && self.status()? & HASRESETHALTREQ == 0 {
+            return Err(
+                "the Debug Module cannot halt a hart at reset: it has no halt-on-reset \
+                 (`dmstatus.hasresethaltreq` is 0)."
+                    .to_string(),
+            );
+        }
+        let bit = if on { SETRESETHALTREQ } else { CLRRESETHALTREQ };
+        self.write(reg::DMCONTROL, self.control(bit))?;
+        self.write(reg::DMCONTROL, self.control(0))
+    }
+
+    /// Waits for a halt that something else brings, such as a reset with
+    /// halt-on-reset, and acknowledges the reset.
+    pub fn wait_halted(&mut self) -> Result<(), String> {
+        self.wait("the hart to halt", |dm| dm.is_halted())?;
+        self.write(reg::DMCONTROL, self.control(ACKHAVERESET))?;
+        self.write(reg::DMCONTROL, self.control(0))?;
+        self.catch_ebreak()
     }
 
     fn need_halted(&mut self, what: &str) -> Result<(), String> {
@@ -772,6 +925,217 @@ impl<D: Dmi> Debug<D> {
         ran
     }
 
+    /// Runs `f` with the hart halted, and lets it run again afterwards if it
+    /// was running.
+    fn halted_for<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let was_running = !self.is_halted()?;
+        if was_running {
+            self.halt()?;
+        }
+        let out = f(self);
+        if was_running {
+            self.run()?;
+        }
+        out
+    }
+
+    /// The breakpoints set: address triggers that halt into the debugger on
+    /// execute. A running hart is halted for a moment to read them.
+    pub fn breakpoints(&mut self) -> Result<Vec<Breakpoint>, String> {
+        self.halted_for(|dm| {
+            let xlen = dm.xlen()?;
+            let saved = dm.read_reg(Reg::Csr(TSELECT))?;
+            let mut out = Vec::new();
+            for t in dm
+                .triggers()?
+                .into_iter()
+                .filter(Trigger::matches_addresses)
+            {
+                dm.write_reg(Reg::Csr(TSELECT), u64::from(t.index))?;
+                if is_breakpoint(dm.read_reg(Reg::Csr(TDATA1))?, xlen) {
+                    let addr = dm.read_reg(Reg::Csr(TDATA2))?;
+                    out.push(Breakpoint {
+                        index: t.index,
+                        addr,
+                    });
+                }
+            }
+            dm.write_reg(Reg::Csr(TSELECT), saved)?;
+            Ok(out)
+        })
+    }
+
+    /// Sets a breakpoint at `addr` on a free address trigger. One already
+    /// there is kept.
+    pub fn set_breakpoint(&mut self, addr: u64) -> Result<Breakpoint, String> {
+        self.halted_for(|dm| {
+            if let Some(b) = dm.breakpoints()?.into_iter().find(|b| b.addr == addr) {
+                return Ok(b);
+            }
+            let saved = dm.read_reg(Reg::Csr(TSELECT))?;
+            let mut free = None;
+            let mut total = 0;
+            for t in dm
+                .triggers()?
+                .into_iter()
+                .filter(Trigger::matches_addresses)
+            {
+                total += 1;
+                dm.write_reg(Reg::Csr(TSELECT), u64::from(t.index))?;
+                let tdata1 = dm.read_reg(Reg::Csr(TDATA1))?;
+                if tdata1 & (T_EXECUTE | T_LOAD | T_STORE) == 0 {
+                    free = Some(t.index);
+                    break;
+                }
+            }
+            dm.write_reg(Reg::Csr(TSELECT), saved)?;
+            let Some(index) = free else {
+                return Err(if total == 0 {
+                    "the hart has no address triggers, so it cannot take a hardware breakpoint."
+                        .to_string()
+                } else {
+                    format!(
+                        "all {total} address triggers are in use. Clear one first: \
+                         `hio cpu break --clear <where>`."
+                    )
+                });
+            };
+            dm.arm(index, Some(addr))?;
+            Ok(Breakpoint { index, addr })
+        })
+    }
+
+    /// Clears the breakpoint at `addr`, or every one. Returns how many.
+    pub fn clear_breakpoints(&mut self, addr: Option<u64>) -> Result<usize, String> {
+        self.halted_for(|dm| {
+            let found: Vec<Breakpoint> = dm
+                .breakpoints()?
+                .into_iter()
+                .filter(|b| addr.is_none_or(|a| a == b.addr))
+                .collect();
+            for b in &found {
+                dm.arm(b.index, None)?;
+            }
+            Ok(found.len())
+        })
+    }
+
+    /// Points trigger `index` at `addr`, or turns it off with `None`.
+    /// `tselect` is put back.
+    fn arm(&mut self, index: u32, addr: Option<u64>) -> Result<(), String> {
+        let xlen = self.xlen()?;
+        let saved = self.read_reg(Reg::Csr(TSELECT))?;
+        self.write_reg(Reg::Csr(TSELECT), u64::from(index))?;
+        let kind = self.read_reg(Reg::Csr(TDATA1))? >> (xlen - 4);
+        let off = kind << (xlen - 4);
+        // Off first, so the trigger never matches a half-written address.
+        self.write_reg(Reg::Csr(TDATA1), off)?;
+        let result = match addr {
+            None => Ok(()),
+            Some(addr) => {
+                self.write_reg(Reg::Csr(TDATA2), addr)?;
+                let want = off | (1 << (xlen - 5)) | T_ACTION_DEBUG | T_M | T_S | T_U | T_EXECUTE;
+                self.write_reg(Reg::Csr(TDATA1), want)?;
+                // `s` and `u` are WARL: a hart without them keeps 0.
+                if is_breakpoint(self.read_reg(Reg::Csr(TDATA1))?, xlen) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "trigger {index} did not take the breakpoint: it may not halt into \
+                         the debugger, or not match on execute."
+                    ))
+                }
+            }
+        };
+        self.write_reg(Reg::Csr(TSELECT), saved)?;
+        result
+    }
+
+    /// Points the exception trigger at `causes` (a bitmap of `mcause`
+    /// values), or turns it off with 0. Returns the causes the hart took:
+    /// it keeps only those it can raise. A running hart is halted for a
+    /// moment.
+    pub fn catch_exceptions(&mut self, causes: u64) -> Result<u64, String> {
+        self.halted_for(|dm| {
+            let xlen = dm.xlen()?;
+            let Some(t) = dm.triggers()?.into_iter().find(Trigger::matches_exceptions) else {
+                return Err(
+                    "the hart has no exception trigger, so it cannot stop on a trap.".to_string(),
+                );
+            };
+            let saved = dm.read_reg(Reg::Csr(TSELECT))?;
+            dm.write_reg(Reg::Csr(TSELECT), u64::from(t.index))?;
+            let off = 5 << (xlen - 4);
+            dm.write_reg(Reg::Csr(TDATA1), off)?;
+            let taken = if causes == 0 {
+                0
+            } else {
+                dm.write_reg(Reg::Csr(TDATA2), causes)?;
+                // `m` / `s` / `u` are WARL: a hart without S or U keeps 0.
+                let want = off | (1 << (xlen - 5)) | E_M | E_S | E_U | E_ACTION_DEBUG;
+                dm.write_reg(Reg::Csr(TDATA1), want)?;
+                dm.read_reg(Reg::Csr(TDATA2))?
+            };
+            dm.write_reg(Reg::Csr(TSELECT), saved)?;
+            Ok(taken)
+        })
+    }
+
+    /// The causes the exception trigger is set to catch, or 0.
+    pub fn caught_exceptions(&mut self) -> Result<u64, String> {
+        self.halted_for(|dm| {
+            let xlen = dm.xlen()?;
+            let Some(t) = dm.triggers()?.into_iter().find(Trigger::matches_exceptions) else {
+                return Ok(0);
+            };
+            let saved = dm.read_reg(Reg::Csr(TSELECT))?;
+            dm.write_reg(Reg::Csr(TSELECT), u64::from(t.index))?;
+            let tdata1 = dm.read_reg(Reg::Csr(TDATA1))?;
+            let armed = tdata1 & (1 << (xlen - 5)) != 0 && tdata1 & (E_M | E_S | E_U) != 0;
+            let causes = if armed {
+                dm.read_reg(Reg::Csr(TDATA2))?
+            } else {
+                0
+            };
+            dm.write_reg(Reg::Csr(TSELECT), saved)?;
+            Ok(causes)
+        })
+    }
+
+    /// Why the hart is halted, telling a breakpoint from a caught trap. The
+    /// hart must be halted.
+    pub fn stop(&mut self) -> Result<Stop, String> {
+        Ok(match self.cause()? {
+            1 => Stop::Ebreak,
+            3 => Stop::Request,
+            4 => Stop::Step,
+            5 => Stop::Reset,
+            2 => {
+                let pc = self.read_reg(Reg::Csr(DPC))?;
+                if self.breakpoints()?.iter().any(|b| b.addr == pc) {
+                    Stop::Breakpoint
+                } else {
+                    let mcause = self.read_reg(Reg::Csr(MCAUSE))?;
+                    let interrupt = mcause >> (self.xlen()? - 1) != 0;
+                    let caught = self.caught_exceptions()?;
+                    if !interrupt && mcause < 64 && caught & (1 << mcause) != 0 {
+                        Stop::Trap {
+                            cause: mcause,
+                            mepc: self.read_reg(Reg::Csr(MEPC))?,
+                            mtval: self.read_reg(Reg::Csr(MTVAL))?,
+                        }
+                    } else {
+                        Stop::Trigger
+                    }
+                }
+            }
+            other => Stop::Other(other),
+        })
+    }
+
     /// Why the hart halted. The hart must be halted.
     pub fn cause(&mut self) -> Result<u64, String> {
         Ok((self.read_reg(Reg::Csr(DCSR))? >> 6) & 0x7)
@@ -805,6 +1169,15 @@ impl<D: Dmi> Debug<D> {
     }
 }
 
+/// An address trigger set by a debugger to halt on execute.
+fn is_breakpoint(tdata1: u64, xlen: u32) -> bool {
+    let kind = tdata1 >> (xlen - 4);
+    (kind == 2 || kind == 6)
+        && tdata1 & (1 << (xlen - 5)) != 0
+        && tdata1 & T_EXECUTE != 0
+        && (tdata1 >> 12) & 0xf == 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -829,6 +1202,9 @@ mod tests {
         xlen: u32,
         /// Access register commands that named a CSR, which it refuses.
         refused_csr: usize,
+        /// `tdata1` / `tdata2` of the triggers: an address match, an
+        /// instruction count, and an exception trigger.
+        tdata: [[u64; 2]; 3],
         log: Vec<Op>,
     }
 
@@ -840,6 +1216,8 @@ mod tests {
             };
             m.csr.insert(0x301, 0x4000_1105);
             m.csr.insert(DCSR, 4 << 28);
+            let shift = xlen - 4;
+            m.tdata = [[2 << shift, 0], [3 << shift, 0], [5 << shift, 0]];
             m.csr.insert(TSELECT, 0);
             m
         }
@@ -855,21 +1233,32 @@ mod tests {
             match (insn >> 12) & 0x7 {
                 // csrrs rd, csr, x0
                 0b010 if insn & 0x7f == 0x73 => {
-                    let v = if csr == DPC {
-                        self.pc
-                    } else {
-                        *self.csr.get(&csr).unwrap_or(&0)
+                    let sel = (self.csr[&TSELECT] as usize).min(3);
+                    let v = match csr {
+                        DPC => self.pc,
+                        TDATA1 | TDATA2 if sel < 3 => self.tdata[sel][(csr - TDATA1) as usize],
+                        _ => *self.csr.get(&csr).unwrap_or(&0),
                     };
                     self.gpr[rd as usize] = v;
                 }
                 // csrrw x0, csr, rs1
                 0b001 if insn & 0x7f == 0x73 => {
                     let v = self.gpr[rs1 as usize];
+                    let sel = (self.csr[&TSELECT] as usize).min(3);
                     if csr == DPC {
                         self.pc = v;
+                    } else if csr == TDATA1 && sel < 3 {
+                        // The type is fixed.
+                        let shift = self.xlen - 4;
+                        let kind = self.tdata[sel][0] >> shift;
+                        self.tdata[sel][0] = (kind << shift) | (v & ((1 << shift) - 1));
+                    } else if csr == TDATA2 && sel < 3 {
+                        // The exception trigger keeps the causes this hart
+                        // can raise (not 0, as with compressed instructions).
+                        self.tdata[sel][1] = if sel == 2 { v & 0xb0f6 } else { v };
                     } else if csr == TSELECT {
-                        // Two triggers.
-                        self.csr.insert(TSELECT, v.min(2));
+                        // Three triggers.
+                        self.csr.insert(TSELECT, v.min(3));
                     } else {
                         self.csr.insert(csr, v);
                     }
@@ -882,6 +1271,7 @@ mod tests {
                 self.gpr[rd as usize] = match sel {
                     0 => 1 << 2,
                     1 => 1 << 3,
+                    2 => 1 << 5,
                     _ => 1,
                 };
             }
@@ -969,9 +1359,12 @@ mod tests {
             }
             if v & RESUMEREQ != 0 && self.halted {
                 self.resumeack = true;
-                if self.csr[&DCSR] & DCSR_STEP != 0 {
+                let dcsr = self.csr[&DCSR] & !(0x7 << 6);
+                // The address trigger fires before the instruction at the PC.
+                if is_breakpoint(self.tdata[0][0], self.xlen) && self.tdata[0][1] == self.pc {
+                    self.csr.insert(DCSR, dcsr | (2 << 6));
+                } else if self.csr[&DCSR] & DCSR_STEP != 0 {
                     self.pc += 4;
-                    let dcsr = self.csr[&DCSR] & !(0x7 << 6);
                     self.csr.insert(DCSR, dcsr | (4 << 6));
                 } else {
                     self.halted = false;
@@ -1114,10 +1507,121 @@ mod tests {
                     index: 1,
                     types: 1 << 3
                 },
+                Trigger {
+                    index: 2,
+                    types: 1 << 5
+                },
             ]
         );
         assert_eq!(triggers[0].type_names(), vec!["mcontrol (address/data)"]);
         assert_eq!(m.csr[&TSELECT], 0);
+    }
+
+    #[test]
+    fn a_breakpoint_is_set_listed_stepped_over_and_cleared() {
+        let mut m = Model::new(32);
+        m.pc = 0x8000_0000;
+        let mut dm = Debug::attach(&mut m, 0).unwrap();
+        // Set while running: halted for a moment, then running again.
+        let b = dm.set_breakpoint(0x8000_0010).unwrap();
+        assert_eq!(
+            b,
+            Breakpoint {
+                index: 0,
+                addr: 0x8000_0010
+            }
+        );
+        assert!(!dm.is_halted().unwrap());
+        assert_eq!(dm.breakpoints().unwrap(), vec![b]);
+        // The same address again is the same breakpoint.
+        assert_eq!(dm.set_breakpoint(0x8000_0010).unwrap(), b);
+        // The one address trigger is taken.
+        let err = dm.set_breakpoint(0x8000_0020).unwrap_err();
+        assert!(err.contains("all 1 address triggers"), "{err}");
+
+        // Halted on it, a step runs the instruction instead of firing again,
+        // and the breakpoint is back afterwards.
+        dm.halt().unwrap();
+        dm.write_reg(Reg::Csr(DPC), 0x8000_0010).unwrap();
+        let dcsr = dm.read_reg(Reg::Csr(DCSR)).unwrap() & !(0x7 << 6);
+        dm.write_reg(Reg::Csr(DCSR), dcsr | (2 << 6)).unwrap();
+        dm.step().unwrap();
+        assert_eq!(dm.read_reg(Reg::Csr(DPC)).unwrap(), 0x8000_0014);
+        assert_eq!(dm.breakpoints().unwrap(), vec![b]);
+
+        // Resuming from it does the same, then runs.
+        dm.write_reg(Reg::Csr(DPC), 0x8000_0010).unwrap();
+        let dcsr = dm.read_reg(Reg::Csr(DCSR)).unwrap() & !(0x7 << 6);
+        dm.write_reg(Reg::Csr(DCSR), dcsr | (2 << 6)).unwrap();
+        dm.resume().unwrap();
+        assert!(!dm.is_halted().unwrap());
+
+        assert_eq!(dm.clear_breakpoints(Some(0x8000_0010)).unwrap(), 1);
+        assert!(dm.breakpoints().unwrap().is_empty());
+        assert_eq!(dm.clear_breakpoints(None).unwrap(), 0);
+    }
+
+    /// `boot --halt`: the request is set before something else resets the
+    /// hart, the hart stops there, and the request and the reset are
+    /// cleared afterwards.
+    #[test]
+    fn a_halt_on_reset_catches_a_reset_from_outside() {
+        let mut m = Model::new(32);
+        Debug::attach(&mut m, 0)
+            .unwrap()
+            .halt_on_reset(true)
+            .unwrap();
+        assert!(m.resethaltreq);
+        // The DUT reset, which the Debug Module does not see coming.
+        m.pc = 0x8000_0000;
+        m.havereset = true;
+        m.halted = m.resethaltreq;
+        let mut dm = Debug::attach(&mut m, 0).unwrap();
+        dm.wait_halted().unwrap();
+        dm.halt_on_reset(false).unwrap();
+        assert_eq!(dm.read_reg(Reg::Csr(DPC)).unwrap(), 0x8000_0000);
+        assert!(!m.resethaltreq);
+        assert!(!m.havereset);
+    }
+
+    /// The exception trigger takes the faults the hart can raise, and a halt
+    /// it causes reads as a trap with where it happened.
+    #[test]
+    fn a_caught_trap_is_told_from_a_breakpoint() {
+        let mut m = Model::new(32);
+        let mut dm = Debug::attach(&mut m, 0).unwrap();
+        assert_eq!(dm.caught_exceptions().unwrap(), 0);
+        let taken = dm.catch_exceptions(FAULTS).unwrap();
+        assert_eq!(taken, FAULTS & 0xb0f6);
+        assert_eq!(dm.caught_exceptions().unwrap(), taken);
+        assert!(
+            !dm.is_halted().unwrap(),
+            "set while running, then running again"
+        );
+
+        // An illegal instruction at 0x8000_0040: the hart stops at the
+        // handler.
+        dm.halt().unwrap();
+        dm.write_reg(Reg::Csr(MCAUSE), 2).unwrap();
+        dm.write_reg(Reg::Csr(MEPC), 0x8000_0040).unwrap();
+        dm.write_reg(Reg::Csr(MTVAL), 0xffff_ffff).unwrap();
+        dm.write_reg(Reg::Csr(DPC), 0x8000_00f8).unwrap();
+        let dcsr = dm.read_reg(Reg::Csr(DCSR)).unwrap() & !(0x7 << 6);
+        dm.write_reg(Reg::Csr(DCSR), dcsr | (2 << 6)).unwrap();
+        assert_eq!(
+            dm.stop().unwrap(),
+            Stop::Trap {
+                cause: 2,
+                mepc: 0x8000_0040,
+                mtval: 0xffff_ffff
+            }
+        );
+        // A breakpoint at the PC is a breakpoint, whatever `mcause` says.
+        dm.set_breakpoint(0x8000_00f8).unwrap();
+        assert_eq!(dm.stop().unwrap(), Stop::Breakpoint);
+
+        assert_eq!(dm.catch_exceptions(0).unwrap(), 0);
+        assert_eq!(dm.caught_exceptions().unwrap(), 0);
     }
 
     #[test]
