@@ -1115,7 +1115,7 @@ pub enum ManifestError {
     #[error("`{}` is not valid TOML", path.display())]
     #[diagnostic(
         code(harness::manifest::parse),
-        help("See doc/guide.md for the full schema.")
+        help("See doc/guide-harness.md for the full schema.")
     )]
     Parse {
         path: PathBuf,

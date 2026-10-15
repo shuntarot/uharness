@@ -476,6 +476,20 @@ enum CpuCmd {
     Boot {
         /// The ELF to run.
         elf: PathBuf,
+        /// Stop at the first instruction, at the prompt, before the program
+        /// runs.
+        ///
+        /// Set breakpoints there, then `resume`. It needs the Debug Module on
+        /// a reset of its own (`reset` in the `dmi` bundle), so that it is up
+        /// while the DUT is held in reset.
+        #[arg(long)]
+        halt: bool,
+        /// Stop on a fault the program did not mean to raise.
+        ///
+        /// Like `cpu catch`, set at the first instruction: the triggers live
+        /// in the core and a reset clears them. Needs what `--halt` needs.
+        #[arg(long)]
+        catch: bool,
         #[command(flatten)]
         attach: AttachArgs,
         /// Arguments after the ELF, which are ignored.
@@ -554,6 +568,53 @@ enum CpuCmd {
         hart: HartArgs,
     },
 
+    /// Read memory at a DUT address, or write it.
+    ///
+    /// The place is an address or a symbol (with the ELF). It goes through
+    /// the window to the memories `dut_base` places there, not through the
+    /// CPU, so the hart need not halt; a CPU with a data cache may hold newer
+    /// data. Without a count a symbol is read whole, an address as one word.
+    Mem {
+        /// Address or symbol.
+        place: String,
+        /// How many 32-bit words.
+        words: Option<u32>,
+        /// Words to write there instead, in order.
+        #[arg(long, num_args = 1.., value_name = "WORD", value_parser = parse_u32)]
+        write: Vec<u32>,
+        #[command(flatten)]
+        hart: HartArgs,
+    },
+
+    /// Set a hardware breakpoint, list them, or clear them.
+    ///
+    /// The place is an address or a symbol (with the ELF). Without one, the
+    /// breakpoints are listed; with `--clear` and no place, all go. A running
+    /// hart is halted for a moment to reach the triggers.
+    Break {
+        /// Address or symbol.
+        place: Option<String>,
+        /// Clear the breakpoint at the place, or all of them.
+        #[arg(long)]
+        clear: bool,
+        #[command(flatten)]
+        hart: HartArgs,
+    },
+
+    /// Stop when the program raises a fault, or stop doing so.
+    ///
+    /// The faults are access faults, misaligned accesses, illegal
+    /// instructions and page faults; not `ecall` or `ebreak`, which programs
+    /// raise on purpose. The hart stops at the trap handler, and the prompt
+    /// says where the fault was. A reset clears it.
+    Catch {
+        /// Stop catching.
+        #[arg(long)]
+        clear: bool,
+        #[command(flatten)]
+        hart: HartArgs,
+    },
+
     /// Reset the hart through the Debug Module (`ndmreset`).
     ///
     /// The Debug Module stays up, and so do the harness memories. What else
@@ -576,6 +637,12 @@ struct HartArgs {
     /// The `dmi` bundle, when the design has more than one.
     #[arg(long, value_name = "BUNDLE")]
     dmi: Option<String>,
+    /// The program's ELF, for symbols.
+    ///
+    /// Places can then be named, and PCs are shown inside functions. In the
+    /// console the program's own ELF is used.
+    #[arg(long, value_name = "PATH")]
+    elf: Option<PathBuf>,
 }
 
 /// How `cpu boot` and `cpu console` find the RTT control block.
@@ -1970,6 +2037,8 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
         ),
         Cmd::Cpu(CpuCmd::Boot {
             ref elf,
+            halt,
+            catch,
             ref attach,
             ref args,
         }) => {
@@ -1979,14 +2048,21 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
                     args.join(" ")
                 );
             }
-            let code = boot(&cli, &mut bus, &map, elf, attach, true)?;
+            let code = boot(
+                &cli,
+                &mut bus,
+                &map,
+                elf,
+                attach,
+                Start::Load { halt, catch },
+            )?;
             exit_with(code)
         }
         Cmd::Cpu(CpuCmd::Console {
             ref elf,
             ref attach,
         }) => {
-            let code = boot(&cli, &mut bus, &map, elf, attach, false)?;
+            let code = boot(&cli, &mut bus, &map, elf, attach, Start::Attach)?;
             exit_with(code)
         }
         Cmd::Cpu(ref cmd) => cpu_debug(&mut bus, &map, cmd, None),
@@ -5395,14 +5471,28 @@ fn rtt_place(elf: &hns_host::elf::Elf, attach: &AttachArgs) -> Option<(u64, Opti
 
 /// Loads (when `load`) and runs an ELF, then stays on its console. Returns
 /// the program's exit status.
+/// How `boot` starts the console.
+#[derive(Clone, Copy)]
+enum Start {
+    /// Load the ELF and run it; with `halt`, stop at the first instruction,
+    /// and with `catch`, stop on a fault.
+    Load { halt: bool, catch: bool },
+    /// Connect to a program that is already running.
+    Attach,
+}
+
 fn boot(
     cli: &Cli,
     bus: &mut Bus,
     map: &RegisterMap,
     path: &PathBuf,
     attach: &AttachArgs,
-    load: bool,
+    start: Start,
 ) -> Result<i32, String> {
+    let (load, halt, catch) = match start {
+        Start::Load { halt, catch } => (true, halt, catch),
+        Start::Attach => (false, false, false),
+    };
     // Everything that can be wrong with the file is found before the board
     // is touched.
     let raw = std::fs::read(path).map_err(|e| read_error(path, e))?;
@@ -5411,6 +5501,19 @@ fn boot(
     let rtt_at = rtt_place(&elf, attach);
     let tohost = elf.symbol("tohost").map(|s| s.value);
     let spans = spans(map)?;
+    // The `ebreak` of a semihosting call must halt into the debugger, which
+    // takes `dcsr.ebreakm` set before the program runs.
+    let semihosting = elf
+        .segments
+        .iter()
+        .any(|s| hns_host::semihosting::appears_in(&s.bytes));
+    if semihosting && dmi_base(map, None).is_err() {
+        return Err(
+            "the program calls the host (semihosting), and answering takes a Debug Module. \
+             Give the core's DMI a bundle with `backing = \"dmi\"`."
+                .to_string(),
+        );
+    }
 
     // (segment, memories it goes to)
     let mut plan = Vec::new();
@@ -5475,7 +5578,39 @@ fn boot(
         if let Some(addr) = tohost {
             hns_host::rtt::Memory::write(&mut mem, addr, &[0; 8][..ptr as usize])?;
         }
+        if halt || catch || semihosting {
+            debug_module(mem.bus, map)?.halt_on_reset(true)?;
+        }
         reset(mem.bus, map, false, true)?;
+    }
+
+    let program = Program {
+        elf: &elf,
+        rtt_at,
+        tohost,
+        ptr,
+        attach,
+        semihosting,
+    };
+    if halt || catch || (semihosting && load) {
+        let mut dm = debug_module(mem.bus, map)?;
+        let waited = dm.wait_halted();
+        dm.halt_on_reset(false)?;
+        waited?;
+        if catch {
+            let taken = dm.catch_exceptions(hns_host::dm::FAULTS)?;
+            println!("{}", catching(taken));
+        }
+        if semihosting {
+            println!("semihosting: answering the terminal, the exit and the time");
+        }
+        if !halt {
+            dm.resume()?;
+        }
+    }
+    if halt {
+        let stop = stop_line(mem.bus, map, Some(&elf))?;
+        return console(cli, &mut mem, &program, None, Some(stop));
     }
 
     let Some((rtt_addr, rtt_size)) = rtt_at else {
@@ -5488,7 +5623,63 @@ fn boot(
         };
     };
     let rtt = wait_rtt(&mut mem, rtt_addr, ptr, rtt_size, attach)?;
-    console(cli, &mut mem, &rtt, tohost, ptr, &elf)
+    let link = Link::open(&mut mem, rtt)?;
+    console(cli, &mut mem, &program, Some(link), None)
+}
+
+/// The Debug Module for `boot --halt`, which must be up while the DUT is
+/// held in reset.
+fn debug_module<'a>(
+    bus: &'a mut Bus,
+    map: &RegisterMap,
+) -> Result<hns_host::dm::Debug<WindowDmi<'a>>, String> {
+    let base = dmi_base(map, None)?;
+    hns_host::dm::Debug::attach(WindowDmi { bus, base }, 0).map_err(|e| {
+        format!(
+            "{e}\n`--halt` needs the Debug Module up while the DUT is held in reset. \
+             Give its reset port in the `dmi` bundle (`reset = \"<port>\"`), so it \
+             takes the harness reset instead."
+        )
+    })
+}
+
+/// What the console needs to know about the program.
+struct Program<'a> {
+    elf: &'a hns_host::elf::Elf,
+    /// Where the RTT control block is, and how large.
+    rtt_at: Option<(u64, Option<u64>)>,
+    tohost: Option<u64>,
+    /// Bytes in a pointer.
+    ptr: u64,
+    attach: &'a AttachArgs,
+    /// The program may call the host (semihosting).
+    semihosting: bool,
+}
+
+/// The RTT control block the console reads and types into.
+struct Link {
+    rtt: hns_host::rtt::Rtt,
+    /// The up channel named `hio-exit`.
+    exit: Option<u64>,
+    can_type: bool,
+}
+
+impl Link {
+    fn open(mem: &mut WindowMem, rtt: hns_host::rtt::Rtt) -> Result<Self, String> {
+        let exit = rtt.find(mem, hns_host::rtt::Dir::Up, "hio-exit")?;
+        Ok(Link {
+            can_type: rtt.down > 0,
+            exit,
+            rtt,
+        })
+    }
+
+    fn hello(&self) -> String {
+        format!(
+            "hio: connected to RTT at {:#x}; Ctrl-A c debug prompt, Ctrl-A x leaves\n",
+            self.rtt.addr
+        )
+    }
 }
 
 /// Polls `tohost` until the program reports.
@@ -5507,6 +5698,28 @@ fn read_tohost(mem: &mut WindowMem, addr: u64, ptr: u64) -> Result<Option<i32>, 
     tohost_status(u64::from_le_bytes(raw))
 }
 
+/// Looks once for the control block. `None` while the program has not set it
+/// up yet.
+fn try_rtt(
+    mem: &mut WindowMem,
+    addr: u64,
+    ptr: u64,
+    size: Option<u64>,
+    attach: &AttachArgs,
+) -> Result<Option<hns_host::rtt::Rtt>, String> {
+    use hns_host::rtt::{AttachError, Layout, Rtt};
+    let found = match attach.rtt_layout {
+        Some(RttLayout::RttTarget) => Rtt::attach_as(mem, addr, Layout { ptr, field: ptr }),
+        Some(RttLayout::Segger) => Rtt::attach_as(mem, addr, Layout { ptr, field: 4 }),
+        None => Rtt::attach(mem, addr, ptr, size),
+    };
+    match found {
+        Ok(rtt) => Ok(Some(rtt)),
+        Err(AttachError::NotReady) => Ok(None),
+        Err(AttachError::Broken(e)) => Err(e),
+    }
+}
+
 /// Waits for the program to set up its control block.
 fn wait_rtt(
     mem: &mut WindowMem,
@@ -5515,63 +5728,63 @@ fn wait_rtt(
     size: Option<u64>,
     attach: &AttachArgs,
 ) -> Result<hns_host::rtt::Rtt, String> {
-    use hns_host::rtt::{AttachError, Layout, Rtt};
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(attach.wait_ms);
     loop {
-        let found = match attach.rtt_layout {
-            Some(RttLayout::RttTarget) => Rtt::attach_as(mem, addr, Layout { ptr, field: ptr }),
-            Some(RttLayout::Segger) => Rtt::attach_as(mem, addr, Layout { ptr, field: 4 }),
-            None => Rtt::attach(mem, addr, ptr, size),
-        };
-        match found {
-            Ok(rtt) => return Ok(rtt),
-            Err(AttachError::Broken(e)) => return Err(e),
-            Err(AttachError::NotReady) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(AttachError::NotReady) => {
-                return Err(format!(
-                    "the RTT control block at {addr:#x} did not appear within {} ms.\n\
-                     Either the program has not reached its RTT setup, or the host cannot \
-                     see it: a write-back data cache holds the block where the window does \
-                     not look. Put RTT in memory the CPU does not cache, or wait longer \
-                     with --wait-ms.",
-                    attach.wait_ms
-                ));
-            }
+        if let Some(rtt) = try_rtt(mem, addr, ptr, size, attach)? {
+            return Ok(rtt);
         }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the RTT control block at {addr:#x} did not appear within {} ms.\n\
+                 Either the program has not reached its RTT setup, or the host cannot \
+                 see it: a write-back data cache holds the block where the window does \
+                 not look. Put RTT in memory the CPU does not cache, or wait longer \
+                 with --wait-ms.",
+                attach.wait_ms
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
 /// Up channel 0 to the terminal, keys to down channel 0, until Ctrl-A x or
 /// until the program reports an exit status.
+/// The console: up channel 0 to the terminal, keys to down channel 0, until
+/// Ctrl-A x or until the program reports an exit status. Ctrl-A c switches to
+/// the prompt and back.
+///
+/// Without a `link` (the program has not set up RTT yet, after `boot
+/// --halt`) it starts at the prompt, and looks for the control block while
+/// it waits.
 fn console(
     cli: &Cli,
     mem: &mut WindowMem,
-    rtt: &hns_host::rtt::Rtt,
-    tohost: Option<u64>,
-    ptr: u64,
-    elf: &hns_host::elf::Elf,
+    program: &Program,
+    mut link: Option<Link>,
+    halted: Option<String>,
 ) -> Result<i32, String> {
-    use hns_host::rtt::Dir;
     use std::io::Write;
 
-    let exit_channel = rtt.find(mem, Dir::Up, "hio-exit")?;
-    let can_type = rtt.down > 0;
-    eprintln!(
-        "hio: connected to RTT at {:#x}; Ctrl-A c debug prompt, Ctrl-A x leaves",
-        rtt.addr
-    );
-
+    let elf = program.elf;
     let raw = RawTerminal::enter();
     let mut out = std::io::stdout();
     let mut ctrl_a = false;
     let mut idle = 0u32;
     // The debug prompt. While it is up, keys go to it and the target's
     // output waits in `held`.
-    let mut at_prompt = false;
     let mut prompt = Prompt::new(Level::Cpu, true);
+    let mut at_prompt = halted.is_some();
     let mut held = Vec::new();
+    let mut watch = HaltWatch::new(mem.bus, mem.map, program.semihosting);
+    let started = std::time::Instant::now();
+    match (&link, &halted) {
+        (Some(link), _) => to_terminal(&raw, &mut out, link.hello().as_bytes())?,
+        (None, Some(stop)) => {
+            let text = format!("{stop}\n{}", prompt.text());
+            to_terminal(&raw, &mut out, text.as_bytes())?;
+        }
+        (None, None) => {}
+    }
     loop {
         let mut worked = false;
 
@@ -5585,6 +5798,20 @@ fn console(
                         drop(raw);
                         eprintln!();
                         return Ok(0);
+                    }
+                    b'c' if at_prompt && link.is_none() => {
+                        let why = if program.rtt_at.is_some() {
+                            "the program has not set up RTT yet: `resume` lets it run."
+                        } else {
+                            "the ELF has no `_SEGGER_RTT`, so there is no console."
+                        };
+                        let text = format!(
+                            "\n({why} Ctrl-A x leaves.)\n{}{}",
+                            prompt.text(),
+                            prompt.edit.line
+                        );
+                        to_terminal(&raw, &mut out, text.as_bytes())?;
+                        continue;
                     }
                     b'c' => {
                         at_prompt = !at_prompt;
@@ -5613,8 +5840,11 @@ fn console(
                     // Commands print plain lines, so the terminal leaves raw
                     // mode while one runs.
                     raw.pause();
-                    if let Err(e) = prompt.run(&line, cli, mem.bus, mem.map, Some(elf)) {
-                        eprintln!("{e}");
+                    match prompt.run(&line, cli, mem.bus, mem.map, Some(elf)) {
+                        Ok(Ran::Halted) => watch.sync(mem.bus),
+                        Ok(Ran::Resumed) => watch.running(),
+                        Ok(_) => {}
+                        Err(e) => eprintln!("{e}"),
                     }
                     let _ = out.flush();
                     raw.resume();
@@ -5622,16 +5852,20 @@ fn console(
                 }
                 continue;
             }
-            if can_type {
+            if let Some(link) = &link
+                && link.can_type
+            {
                 // A key that does not fit is dropped; the target is not reading.
-                rtt.write_down(mem, 0, &[key])?;
+                link.rtt.write_down(mem, 0, &[key])?;
             }
         }
 
         // At the prompt the output is kept for later, up to a limit; past it,
         // the target's own buffer holds the rest.
-        if !at_prompt || held.len() < HELD_MAX {
-            let text = rtt.read_up(mem, 0, 4096)?;
+        if let Some(link) = &link
+            && (!at_prompt || held.len() < HELD_MAX)
+        {
+            let text = link.rtt.read_up(mem, 0, 4096)?;
             if !text.is_empty() {
                 worked = true;
                 if at_prompt {
@@ -5642,38 +5876,105 @@ fn console(
             }
         }
 
+        // A hart that halts by itself, at a breakpoint: say where, and go to
+        // the prompt.
+        let look = if worked { None } else { watch.look(mem.bus) };
+        // A semihosting call may be waiting from before the console started,
+        // so any halt is looked at once, not only a new one.
+        if look.is_some() && program.semihosting && !watch.examined {
+            match semihosting_call(mem, started)? {
+                None => watch.examined = true,
+                Some((outcome, said)) => {
+                    let mut text = said.stdout;
+                    text.extend(said.stderr);
+                    if at_prompt {
+                        held.extend(text);
+                    } else {
+                        to_terminal(&raw, &mut out, &text)?;
+                    }
+                    match outcome {
+                        hns_host::semihosting::Outcome::Exit(code) => {
+                            drop(raw);
+                            return Ok(code);
+                        }
+                        hns_host::semihosting::Outcome::Return(_) => {
+                            watch.running();
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        if look == Some(true) {
+            raw.pause();
+            let stop = stop_line(mem.bus, mem.map, Some(elf)).unwrap_or_else(|e| e);
+            raw.resume();
+            // Without a terminal nobody can debug it, and waiting would hang
+            // a test run.
+            if !raw.active() {
+                return Err(format!(
+                    "{stop}\nThere is no terminal to debug it from, so hio stops here."
+                ));
+            }
+            at_prompt = true;
+            prompt.level = Level::Cpu;
+            let text = format!("\n{stop}\n{}{}", prompt.text(), prompt.edit.line);
+            to_terminal(&raw, &mut out, text.as_bytes())?;
+            continue;
+        }
+
+        if !worked {
+            idle += 1;
+        } else {
+            idle = 0;
+        }
+
+        // Not connected yet: look for the control block now and then. Its
+        // output waits in `held` until Ctrl-A c.
+        if link.is_none()
+            && idle.is_multiple_of(16)
+            && let Some((addr, size)) = program.rtt_at
+            && let Some(rtt) = try_rtt(mem, addr, program.ptr, size, program.attach)?
+        {
+            let opened = Link::open(mem, rtt)?;
+            held.extend_from_slice(opened.hello().as_bytes());
+            link = Some(opened);
+        }
+
         // The end of the program, after its last output is shown. Not while
         // at the prompt: a reset from there rebuilds the control block, and
         // the output is not shown yet.
         if !worked && !at_prompt {
-            if let Some(n) = exit_channel {
-                let code = rtt.read_up(mem, n, 1)?;
+            if let Some(link) = &link
+                && let Some(n) = link.exit
+            {
+                let code = link.rtt.read_up(mem, n, 1)?;
                 if let Some(&code) = code.first() {
                     drop(raw);
                     return Ok(code as i32);
                 }
             }
-            if let Some(addr) = tohost
-                && let Some(code) = read_tohost(mem, addr, ptr)?
+            if let Some(addr) = program.tohost
+                && let Some(code) = read_tohost(mem, addr, program.ptr)?
             {
                 drop(raw);
                 return Ok(code);
             }
-            idle += 1;
             // The magic costs a round trip, so it is looked at only when idle.
-            if idle.is_multiple_of(16) && !rtt.alive(mem)? {
+            if let Some(link) = &link
+                && idle.is_multiple_of(16)
+                && !link.rtt.alive(mem)?
+            {
                 drop(raw);
                 return Err(format!(
                     "the RTT control block at {:#x} is gone: the target was reset or \
                      reloaded under the console.",
-                    rtt.addr
+                    link.rtt.addr
                 ));
             }
+        }
+        if !worked {
             std::thread::sleep(std::time::Duration::from_millis(5));
-        } else if !worked {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        } else {
-            idle = 0;
         }
     }
 }
@@ -5800,6 +6101,20 @@ enum Level {
     Cpu,
 }
 
+/// What a line at the prompt did to the hart, so that a halt someone typed
+/// is not announced and one that follows a resume is.
+#[derive(Debug, PartialEq, Eq)]
+enum Ran {
+    /// Nothing that moves the hart on purpose. A halt seen later is news:
+    /// `break` on a running hart may hit at once.
+    Done,
+    /// Halted on purpose (`halt`, `step`, `reset --halt`).
+    Halted,
+    /// Let run (`resume`, a reset).
+    Resumed,
+    Quit,
+}
+
 /// The prompt: the line being typed and the level it is at.
 struct Prompt {
     level: Level,
@@ -5837,7 +6152,7 @@ impl Prompt {
         }
     }
 
-    /// Runs one line. Returns true for `exit`.
+    /// Runs one line.
     fn run(
         &mut self,
         line: &str,
@@ -5845,18 +6160,31 @@ impl Prompt {
         bus: &mut Bus,
         map: &RegisterMap,
         elf: Option<&hns_host::elf::Elf>,
-    ) -> Result<bool, String> {
+    ) -> Result<Ran, String> {
         match prompt_action(self.level, self.in_console, line)? {
             PromptAction::Nothing => {}
             PromptAction::Say(text) => print!("{text}"),
             PromptAction::Enter(level) => self.level = level,
-            PromptAction::Quit => return Ok(true),
+            PromptAction::Quit => return Ok(Ran::Quit),
             PromptAction::Cpu(cmd) | PromptAction::Hio(Step::Window(Cmd::Cpu(cmd))) => {
-                cpu_debug(bus, map, &cmd, elf)?
+                cpu_debug(bus, map, &cmd, elf)?;
+                return Ok(match cmd {
+                    CpuCmd::Halt { .. }
+                    | CpuCmd::Step { .. }
+                    | CpuCmd::Reset { halt: true, .. } => Ran::Halted,
+                    CpuCmd::Resume { .. } | CpuCmd::Reset { halt: false, .. } => Ran::Resumed,
+                    _ => Ran::Done,
+                });
             }
-            PromptAction::Hio(step) => run_step(cli, bus, map, step)?,
+            PromptAction::Hio(step) => {
+                let reset = matches!(step, Step::Window(Cmd::Reset { .. }));
+                run_step(cli, bus, map, step)?;
+                if reset {
+                    return Ok(Ran::Resumed);
+                }
+            }
         }
-        Ok(false)
+        Ok(Ran::Done)
     }
 }
 
@@ -5972,10 +6300,10 @@ fn shell(cli: &Cli) -> Result<(), String> {
         for (i, line) in std::io::stdin().lock().lines().enumerate() {
             let line = line.map_err(|e| format!("cannot read standard input: {e}"))?;
             let text = line.split('#').next().unwrap_or("").trim();
-            let quit = prompt
+            let ran = prompt
                 .run(text, cli, &mut bus, &map, None)
                 .map_err(|e| format!("line {}: {line}\n{e}", i + 1))?;
-            if quit {
+            if ran == Ran::Quit {
                 break;
             }
         }
@@ -5990,10 +6318,18 @@ fn shell(cli: &Cli) -> Result<(), String> {
     );
     let raw = RawTerminal::enter();
     let mut out = std::io::stdout();
+    let mut watch = HaltWatch::new(&mut bus, &map, false);
     to_terminal(&raw, &mut out, prompt.text().as_bytes())?;
     loop {
         let keys = raw.keys();
         if keys.is_empty() {
+            if watch.poll(&mut bus) {
+                raw.pause();
+                let stop = stop_line(&mut bus, &map, None).unwrap_or_else(|e| e);
+                raw.resume();
+                let text = format!("\n{stop}\n{}{}", prompt.text(), prompt.edit.line);
+                to_terminal(&raw, &mut out, text.as_bytes())?;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
             continue;
         }
@@ -6008,20 +6344,117 @@ fn shell(cli: &Cli) -> Result<(), String> {
             to_terminal(&raw, &mut out, &echo)?;
             if let Some(line) = line {
                 raw.pause();
-                let quit = prompt.run(&line, cli, &mut bus, &map, None);
+                let ran = prompt.run(&line, cli, &mut bus, &map, None);
+                match &ran {
+                    Ok(Ran::Halted) => watch.sync(&mut bus),
+                    Ok(Ran::Resumed) => watch.running(),
+                    _ => {}
+                }
+                if let Err(e) = &ran {
+                    eprintln!("{e}");
+                }
                 raw.resume();
-                match quit {
-                    Ok(true) => return Ok(()),
-                    Ok(false) => {}
-                    Err(e) => {
-                        raw.pause();
-                        eprintln!("{e}");
-                        raw.resume();
-                    }
+                if ran == Ok(Ran::Quit) {
+                    return Ok(());
                 }
                 to_terminal(&raw, &mut out, prompt.text().as_bytes())?;
             }
         }
+    }
+}
+
+/// `cpu mem`: words at a DUT address, four to a line, each line named by
+/// the symbol it falls in.
+fn mem(
+    bus: &mut Bus,
+    map: &RegisterMap,
+    elf: Option<&hns_host::elf::Elf>,
+    place: &str,
+    words: Option<u32>,
+    write: &[u32],
+) -> Result<(), String> {
+    use hns_host::rtt::Memory;
+    /// Words read when a symbol is larger, unless a count is given.
+    const MOST: u64 = 256;
+
+    let addr = place_address(place, elf)?;
+    let size = elf
+        .and_then(|e| e.symbols.iter().find(|s| s.value == addr && s.size > 0))
+        .map(|s| s.size.div_ceil(4));
+    let count = match (words, write.is_empty()) {
+        (_, false) => write.len() as u64,
+        (Some(n), true) => u64::from(n.max(1)),
+        (None, true) => size.unwrap_or(1).min(MOST),
+    };
+    let mut mem = WindowMem {
+        bus,
+        map,
+        spans: spans(map)?,
+    };
+    if !write.is_empty() {
+        let bytes: Vec<u8> = write.iter().flat_map(|w| w.to_le_bytes()).collect();
+        mem.write(addr, &bytes)?;
+    }
+    let mut bytes = vec![0; count as usize * 4];
+    mem.read(addr, &mut bytes)?;
+    for (i, line) in bytes.chunks(16).enumerate() {
+        let at = addr + i as u64 * 16;
+        let words: Vec<String> = line
+            .chunks(4)
+            .map(|w| {
+                format!(
+                    "{:#010x}",
+                    u32::from_le_bytes(w.try_into().expect("4 bytes"))
+                )
+            })
+            .collect();
+        println!("{at:#010x}{}  {}", symbolize(elf, at), words.join(" "));
+    }
+    if words.is_none() && write.is_empty() && size.is_some_and(|s| s > MOST) {
+        println!("(the first {MOST} words; give a count for more)");
+    }
+    Ok(())
+}
+
+/// An address typed as a number or a symbol. A Rust symbol may be named as
+/// it reads (`hello::main`) or by its last part (`main`) when that is unique.
+fn place_address(place: &str, elf: Option<&hns_host::elf::Elf>) -> Result<u64, String> {
+    if let Ok(addr) = parse_u64(place) {
+        return Ok(addr);
+    }
+    let Some(elf) = elf else {
+        return Err(format!(
+            "`{place}` is not an address, and there is no ELF to look it up in. \
+             Give an address, or the program with --elf."
+        ));
+    };
+    let readable = |name: &str| format!("{:#}", rustc_demangle::demangle(name));
+    let exact: Vec<_> = elf
+        .symbols
+        .iter()
+        .filter(|s| s.name == place || readable(&s.name) == place)
+        .collect();
+    let found = if exact.is_empty() {
+        elf.symbols
+            .iter()
+            .filter(|s| readable(&s.name).ends_with(&format!("::{place}")))
+            .collect()
+    } else {
+        exact
+    };
+    let mut addrs: Vec<u64> = found.iter().map(|s| s.value).collect();
+    addrs.dedup();
+    match addrs.as_slice() {
+        [addr] => Ok(*addr),
+        [] => Err(format!("the ELF has no symbol `{place}`.")),
+        _ => Err(format!(
+            "`{place}` names several symbols: {}. Give the whole name.",
+            found
+                .iter()
+                .map(|s| readable(&s.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
 }
 
@@ -6052,6 +6485,178 @@ fn symbolize(elf: Option<&hns_host::elf::Elf>, addr: u64) -> String {
         0 => format!(" <{name}>"),
         off => format!(" <{name}+{off:#x}>"),
     }
+}
+
+/// Notices the hart halting by itself, at a breakpoint, while the console or
+/// the prompt waits for keys. It reads `dmstatus` every so many idle rounds,
+/// and only on a design with a Debug Module.
+struct HaltWatch {
+    base: Option<u32>,
+    halted: bool,
+    rounds: u32,
+    /// Idle rounds between looks.
+    every: u32,
+    /// This halt was looked at for a semihosting call, and was not one.
+    examined: bool,
+}
+
+impl HaltWatch {
+    /// Idle rounds between looks; a round sleeps 5 to 10 ms. With `every`
+    /// look, for a program that calls the host and waits on each answer.
+    fn new(bus: &mut Bus, map: &RegisterMap, every: bool) -> Self {
+        let mut watch = HaltWatch {
+            base: dmi_base(map, None).ok(),
+            halted: false,
+            rounds: 0,
+            every: if every { 1 } else { 20 },
+            examined: false,
+        };
+        watch.sync(bus);
+        watch
+    }
+
+    fn halted_now(bus: &mut Bus, base: u32) -> Result<bool, String> {
+        use hns_host::dm::{Dmi, Op, reg};
+        let status = WindowDmi { bus, base }.run(&[Op::Read(reg::DMSTATUS)])?[0];
+        Ok(hns_host::dm::all_halted(status))
+    }
+
+    /// After a resume: a halt from here on is news, even one that came
+    /// before the next look.
+    fn running(&mut self) {
+        self.halted = false;
+    }
+
+    /// Takes the state as it is now, so a halt someone typed is not news.
+    fn sync(&mut self, bus: &mut Bus) {
+        if let Some(base) = self.base
+            && let Ok(halted) = Self::halted_now(bus, base)
+        {
+            self.halted = halted;
+        }
+    }
+
+    /// True when the hart has halted since the last look.
+    fn poll(&mut self, bus: &mut Bus) -> bool {
+        self.look(bus).is_some_and(|news| news)
+    }
+
+    /// On a look: `Some(news)` while the hart is halted, where `news` says it
+    /// halted since the last look. `None` while it runs, or between looks.
+    fn look(&mut self, bus: &mut Bus) -> Option<bool> {
+        let base = self.base?;
+        self.rounds += 1;
+        if !self.rounds.is_multiple_of(self.every) {
+            return None;
+        }
+        let halted = Self::halted_now(bus, base).ok()?;
+        let news = halted && !self.halted;
+        self.halted = halted;
+        if !halted {
+            self.examined = false;
+        }
+        halted.then_some(news)
+    }
+}
+
+/// Answers the semihosting call hart 0 is halted on, and lets it go on.
+/// `None` when it is halted for another reason.
+fn semihosting_call(
+    mem: &mut WindowMem,
+    started: std::time::Instant,
+) -> Result<
+    Option<(
+        hns_host::semihosting::Outcome,
+        hns_host::semihosting::Output,
+    )>,
+    String,
+> {
+    use hns_host::dm::{Debug, Reg};
+    use hns_host::rtt::Memory;
+    use hns_host::semihosting::{Outcome, Output, SEQUENCE, serve};
+
+    let base = dmi_base(mem.map, None)?;
+    let pc = Reg::parse("pc").expect("pc is a name");
+    let (at, op, param, xlen) = {
+        let mut dm = Debug::attach(WindowDmi { bus: mem.bus, base }, 0)?;
+        if dm.cause()? != 1 {
+            return Ok(None);
+        }
+        let at = dm.read_reg(pc)?;
+        (
+            at,
+            dm.read_reg(Reg::Gpr(10))?,
+            dm.read_reg(Reg::Gpr(11))?,
+            dm.xlen()?,
+        )
+    };
+    let mut code = [0u8; 12];
+    if at < 4 || mem.read(at - 4, &mut code).is_err() {
+        return Ok(None);
+    }
+    let words: Vec<u32> = code
+        .chunks(4)
+        .map(|w| u32::from_le_bytes(w.try_into().expect("4 bytes")))
+        .collect();
+    if words != SEQUENCE {
+        return Ok(None);
+    }
+    let mut said = Output::default();
+    let outcome = serve(mem, op, param, xlen, started, &mut said)?;
+    if let Outcome::Return(value) = outcome {
+        let mut dm = Debug::attach(WindowDmi { bus: mem.bus, base }, 0)?;
+        dm.write_reg(Reg::Gpr(10), value)?;
+        // On to the `srai` after the `ebreak`, which does nothing.
+        dm.write_reg(pc, at + 4)?;
+        dm.resume()?;
+    }
+    Ok(Some((outcome, said)))
+}
+
+/// "hart 0 halted at pc ... (why)" for hart 0.
+fn stop_line(
+    bus: &mut Bus,
+    map: &RegisterMap,
+    elf: Option<&hns_host::elf::Elf>,
+) -> Result<String, String> {
+    use hns_host::dm::Stop;
+    use hns_host::dm::{Debug, Reg};
+    let base = dmi_base(map, None)?;
+    let mut dm = Debug::attach(WindowDmi { bus, base }, 0)?;
+    let pc = dm.read_reg(Reg::parse("pc").expect("pc is a name"))?;
+    let xlen = dm.xlen()?;
+    let at = |addr: u64| format!("{}{}", word(addr, xlen), symbolize(elf, addr));
+    let why = match dm.stop()? {
+        Stop::Trap { cause, mepc, mtval } => {
+            return Ok(format!(
+                "hart 0 trapped: {} at {} (mtval {}); halted at the handler, pc {}",
+                hns_host::dm::exception_text(cause),
+                at(mepc),
+                word(mtval, xlen),
+                at(pc)
+            ));
+        }
+        Stop::Breakpoint => "breakpoint",
+        Stop::Request => "halt request",
+        Stop::Step => "single step",
+        Stop::Ebreak => "ebreak",
+        Stop::Reset => "halt at reset",
+        Stop::Trigger => "trigger",
+        Stop::Other(cause) => hns_host::dm::cause_text(cause),
+    };
+    Ok(format!("hart 0 halted at pc {} ({why})", at(pc)))
+}
+
+/// "catching: ..." for the faults the exception trigger takes.
+fn catching(causes: u64) -> String {
+    if causes == 0 {
+        return "not catching faults".to_string();
+    }
+    let names: Vec<&str> = (0..64)
+        .filter(|c| causes & (1 << c) != 0)
+        .map(hns_host::dm::exception_text)
+        .collect();
+    format!("catching: {}", names.join(", "))
 }
 
 /// The DMI registers of a `dmi` region, reached through the window.
@@ -6136,8 +6741,31 @@ fn cpu_debug(
         | CpuCmd::Resume { hart }
         | CpuCmd::Step { hart, .. }
         | CpuCmd::Regs { hart, .. }
+        | CpuCmd::Break { hart, .. }
+        | CpuCmd::Mem { hart, .. }
+        | CpuCmd::Catch { hart, .. }
         | CpuCmd::Reset { hart, .. } => hart,
     };
+    let loaded;
+    let elf = match (elf, &args.elf) {
+        (Some(elf), _) => Some(elf),
+        (None, Some(path)) => {
+            let raw = std::fs::read(path).map_err(|e| read_error(path, e))?;
+            loaded = hns_host::elf::Elf::parse(&raw)?;
+            Some(&loaded)
+        }
+        (None, None) => None,
+    };
+    // Memory goes through the window, not the Debug Module.
+    if let CpuCmd::Mem {
+        place,
+        words,
+        write,
+        ..
+    } = cmd
+    {
+        return mem(bus, map, elf, place, *words, write);
+    }
     let base = dmi_base(map, args.dmi.as_deref())?;
     let window = WindowDmi { bus, base };
 
@@ -6259,6 +6887,39 @@ fn cpu_debug(
             let v = dm.read_reg(r)?;
             println!("{r} = {}", word(v, dm.xlen()?));
         }
+        CpuCmd::Break { place, clear, .. } => {
+            let addr = match place {
+                Some(place) => Some(place_address(place, elf)?),
+                None => None,
+            };
+            // The triggers are reached first: on a running hart that halts it
+            // for a moment, which is also when XLEN can be learnt.
+            let (listed, cleared) = match (addr, *clear) {
+                (Some(addr), false) => (vec![dm.set_breakpoint(addr)?], None),
+                (addr, true) => (Vec::new(), Some((addr, dm.clear_breakpoints(addr)?))),
+                (None, false) => (dm.breakpoints()?, None),
+            };
+            let xlen = dm.xlen()?;
+            match cleared {
+                Some((Some(_), 0)) => return Err("no breakpoint is set there.".to_string()),
+                Some((_, n)) => println!("cleared {n} breakpoint{}", if n == 1 { "" } else { "s" }),
+                None if listed.is_empty() => println!("no breakpoints"),
+                None => {
+                    for b in &listed {
+                        println!(
+                            "breakpoint {} at {}{}",
+                            b.index,
+                            word(b.addr, xlen),
+                            symbolize(elf, b.addr)
+                        );
+                    }
+                }
+            }
+        }
+        CpuCmd::Catch { clear, .. } => {
+            let causes = if *clear { 0 } else { hns_host::dm::FAULTS };
+            println!("{}", catching(dm.catch_exceptions(causes)?));
+        }
         CpuCmd::Reset { halt, .. } => {
             dm.reset(*halt)?;
             if *halt {
@@ -6267,7 +6928,9 @@ fn cpu_debug(
                 println!("hart {hart} reset and running");
             }
         }
-        CpuCmd::Boot { .. } | CpuCmd::Console { .. } | CpuCmd::Dmi { .. } => unreachable!(),
+        CpuCmd::Boot { .. } | CpuCmd::Console { .. } | CpuCmd::Dmi { .. } | CpuCmd::Mem { .. } => {
+            unreachable!()
+        }
     }
     Ok(())
 }
@@ -6727,6 +7390,38 @@ mod tests {
         assert_eq!(symbolize(Some(&elf), 0x8000_0000), " <_start>");
         assert_eq!(symbolize(Some(&elf), 0x8000_0100), "");
         assert_eq!(symbolize(None, 0x8000_0b72), "");
+    }
+
+    /// A place is an address, or a symbol by its stored, readable or last
+    /// name; an unclear one is refused with the names to choose from.
+    #[test]
+    fn a_place_is_an_address_or_a_symbol() {
+        let sym = |name: &str, value| hns_host::elf::Symbol {
+            name: name.to_string(),
+            value,
+            size: 4,
+        };
+        let elf = hns_host::elf::Elf {
+            wide: false,
+            segments: Vec::new(),
+            symbols: vec![
+                sym("main", 0x100),
+                sym("_ZN11hazard3_bsp4getc17h0123456789abcdefE", 0x200),
+                sym("_ZN11hazard3_bsp3rtt4exit17h0123456789abcdefE", 0x300),
+                sym("_ZN11hazard3_bsp4exit17h0123456789abcdefE", 0x400),
+            ],
+        };
+        let at = |place| place_address(place, Some(&elf));
+        assert_eq!(at("0x80000000"), Ok(0x8000_0000));
+        assert_eq!(at("main"), Ok(0x100));
+        assert_eq!(at("hazard3_bsp::getc"), Ok(0x200));
+        assert_eq!(at("getc"), Ok(0x200));
+        assert_eq!(at("hazard3_bsp::exit"), Ok(0x400));
+        let err = at("exit").unwrap_err();
+        assert!(err.contains("hazard3_bsp::rtt::exit"), "{err}");
+        assert!(at("nope").unwrap_err().contains("no symbol"));
+        let err = place_address("main", None).unwrap_err();
+        assert!(err.contains("--elf"), "{err}");
     }
 
     /// A map with regions `(name, kind, base)`.

@@ -327,9 +327,10 @@ fn every_shipped_target_synthesizes() {
 /// The manual's tables are kept by hand, so a new value is easy to forget.
 #[test]
 fn the_manual_lists_every_backing_and_contract() {
-    let manual =
-        fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("doc/guide.md"))
-            .unwrap();
+    let manual = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("doc/guide-harness.md"),
+    )
+    .unwrap();
 
     for backing in [
         "bram",
@@ -343,20 +344,20 @@ fn the_manual_lists_every_backing_and_contract() {
     ] {
         assert!(
             manual.contains(backing),
-            "doc/guide.md does not mention the `{backing}` backing"
+            "doc/guide-harness.md does not mention the `{backing}` backing"
         );
     }
     for contract in ["fixed_latency", "valid_ready", "valid_only"] {
         assert!(
             manual.contains(contract),
-            "doc/guide.md does not mention the `{contract}` contract"
+            "doc/guide-harness.md does not mention the `{contract}` contract"
         );
     }
     // Removed names must not remain.
     for gone in ["`host_fifo`", "`req_ack`", "`tagged`"] {
         assert!(
             !manual.contains(gone),
-            "doc/guide.md still mentions {gone}, which no longer exists"
+            "doc/guide-harness.md still mentions {gone}, which no longer exists"
         );
     }
 }
