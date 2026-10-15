@@ -20,7 +20,6 @@ use hns_regs::{Access, RegisterMap};
     about = "Poke a veryl-harness window over JTAG or PCIe",
     long_about = None,
     disable_help_flag = true,
-    arg_required_else_help = true,
     after_help = "See 'hio help <command>' for more on a command, and 'hio help options' for every option."
 )]
 struct Cli {
@@ -162,8 +161,9 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::HelpShort)]
     help: Option<bool>,
 
+    /// Without a command, `hio` opens a prompt that keeps the link open.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -469,6 +469,10 @@ enum CpuCmd {
     /// the DUT. With `_SEGGER_RTT` it then shows up channel 0 and sends keys to
     /// down channel 0; Ctrl-A x leaves. The exit status is the program's, from
     /// `tohost` or from an up channel named `hio-exit`.
+    ///
+    /// Ctrl-A c switches to the prompt and back. It opens at the CPU
+    /// commands (`halt`, `step 3`, `regs`); `hio` reaches the others. The
+    /// target's output waits until you go back.
     Boot {
         /// The ELF to run.
         elf: PathBuf,
@@ -939,7 +943,7 @@ fn run_step(cli: &Cli, bus: &mut Bus, map: &RegisterMap, step: Step) -> Result<(
         | Cmd::Completions { .. } => {
             unreachable!("refused when the script was read")
         }
-        Cmd::Cpu(cmd) => cpu_debug(bus, map, &cmd),
+        Cmd::Cpu(cmd) => cpu_debug(bus, map, &cmd, None),
         Cmd::Id => id(bus, map),
         Cmd::Read { who, at, words } => do_read(bus, map, &who, at, words),
         Cmd::Write { who, values } => do_write(bus, map, &who, &values),
@@ -1720,6 +1724,9 @@ fn run() -> Result<(), String> {
     let matches = short_help_command().get_matches();
     let cli =
         <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    if cli.cmd.is_none() {
+        return shell(&cli);
+    }
     run_cli(cli)
 }
 
@@ -1796,19 +1803,23 @@ fn options_help() -> String {
 
 /// Split from `run` so tests can check that refusals happen before the board
 /// is touched.
-fn run_cli(cli: Cli) -> Result<(), String> {
-    if let Cmd::Run { file } = &cli.cmd {
+fn run_cli(mut cli: Cli) -> Result<(), String> {
+    let cmd = cli
+        .cmd
+        .take()
+        .expect("`run` opens the prompt when there is no command");
+    if let Cmd::Run { file } = &cmd {
         return run_script(&cli, file);
     }
-    if let Cmd::Completions { shell } = cli.cmd {
+    if let Cmd::Completions { shell } = cmd {
         return completions(shell);
     }
-    if matches!(cli.cmd, Cmd::Targets) {
+    if matches!(cmd, Cmd::Targets) {
         return targets();
     }
     // The card moves data only over PCIe. Allowing `--dma` over JTAG would
     // test PCIe while the user thinks they test JTAG.
-    let forced = match &cli.cmd {
+    let forced = match &cmd {
         Cmd::Memtest { dma: true, .. } => Some("memtest"),
         Cmd::Load { dma: true, .. } => Some("load"),
         _ => None,
@@ -1820,7 +1831,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
     }
     // Parallel reads help only over PCIe. JTAG is one cable, so more threads
     // only wait longer. Refuse, or the numbers read as a bug.
-    let asked_threads = match &cli.cmd {
+    let asked_threads = match &cmd {
         Cmd::Bench { threads, .. } => Some(*threads),
         Cmd::Memtest { threads, .. } => *threads,
         _ => None,
@@ -1841,7 +1852,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
     // the TAP and have no BAR equivalent. Without this, `--transport pcie`
     // would quietly use JTAG.
     if cli.transport_name() == "pcie" {
-        let only_jtag = match &cli.cmd {
+        let only_jtag = match &cmd {
             Cmd::Probe => Some("probe"),
             Cmd::Program { .. } => Some("program"),
             Cmd::Erase => Some("erase"),
@@ -1858,14 +1869,14 @@ fn run_cli(cli: Cli) -> Result<(), String> {
         }
     }
 
-    if matches!(cli.cmd, Cmd::Probe) {
+    if matches!(cmd, Cmd::Probe) {
         return probe(&cli);
     }
     if let Cmd::Program {
         file,
         allow_any_device,
         erase_wait_ms,
-    } = &cli.cmd
+    } = &cmd
     {
         let file = match file {
             Some(f) => f.clone(),
@@ -1873,7 +1884,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
         };
         return program(&cli, &file, *allow_any_device, *erase_wait_ms);
     }
-    if matches!(cli.cmd, Cmd::Erase) {
+    if matches!(cmd, Cmd::Erase) {
         return erase(&cli);
     }
 
@@ -1881,13 +1892,13 @@ fn run_cli(cli: Cli) -> Result<(), String> {
 
     // `check` opens the window itself, so a window that does not open is one
     // line of its report.
-    if matches!(cli.cmd, Cmd::Check) {
+    if matches!(cmd, Cmd::Check) {
         return check(&cli, &map_path, &map);
     }
 
     // A missing requester is known from the map. Check before opening, or the
     // error would be about the probe.
-    if matches!(cli.cmd, Cmd::DmaFire { .. }) {
+    if matches!(cmd, Cmd::DmaFire { .. }) {
         require_requester(&map)?;
     }
 
@@ -1896,11 +1907,11 @@ fn run_cli(cli: Cli) -> Result<(), String> {
     // Always check the identity first. Many probe values can come from
     // defaults, and a wrong one silently reaches something else. It costs
     // one round trip.
-    if !cli.no_verify && !matches!(cli.cmd, Cmd::Id) {
+    if !cli.no_verify && !matches!(cmd, Cmd::Id) {
         check_identity(&mut bus, &map)?;
     }
 
-    match cli.cmd {
+    match cmd {
         Cmd::Targets
         | Cmd::Probe
         | Cmd::Program { .. }
@@ -1968,17 +1979,17 @@ fn run_cli(cli: Cli) -> Result<(), String> {
                     args.join(" ")
                 );
             }
-            let code = boot(&mut bus, &map, elf, attach, true)?;
+            let code = boot(&cli, &mut bus, &map, elf, attach, true)?;
             exit_with(code)
         }
         Cmd::Cpu(CpuCmd::Console {
             ref elf,
             ref attach,
         }) => {
-            let code = boot(&mut bus, &map, elf, attach, false)?;
+            let code = boot(&cli, &mut bus, &map, elf, attach, false)?;
             exit_with(code)
         }
-        Cmd::Cpu(ref cmd) => cpu_debug(&mut bus, &map, cmd),
+        Cmd::Cpu(ref cmd) => cpu_debug(&mut bus, &map, cmd, None),
         Cmd::DmaFire {
             ref bundle,
             at,
@@ -5385,6 +5396,7 @@ fn rtt_place(elf: &hns_host::elf::Elf, attach: &AttachArgs) -> Option<(u64, Opti
 /// Loads (when `load`) and runs an ELF, then stays on its console. Returns
 /// the program's exit status.
 fn boot(
+    cli: &Cli,
     bus: &mut Bus,
     map: &RegisterMap,
     path: &PathBuf,
@@ -5476,7 +5488,7 @@ fn boot(
         };
     };
     let rtt = wait_rtt(&mut mem, rtt_addr, ptr, rtt_size, attach)?;
-    console(&mut mem, &rtt, tohost, ptr)
+    console(cli, &mut mem, &rtt, tohost, ptr, &elf)
 }
 
 /// Polls `tohost` until the program reports.
@@ -5534,22 +5546,32 @@ fn wait_rtt(
 /// Up channel 0 to the terminal, keys to down channel 0, until Ctrl-A x or
 /// until the program reports an exit status.
 fn console(
+    cli: &Cli,
     mem: &mut WindowMem,
     rtt: &hns_host::rtt::Rtt,
     tohost: Option<u64>,
     ptr: u64,
+    elf: &hns_host::elf::Elf,
 ) -> Result<i32, String> {
     use hns_host::rtt::Dir;
     use std::io::Write;
 
     let exit_channel = rtt.find(mem, Dir::Up, "hio-exit")?;
     let can_type = rtt.down > 0;
-    eprintln!("hio: connected to RTT at {:#x}; Ctrl-A x leaves", rtt.addr);
+    eprintln!(
+        "hio: connected to RTT at {:#x}; Ctrl-A c debug prompt, Ctrl-A x leaves",
+        rtt.addr
+    );
 
     let raw = RawTerminal::enter();
     let mut out = std::io::stdout();
     let mut ctrl_a = false;
     let mut idle = 0u32;
+    // The debug prompt. While it is up, keys go to it and the target's
+    // output waits in `held`.
+    let mut at_prompt = false;
+    let mut prompt = Prompt::new(Level::Cpu, true);
+    let mut held = Vec::new();
     loop {
         let mut worked = false;
 
@@ -5558,13 +5580,46 @@ fn console(
             worked = true;
             if ctrl_a {
                 ctrl_a = false;
-                if key == b'x' {
-                    drop(raw);
-                    eprintln!();
-                    return Ok(0);
+                match key {
+                    b'x' => {
+                        drop(raw);
+                        eprintln!();
+                        return Ok(0);
+                    }
+                    b'c' => {
+                        at_prompt = !at_prompt;
+                        if at_prompt {
+                            let line = format!("\n{}{}", prompt.text(), prompt.edit.line);
+                            to_terminal(&raw, &mut out, line.as_bytes())?;
+                        } else {
+                            to_terminal(&raw, &mut out, b"\n")?;
+                            to_terminal(&raw, &mut out, &std::mem::take(&mut held))?;
+                        }
+                        continue;
+                    }
+                    _ => {}
                 }
             } else if key == 0x01 {
                 ctrl_a = true;
+                continue;
+            }
+            if at_prompt {
+                let mut echo = Vec::new();
+                let line = prompt.edit.key(key, &mut echo);
+                if raw.active() {
+                    to_terminal(&raw, &mut out, &echo)?;
+                }
+                if let Some(line) = line {
+                    // Commands print plain lines, so the terminal leaves raw
+                    // mode while one runs.
+                    raw.pause();
+                    if let Err(e) = prompt.run(&line, cli, mem.bus, mem.map, Some(elf)) {
+                        eprintln!("{e}");
+                    }
+                    let _ = out.flush();
+                    raw.resume();
+                    to_terminal(&raw, &mut out, prompt.text().as_bytes())?;
+                }
                 continue;
             }
             if can_type {
@@ -5573,30 +5628,24 @@ fn console(
             }
         }
 
-        let text = rtt.read_up(mem, 0, 4096)?;
-        if !text.is_empty() {
-            worked = true;
-            // The terminal is raw, so a bare LF would not return the carriage.
-            let text = if raw.active() {
-                text.iter()
-                    .flat_map(|&b| {
-                        if b == b'\n' {
-                            vec![b'\r', b'\n']
-                        } else {
-                            vec![b]
-                        }
-                    })
-                    .collect()
-            } else {
-                text
-            };
-            out.write_all(&text)
-                .and_then(|_| out.flush())
-                .map_err(|e| e.to_string())?;
+        // At the prompt the output is kept for later, up to a limit; past it,
+        // the target's own buffer holds the rest.
+        if !at_prompt || held.len() < HELD_MAX {
+            let text = rtt.read_up(mem, 0, 4096)?;
+            if !text.is_empty() {
+                worked = true;
+                if at_prompt {
+                    held.extend_from_slice(&text);
+                } else {
+                    to_terminal(&raw, &mut out, &text)?;
+                }
+            }
         }
 
-        // The end of the program, after its last output is shown.
-        if !worked {
+        // The end of the program, after its last output is shown. Not while
+        // at the prompt: a reset from there rebuilds the control block, and
+        // the output is not shown yet.
+        if !worked && !at_prompt {
             if let Some(n) = exit_channel {
                 let code = rtt.read_up(mem, n, 1)?;
                 if let Some(&code) = code.first() {
@@ -5621,9 +5670,387 @@ fn console(
                 ));
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
+        } else if !worked {
+            std::thread::sleep(std::time::Duration::from_millis(5));
         } else {
             idle = 0;
         }
+    }
+}
+
+/// Target output kept while at the prompt.
+const HELD_MAX: usize = 1 << 20;
+
+/// Writes to the terminal. In raw mode a bare LF does not return the
+/// carriage, so it gets a CR.
+fn to_terminal(raw: &RawTerminal, out: &mut std::io::Stdout, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let text: Vec<u8> = if raw.active() {
+        bytes
+            .iter()
+            .flat_map(|&b| {
+                if b == b'\n' {
+                    vec![b'\r', b'\n']
+                } else {
+                    vec![b]
+                }
+            })
+            .collect()
+    } else {
+        bytes.to_vec()
+    };
+    out.write_all(&text)
+        .and_then(|_| out.flush())
+        .map_err(|e| e.to_string())
+}
+
+/// The line typed at the prompt. The terminal is raw, so this does its own
+/// echo: printable keys, Backspace, Ctrl-C / Ctrl-U to drop the line, and the
+/// up and down arrows for earlier lines.
+#[derive(Default)]
+struct LineEdit {
+    line: String,
+    history: Vec<String>,
+    /// How far back in `history` the line came from; 0 is a new line.
+    back: usize,
+    /// An escape sequence being read.
+    esc: Vec<u8>,
+}
+
+impl LineEdit {
+    /// Takes one key. Returns the line when Enter ends it; `echo` gets what
+    /// to show.
+    fn key(&mut self, key: u8, echo: &mut Vec<u8>) -> Option<String> {
+        if !self.esc.is_empty() || key == 0x1b {
+            self.esc.push(key);
+            match self.esc.as_slice() {
+                [0x1b] | [0x1b, b'['] => return None,
+                [0x1b, b'[', b'A'] => self.recall(true, echo),
+                [0x1b, b'[', b'B'] => self.recall(false, echo),
+                _ => {}
+            }
+            self.esc.clear();
+            return None;
+        }
+        match key {
+            b'\r' | b'\n' => {
+                echo.push(b'\n');
+                let line = std::mem::take(&mut self.line);
+                self.back = 0;
+                if !line.trim().is_empty() && self.history.last() != Some(&line) {
+                    self.history.push(line.clone());
+                }
+                Some(line)
+            }
+            0x7f | 0x08 => {
+                if self.line.pop().is_some() {
+                    echo.extend_from_slice(b"\x08 \x08");
+                }
+                None
+            }
+            0x03 | 0x15 => {
+                self.erase(echo);
+                self.back = 0;
+                None
+            }
+            0x20..=0x7e => {
+                self.line.push(key as char);
+                echo.push(key);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn erase(&mut self, echo: &mut Vec<u8>) {
+        for _ in 0..self.line.len() {
+            echo.extend_from_slice(b"\x08 \x08");
+        }
+        self.line.clear();
+    }
+
+    /// Up (`older`) or down through the lines typed before.
+    fn recall(&mut self, older: bool, echo: &mut Vec<u8>) {
+        let back = if older {
+            (self.back + 1).min(self.history.len())
+        } else {
+            self.back.saturating_sub(1)
+        };
+        if back == self.back {
+            return;
+        }
+        self.back = back;
+        self.erase(echo);
+        if back > 0 {
+            self.line = self.history[self.history.len() - back].clone();
+            echo.extend_from_slice(self.line.as_bytes());
+        }
+    }
+}
+
+/// Which commands a bare word names at the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Level {
+    /// The lines of a procedure file: `read dmem 0x100`, `cpu halt`.
+    Top,
+    /// `hio cpu` commands without `cpu`: `halt`, `step 3`.
+    Cpu,
+}
+
+/// The prompt: the line being typed and the level it is at.
+struct Prompt {
+    level: Level,
+    edit: LineEdit,
+    /// Inside `cpu boot` / `cpu console`, where Ctrl-A c is the way out.
+    in_console: bool,
+}
+
+/// What a line at the prompt asks for.
+enum PromptAction {
+    Nothing,
+    /// Text to print, such as `help`.
+    Say(String),
+    Enter(Level),
+    Quit,
+    /// A `hio cpu` command.
+    Cpu(CpuCmd),
+    /// A line of a procedure file.
+    Hio(Step),
+}
+
+impl Prompt {
+    fn new(level: Level, in_console: bool) -> Self {
+        Prompt {
+            level,
+            edit: LineEdit::default(),
+            in_console,
+        }
+    }
+
+    fn text(&self) -> &'static str {
+        match self.level {
+            Level::Top => "(hio) ",
+            Level::Cpu => "(hio cpu) ",
+        }
+    }
+
+    /// Runs one line. Returns true for `exit`.
+    fn run(
+        &mut self,
+        line: &str,
+        cli: &Cli,
+        bus: &mut Bus,
+        map: &RegisterMap,
+        elf: Option<&hns_host::elf::Elf>,
+    ) -> Result<bool, String> {
+        match prompt_action(self.level, self.in_console, line)? {
+            PromptAction::Nothing => {}
+            PromptAction::Say(text) => print!("{text}"),
+            PromptAction::Enter(level) => self.level = level,
+            PromptAction::Quit => return Ok(true),
+            PromptAction::Cpu(cmd) | PromptAction::Hio(Step::Window(Cmd::Cpu(cmd))) => {
+                cpu_debug(bus, map, &cmd, elf)?
+            }
+            PromptAction::Hio(step) => run_step(cli, bus, map, step)?,
+        }
+        Ok(false)
+    }
+}
+
+/// Reads a line at `level`. A level's name moves there (`cpu`, `hio`; `up`
+/// is `hio` too), and a line that starts with it runs there once. `help`
+/// lists what a level takes.
+fn prompt_action(level: Level, in_console: bool, line: &str) -> Result<PromptAction, String> {
+    use clap::Parser;
+
+    #[derive(Parser)]
+    #[command(name = "", no_binary_name = true)]
+    struct CpuLine {
+        #[command(subcommand)]
+        cmd: CpuCmd,
+    }
+
+    let shown = |e: &clap::Error| {
+        matches!(
+            e.kind(),
+            clap::error::ErrorKind::DisplayHelp
+                | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        )
+    };
+    let mut words: Vec<&str> = line.split_whitespace().collect();
+    let Some(&first) = words.first() else {
+        return Ok(PromptAction::Nothing);
+    };
+    if first == "hio" {
+        if words.len() == 1 {
+            return Ok(PromptAction::Enter(Level::Top));
+        }
+        // A line from the shell, or one top-level line from `(hio cpu)`.
+        return prompt_action(Level::Top, in_console, &words[1..].join(" "));
+    }
+    let level = if level == Level::Top && first == "cpu" && words.len() > 1 {
+        // `cpu halt` at `(hio)` runs as `halt` at `(hio cpu)`, which also
+        // gives it the ELF's symbols.
+        words.remove(0);
+        Level::Cpu
+    } else {
+        level
+    };
+    let first = words[0];
+    let line = &words.join(" ");
+    if words.len() == 1 {
+        match (level, first) {
+            (Level::Top, "help") => {
+                return Ok(PromptAction::Say(format!(
+                    "{}\nLines are as in a procedure file. `cpu` goes to the CPU commands; \
+                     `help <command>` says more.\n",
+                    command_list()
+                )));
+            }
+            (Level::Top, "cpu") => return Ok(PromptAction::Enter(Level::Cpu)),
+            (Level::Cpu, "up") => return Ok(PromptAction::Enter(Level::Top)),
+            (Level::Cpu, "cpu") => return Ok(PromptAction::Nothing),
+            (_, "exit") if in_console => {
+                return Err("Ctrl-A c goes back to the console; Ctrl-A x leaves.".to_string());
+            }
+            (_, "exit") => return Ok(PromptAction::Quit),
+            _ => {}
+        }
+    }
+    let busy = |what: &str| -> Result<PromptAction, String> {
+        Err(if in_console {
+            "the console is already open: Ctrl-A c goes back to it.".to_string()
+        } else {
+            format!("`{what}` takes over the terminal; run it on its own, outside the prompt.")
+        })
+    };
+    match level {
+        Level::Top => {
+            if let Err(e) = Line::try_parse_from(&words)
+                && shown(&e)
+            {
+                return Ok(PromptAction::Say(e.to_string()));
+            }
+            Ok(PromptAction::Hio(parse_step(line)?))
+        }
+        Level::Cpu => match CpuLine::try_parse_from(&words) {
+            Ok(parsed) => match parsed.cmd {
+                CpuCmd::Boot { .. } | CpuCmd::Console { .. } => busy(first),
+                cmd => Ok(PromptAction::Cpu(cmd)),
+            },
+            Err(e) if shown(&e) => Ok(PromptAction::Say(format!(
+                "{}`hio` goes back to the other commands; `hio <line>` runs one of them.\n",
+                e
+            ))),
+            Err(e) => Err(format!(
+                "{}\nThese are the `hio cpu` commands; `hio` goes back to the others, \
+                 and `hio <line>` runs one of them.",
+                e.to_string().trim_end()
+            )),
+        },
+    }
+}
+
+/// `hio` with no command: a prompt that keeps the link open, so one command
+/// after another costs no reconnection. Lines are those of a procedure file.
+/// Read from a pipe, the lines just run, and the first error stops them.
+fn shell(cli: &Cli) -> Result<(), String> {
+    let help = |e: String| format!("{e}\n`hio --help` lists the commands.");
+    let (map_path, map) = find_regs(cli).map_err(help)?;
+    let mut bus = open_bus(cli, &map_path, &map).map_err(help)?;
+    if !cli.no_verify {
+        check_identity(&mut bus, &map)?;
+    }
+    let mut prompt = Prompt::new(Level::Top, false);
+
+    // SAFETY: a plain query on fd 0.
+    if unsafe { libc::isatty(0) } == 0 {
+        use std::io::BufRead;
+        for (i, line) in std::io::stdin().lock().lines().enumerate() {
+            let line = line.map_err(|e| format!("cannot read standard input: {e}"))?;
+            let text = line.split('#').next().unwrap_or("").trim();
+            let quit = prompt
+                .run(text, cli, &mut bus, &map, None)
+                .map_err(|e| format!("line {}: {line}\n{e}", i + 1))?;
+            if quit {
+                break;
+            }
+        }
+        return Ok(());
+    }
+
+    eprintln!(
+        "hio: connected to {} ({}, map {:#010x}); `help` lists commands, Ctrl-D leaves",
+        map.target.as_deref().unwrap_or("the board"),
+        map.dut,
+        map.map_hash
+    );
+    let raw = RawTerminal::enter();
+    let mut out = std::io::stdout();
+    to_terminal(&raw, &mut out, prompt.text().as_bytes())?;
+    loop {
+        let keys = raw.keys();
+        if keys.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        for key in keys {
+            // Ctrl-D on an empty line leaves, as in a shell.
+            if key == 0x04 && prompt.edit.line.is_empty() {
+                to_terminal(&raw, &mut out, b"\n")?;
+                return Ok(());
+            }
+            let mut echo = Vec::new();
+            let line = prompt.edit.key(key, &mut echo);
+            to_terminal(&raw, &mut out, &echo)?;
+            if let Some(line) = line {
+                raw.pause();
+                let quit = prompt.run(&line, cli, &mut bus, &map, None);
+                raw.resume();
+                match quit {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(e) => {
+                        raw.pause();
+                        eprintln!("{e}");
+                        raw.resume();
+                    }
+                }
+                to_terminal(&raw, &mut out, prompt.text().as_bytes())?;
+            }
+        }
+    }
+}
+
+/// ` <name+0x1c>` for an address inside a symbol of the ELF, or nothing.
+///
+/// A sized symbol that holds the address wins; a label without a size only
+/// names its own address. Assembler locals (`.L…`) and mapping symbols
+/// (`$x`) name nothing a reader looks for.
+fn symbolize(elf: Option<&hns_host::elf::Elf>, addr: u64) -> String {
+    let Some(elf) = elf else {
+        return String::new();
+    };
+    let named = || {
+        elf.symbols
+            .iter()
+            .filter(|s| !s.name.is_empty() && !s.name.starts_with(['.', '$']))
+    };
+    let inside = named()
+        .filter(|s| s.size > 0 && s.value <= addr && addr < s.value + s.size)
+        .min_by_key(|s| s.size)
+        .or_else(|| named().find(|s| s.value == addr));
+    let Some(s) = inside else {
+        return String::new();
+    };
+    // `{:#}` leaves out the hash that Rust adds to every name.
+    let name = format!("{:#}", rustc_demangle::demangle(&s.name));
+    match addr - s.value {
+        0 => format!(" <{name}>"),
+        off => format!(" <{name}+{off:#x}>"),
     }
 }
 
@@ -5691,7 +6118,12 @@ fn dmi_base(map: &RegisterMap, bundle: Option<&str>) -> Result<u32, String> {
 }
 
 /// The `cpu` commands that talk to the Debug Module.
-fn cpu_debug(bus: &mut Bus, map: &RegisterMap, cmd: &CpuCmd) -> Result<(), String> {
+fn cpu_debug(
+    bus: &mut Bus,
+    map: &RegisterMap,
+    cmd: &CpuCmd,
+    elf: Option<&hns_host::elf::Elf>,
+) -> Result<(), String> {
     use hns_host::dm::{Debug, Reg, reg};
 
     let args = match cmd {
@@ -5742,7 +6174,11 @@ fn cpu_debug(bus: &mut Bus, map: &RegisterMap, cmd: &CpuCmd) -> Result<(), Strin
     let stopped = |dm: &mut Debug<WindowDmi>| -> Result<String, String> {
         let pc = dm.read_reg(Reg::parse("pc").expect("pc is a name"))?;
         let cause = hns_host::dm::cause_text(dm.cause()?);
-        Ok(format!("pc {} ({cause})", word(pc, dm.xlen()?)))
+        Ok(format!(
+            "pc {}{} ({cause})",
+            word(pc, dm.xlen()?),
+            symbolize(elf, pc)
+        ))
     };
     match cmd {
         CpuCmd::Info { .. } => {
@@ -5850,30 +6286,58 @@ fn word(value: u64, xlen: u32) -> String {
 /// stdin as it comes.
 struct RawTerminal {
     saved: Option<libc::termios>,
+    raw: Option<libc::termios>,
 }
 
 impl RawTerminal {
     fn enter() -> RawTerminal {
         // SAFETY: plain calls on fd 0 with a zeroed termios they fill in.
         unsafe {
+            let none = RawTerminal {
+                saved: None,
+                raw: None,
+            };
             if libc::isatty(0) == 0 {
-                return RawTerminal { saved: None };
+                return none;
             }
             let mut saved: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(0, &mut saved) != 0 {
-                return RawTerminal { saved: None };
+                return none;
             }
             let mut raw = saved;
             libc::cfmakeraw(&mut raw);
             if libc::tcsetattr(0, libc::TCSAFLUSH, &raw) != 0 {
-                return RawTerminal { saved: None };
+                return none;
             }
-            RawTerminal { saved: Some(saved) }
+            RawTerminal {
+                saved: Some(saved),
+                raw: Some(raw),
+            }
         }
     }
 
     fn active(&self) -> bool {
         self.saved.is_some()
+    }
+
+    /// The terminal as it was, for a while. Keys typed meanwhile are kept.
+    fn pause(&self) {
+        if let Some(saved) = &self.saved {
+            // SAFETY: a termios that `enter` read from the same fd.
+            unsafe {
+                libc::tcsetattr(0, libc::TCSANOW, saved);
+            }
+        }
+    }
+
+    /// Raw again after `pause`.
+    fn resume(&self) {
+        if let Some(raw) = &self.raw {
+            // SAFETY: a termios that `enter` made for the same fd.
+            unsafe {
+                libc::tcsetattr(0, libc::TCSANOW, raw);
+            }
+        }
     }
 
     /// The bytes waiting on stdin, without blocking.
@@ -6115,6 +6579,154 @@ mod tests {
             region("scratch", 2048),
         ))
         .unwrap()
+    }
+
+    /// Types `keys` into a fresh editor; the lines it finished, and the echo.
+    fn typed(edit: &mut LineEdit, keys: &[u8]) -> (Vec<String>, Vec<u8>) {
+        let (mut lines, mut echo) = (Vec::new(), Vec::new());
+        for &k in keys {
+            if let Some(line) = edit.key(k, &mut echo) {
+                lines.push(line);
+            }
+        }
+        (lines, echo)
+    }
+
+    /// The prompt's line editing: echo, Backspace, dropping a line, and
+    /// going back to earlier lines with the arrows.
+    #[test]
+    fn the_prompt_edits_and_recalls_lines() {
+        let mut edit = LineEdit::default();
+        let (lines, echo) = typed(&mut edit, b"haltt\x7f\r");
+        assert_eq!(lines, ["halt"]);
+        assert_eq!(echo, b"haltt\x08 \x08\n");
+
+        // Ctrl-C drops what was typed; the next line starts clean.
+        let (lines, _) = typed(&mut edit, b"regs\x03step 2\r");
+        assert_eq!(lines, ["step 2"]);
+
+        // Up twice gives the line before the last one.
+        let (lines, _) = typed(&mut edit, b"\x1b[A\x1b[A\r");
+        assert_eq!(lines, ["halt"]);
+        // Down past the newest gives an empty line again.
+        let (lines, _) = typed(&mut edit, b"\x1b[A\x1b[B\r");
+        assert_eq!(lines, [""]);
+        assert_eq!(edit.history, ["halt", "step 2", "halt"]);
+    }
+
+    /// At `(hio)` a line is a procedure-file line; at `(hio cpu)` it is a
+    /// `hio cpu` command without `cpu`. `cpu` and `up` move between them.
+    #[test]
+    fn the_prompt_reads_lines_by_level() {
+        let top = |line| prompt_action(Level::Top, false, line);
+        let cpu = |line| prompt_action(Level::Cpu, false, line);
+        assert!(matches!(
+            top("reset --hold"),
+            Ok(PromptAction::Hio(Step::Window(Cmd::Reset {
+                hold: true,
+                ..
+            })))
+        ));
+        assert!(matches!(
+            top("cpu halt"),
+            Ok(PromptAction::Cpu(CpuCmd::Halt { .. }))
+        ));
+        assert!(matches!(top("cpu"), Ok(PromptAction::Enter(Level::Cpu))));
+        assert!(matches!(
+            cpu("step 3"),
+            Ok(PromptAction::Cpu(CpuCmd::Step { count: 3, .. }))
+        ));
+        // `reset` is the CPU's at `(hio cpu)`, the DUT's at `(hio)`.
+        assert!(matches!(
+            cpu("reset --halt"),
+            Ok(PromptAction::Cpu(CpuCmd::Reset { halt: true, .. }))
+        ));
+        assert!(matches!(cpu("up"), Ok(PromptAction::Enter(Level::Top))));
+        assert!(matches!(top("   "), Ok(PromptAction::Nothing)));
+        assert!(matches!(top("help"), Ok(PromptAction::Say(_))));
+        assert!(matches!(top("help read"), Ok(PromptAction::Say(_))));
+        assert!(matches!(cpu("help"), Ok(PromptAction::Say(_))));
+        assert!(matches!(top("exit"), Ok(PromptAction::Quit)));
+
+        let Err(err) = cpu("read dmem 0x100") else {
+            panic!("a top-level command was taken at (hio cpu)");
+        };
+        assert!(err.contains("`hio <line>`"), "{err}");
+        let Err(err) = top("cpu boot a.elf") else {
+            panic!("boot was taken at the prompt");
+        };
+        assert!(err.contains("on its own"), "{err}");
+
+        // `hio` is a level's name too, and a prefix for one line.
+        assert!(matches!(cpu("hio"), Ok(PromptAction::Enter(Level::Top))));
+        assert!(matches!(top("hio"), Ok(PromptAction::Enter(Level::Top))));
+        assert!(matches!(
+            cpu("hio reset --hold"),
+            Ok(PromptAction::Hio(Step::Window(Cmd::Reset {
+                hold: true,
+                ..
+            })))
+        ));
+        assert!(matches!(
+            top("hio read harness_magic"),
+            Ok(PromptAction::Hio(Step::Window(Cmd::Read { .. })))
+        ));
+        assert!(matches!(
+            cpu("hio cpu step 2"),
+            Ok(PromptAction::Cpu(CpuCmd::Step { count: 2, .. }))
+        ));
+
+        // Inside the console, `exit` and `boot` point at its keys.
+        let Err(err) = prompt_action(Level::Cpu, true, "exit") else {
+            panic!("exit was taken inside the console");
+        };
+        assert!(err.contains("Ctrl-A x"), "{err}");
+        let Err(err) = prompt_action(Level::Cpu, true, "console a.elf") else {
+            panic!("console was taken inside the console");
+        };
+        assert!(err.contains("Ctrl-A c"), "{err}");
+    }
+
+    /// The PC is shown inside the function that holds it.
+    #[test]
+    fn an_address_is_named_by_the_symbol_around_it() {
+        let elf = hns_host::elf::Elf {
+            wide: false,
+            segments: Vec::new(),
+            symbols: vec![
+                hns_host::elf::Symbol {
+                    name: "main".to_string(),
+                    value: 0x8000_0b56,
+                    size: 0x40,
+                },
+                hns_host::elf::Symbol {
+                    name: "_start".to_string(),
+                    value: 0x8000_0000,
+                    size: 0,
+                },
+                // A local label inside `main`, and a mangled Rust name.
+                hns_host::elf::Symbol {
+                    name: ".L0 ".to_string(),
+                    value: 0x8000_0b5a,
+                    size: 0,
+                },
+                hns_host::elf::Symbol {
+                    name: "_RNvMs3_Cslv7u3prg1jP_10rtt_targetNtB5_11DownChannel4read".to_string(),
+                    value: 0x8000_0c00,
+                    size: 0x40,
+                },
+            ],
+        };
+        assert_eq!(symbolize(Some(&elf), 0x8000_0b5a), " <main+0x4>");
+        assert_eq!(
+            symbolize(Some(&elf), 0x8000_0c20),
+            " <<rtt_target::DownChannel>::read+0x20>"
+        );
+        assert_eq!(symbolize(Some(&elf), 0x8000_0b72), " <main+0x1c>");
+        assert_eq!(symbolize(Some(&elf), 0x8000_0b56), " <main>");
+        assert_eq!(symbolize(Some(&elf), 0x8000_0000), " <_start>");
+        assert_eq!(symbolize(Some(&elf), 0x8000_0100), "");
+        assert_eq!(symbolize(None, 0x8000_0b72), "");
     }
 
     /// A map with regions `(name, kind, base)`.
