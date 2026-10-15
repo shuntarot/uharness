@@ -505,6 +505,24 @@ discovered from the FTDI device, and whatever is guessed is **verified against
 magic and the map hash before anything else happens** (`--no-verify` skips it).
 `hio probe` shows what would be used.
 
+**`hio` alone opens a prompt** that keeps the link open, so each command
+answers without reconnecting. A line is a line of a procedure file; `cpu`
+goes to the CPU commands, where `halt` or `step 3` need no `cpu`, and `hio`
+comes back. A line that starts with `cpu` or `hio` runs there once, without
+moving. `help` lists the commands; Ctrl-D or `exit` leaves. From a pipe
+(`hio < steps.hio`) the lines just run, and the first error stops them.
+
+```
+$ hio
+(hio) read ctl_status
+(hio) reset --hold
+(hio) cpu
+(hio cpu) halt
+(hio cpu) hio read ctl_status
+(hio cpu) hio
+(hio)
+```
+
 | subcommand | |
 |---|---|
 | `targets` | boards this build knows, and what each can do |
@@ -675,7 +693,8 @@ HIO_REGS = { value = "../hns/regs.json", relative = true }
 It holds the DUT in reset, puts each segment into every memory that covers its
 address (`dut_base`), clears the `_SEGGER_RTT` block, and releases the DUT. Up
 channel 0 goes to the terminal and keys go to down channel 0; Ctrl-A x
-leaves. `hio cpu console <elf>` connects without loading.
+leaves. `hio cpu console <elf>` connects without loading, so leaving and
+coming back is harmless.
 
 The exit status is the program's: from `tohost` (1 passes, `(code << 1) | 1`
 fails with `code`), or from the first byte on an up channel named `hio-exit`.
@@ -698,7 +717,22 @@ hio cpu dmi dmstatus      # one DMI register, raw; give a value to write it
 ```
 
 `--hart N` selects a hart. These work in a procedure file too; `cpu boot` and
-`cpu console` do not, because they take over the terminal. A halt also makes
+`cpu console` do not, because they take over the terminal.
+
+In the console, Ctrl-A c switches to the prompt and back, so there is no
+need to leave. It opens at the CPU commands; `hio` reaches the others. The
+PC is shown by symbol.
+
+```
+(hio cpu) halt
+hart 0 halted at pc 0x80000b72 <main+0x1c> (halt request)
+(hio cpu) step 2
+(hio cpu) hio read dmem 0x100
+(hio cpu) resume
+```
+
+The target's output waits while the prompt is up and shows when you go back.
+Up and down recall earlier lines; Ctrl-C drops the line. A halt also makes
 `ebreak` in the program halt into the debugger. CSRs the Debug Module cannot
 reach directly go through its program buffer, with `s0` saved and put back.
 
