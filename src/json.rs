@@ -259,6 +259,14 @@ pub struct BundleOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dmi: Option<DmiOutput>,
 
+    /// An APB slave in the DUT (`slave` with APB roles).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apb_slave: Option<ApbSlaveOutput>,
+
+    /// An AXI4 slave in the DUT (`slave` on a `::slave` port).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub axi_slave: Option<AxiSlaveOutput>,
+
     /// The memory a DUT AXI4 master reaches (`bram` / `dram`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub axi_mem: Option<AxiMemOutput>,
@@ -306,6 +314,33 @@ pub struct DmiOutput {
     pub reset: Option<String>,
 }
 
+/// An APB slave in the DUT (`slave`), which the harness drives.
+#[derive(Debug, Serialize)]
+pub struct ApbSlaveOutput {
+    /// Bits of the byte address.
+    pub addr_width: usize,
+    /// Whether the slave has `pready`. Without it, it answers in the access
+    /// phase.
+    pub pready: bool,
+    /// Whether the slave has `pslverr`. The harness counts the transfers it
+    /// ends in `<bundle>_slverr`.
+    pub pslverr: bool,
+    /// Its size in the window, in bytes.
+    pub size_bytes: usize,
+}
+
+/// An AXI4 slave in the DUT (`slave`), which the harness drives one word at a
+/// time.
+#[derive(Debug, Serialize)]
+pub struct AxiSlaveOutput {
+    pub port: String,
+    pub addr_width: u32,
+    pub data_bytes: u32,
+    /// The bytes shown in the window. Absent: the whole address space.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aperture_bytes: Option<usize>,
+}
+
 /// An AXI4 memory.
 #[derive(Debug, Serialize)]
 pub struct AxiMemOutput {
@@ -323,6 +358,10 @@ pub struct AxiMemOutput {
     /// The DUT address of the first byte. Absent without `dut_base`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dut_base: Option<u64>,
+    /// The DUT side is a transfer-level port, turned into AXI4 by
+    /// `hns::xfer2axi`; `port` is then empty. Absent for an AXI4 port.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub transfer_level: bool,
 }
 
 /// The heartbeat UART.
@@ -603,6 +642,10 @@ pub struct RegionOutput {
     /// is a moving window, and the `<name>_base_<master>` register sets where
     /// it looks.
     pub total_bytes: u64,
+    /// The harness drives nothing here while the DUT is reset (an APB or AXI4
+    /// slave of the DUT). Absent when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub held_in_dut_reset: bool,
 }
 
 /// Used by both `regs.json` and `check --json`.
@@ -668,6 +711,7 @@ pub fn register_map(
                 entry_bytes: region.entry_bytes,
                 depth: region.depth,
                 total_bytes: region.total_bytes,
+                held_in_dut_reset: region.held_in_dut_reset,
             })
             .collect(),
         dut_base: map.dut_bases.iter().cloned().collect(),
@@ -877,14 +921,34 @@ pub fn ok(
                         size_bytes: slave.size_bytes(),
                     }),
                 dmi: plan
-                    .dmis
+                    .apbs
                     .iter()
-                    .find(|dmi| dmi.bundle == binding.bundle)
+                    .find(|dmi| dmi.bundle == binding.bundle && dmi.debug_module)
                     .map(|dmi| DmiOutput {
                         addr_width: dmi.addr_width,
                         pready: dmi.pready.is_some(),
                         size_bytes: dmi.size_bytes(),
                         reset: dmi.reset.clone(),
+                    }),
+                axi_slave: plan
+                    .axi_slaves
+                    .iter()
+                    .find(|axi| axi.bundle == binding.bundle)
+                    .map(|axi| AxiSlaveOutput {
+                        port: axi.port.clone(),
+                        addr_width: axi.addr_width,
+                        data_bytes: axi.data_bytes,
+                        aperture_bytes: axi.aperture_bytes,
+                    }),
+                apb_slave: plan
+                    .apbs
+                    .iter()
+                    .find(|apb| apb.bundle == binding.bundle && !apb.debug_module)
+                    .map(|apb| ApbSlaveOutput {
+                        addr_width: apb.addr_width,
+                        pready: apb.pready.is_some(),
+                        pslverr: apb.pslverr.is_some(),
+                        size_bytes: apb.size_bytes(),
                     }),
                 axi_mem: plan
                     .axi_mems
@@ -899,6 +963,7 @@ pub fn ok(
                         depth_declared: !mem.depth_defaulted,
                         aperture_bytes: mem.aperture_bytes,
                         dut_base: (mem.dut_base != 0).then_some(mem.dut_base),
+                        transfer_level: mem.xfer.is_some(),
                     }),
             }
         })

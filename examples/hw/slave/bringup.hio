@@ -1,0 +1,48 @@
+# slave -- hio run bringup.hio
+# Each region is a register file inside the DUT. The expected values are in
+# the comments.
+
+echo == identity ==
+id
+
+echo == comb: answers in the same cycle (latency 0) ==
+write comb 0 0x11110000 0x11110001 0x11110002 0x11110003
+# 0x11110000 0x11110001 0x11110002 0x11110003
+read comb 0 4
+memtest comb
+
+echo == pipe: 3 stages, each adds 1 (latency 3) ==
+write pipe 0 0x22220000 0x22220010 0x22220020
+# 0x22220002 0x22220012 0x22220022: a word taken a cycle off would differ
+read pipe 0 3
+
+echo == nar: 8 bits ==
+write nar 4 0xdeadbe5a
+# 0x0000005a
+read nar 4
+
+echo == apb: waits with pready, the last word ends with pslverr ==
+# 0
+read apb_slverr
+write apb 4 0x12345678
+# 0x12345678
+read apb 4
+write apb 60 0x9abcdef0
+# 0x9abcdef0
+read apb 60
+# 2: one write and one read of the last word
+read apb_slverr
+
+echo == axi: 64-bit AXI4, one word per access ==
+write axi 16 0x11112222 0x33334444
+# 0x11112222 0x33334444
+read axi 16 2
+write axi 20 0x55556666
+# 0x11112222 0x55556666: writing the high word left the low one alone
+read axi 16 2
+# the read count, then the same plus one: each window read is one AXI4 read
+read axi 248
+read axi 248
+
+echo == nothing timed out ==
+id

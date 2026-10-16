@@ -215,6 +215,11 @@ pub struct Region {
     /// The bytes of the whole memory. For a moving window (aperture) it is
     /// larger than `size_bytes`. When equal, the window does not move.
     pub total_bytes: u64,
+
+    /// The harness drives nothing here while the DUT is reset: an APB or AXI4
+    /// slave of the DUT, which may never answer then. An access in that time
+    /// is left to the window's timeout.
+    pub held_in_dut_reset: bool,
 }
 
 impl Region {
@@ -483,8 +488,9 @@ pub fn build(
     memories: &[crate::terminator::MemPlan],
     host_mems: &[crate::terminator::HostMemPlan],
     slaves: &[crate::terminator::SlavePlan],
-    dmis: &[crate::terminator::DmiPlan],
+    apbs: &[crate::terminator::ApbPlan],
     axi_mems: &[crate::terminator::AxiMemPlan],
+    axi_slaves: &[crate::terminator::AxiSlavePlan],
     // With PCIe: the IDs and the BAR (`plan::pcie_identity`, from the resolved
     // transport). The `dma` registers exist only on PCIe, because JTAG has no
     // place for the card to write back to. It also checks that the window fits
@@ -534,16 +540,38 @@ pub fn build(
             None,
         ));
     }
-    // A Debug Module the same way, one word per DMI register. Its kind tells
-    // `hio cpu` where it is.
-    for dmi in dmis {
-        wanted.push(Wanted::new(
-            &dmi.bundle,
-            RegionKind::Dmi,
-            WORD_BITS / 8,
-            dmi.size_bytes() as u64 / (WORD_BITS / 8) as u64,
-            None,
-        ));
+    // An AXI4 slave of the DUT the same way, one word per entry; a wider bus
+    // is split by `hns::axi_host`.
+    for axi in axi_slaves {
+        wanted.push(
+            Wanted::new(
+                &axi.bundle,
+                RegionKind::Dut,
+                WORD_BITS / 8,
+                axi.region_words(),
+                axi.aperture_bytes,
+            )
+            .held(true),
+        );
+    }
+    // An APB slave the same way, one word per register. A Debug Module's kind
+    // tells `hio cpu` where it is.
+    for apb in apbs {
+        // A Debug Module with a `reset` of its own is not reset with the DUT.
+        wanted.push(
+            Wanted::new(
+                &apb.bundle,
+                if apb.debug_module {
+                    RegionKind::Dmi
+                } else {
+                    RegionKind::Dut
+                },
+                WORD_BITS / 8,
+                apb.size_bytes() as u64 / (WORD_BITS / 8) as u64,
+                None,
+            )
+            .held(apb.reset.is_none()),
+        );
     }
     let regions = place_regions(manifest, wanted)?;
     let mut offset = regions
@@ -714,6 +742,25 @@ pub fn build(
         ));
     }
 
+    // The APB transfers the slave ended with `pslverr`. A write is answered
+    // before its transfer ends, so the error cannot come back with it; the
+    // host reads the count instead, before and after.
+    for apb in apbs.iter().filter(|apb| apb.pslverr.is_some()) {
+        registers.push(Register {
+            name: format!("{}_slverr", apb.bundle),
+            kind: Kind::Terminator,
+            offset,
+            words: 1,
+            width: WORD_BITS,
+            access: Access::ReadOnly,
+            bundle: Some(apb.bundle.clone()),
+            value: None,
+            self_clearing: None,
+            role: Some("slverr"),
+        });
+        offset += WORD_BITS / 8;
+    }
+
     // The interrupt line as the DUT drives it, so it can be watched without
     // the host's interrupt handler, and over JTAG too.
     for binding in bindings {
@@ -835,8 +882,10 @@ pub fn build(
             role: Some("depth"),
         });
         offset += WORD_BITS / 8;
-        // With `dut_base`, `hns::axi_range` counts the transfers it refuses.
-        if dram.dut_base != 0 {
+        // With `dut_base`, `hns::axi_range` counts the transfers it refuses;
+        // with a transfer-level port, `hns::xfer2axi` counts the commands it
+        // cannot serve as asked.
+        if dram.dut_base != 0 || dram.xfer.is_some() {
             registers.push(Register {
                 name: format!("{}_oor", dram.bundle),
                 kind: Kind::Terminator,
@@ -1177,6 +1226,7 @@ struct Wanted {
     depth: u64,
     total_bytes: u64,
     size_bytes: usize,
+    held_in_dut_reset: bool,
 }
 
 impl Wanted {
@@ -1197,7 +1247,14 @@ impl Wanted {
             depth,
             total_bytes,
             size_bytes,
+            held_in_dut_reset: false,
         }
+    }
+
+    /// Marks a region the harness does not drive while the DUT is reset.
+    fn held(mut self, held: bool) -> Wanted {
+        self.held_in_dut_reset = held;
+        self
     }
 
     fn at(self, base: usize) -> Region {
@@ -1209,6 +1266,7 @@ impl Wanted {
             entry_bytes: self.entry_bytes,
             depth: self.depth,
             total_bytes: self.total_bytes,
+            held_in_dut_reset: self.held_in_dut_reset,
         }
     }
 }
@@ -1449,6 +1507,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 pcie,
             )
         };
@@ -1528,6 +1587,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1584,6 +1644,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1603,6 +1664,7 @@ mod tests {
             &dut,
             &manifest(CSR),
             &[binding("csr", &["i_en"])],
+            &[],
             &[],
             &[],
             &[],
@@ -1638,6 +1700,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1665,6 +1728,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1679,6 +1743,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1686,6 +1751,7 @@ mod tests {
             &b,
             &manifest(CSR),
             &[binding("csr", &["i_csr_addr"])],
+            &[],
             &[],
             &[],
             &[],
@@ -1723,6 +1789,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1751,6 +1818,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap_err();
@@ -1765,6 +1833,7 @@ mod tests {
             &dut,
             &manifest(CSR),
             &[binding("csr", &["b_pad"])],
+            &[],
             &[],
             &[],
             &[],
@@ -1792,6 +1861,7 @@ mod tests {
             &dut,
             &manifest(CSR),
             &[binding("csr", &["i_x"])],
+            &[],
             &[],
             &[],
             &[],
@@ -1850,6 +1920,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1890,6 +1961,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1913,6 +1985,7 @@ mod tests {
             &dut,
             &manifest(CSR),
             &bindings,
+            &[],
             &[],
             &[],
             &[],
@@ -1952,6 +2025,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1978,6 +2052,7 @@ mod tests {
             depth_defaulted: false,
             aperture_bytes: None,
             dut_base: 0,
+            xfer: None,
         };
         let card = crate::manifest::Pcie::default();
         let map = |pcie: Option<&crate::manifest::Pcie>, mems: &[crate::terminator::AxiMemPlan]| {
@@ -1992,6 +2067,7 @@ mod tests {
                 &[],
                 &[],
                 mems,
+                &[],
                 pcie,
             )
             .unwrap()
@@ -2065,6 +2141,7 @@ mod tests {
             rdata: format!("o_{bundle}_rdata"),
             width: 32,
             wdata: None,
+            wdata_width: 0,
             we: None,
             latency: 1,
         };
@@ -2087,6 +2164,7 @@ mod tests {
                 &[],
                 &[],
                 &slaves,
+                &[],
                 &[],
                 &[],
                 None,
@@ -2150,6 +2228,7 @@ mod tests {
             &dut,
             &manifest(&format!("{CSR}window_base = 0\n")),
             &[binding("csr", &["i_csr_addr"])],
+            &[],
             &[],
             &[],
             &[],

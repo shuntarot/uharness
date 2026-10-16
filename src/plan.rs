@@ -17,7 +17,7 @@ use crate::heartbeat;
 use crate::manifest::{self, Loaded};
 use crate::regmap::{self, RegisterMap};
 use crate::target::Target;
-use crate::terminator::{self, AxiMemPlan, DmiPlan, FifoPlan, HostMemPlan, MemPlan, SlavePlan};
+use crate::terminator::{self, ApbPlan, AxiMemPlan, FifoPlan, HostMemPlan, MemPlan, SlavePlan};
 use crate::unconnected::{self, Unconnected};
 
 pub struct Plan {
@@ -44,11 +44,15 @@ pub struct Plan {
     /// Addressable slave interfaces of the DUT, sorted by bundle name.
     pub slaves: Vec<SlavePlan>,
 
-    /// Debug Modules of the DUT, reached on their DMI, sorted by bundle name.
-    pub dmis: Vec<DmiPlan>,
+    /// APB slaves of the DUT (`dmi`, and `slave` with APB roles), sorted by
+    /// bundle name.
+    pub apbs: Vec<ApbPlan>,
 
     /// Memories the DUT reaches as an AXI4 master, sorted by bundle name.
     pub axi_mems: Vec<AxiMemPlan>,
+
+    /// AXI4 slaves of the DUT (`slave`), sorted by bundle name.
+    pub axi_slaves: Vec<crate::terminator::AxiSlavePlan>,
 
     /// The `host_irq` bundle, if there is one (INTx has one pin).
     pub irqs: Vec<crate::terminator::IrqPlan>,
@@ -259,18 +263,20 @@ pub enum PlanError {
     )]
     NoTerminator { bundle: String, backing: String },
 
-    /// `latency = 0` needs a place to hold the answer until the window
-    /// finishes the transaction; 2 or more needs a counter.
-    #[error(
-        "[bundle.{bundle}] is an addressable interface with `latency = {latency}`, which is not generated yet"
-    )]
+    /// The decoder waits with one flip-flop per cycle, and the window gives
+    /// up on an answer after 10 us.
+    #[error("[bundle.{bundle}] is a `slave` with `latency = {latency}`, more than {max}")]
     #[diagnostic(
-        code(harness::plan::slave_latency_not_one),
+        code(harness::plan::slave_latency_too_long),
         help(
-            "Only `latency = 1` is supported so far. State the DUT's real latency. If it is not 1, drop the `addr` role so each port becomes its own register."
+            "The harness waits `latency` cycles for `rdata`, one flip-flop per cycle, and the window gives up after 10 us. A register file that takes longer than {max} cycles should say when it answers: give it an APB port (`pready`) and use the APB roles."
         )
     )]
-    SlaveLatencyNotOne { bundle: String, latency: u32 },
+    SlaveLatencyTooLong {
+        bundle: String,
+        latency: u32,
+        max: u32,
+    },
 
     /// A write to the partial last word has nowhere to go. The indirect ports
     /// collect words until the entry is complete.
@@ -352,9 +358,15 @@ pub fn build(
     let memories = terminator::resolve_memories(&dut, &loaded.manifest, &bindings, &contracts)?;
     let host_mems = terminator::resolve_host_mem(&dut, &loaded.manifest, &bindings, &contracts)?;
     let slaves = terminator::resolve_slaves(&dut, &loaded.manifest, &bindings, &contracts)?;
-    let dmis = terminator::resolve_dmis(&dut, &loaded.manifest, &bindings, &contracts)?;
-    let axi_mems =
-        terminator::resolve_axi_mems(&dut, &loaded.manifest, &bindings, target.as_ref())?;
+    let apbs = terminator::resolve_apbs(&dut, &loaded.manifest, &bindings, &contracts)?;
+    let axi_mems = terminator::resolve_axi_mems(
+        &dut,
+        &loaded.manifest,
+        &bindings,
+        &contracts,
+        target.as_ref(),
+    )?;
+    let axi_slaves = terminator::resolve_axi_slaves(&dut, &loaded.manifest, &bindings)?;
     let irqs = terminator::resolve_irqs(&dut, &loaded.manifest, &bindings)?;
     let flrs = terminator::resolve_flrs(&dut, &loaded.manifest, &bindings)?;
     terminator::check_claimed(
@@ -364,8 +376,9 @@ pub fn build(
         &memories,
         &host_mems,
         &slaves,
-        &dmis,
+        &apbs,
         &axi_mems,
+        &axi_slaves,
         &irqs,
         &flrs,
     )?;
@@ -409,8 +422,9 @@ pub fn build(
         &memories,
         &host_mems,
         &slaves,
-        &dmis,
+        &apbs,
         &axi_mems,
+        &axi_slaves,
         pcie.as_ref(),
     )?;
 
@@ -440,8 +454,9 @@ pub fn build(
         memories,
         host_mems,
         slaves,
-        dmis,
+        apbs,
         axi_mems,
+        axi_slaves,
         irqs,
         flrs,
         registers,
@@ -480,6 +495,10 @@ fn harness_name(dut_project: &str, out_dir_name: &str) -> Result<String, PlanErr
 /// target.
 ///
 /// Exit 0 from `check --target` means that `gen` succeeds.
+/// The longest `latency` of a `slave` RAM port. Far beyond any register file,
+/// and 6.4 us at 10 MHz, inside the 10 us the window waits.
+pub const MAX_SLAVE_LATENCY: u32 = 64;
+
 fn generatable(plan: &Plan) -> Result<(), PlanError> {
     use crate::manifest::Backing;
 
@@ -573,10 +592,15 @@ fn generatable(plan: &Plan) -> Result<(), PlanError> {
         }
     }
 
-    if let Some(slave) = plan.slaves.iter().find(|slave| slave.latency != 1) {
-        return Err(PlanError::SlaveLatencyNotOne {
+    if let Some(slave) = plan
+        .slaves
+        .iter()
+        .find(|slave| slave.latency > MAX_SLAVE_LATENCY)
+    {
+        return Err(PlanError::SlaveLatencyTooLong {
             bundle: slave.bundle.clone(),
             latency: slave.latency,
+            max: MAX_SLAVE_LATENCY,
         });
     }
 

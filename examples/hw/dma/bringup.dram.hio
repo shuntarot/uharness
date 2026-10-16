@@ -1,0 +1,50 @@
+# dma on dram -- hio run bringup.dram.hio
+# The same DUT and the same copy as bringup.hio, on the board's memory. The
+# memory is a region here, so the host reads it directly.
+
+echo == identity ==
+id
+# 1 once the memory controller is calibrated; nothing reaches it before
+read hmem_calib
+read hmem_oor
+
+echo == copy four beats, as on bram ==
+load hmem pattern.bin --verify
+write i_addr 0 0
+write i_dst 64 0
+write i_size 32
+write i_start 1
+write i_start 0
+# Over PCIe the next read comes right away; give the copy time to finish.
+sleep 10
+# 0, 4, 10
+read o_busy
+read o_beats
+read o_sum
+# 1 0 2 0 3 0 4 0
+read hmem 64 8
+
+echo == copy 300 beats: two bursts to read, three to write ==
+# ramp.bin holds the 64-bit values 1 to 300. It is read from byte 8192, more
+# than one burst of 256 beats, and written to byte 16000, across the 4 KB edge
+# at 16384.
+load hmem ramp.bin --at 2048 --verify
+write i_addr 8192 0
+write i_dst 16000 0
+write i_size 2400
+write i_start 1
+write i_start 0
+# Over PCIe the next read comes right away; give the copy time to finish.
+sleep 10
+# 0, 300 (0x12c), 45150 (0xb05e)
+read o_busy
+read o_beats
+read o_sum
+# 1 0, then 48 0 49 0 on either side of 16384, then 300 0
+read hmem 16000 2
+read hmem 16376 4
+read hmem 18392 2
+
+echo == nothing was refused ==
+read hmem_oor
+id

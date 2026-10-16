@@ -1,6 +1,8 @@
 /// `hns::apb_host` against an APB slave that counts its reads and stretches
-/// the access phase: each window access is one APB transfer, and a read that
-/// comes during a write waits for it.
+/// the access phase: each window access is one APB transfer, a read that
+/// comes during a write waits for it, each transfer the slave ends with
+/// `pslverr` is counted once, and nothing reaches the slave while it is held
+/// in reset, not even after.
 #[test(apb_host_makes_one_transfer_per_access)]
 module test_apb_host {
     inst clk: $tb::clock_gen;
@@ -21,12 +23,16 @@ module test_apb_host {
     var pwdata : logic<32>;
     var prdata : logic<32>;
     var pready : logic    ;
+    var pslverr: logic    ;
+    var slverrs: logic<32>;
+    var hold   : logic    ;
 
     inst u: apb_host #(
         ADDR_BITS: 9,
     ) (
         i_clk    : clk    ,
         i_rst    : rst    ,
+        i_hold   : hold   ,
         i_addr   : addr   ,
         i_wdata  : wdata  ,
         i_we     : we     ,
@@ -41,6 +47,8 @@ module test_apb_host {
         o_pwdata : pwdata ,
         i_prdata : prdata ,
         i_pready : pready ,
+        i_pslverr: pslverr,
+        o_slverrs: slverrs,
     );
 
     // The slave: 128 words, and a count of the reads it answered. The access
@@ -52,6 +60,9 @@ module test_apb_host {
     var waits  : logic<2>       ;
 
     assign pready = stretch == waits;
+    // The upper half answers with an error. It is high for the whole access
+    // phase, so a count per cycle would show.
+    assign pslverr = paddr[8];
     assign prdata = mem[paddr[8:2]] + reads;
 
     always_ff (clk, rst) {
@@ -122,6 +133,7 @@ module test_apb_host {
         we    = 0;
         re    = 0;
         waits = 0;
+        hold  = 0;
         rst.assert(4);
         clk.next(4);
 
@@ -155,6 +167,46 @@ module test_apb_host {
 
         clk.next(8);
         $assert(reads == 4 && writes == 3);
+
+        // Errors so far: the write and the read at 0x1fc. A slow one counts
+        // once too.
+        $assert(slverrs == 2);
+        get(9'h1fc);
+        $assert(slverrs == 3);
+
+        // Held: a read and a write are not taken, and not run later either.
+        waits = 0;
+        hold  = 1;
+        clk.next(1);
+        $assert(!wready);
+        addr = 9'h010;
+        re   = 1;
+        clk.next(1);
+        re = 0;
+        clk.next(8);
+        $assert(!rvalid && !psel);
+        hold = 0;
+        clk.next(8);
+        $assert(reads == 5 && writes == 3 && !psel);
+
+        // A transfer on the bus when the hold comes is dropped, unanswered.
+        waits = 3;
+        addr  = 9'h010;
+        re    = 1;
+        clk.next(1);
+        re = 0;
+        clk.next(2);
+        hold = 1;
+        clk.next(1);
+        $assert(!psel);
+        clk.next(4);
+        hold = 0;
+        clk.next(8);
+        $assert(reads == 5 && !psel);
+
+        // And it works again.
+        get(9'h010);
+        $assert(got == 32'h1111_0005 && reads == 6);
         $finish();
     }
 }

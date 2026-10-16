@@ -80,7 +80,7 @@ data lives (`backing`); the shape of the port is read from the DUT.**
 | `backing` | see below | **required** |
 | `ports` | array, or a table of roles | matched by name |
 | `contract` | see below | **follows from the ports**; if written, it is checked |
-| `latency` | integer | required for a fixed-latency memory port and for `slave`; only for ports without a handshake |
+| `latency` | integer | required for a fixed-latency memory port, for `slave`, and wherever `contract = "fixed_latency"` is written; only for ports without a handshake |
 | `depth` | power of two | 256 for `host_poll_fifo`; for memory, from the address width |
 | `addressing` | `"byte"` / `"word"` | fixed-latency memory port only; required when a word is wider than 8 bits |
 | `access` | `"indirect"` / `"region"` | fixed-latency memory port only; default `region` |
@@ -98,7 +98,7 @@ Sizes accept a suffix: `4k`, `256M` (1024-based). `depth`, `aperture`,
 | value | where | |
 |---|---|---|
 | `reg` | a harness register per port | works |
-| `slave` | **inside the DUT**: it offers an addressable interface, the host drives it | works |
+| `slave` | **inside the DUT**: it offers a RAM port, an APB slave or an AXI4 slave, the host drives it | works |
 | `dmi` | **inside the DUT**: a RISC-V Debug Module's DMI, an APB slave the host drives | works |
 | `host_poll_fifo` | a harness FIFO the host polls | works |
 | `bram` | FPGA memory | works |
@@ -116,28 +116,45 @@ means "check that this is what I think", and a mismatch is an error.
 
 | value | plain ports | addressable ports |
 |---|---|---|
-| `fixed_latency` | no handshake (needs `latency`) | `addr` `rdata` `wdata` `we` `wstrb` `re` |
-| `valid_ready` | `valid` + `ready` | `rd_cmd_*` / `rd_*`, `wr_*` — transfer level |
-| `valid_only` | `valid` alone; **beats can be dropped** | — |
-| `axi` | — | `modport $std::axi4_if::<..>::master` |
-| `apb` | — | `psel` `penable` `pwrite` `paddr` `pwdata` `prdata` (`pready`) — `dmi` only |
+| `fixed_latency` | **wires**: no handshake (needs `latency`) | **RAM port**: `addr` `rdata` `wdata` `we` `wstrb` `re`, read data a fixed number of cycles later, as from an FPGA block RAM |
+| `valid_ready` | **stream**: `valid` + `ready` | **request / response**: `rd_cmd_*` / `rd_*`, `wr_*`; the answer comes whenever it is ready |
+| `valid_only` | **stream, no ready**: `valid` alone; **beats can be dropped** | — |
+| `axi` | — | **AXI4**: `modport $std::axi4_if::<..>::master` (`::slave` for `slave`) |
+| `apb` | — | **APB**: `psel` `penable` `pwrite` `paddr` `pwdata` `prdata` (`pready`, `pslverr`) — `slave` and `dmi` |
 
 A `valid_only` sink cannot be stalled, so the harness counts what it drops in
 `<bundle>_drops`.
 
-Which combinations exist today:
+Which combinations exist today, by the shapes above:
 
-| | `bram` / `bram_preload` | `dram` | `slave` |
-|---|---|---|---|
-| `fixed_latency` | ✅ | needs an adapter | ✅ |
-| `valid_ready` (transfer level) | ✅ | needs an adapter | — |
-| `axi` | ✅ | ✅ | — |
+| backing | wires<br>`fixed_latency` | RAM port<br>`fixed_latency` | stream<br>`valid_ready` | request / response<br>`valid_ready` | stream, no ready<br>`valid_only` | AXI4<br>`axi` | APB<br>`apb` |
+|---|---|---|---|---|---|---|---|
+| `reg` | ✅ | | ✅ | | ✅ | | |
+| `slave` | | ✅ | | | | ✅ | ✅ |
+| `dmi` | | | | | | | ✅ |
+| `host_poll_fifo` | | | ✅ | | ✅ | | |
+| `bram` | | ✅ | | ✅ | | ✅ | |
+| `bram_preload` | | ✅ read only | | | | | |
+| `dram` | | | | ✅ | | ✅ | |
+| `host_irq` | ✅ | | | | | | |
+| `pcie_flr` | ✅ | | | | | | |
 
-`reg` takes `fixed_latency` / `valid_ready` / `valid_only`; `host_poll_fifo`
-takes `valid_ready` / `valid_only`.
+Anything not marked is refused when the harness is generated. On a RAM port
+the backings differ only in who holds the memory: with `bram` and
+`bram_preload` the DUT drives the port and the harness holds the memory; with
+`slave` the DUT holds it (a register file) and the host drives the port.
 
-**Moving from `bram` to `dram` is one word in the manifest** — the DUT does not
-change.
+- `slave` on a RAM port: `latency` 0 to 64, and `rdata` / `wdata` up to 32
+  bits. An APB slave waits with `pready` instead.
+- `dram` answers when it can, so the DUT must be able to wait: AXI4 or
+  request / response. A RAM port cannot wait, so it cannot use `dram`.
+- `host_irq` and `pcie_flr` need the PCIe transport: one 1-bit port (plus a
+  1-bit done output for `pcie_flr`), at most one bundle each.
+- `host_mem` and `observe` are accepted by `check` but not generated yet.
+
+**On an AXI4 or a request / response port, moving from `bram` to `dram` is one
+word in the manifest** — the DUT does not change (`dram` also needs
+`aperture`).
 
 #### ports and roles
 
@@ -237,6 +254,17 @@ Write `<bundle>_delay` (0-255) to stall every transfer that many cycles, and
 `<bundle>_jitter` to vary it — FPGA memory is fast and regular, so without this
 "the DUT survives a slow responder" is never actually tested.
 
+The address is cut to a whole beat and the size rounded up to whole beats. A
+read that runs off the end returns the beats inside, `rd_last` on the last of
+them; a write takes every beat and stores the ones inside. Either is counted
+in `<bundle>_oor`. A read with no beat inside returns nothing, so a DUT
+waiting for `rd_last` waits forever.
+
+With `backing = "dram"` the same port is turned into AXI4 bursts (at most 256
+beats, never across 4 KB) on the board's memory. `wr_done_valid` then comes
+once the memory has taken every burst. `<bundle>_delay` is not there: the
+memory is slow and uneven by itself.
+
 **A register file inside the DUT.** Same roles as memory; the difference is
 direction — `addr` is a DUT input.
 
@@ -249,7 +277,51 @@ ports   = { addr = "i_csr_addr", wdata = "i_csr_wdata",
 ```
 
 The window it occupies follows from the width of `addr` (`2^width` words), and
-the address arrives as a word index.
+the address arrives as a word index. Name every role in `ports`; none is
+guessed for a RAM port.
+
+- `latency` is how many cycles after `addr` the DUT's `rdata` holds the
+  answer, 0 to 64. With 0 the harness holds the answer itself; with more, the
+  DUT's read pipeline must advance every cycle.
+- `rdata` and `wdata` can be narrower than 32 bits: a write gives the low bits,
+  and a read comes back with zeros above them.
+
+The same with an APB slave. Ports are found by their `p*` suffix:
+
+```toml
+[bundle.csr]
+backing = "slave"     # i_csr_psel, i_csr_penable, i_csr_pwrite, i_csr_paddr,
+                      # i_csr_pwdata, o_csr_prdata, o_csr_pready, o_csr_pslverr
+```
+
+- `paddr` is a byte address of 32-bit registers, 2 to 31 bits; the window
+  gives it `2^width` bytes. Without `pready` the slave answers in the access
+  phase.
+- One host access is one APB transfer; nothing is read ahead or twice.
+- A transfer the slave ends with `pslverr` is counted in `<bundle>_slverr`
+  (read only, saturating). A write is answered before its transfer ends, so
+  the error cannot come back with it: read the count before and after.
+
+And with an AXI4 slave: a `::slave` modport port, found by its type.
+
+```toml
+[bundle.csr]
+backing = "slave"
+ports   = ["csr"]     # csr : modport $std::axi4_if::<..>::slave
+```
+
+- Each host access is one single-beat AXI4 transfer of one 32-bit word; on a
+  wider bus the other strobes are off and the read takes its part of the beat.
+- The window shows the whole address space (`2^width` bytes), up to 31 bits.
+  A wider one needs `aperture`, a moving window as for `dram`.
+- The bus must be 32 bits or a power-of-two multiple.
+
+While the DUT is held in reset (`hio reset --hold`, or during `hio reset`),
+an APB or AXI4 slave is not driven: it may not answer then. `hio` refuses to
+touch such a region until `hio reset --release`; `regs.json` marks it
+`held_in_dut_reset`. Another host that tries anyway gets no answer, and the
+window ends the access after 10 µs with an error, counted in `timeouts`.
+Nothing asked then reaches the DUT later.
 
 **A RISC-V Debug Module.** Its DMI, as the APB slave the Debug Module offers
 (Hazard3's `hazard3_dm` does). Ports are found by their `p*` suffix.

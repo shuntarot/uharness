@@ -13,12 +13,21 @@
 /// The window is 32 bits; the AXI bus can be wider. The word is selected here:
 /// a write sets `WSTRB` only for its 4 bytes, and a read is cut out of the
 /// returned beat. The window-side decode then stays at one entry per word.
+///
+/// While `i_hold` is high the slave is being reset (a DUT slave), and it may
+/// never answer. No transfer starts, the open ones are dropped, and window
+/// accesses are not taken: the window times out on them instead. A response
+/// that arrives when nothing is open is dropped, so it cannot be taken for a
+/// later read.
 pub module axi_host::<PKG: $std::axi4_prototype> #(
     /// Width of the window's 32-bit word index.
     param ADDR_W: u32 = 8,
 ) (
     i_clk: input clock,
     i_rst: input reset,
+
+    /// The slave is being reset. Tie to 0 for a slave that is not.
+    i_hold: input logic,
 
     axi: modport $std::axi4_if::<PKG>::master,
 
@@ -125,44 +134,49 @@ pub module axi_host::<PKG: $std::axi4_prototype> #(
         } else {
             r_out = 0;
 
-            if !w_busy && i_hwe {
-                w_busy  = 1;
-                aw_done = 0;
-                wd_done = 0;
-                w_addr  = byte_addr;
-                w_data  = {i_hwdata repeat WORDS};
-                w_strb  = strb_one << strb_shift;
+            if i_hold {
+                w_busy = 0;
+                r_busy = 0;
             } else {
-                if axi.awvalid && axi.awready {
-                    aw_done = 1;
+                if !w_busy && i_hwe {
+                    w_busy  = 1;
+                    aw_done = 0;
+                    wd_done = 0;
+                    w_addr  = byte_addr;
+                    w_data  = {i_hwdata repeat WORDS};
+                    w_strb  = strb_one << strb_shift;
+                } else {
+                    if axi.awvalid && axi.awready {
+                        aw_done = 1;
+                    }
+                    if axi.wvalid && axi.wready {
+                        wd_done = 1;
+                    }
+                    if w_busy && axi.bvalid && axi.bready {
+                        w_busy = 0;
+                    }
                 }
-                if axi.wvalid && axi.wready {
-                    wd_done = 1;
-                }
-                if axi.bvalid && axi.bready {
-                    w_busy = 0;
-                }
-            }
 
-            if !r_busy && i_hre {
-                r_busy  = 1;
-                ar_done = 0;
-                r_addr  = byte_addr;
-                r_word  = word;
-            } else {
-                if axi.arvalid && axi.arready {
-                    ar_done = 1;
-                }
-                if axi.rvalid && axi.rready {
-                    r_busy = 0;
-                    r_data = axi.rdata[r_word * 32+:32];
-                    r_out  = 1;
+                if !r_busy && i_hre {
+                    r_busy  = 1;
+                    ar_done = 0;
+                    r_addr  = byte_addr;
+                    r_word  = word;
+                } else {
+                    if axi.arvalid && axi.arready {
+                        ar_done = 1;
+                    }
+                    if r_busy && axi.rvalid && axi.rready {
+                        r_busy = 0;
+                        r_data = axi.rdata[r_word * 32+:32];
+                        r_out  = 1;
+                    }
                 }
             }
         }
     }
 
-    assign o_hwready = ~w_busy;
+    assign o_hwready = ~w_busy & ~i_hold;
     assign o_hrvalid = r_out;
     assign o_hrdata  = r_data;
 }

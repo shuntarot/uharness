@@ -3928,6 +3928,27 @@ fn mem_batch(port: &MemPort<'_>) -> Batch {
     b
 }
 
+/// Refuses a region the harness does not drive while the DUT is held in
+/// reset. The window would wait out its timeout and answer with an error,
+/// which the JTAG bridge keeps until the FPGA is configured again.
+fn not_held(bus: &mut Bus, map: &RegisterMap, region: &hns_regs::Region) -> Result<(), String> {
+    if !region.held_in_dut_reset {
+        return Ok(());
+    }
+    let Ok(state) = map.get("dut_reset_state") else {
+        return Ok(());
+    };
+    if rd(bus, state.offset as u32)? & 1 == 1 {
+        return Err(format!(
+            "the DUT is held in reset, and `{}` is a slave inside it: the harness does not \
+             drive it until the DUT runs again. The access was not made.\n\
+             Release the DUT first: hio reset --release",
+            region.name
+        ));
+    }
+    Ok(())
+}
+
 /// Reads a region, one round trip per window page.
 fn read_region(
     bus: &mut Bus,
@@ -3936,6 +3957,7 @@ fn read_region(
     at: u64,
     words: usize,
 ) -> Result<Vec<u32>, String> {
+    not_held(bus, map, region)?;
     let master = bus.master();
     region_span(region, at, words)?;
     let mut out = Vec::new();
@@ -3957,6 +3979,7 @@ fn write_region(
     at: u64,
     values: &[u64],
 ) -> Result<(), String> {
+    not_held(bus, map, region)?;
     let master = bus.master();
     region_span(region, at, values.len())?;
     let mut done = 0usize;
@@ -4160,6 +4183,7 @@ fn bench_region(
     both: bool,
     threads: usize,
 ) -> Result<(), String> {
+    not_held(bus, map, region)?;
     let master = bus.master();
     // Count only the entries. Past them a read returns 0 and bumps `oor`,
     // which says nothing about the transport.
@@ -4380,6 +4404,9 @@ fn memtest(
 ) -> Result<(), String> {
     let master = bus.master();
     let port = mem_port(map, bundle)?;
+    if let MemPort::Region(region) = &port {
+        not_held(bus, map, region)?;
+    }
     let depth = port.depth();
     let words_per_entry = port.words();
     let entry_bytes = port.entry_bytes();
@@ -4811,6 +4838,9 @@ fn load(
 ) -> Result<(), String> {
     // A region and an indirect port load the same way; only the access differs.
     let port = mem_port(map, bundle)?;
+    if let MemPort::Region(region) = &port {
+        not_held(bus, map, region)?;
+    }
     let depth = port.depth();
     let entry_bytes = port.entry_bytes();
     let raw = std::fs::read(file).map_err(|e| read_error(file, e))?;
@@ -7884,6 +7914,7 @@ mod tests {
         let region = hns_regs::Region {
             kind: Some("memory".to_string()),
             total_bytes: None,
+            held_in_dut_reset: false,
             name: "imem".to_string(),
             window_base: 0x200,
             size_bytes: 512,

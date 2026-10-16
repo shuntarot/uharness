@@ -179,7 +179,7 @@ pub enum ContractError {
     #[diagnostic(
         code(harness::contract::host_mem_role_on_other),
         help(
-            "`rd_*` / `wr_*` describe a transfer-level port (\"read N bytes from A\"). Only `bram` and `host_mem` can serve one.\n\nChange the backing, or use the roles this backing knows."
+            "`rd_*` / `wr_*` describe a transfer-level port (\"read N bytes from A\"). Only `bram`, `dram` and `host_mem` can serve one.\n\nChange the backing, or use the roles this backing knows."
         )
     )]
     HostMemRoleOnOther {
@@ -209,7 +209,7 @@ Without `{missing}` the terminator cannot tell {why}."
     #[diagnostic(
         code(harness::contract::apb_role_on_other),
         help(
-            "`psel` / `penable` / `pwrite` / `paddr` / `pwdata` / `prdata` / `pready` describe an APB slave, and only `dmi` takes one: the DMI of a RISC-V Debug Module.\n\nUse `backing = \"dmi\"`, or the roles this backing knows."
+            "`psel` / `penable` / `pwrite` / `paddr` / `pwdata` / `prdata` / `pready` / `pslverr` describe an APB slave. Only `slave` (a register file in the DUT) and `dmi` (the DMI of a RISC-V Debug Module) take one.\n\nUse `backing = \"slave\"` or `\"dmi\"`, or the roles this backing knows."
         )
     )]
     ApbRoleOnOther {
@@ -219,11 +219,11 @@ Without `{missing}` the terminator cannot tell {why}."
         backing: String,
     },
 
-    #[error("[bundle.{bundle}] is `dmi` but has no `{missing}`")]
+    #[error("[bundle.{bundle}] is an APB slave but has no `{missing}`")]
     #[diagnostic(
         code(harness::contract::apb_incomplete),
         help(
-            "A `dmi` bundle is the APB slave of a Debug Module: `psel`, `penable`, `pwrite`, `paddr`, `pwdata` and `prdata`, and `pready` if it has one. Without `{missing}` the harness cannot tell {why}.\n\nPorts are found by these suffixes, after the bundle prefix. If yours are named otherwise, name them:\n\n    ports = {{ psel = \"..\", penable = \"..\", .. }}"
+            "An APB slave has `psel`, `penable`, `pwrite`, `paddr`, `pwdata` and `prdata`, and `pready` (and for `slave`, `pslverr`) if it has one. Without `{missing}` the harness cannot tell {why}.\n\nPorts are found by these suffixes, after the bundle prefix. If yours are named otherwise, name them:\n\n    ports = {{ psel = \"..\", penable = \"..\", .. }}"
         )
     )]
     ApbIncomplete {
@@ -342,10 +342,10 @@ fn resolve_one(
     let spec = bundle.ports.as_ref();
     let backing = bundle.backing;
     // The dictionary has memory names only for memory terminators, and APB
-    // names only for `dmi`.
+    // names only for `dmi` and `slave`.
     let memory = backing.is_memory();
-    let apb = backing == Backing::Dmi;
-    let mut roles = assign_roles(dut, binding, spec, prefixes, memory, apb);
+    let apb_names = matches!(backing, Backing::Dmi | Backing::Slave);
+    let mut roles = assign_roles(dut, binding, spec, prefixes, memory, apb_names);
     // AXI4 comes from the type, not from a name or `ports`: a modport of
     // `std::axi4_if` is the role. Without this, it would become payload.
     for assignment in &mut roles {
@@ -392,8 +392,8 @@ fn resolve_one(
     }
 
     // Transfer-level roles have meaning only on an addressable backing. The
-    // port shape is the same for `bram` and `host_mem`.
-    let addressable = matches!(backing, Backing::Bram | Backing::HostMem);
+    // port shape is the same for `bram`, `dram` and `host_mem`.
+    let addressable = matches!(backing, Backing::Bram | Backing::Dram | Backing::HostMem);
     if !addressable && let Some(found) = roles.iter().find(|r| r.role.is_host_mem()) {
         return Err(ContractError::HostMemRoleOnOther {
             bundle: binding.bundle.clone(),
@@ -404,7 +404,7 @@ fn resolve_one(
     }
 
     // APB roles were written explicitly on another backing.
-    if !apb && let Some(found) = roles.iter().find(|r| r.role.is_apb()) {
+    if !apb_names && let Some(found) = roles.iter().find(|r| r.role.is_apb()) {
         return Err(ContractError::ApbRoleOnOther {
             bundle: binding.bundle.clone(),
             port: found.port.clone(),
@@ -415,6 +415,9 @@ fn resolve_one(
 
     // APB has its own handshake (`psel` / `penable` / `pready`), so the
     // valid/ready check does not apply. Check that the roles are complete.
+    // A `slave` is APB when it has an APB role, and a RAM port otherwise.
+    let apb = backing == Backing::Dmi
+        || (backing == Backing::Slave && roles.iter().any(|r| r.role.is_apb()));
     if apb {
         check_apb(&binding.bundle, &roles)?;
         if let Some(declared) = declared
@@ -424,7 +427,11 @@ fn resolve_one(
                 bundle: binding.bundle.clone(),
                 declared: declared.as_str(),
                 inferred: Contract::Apb.as_str(),
-                why: "`dmi` takes an APB slave",
+                why: if backing == Backing::Dmi {
+                    "`dmi` takes an APB slave"
+                } else {
+                    "the ports are an APB slave"
+                },
             });
         }
         return Ok(BundleContract {
@@ -534,10 +541,10 @@ fn resolve_one(
     })
 }
 
-/// Checks that a `dmi` bundle is a whole APB slave and nothing else.
+/// Checks that an APB bundle has the roles it needs, each once.
 ///
 /// Directions and widths are checked with the ports, in
-/// `terminator::resolve_dmis`.
+/// `terminator::resolve_apbs`.
 fn check_apb(bundle: &str, roles: &[RoleAssignment]) -> Result<(), ContractError> {
     const NEEDED: &[(Role, &str, &str)] = &[
         (Role::Psel, "psel", "when a transfer starts"),
@@ -555,7 +562,11 @@ fn check_apb(bundle: &str, roles: &[RoleAssignment]) -> Result<(), ContractError
             why,
         });
     }
-    for role in NEEDED.iter().map(|(role, ..)| *role).chain([Role::Pready]) {
+    for role in NEEDED
+        .iter()
+        .map(|(role, ..)| *role)
+        .chain([Role::Pready, Role::Pslverr])
+    {
         let ports: Vec<&str> = roles
             .iter()
             .filter(|r| r.role == role)
@@ -731,9 +742,9 @@ fn role_from_name(
     let stripped = prefixes.strip(name, direction);
     let last = stripped.rsplit('_').next()?;
     if apb {
-        // Only for `dmi`. The APB names are distinct, so nothing else is
-        // guessed there: a stray `valid` in a DMI bundle is payload and is
-        // refused later.
+        // Only for `dmi` and `slave`. The APB names are distinct, so nothing
+        // else is guessed there: a stray `valid` in an APB bundle is payload
+        // and is refused later.
         return match last {
             "psel" => Some(Role::Psel),
             "penable" => Some(Role::Penable),
@@ -742,6 +753,7 @@ fn role_from_name(
             "pwdata" => Some(Role::Pwdata),
             "prdata" => Some(Role::Prdata),
             "pready" => Some(Role::Pready),
+            "pslverr" => Some(Role::Pslverr),
             _ => None,
         };
     }

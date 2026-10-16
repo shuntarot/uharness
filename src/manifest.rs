@@ -304,8 +304,9 @@ pub enum Role {
     /// not need to be in `ports`. It can be written to state it explicitly.
     Axi4,
 
-    // --- APB, for `dmi`. The DUT is the slave: `psel` to `pwdata` are DUT
-    //     inputs, `prdata` and `pready` DUT outputs.
+    // --- APB, for `dmi` and `slave`. The DUT is the slave: `psel` to
+    //     `pwdata` are DUT inputs, `prdata`, `pready` and `pslverr` DUT
+    //     outputs.
     Psel,
     Penable,
     Pwrite,
@@ -315,6 +316,8 @@ pub enum Role {
     Prdata,
     /// Optional. Without it the slave always answers in the access phase.
     Pready,
+    /// Optional, `slave` only. The harness counts the transfers it ends.
+    Pslverr,
 
     /// A payload that is none of the above.
     Data,
@@ -377,6 +380,7 @@ impl Role {
             Role::Pwdata => "pwdata",
             Role::Prdata => "prdata",
             Role::Pready => "pready",
+            Role::Pslverr => "pslverr",
             Role::Data => "data",
         }
     }
@@ -388,7 +392,7 @@ impl Role {
         )
     }
 
-    /// An APB role (`dmi`).
+    /// An APB role (`dmi`, `slave`).
     pub fn is_apb(&self) -> bool {
         matches!(
             self,
@@ -399,6 +403,7 @@ impl Role {
                 | Role::Pwdata
                 | Role::Prdata
                 | Role::Pready
+                | Role::Pslverr
         )
     }
 

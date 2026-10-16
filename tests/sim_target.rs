@@ -449,3 +449,211 @@ fn a_target_patch_sizes_the_simulated_dram() {
     assert!(sim.contains("hns::axi_aw"), "{sim}");
     common::veryl_check(&hns).unwrap();
 }
+
+/// A DMA engine on a transfer-level port: it writes `nbytes` of `seed + i`
+/// to `addr`, or reads `nbytes` from `addr` and sums them.
+const XFER_DUT: &str = r#"
+module dut_top (
+    i_clk   : input  clock    ,
+    i_rst   : input  reset    ,
+    i_go_rd : input  logic    ,
+    i_go_wr : input  logic    ,
+    i_addr  : input  logic<32>,
+    i_nbytes: input  logic<32>,
+    i_seed  : input  logic<32>,
+    o_busy  : output logic    ,
+    o_sum   : output logic<32>,
+    o_beats : output logic<32>,
+    o_dones : output logic<32>,
+
+    o_rc_valid: output logic    ,
+    i_rc_ready: input  logic    ,
+    o_rc_addr : output logic<32>,
+    o_rc_size : output logic<32>,
+    i_r_valid : input  logic    ,
+    o_r_ready : output logic    ,
+    i_r_data  : input  logic<32>,
+    i_r_last  : input  logic    ,
+    o_wc_valid: output logic    ,
+    i_wc_ready: input  logic    ,
+    o_wc_addr : output logic<32>,
+    o_wc_size : output logic<32>,
+    o_w_valid : output logic    ,
+    i_w_ready : input  logic    ,
+    o_w_data  : output logic<32>,
+    o_w_last  : output logic    ,
+    i_w_done  : input  logic    ,
+) {
+    enum state_t: logic<3> {
+        IDLE,
+        RCMD,
+        RDATA,
+        WCMD,
+        WDATA,
+        WDONE,
+    }
+    var state: state_t  ;
+    var rd_q : logic    ;
+    var wr_q : logic    ;
+    var left : logic<32>;
+    var n    : logic<32>;
+
+    assign o_busy     = state != state_t::IDLE;
+    assign o_rc_valid = state == state_t::RCMD;
+    assign o_rc_addr  = i_addr;
+    assign o_rc_size  = i_nbytes;
+    assign o_r_ready  = state == state_t::RDATA;
+    assign o_wc_valid = state == state_t::WCMD;
+    assign o_wc_addr  = i_addr;
+    assign o_wc_size  = i_nbytes;
+    assign o_w_valid  = state == state_t::WDATA;
+    assign o_w_data   = i_seed + n;
+    assign o_w_last   = left == 1;
+
+    always_ff {
+        if_reset {
+            state   = state_t::IDLE;
+            rd_q    = 0;
+            wr_q    = 0;
+            left    = 0;
+            n       = 0;
+            o_sum   = 0;
+            o_beats = 0;
+            o_dones = 0;
+        } else {
+            rd_q = i_go_rd;
+            wr_q = i_go_wr;
+            case state {
+                state_t::IDLE: if i_go_rd && !rd_q {
+                    state   = state_t::RCMD;
+                    o_sum   = 0;
+                    o_beats = 0;
+                } else if i_go_wr && !wr_q {
+                    state = state_t::WCMD;
+                    left  = i_nbytes >> 2;
+                    n     = 0;
+                }
+                state_t::RCMD: if i_rc_ready {
+                    state = state_t::RDATA;
+                }
+                state_t::RDATA: if i_r_valid {
+                    o_sum   += i_r_data;
+                    o_beats += 1;
+                    if i_r_last {
+                        state = state_t::IDLE;
+                    }
+                }
+                state_t::WCMD: if i_wc_ready {
+                    state = state_t::WDATA;
+                }
+                state_t::WDATA: if i_w_ready {
+                    n    += 1;
+                    left -= 1;
+                    if left == 1 {
+                        state = state_t::WDONE;
+                    }
+                }
+                state_t::WDONE: if i_w_done {
+                    state   = state_t::IDLE;
+                    o_dones += 1;
+                }
+                default: state = state_t::IDLE;
+            }
+        }
+    }
+}
+"#;
+
+const XFER_HARNESS_TOML: &str = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 100\n\n\
+[bundle.ctl]\nbacking = \"reg\"\nports = [\"i_go_rd\", \"i_go_wr\", \"i_addr\", \"i_nbytes\", \"i_seed\", \"o_busy\", \"o_sum\", \"o_beats\", \"o_dones\"]\n\n\
+[bundle.mem]\nbacking = \"dram\"\naperture = \"1M\"\n\
+ports = { rd_cmd_valid = \"o_rc_valid\", rd_cmd_ready = \"i_rc_ready\", rd_cmd_addr = \"o_rc_addr\", rd_cmd_size = \"o_rc_size\", \
+rd_valid = \"i_r_valid\", rd_ready = \"o_r_ready\", rd_data = \"i_r_data\", rd_last = \"i_r_last\", \
+wr_cmd_valid = \"o_wc_valid\", wr_cmd_ready = \"i_wc_ready\", wr_cmd_addr = \"o_wc_addr\", wr_cmd_size = \"o_wc_size\", \
+wr_valid = \"o_w_valid\", wr_ready = \"i_w_ready\", wr_data = \"o_w_data\", wr_last = \"o_w_last\", wr_done_valid = \"i_w_done\" }\n";
+
+/// A DUT built for `bram`'s transfer level runs on `dram` unchanged:
+/// `hns::xfer2axi` turns its commands into AXI4 bursts. 300 beats from byte
+/// 4000 cross a 4 KB edge and are longer than one burst; the host sees the
+/// data through the same memory, and a read off the end is served short and
+/// counted.
+#[test]
+fn a_transfer_level_dma_engine_runs_on_dram() {
+    let dir = fixture(XFER_DUT, XFER_HARNESS_TOML);
+    let out = harness(dir.path(), &["gen", "--target", "sim"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let hns = dir.path().join("hns");
+    let sim = fs::read_to_string(hns.join("src/sim.veryl")).unwrap();
+    assert!(sim.contains("hns::xfer2axi"), "{sim}");
+    let regs: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(hns.join("regs.json")).unwrap()).unwrap();
+    let offset = |name: &str| -> u32 {
+        regs["registers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} in regs.json"))["offset"]
+            .as_u64()
+            .unwrap() as u32
+    };
+    let total = regs["regions"][0]["total_bytes"].as_u64().unwrap() as u32;
+    let window = regs["regions"][0]["size_bytes"].as_u64().unwrap() as u32;
+
+    let (mut child, mut link) = start(dir.path());
+    let wait_idle = |link: &mut Link| {
+        for _ in 0..1000 {
+            if link.read32(offset("o_busy")).unwrap() == 0 {
+                return;
+            }
+        }
+        panic!("the DMA engine never finished");
+    };
+
+    // Write 300 beats of 0x100 + i from byte 4000.
+    let mut batch = hns_host::Batch::new();
+    batch.write(offset("mem_base_jtag"), 0);
+    batch.write(offset("i_addr"), 4000);
+    batch.write(offset("i_nbytes"), 1200);
+    batch.write(offset("i_seed"), 0x100);
+    batch.write(offset("i_go_wr"), 1);
+    batch.write(offset("i_go_wr"), 0);
+    link.run(&batch).unwrap();
+    wait_idle(&mut link);
+    assert_eq!(link.read32(offset("o_dones")).unwrap(), 1);
+    // The host sees it in the same memory, across the 4 KB edge.
+    assert_eq!(link.read32(4000).unwrap(), 0x100);
+    assert_eq!(link.read32(4096).unwrap(), 0x100 + 24);
+    assert_eq!(link.read32(4000 + 299 * 4).unwrap(), 0x100 + 299);
+
+    // Read them back: 300 beats, 300 * 0x100 + (0 + .. + 299).
+    let mut batch = hns_host::Batch::new();
+    batch.write(offset("i_go_rd"), 1);
+    batch.write(offset("i_go_rd"), 0);
+    link.run(&batch).unwrap();
+    wait_idle(&mut link);
+    assert_eq!(link.read32(offset("o_beats")).unwrap(), 300);
+    assert_eq!(
+        link.read32(offset("o_sum")).unwrap(),
+        300 * 0x100 + 299 * 300 / 2
+    );
+    assert_eq!(link.read32(offset("mem_oor")).unwrap(), 0);
+
+    // Off the end: 4 beats asked, 2 inside.
+    let mut batch = hns_host::Batch::new();
+    batch.write(offset("mem_base_jtag"), total / window - 1);
+    batch.write(window - 8, 7);
+    batch.write(window - 4, 8);
+    batch.write(offset("i_addr"), total - 8);
+    batch.write(offset("i_nbytes"), 16);
+    batch.write(offset("i_go_rd"), 1);
+    batch.write(offset("i_go_rd"), 0);
+    link.run(&batch).unwrap();
+    wait_idle(&mut link);
+    assert_eq!(link.read32(offset("o_beats")).unwrap(), 2);
+    assert_eq!(link.read32(offset("o_sum")).unwrap(), 15);
+    assert_eq!(link.read32(offset("mem_oor")).unwrap(), 1);
+
+    link.finish().unwrap();
+    assert!(child.wait().unwrap().success());
+}
