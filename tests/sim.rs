@@ -1778,6 +1778,254 @@ module slave_window {{
     );
 }
 
+/// `slave` RAM ports with other latencies and a narrow register.
+///
+/// `comb` answers in the same cycle (`latency = 0`), so the harness holds the
+/// answer. `pipe` answers 3 cycles later through a pipeline that runs every
+/// cycle, so the harness must take the word from exactly 3 cycles after the
+/// address. `nar` is 8 bits wide: it takes the low byte of a write and reads
+/// back with zeros above it.
+#[test]
+fn slaves_with_other_latencies_and_widths_answer_right() {
+    let dut = r#"
+module dut_top (
+    i_clk       : input  clock    ,
+    i_rst       : input  reset    ,
+    i_comb_addr : input  logic<3> ,
+    i_comb_wdata: input  logic<32>,
+    i_comb_we   : input  logic    ,
+    o_comb_rdata: output logic<32>,
+    i_pipe_addr : input  logic<3> ,
+    i_pipe_wdata: input  logic<32>,
+    i_pipe_we   : input  logic    ,
+    o_pipe_rdata: output logic<32>,
+    i_nar_addr : input  logic<2> ,
+    i_nar_wdata: input  logic<8> ,
+    i_nar_we   : input  logic    ,
+    o_nar_rdata: output logic<8> ,
+) {
+    var comb: logic<32> [8];
+    var pipe: logic<32> [8];
+    var nar : logic<8>  [4];
+    var p1  : logic<32>     ;
+    var p2  : logic<32>     ;
+
+    assign o_comb_rdata = comb[i_comb_addr];
+    always_ff {
+        if i_comb_we {
+            comb[i_comb_addr] = i_comb_wdata;
+        }
+        if i_pipe_we {
+            pipe[i_pipe_addr] = i_pipe_wdata;
+        }
+        // Three stages, each a different value, so an answer taken a cycle
+        // early or late shows.
+        p1           = pipe[i_pipe_addr];
+        p2           = p1 + 1;
+        o_pipe_rdata = p2 + 1;
+        if i_nar_we {
+            nar[i_nar_addr] = i_nar_wdata;
+        }
+        o_nar_rdata = nar[i_nar_addr];
+    }
+}
+"#;
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n\
+[bundle.comb]\nbacking = \"slave\"\nlatency = 0\nports = { addr = \"i_comb_addr\", wdata = \"i_comb_wdata\", we = \"i_comb_we\", rdata = \"o_comb_rdata\" }\n\n\
+[bundle.pipe]\nbacking = \"slave\"\nlatency = 3\nports = { addr = \"i_pipe_addr\", wdata = \"i_pipe_wdata\", we = \"i_pipe_we\", rdata = \"o_pipe_rdata\" }\n\n\
+[bundle.nar]\nbacking = \"slave\"\nlatency = 1\nports = { addr = \"i_nar_addr\", wdata = \"i_nar_wdata\", we = \"i_nar_we\", rdata = \"o_nar_rdata\" }\n";
+
+    let dir = fixture(manifest, dut, "");
+    let map = offsets(dir.path());
+    let (comb, pipe, nar) = (
+        region_base(&map, "comb"),
+        region_base(&map, "pipe"),
+        region_base(&map, "nar"),
+    );
+
+    let tb = format!(
+        r#"
+#[test(slave_latencies)]
+module slave_latencies {{
+{BUS}
+    initial {{
+        start();
+
+        for i in 0..8 {{
+            wr({comb} + i * 4, 32'h1111_0000 + i);
+            wr({pipe} + i * 4, 32'h2222_0000 + i * 16);
+        }}
+        for i in 0..8 {{
+            $assert(rd({comb} + i * 4) == 32'h1111_0000 + i);
+            // The pipeline adds 2 on the way out.
+            $assert(rd({pipe} + i * 4) == 32'h2222_0002 + i * 16);
+        }}
+        $display("comb[3] = %h  pipe[3] = %h", rd({comb} + 12), rd({pipe} + 12));
+
+        // Only the low byte goes in; the rest reads as zeros.
+        wr({nar} + 4, 32'hdead_be5a);
+        $display("nar[1] = %h", rd({nar} + 4));
+        $assert(rd({nar} + 4) == 32'h0000_005a);
+
+        $finish();
+    }}
+}}
+"#
+    );
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
+/// An AXI4 register file in the DUT (`slave` on a `::slave` port).
+///
+/// The bus is 64 bits, so each window word is half a beat: a write sets only
+/// its 4 strobe bits, and a read takes its half of the beat. The stand-in
+/// answers reads 2 cycles late and counts them in its last register. Three
+/// checks: writes land in the right half, reads come back, and each window
+/// read is exactly one AXI4 read.
+#[test]
+fn an_axi4_slave_is_driven_one_beat_per_window_access() {
+    let dut = r#"
+module dut_top (
+    i_clk: input clock,
+    i_rst: input reset,
+    csr  : modport $std::axi4_if::<$std::axi4_pkg::<8, 8, 4, 1, 1, 1, 1, 1>>::slave,
+) {
+    var regs : logic<64> [31];
+    var reads: logic<32>      ;
+
+    var w_open: logic   ;
+    var w_addr: logic<5>;
+    var b_out : logic   ;
+    var r_wait: logic<2>;
+    var r_addr: logic<5>;
+    var r_out : logic   ;
+    var r_data: logic<64>;
+    var bid   : logic<4>;
+    var rid   : logic<4>;
+
+    always_comb {
+        csr.awready = !w_open && !b_out;
+        csr.wready  = w_open;
+        csr.bvalid  = b_out;
+        csr.bresp   = 2'b00;
+        csr.bid     = bid;
+        csr.buser   = 0;
+        csr.arready = r_wait == 0 && !r_out;
+        csr.rvalid  = r_out;
+        csr.rdata   = r_data;
+        csr.rresp   = 2'b00;
+        csr.rid     = rid;
+        csr.rlast   = 1;
+        csr.ruser   = 0;
+    }
+
+    always_ff {
+        if_reset {
+            reads  = 0;
+            w_open = 0;
+            w_addr = 0;
+            b_out  = 0;
+            r_wait = 0;
+            r_addr = 0;
+            r_out  = 0;
+            r_data = 0;
+            bid    = 0;
+            rid    = 0;
+        } else {
+            if csr.awvalid && csr.awready {
+                w_open = 1;
+                w_addr = csr.awaddr[7:3];
+                bid    = csr.awid;
+            }
+            if csr.wvalid && csr.wready {
+                w_open = 0;
+                b_out  = 1;
+                for i in 0..8 {
+                    if csr.wstrb[i] {
+                        regs[w_addr][i * 8+:8] = csr.wdata[i * 8+:8];
+                    }
+                }
+            }
+            if csr.bvalid && csr.bready {
+                b_out = 0;
+            }
+            if csr.arvalid && csr.arready {
+                r_wait = 2;
+                r_addr = csr.araddr[7:3];
+                rid    = csr.arid;
+            } else if r_wait != 0 {
+                r_wait -= 1;
+                if r_wait == 1 {
+                    r_out  = 1;
+                    r_data = if r_addr == 31 ? {32'h0, reads} : regs[r_addr];
+                    reads += 1;
+                }
+            }
+            if csr.rvalid && csr.rready {
+                r_out = 0;
+            }
+        }
+    }
+}
+"#;
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.csr]\nbacking = \"slave\"\nports = [\"csr\"]\n";
+
+    let dir = fixture(manifest, dut, "");
+    let map = offsets(dir.path());
+    let region = map["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|region| region["name"] == "csr")
+        .unwrap();
+    assert_eq!(region["kind"], "dut", "{map:#?}");
+    assert_eq!(region["size_bytes"], 256, "{map:#?}");
+    let base = region_base(&map, "csr");
+    // Register 2 is bytes 16..24: its low word at 16, its high word at 20.
+    // The read count is the low word of register 31.
+    let (lo, hi, count) = (base + 16, base + 20, base + 31 * 8);
+    let magic = offset_of(&map, "harness_magic");
+
+    let tb = format!(
+        r#"
+#[test(axi_slave_window)]
+module axi_slave_window {{
+{BUS}
+    var first : logic<32>;
+    var second: logic<32>;
+
+    initial {{
+        start();
+
+        wr({lo}, 32'h1111_2222);
+        wr({hi}, 32'h3333_4444);
+        $assert(rd({lo}) == 32'h1111_2222);
+        $assert(rd({hi}) == 32'h3333_4444);
+        // Writing the high word left the low one alone.
+        $assert(rd({lo}) == 32'h1111_2222);
+
+        first  = rd({count});
+        second = rd({count});
+        $display("reads counted: %0d then %0d", first, second);
+        $assert(second == first + 1);
+
+        $assert(rd({magic}) == 32'h5648524e);
+        $finish();
+    }}
+}}
+"#
+    );
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
 /// A Debug Module's DMI, an APB slave the harness drives (`dmi`).
 ///
 /// The stand-in counts the reads it answers and stretches each access phase
@@ -1864,6 +2112,103 @@ module dmi_window {{
         second = rd({count});
         $display("reads counted: %0d then %0d", first, second);
         $assert(second == first + 1);
+
+        $assert(rd({magic}) == 32'h5648524e);
+
+        $finish();
+    }}
+}}
+"#
+    );
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
+/// An APB register file in the DUT (`slave` with APB roles).
+///
+/// The roles come from the `p*` suffixes. The stand-in stretches each access
+/// phase with `pready` and ends the transfers to its last word with
+/// `pslverr`. Three checks: writes and reads reach it, the region is a plain
+/// DUT region (not `dmi`), and each errored transfer is counted once in
+/// `csr_slverr`.
+#[test]
+fn an_apb_slave_is_driven_and_its_errors_are_counted() {
+    let dut = r#"
+module dut_top (
+    i_clk        : input  clock    ,
+    i_rst        : input  reset    ,
+    i_csr_psel   : input  logic    ,
+    i_csr_penable: input  logic    ,
+    i_csr_pwrite : input  logic    ,
+    i_csr_paddr  : input  logic<6> ,
+    i_csr_pwdata : input  logic<32>,
+    o_csr_prdata : output logic<32>,
+    o_csr_pready : output logic    ,
+    o_csr_pslverr: output logic    ,
+) {
+    var regs : logic<32> [16];
+    var stall: logic<2>      ;
+    let word : logic<4>      = i_csr_paddr[5:2];
+    let done : logic         = i_csr_psel && i_csr_penable && o_csr_pready;
+
+    assign o_csr_pready  = stall == 1;
+    assign o_csr_prdata  = regs[word];
+    assign o_csr_pslverr = word == 4'hf;
+
+    always_ff {
+        if_reset {
+            stall = 0;
+        } else if i_csr_psel && i_csr_penable {
+            stall = if o_csr_pready ? 0 : stall + 1;
+        }
+    }
+    always_ff {
+        if done && i_csr_pwrite {
+            regs[word] = i_csr_pwdata;
+        }
+    }
+}
+"#;
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.csr]\nbacking = \"slave\"\n";
+
+    let dir = fixture(manifest, dut, "");
+    let map = offsets(dir.path());
+    let region = map["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|region| region["name"] == "csr")
+        .unwrap();
+    assert_eq!(region["kind"], "dut", "{map:#?}");
+    assert_eq!(region["size_bytes"], 64, "{map:#?}");
+    let base = region_base(&map, "csr");
+    let (slverr, magic) = (
+        offset_of(&map, "csr_slverr"),
+        offset_of(&map, "harness_magic"),
+    );
+    let (reg1, reg15) = (base + 4, base + 15 * 4);
+
+    let tb = format!(
+        r#"
+#[test(apb_slave_window)]
+module apb_slave_window {{
+{BUS}
+    initial {{
+        start();
+
+        wr({reg1}, 32'h1234_5678);
+        $assert(rd({reg1}) == 32'h1234_5678);
+        $assert(rd({slverr}) == 0);
+
+        // The last word answers with an error: one write, one read.
+        wr({reg15}, 32'h9abc_def0);
+        $display("errored read: %h", rd({reg15}));
+        $assert(rd({slverr}) == 2);
+        $assert(rd({reg1}) == 32'h1234_5678);
+        $assert(rd({slverr}) == 2);
 
         $assert(rd({magic}) == 32'h5648524e);
 

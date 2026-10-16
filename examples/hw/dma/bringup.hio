@@ -17,6 +17,8 @@ write i_dst 64 0
 write i_size 32
 write i_start 1
 write i_start 0
+# Over PCIe the next read comes right away; give the copy time to finish.
+sleep 10
 read o_busy
 read o_beats
 read o_sum

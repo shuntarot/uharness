@@ -360,7 +360,7 @@ pub enum TerminatorError {
     #[diagnostic(
         code(harness::terminator::slave_needs_addr),
         help(
-            "A slave is an interface the host addresses. The harness drives `addr` and reads `rdata`. Name them:\n\n    ports = {{ addr = \"<port>\", rdata = \"<port>\" }}\n\nIf the ports are plain registers, use `backing = \"reg\"`."
+            "A slave is an interface the host addresses: a RAM port, where the harness drives `addr` and reads `rdata`, or an APB slave (`psel`, `penable`, `pwrite`, `paddr`, `pwdata`, `prdata`). Name the roles:\n\n    ports = {{ addr = \"<port>\", rdata = \"<port>\" }}\n\nIf the ports are plain registers, use `backing = \"reg\"`."
         )
     )]
     SlaveNeedsAddr { bundle: String },
@@ -384,7 +384,7 @@ pub enum TerminatorError {
     #[diagnostic(
         code(harness::terminator::dram_needs_axi4),
         help(
-            "The board's memory controller takes AXI4, so the DUT has to present a `$std::axi4_if::master` port.\n\nFor a memory port with a fixed latency, use `backing = \"bram\"`."
+            "The board's memory controller has a variable latency, so the DUT has to be able to wait: present a `$std::axi4_if::master` port, or the transfer-level roles (`rd_cmd_*` / `rd_*` / `wr_*`).\n\nFor a memory port with a fixed latency, use `backing = \"bram\"`."
         )
     )]
     DramNeedsAxi4 { bundle: String },
@@ -411,6 +411,19 @@ pub enum TerminatorError {
         )
     )]
     NotTerminated { bundle: String, backing: String },
+
+    #[error("[bundle.{bundle}] carries `{port}`, which is {width} bits wide")]
+    #[diagnostic(
+        code(harness::terminator::slave_wider_than_a_word),
+        help(
+            "The window is 32 bits, and a register wider than one window word is not supported yet. Split it into 32-bit registers in a wrapper around the DUT."
+        )
+    )]
+    SlaveWiderThanAWord {
+        bundle: String,
+        port: String,
+        width: usize,
+    },
 
     #[error("[bundle.{bundle}] carries `{port}`, which is {width} bits wide")]
     #[diagnostic(
@@ -453,6 +466,31 @@ pub enum TerminatorError {
         port: String,
         what: &'static str,
     },
+
+    #[error("[bundle.{bundle}] addresses {addr_width} bits of bytes on `{port}`, which {what}")]
+    #[diagnostic(
+        code(harness::terminator::apb_slave_address_width),
+        help(
+            "`paddr` is a byte address of 32-bit registers, so it needs at least {min} bits. The harness maps the whole range into the host window, so it takes at most {max}.\n\nGive the port {min} to {max} bits in a wrapper around the DUT."
+        )
+    )]
+    ApbSlaveAddressWidth {
+        bundle: String,
+        port: String,
+        addr_width: usize,
+        what: &'static str,
+        min: usize,
+        max: usize,
+    },
+
+    #[error("[bundle.{bundle}] is an APB `slave` and also carries `{port}`, which is no APB port")]
+    #[diagnostic(
+        code(harness::terminator::apb_slave_stray_port),
+        help(
+            "An APB `slave` bundle holds the APB slave and nothing else: `psel`, `penable`, `pwrite`, `paddr`, `pwdata`, `prdata`, and optionally `pready` and `pslverr`.\n\nMove `{port}` to another bundle, or tie it off with `[tie_off]` / `[leave_open]`."
+        )
+    )]
+    ApbSlaveStrayPort { bundle: String, port: String },
 
     #[error("[bundle.{bundle}] is `dmi` and also carries `{port}`, which is no APB port")]
     #[diagnostic(
@@ -830,6 +868,38 @@ pub enum TerminatorError {
     )]
     DepthNotApplicable { bundle: String, backing: String },
 
+    /// The harness drives every channel of a DUT slave, so a one-sided
+    /// modport would leave a read or a write with nowhere to go.
+    #[error("[bundle.{bundle}] is `slave` but presents `{port}` as `{modport}`, not `slave`")]
+    #[diagnostic(
+        code(harness::terminator::axi_slave_not_a_slave),
+        help(
+            "In a `slave` bundle the host drives the DUT, so the DUT's AXI4 port must be `::slave`. A `::master` port reads and writes a memory: use `backing = \"bram\"` or `\"dram\"`."
+        )
+    )]
+    AxiSlaveNotASlave {
+        bundle: String,
+        port: String,
+        modport: String,
+    },
+
+    /// The window has a 32-bit address and other regions share it.
+    #[error(
+        "[bundle.{bundle}] addresses {addr_width} bits on `{port}`, which does not fit the host window"
+    )]
+    #[diagnostic(
+        code(harness::terminator::axi_slave_too_large),
+        help(
+            "The host window has a 32-bit address, so it shows at most 2^{max} bytes of a slave at once. Show it through a moving window of a size you choose; `<bundle>_base_jtag` picks which part:\n\n    [bundle.{bundle}]\n    aperture = \"64k\""
+        )
+    )]
+    AxiSlaveTooLarge {
+        bundle: String,
+        port: String,
+        addr_width: u32,
+        max: u32,
+    },
+
     /// An unconnected channel gives a read that never returns or a write that
     /// never ends.
     #[error("[bundle.{bundle}] presents `{port}` as `{modport}`, not `master`")]
@@ -958,6 +1028,221 @@ pub enum TerminatorError {
 // Resolution
 // ---------------------------------------------------------------------------
 
+/// The ports of a transfer-level bundle, checked against the DUT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XferPorts {
+    pub read: Option<HostMemRead>,
+    pub write: Option<HostMemWrite>,
+    /// The beat width, the same in both directions.
+    pub data_width: usize,
+    pub cmd_addr_width: usize,
+    pub cmd_size_width: usize,
+}
+
+/// Checks the transfer-level ports of a bundle: each present side whole, the
+/// directions, the widths, and the strobe. Shared by `bram` (`hns::hmem`) and
+/// `dram` (`hns::xfer2axi`), which serve the same port.
+fn resolve_xfer_ports(
+    dut: &Dut,
+    binding: &Binding,
+    contract: &BundleContract,
+) -> Result<XferPorts, TerminatorError> {
+    let want = |role: Role| {
+        contract
+            .roles
+            .iter()
+            .find(|assignment| assignment.role == role)
+            .map(|assignment| assignment.port.clone())
+    };
+    // The contract check already ensured that a side that is present is
+    // complete.
+    let find = |role: Role| want(role).expect("check_host_mem has required this half whole");
+
+    let width_of = |name: &str| -> Result<usize, TerminatorError> {
+        port_of(dut, name)
+            .width()
+            .ok_or_else(|| TerminatorError::UnresolvedWidth {
+                bundle: binding.bundle.clone(),
+                port: name.to_string(),
+            })
+    };
+    let single_bit = |port: &str, role: &'static str| -> Result<(), TerminatorError> {
+        expect_single_bit(&binding.bundle, port_of(dut, port), role)
+    };
+    // Check each direction against the DUT declaration (symbol table).
+    // Otherwise an `rd_cmd_valid` that is a DUT input would pass, and fail
+    // later in `veryl build` or on the board.
+    let direction = |port: &str, role: &'static str, want| -> Result<(), TerminatorError> {
+        expect_direction(
+            Shape::TransferLevel,
+            &binding.bundle,
+            port_of(dut, port),
+            role,
+            want,
+        )
+    };
+    use PortDirection::{Input, Output};
+
+    let read = match want(Role::RdCmdValid) {
+        Some(cmd_valid) => {
+            let r = HostMemRead {
+                cmd_valid,
+                cmd_ready: find(Role::RdCmdReady),
+                cmd_addr: find(Role::RdCmdAddr),
+                cmd_size: find(Role::RdCmdSize),
+                valid: find(Role::RdValid),
+                ready: find(Role::RdReady),
+                data: find(Role::RdData),
+                last: find(Role::RdLast),
+            };
+            for (port, role, want) in [
+                (&r.cmd_valid, "rd_cmd_valid", Output),
+                (&r.cmd_ready, "rd_cmd_ready", Input),
+                (&r.cmd_addr, "rd_cmd_addr", Output),
+                (&r.cmd_size, "rd_cmd_size", Output),
+                (&r.valid, "rd_valid", Input),
+                (&r.ready, "rd_ready", Output),
+                (&r.data, "rd_data", Input),
+                (&r.last, "rd_last", Input),
+            ] {
+                direction(port, role, want)?;
+            }
+            for (port, role) in [
+                (&r.cmd_valid, "rd_cmd_valid"),
+                (&r.cmd_ready, "rd_cmd_ready"),
+                (&r.valid, "rd_valid"),
+                (&r.ready, "rd_ready"),
+                (&r.last, "rd_last"),
+            ] {
+                single_bit(port, role)?;
+            }
+            Some(r)
+        }
+        None => None,
+    };
+
+    let write = match want(Role::WrCmdValid) {
+        Some(cmd_valid) => {
+            let w = HostMemWrite {
+                cmd_valid,
+                cmd_ready: find(Role::WrCmdReady),
+                cmd_addr: find(Role::WrCmdAddr),
+                cmd_size: find(Role::WrCmdSize),
+                valid: find(Role::WrValid),
+                ready: find(Role::WrReady),
+                data: find(Role::WrData),
+                strb: want(Role::WrStrb),
+                last: find(Role::WrLast),
+                done_valid: want(Role::WrDoneValid),
+            };
+            for (port, role, want) in [
+                (&w.cmd_valid, "wr_cmd_valid", Output),
+                (&w.cmd_ready, "wr_cmd_ready", Input),
+                (&w.cmd_addr, "wr_cmd_addr", Output),
+                (&w.cmd_size, "wr_cmd_size", Output),
+                (&w.valid, "wr_valid", Output),
+                (&w.ready, "wr_ready", Input),
+                (&w.data, "wr_data", Output),
+                (&w.last, "wr_last", Output),
+            ] {
+                direction(port, role, want)?;
+            }
+            if let Some(strb) = &w.strb {
+                direction(strb, "wr_strb", Output)?;
+            }
+            for (port, role) in [
+                (&w.cmd_valid, "wr_cmd_valid"),
+                (&w.cmd_ready, "wr_cmd_ready"),
+                (&w.valid, "wr_valid"),
+                (&w.ready, "wr_ready"),
+                (&w.last, "wr_last"),
+            ] {
+                single_bit(port, role)?;
+            }
+            if let Some(done) = &w.done_valid {
+                direction(done, "wr_done_valid", Input)?;
+                single_bit(done, "wr_done_valid")?;
+            }
+            Some(w)
+        }
+        None => None,
+    };
+
+    // Take the widths from the side that is present. With both sides, they
+    // must match.
+    let (data_width, cmd_addr_width, cmd_size_width) = match (&read, &write) {
+        (Some(r), _) => (
+            width_of(&r.data)?,
+            width_of(&r.cmd_addr)?,
+            width_of(&r.cmd_size)?,
+        ),
+        (None, Some(w)) => (
+            width_of(&w.data)?,
+            width_of(&w.cmd_addr)?,
+            width_of(&w.cmd_size)?,
+        ),
+        (None, None) => unreachable!("check_host_mem refuses a bundle with no role"),
+    };
+    if let (Some(r), Some(w)) = (&read, &write) {
+        let rw = width_of(&r.data)?;
+        let ww = width_of(&w.data)?;
+        if rw != ww {
+            return Err(TerminatorError::HostMemWidthMismatch {
+                bundle: binding.bundle.clone(),
+                read: rw,
+                write: ww,
+            });
+        }
+        for (what, read, write) in [
+            ("addr", &r.cmd_addr, &w.cmd_addr),
+            ("size", &r.cmd_size, &w.cmd_size),
+        ] {
+            let (read, write) = (width_of(read)?, width_of(write)?);
+            if read != write {
+                return Err(TerminatorError::HostMemCommandWidthMismatch {
+                    bundle: binding.bundle.clone(),
+                    what,
+                    read,
+                    write,
+                });
+            }
+        }
+    }
+
+    let bytes = data_width / 8;
+    // The address becomes an entry index by dropping low bits, so a beat
+    // must be a power-of-two number of bytes.
+    if data_width % 8 != 0 || !bytes.is_power_of_two() {
+        return Err(TerminatorError::HostMemBeatWidth {
+            bundle: binding.bundle.clone(),
+            width: data_width,
+        });
+    }
+
+    // One strobe bit per byte. emit declares `w_<strb>` as `data / 8` bits.
+    if let Some(strb) = write.as_ref().and_then(|w| w.strb.as_ref()) {
+        let width = width_of(strb)?;
+        if width * 8 != data_width {
+            return Err(TerminatorError::StrobeWidth {
+                bundle: binding.bundle.clone(),
+                port: strb.clone(),
+                role: "wr_strb",
+                width,
+                data: data_width,
+                want: data_width / 8,
+            });
+        }
+    }
+
+    Ok(XferPorts {
+        read,
+        write,
+        data_width,
+        cmd_addr_width,
+        cmd_size_width,
+    })
+}
+
 /// Plans the transfer-level bundles, only where a stand-in exists.
 ///
 /// The contract check (`contract::check_host_mem`) has already checked that the
@@ -997,192 +1282,14 @@ pub fn resolve_host_mem(
             .iter()
             .find(|contract| contract.bundle == binding.bundle)
             .expect("every bundle gets a contract");
-        let want = |role: Role| {
-            contract
-                .roles
-                .iter()
-                .find(|assignment| assignment.role == role)
-                .map(|assignment| assignment.port.clone())
-        };
-        // The contract check already ensured that a side that is present is
-        // complete.
-        let find = |role: Role| want(role).expect("check_host_mem has required this half whole");
-
-        let width_of = |name: &str| -> Result<usize, TerminatorError> {
-            port_of(dut, name)
-                .width()
-                .ok_or_else(|| TerminatorError::UnresolvedWidth {
-                    bundle: binding.bundle.clone(),
-                    port: name.to_string(),
-                })
-        };
-        let single_bit = |port: &str, role: &'static str| -> Result<(), TerminatorError> {
-            expect_single_bit(&binding.bundle, port_of(dut, port), role)
-        };
-        // Check each direction against the DUT declaration (symbol table).
-        // Otherwise an `rd_cmd_valid` that is a DUT input would pass, and fail
-        // later in `veryl build` or on the board.
-        let direction = |port: &str, role: &'static str, want| -> Result<(), TerminatorError> {
-            expect_direction(
-                Shape::TransferLevel,
-                &binding.bundle,
-                port_of(dut, port),
-                role,
-                want,
-            )
-        };
-        use PortDirection::{Input, Output};
-
-        let read = match want(Role::RdCmdValid) {
-            Some(cmd_valid) => {
-                let r = HostMemRead {
-                    cmd_valid,
-                    cmd_ready: find(Role::RdCmdReady),
-                    cmd_addr: find(Role::RdCmdAddr),
-                    cmd_size: find(Role::RdCmdSize),
-                    valid: find(Role::RdValid),
-                    ready: find(Role::RdReady),
-                    data: find(Role::RdData),
-                    last: find(Role::RdLast),
-                };
-                for (port, role, want) in [
-                    (&r.cmd_valid, "rd_cmd_valid", Output),
-                    (&r.cmd_ready, "rd_cmd_ready", Input),
-                    (&r.cmd_addr, "rd_cmd_addr", Output),
-                    (&r.cmd_size, "rd_cmd_size", Output),
-                    (&r.valid, "rd_valid", Input),
-                    (&r.ready, "rd_ready", Output),
-                    (&r.data, "rd_data", Input),
-                    (&r.last, "rd_last", Input),
-                ] {
-                    direction(port, role, want)?;
-                }
-                for (port, role) in [
-                    (&r.cmd_valid, "rd_cmd_valid"),
-                    (&r.cmd_ready, "rd_cmd_ready"),
-                    (&r.valid, "rd_valid"),
-                    (&r.ready, "rd_ready"),
-                    (&r.last, "rd_last"),
-                ] {
-                    single_bit(port, role)?;
-                }
-                Some(r)
-            }
-            None => None,
-        };
-
-        let write = match want(Role::WrCmdValid) {
-            Some(cmd_valid) => {
-                let w = HostMemWrite {
-                    cmd_valid,
-                    cmd_ready: find(Role::WrCmdReady),
-                    cmd_addr: find(Role::WrCmdAddr),
-                    cmd_size: find(Role::WrCmdSize),
-                    valid: find(Role::WrValid),
-                    ready: find(Role::WrReady),
-                    data: find(Role::WrData),
-                    strb: want(Role::WrStrb),
-                    last: find(Role::WrLast),
-                    done_valid: want(Role::WrDoneValid),
-                };
-                for (port, role, want) in [
-                    (&w.cmd_valid, "wr_cmd_valid", Output),
-                    (&w.cmd_ready, "wr_cmd_ready", Input),
-                    (&w.cmd_addr, "wr_cmd_addr", Output),
-                    (&w.cmd_size, "wr_cmd_size", Output),
-                    (&w.valid, "wr_valid", Output),
-                    (&w.ready, "wr_ready", Input),
-                    (&w.data, "wr_data", Output),
-                    (&w.last, "wr_last", Output),
-                ] {
-                    direction(port, role, want)?;
-                }
-                if let Some(strb) = &w.strb {
-                    direction(strb, "wr_strb", Output)?;
-                }
-                for (port, role) in [
-                    (&w.cmd_valid, "wr_cmd_valid"),
-                    (&w.cmd_ready, "wr_cmd_ready"),
-                    (&w.valid, "wr_valid"),
-                    (&w.ready, "wr_ready"),
-                    (&w.last, "wr_last"),
-                ] {
-                    single_bit(port, role)?;
-                }
-                if let Some(done) = &w.done_valid {
-                    direction(done, "wr_done_valid", Input)?;
-                    single_bit(done, "wr_done_valid")?;
-                }
-                Some(w)
-            }
-            None => None,
-        };
-
-        // Take the widths from the side that is present. With both sides, they
-        // must match.
-        let (data_width, cmd_addr_width, cmd_size_width) = match (&read, &write) {
-            (Some(r), _) => (
-                width_of(&r.data)?,
-                width_of(&r.cmd_addr)?,
-                width_of(&r.cmd_size)?,
-            ),
-            (None, Some(w)) => (
-                width_of(&w.data)?,
-                width_of(&w.cmd_addr)?,
-                width_of(&w.cmd_size)?,
-            ),
-            (None, None) => unreachable!("check_host_mem refuses a bundle with no role"),
-        };
-        if let (Some(r), Some(w)) = (&read, &write) {
-            let rw = width_of(&r.data)?;
-            let ww = width_of(&w.data)?;
-            if rw != ww {
-                return Err(TerminatorError::HostMemWidthMismatch {
-                    bundle: binding.bundle.clone(),
-                    read: rw,
-                    write: ww,
-                });
-            }
-            for (what, read, write) in [
-                ("addr", &r.cmd_addr, &w.cmd_addr),
-                ("size", &r.cmd_size, &w.cmd_size),
-            ] {
-                let (read, write) = (width_of(read)?, width_of(write)?);
-                if read != write {
-                    return Err(TerminatorError::HostMemCommandWidthMismatch {
-                        bundle: binding.bundle.clone(),
-                        what,
-                        read,
-                        write,
-                    });
-                }
-            }
-        }
-
-        let bytes = data_width / 8;
-        // The address becomes an entry index by dropping low bits, so a beat
-        // must be a power-of-two number of bytes.
-        if data_width % 8 != 0 || !bytes.is_power_of_two() {
-            return Err(TerminatorError::HostMemBeatWidth {
-                bundle: binding.bundle.clone(),
-                width: data_width,
-            });
-        }
-
-        // One strobe bit per byte. emit declares `w_<strb>` as `data / 8` bits.
-        if let Some(strb) = write.as_ref().and_then(|w| w.strb.as_ref()) {
-            let width = width_of(strb)?;
-            if width * 8 != data_width {
-                return Err(TerminatorError::StrobeWidth {
-                    bundle: binding.bundle.clone(),
-                    port: strb.clone(),
-                    role: "wr_strb",
-                    width,
-                    data: data_width,
-                    want: data_width / 8,
-                });
-            }
-        }
+        let ports = resolve_xfer_ports(dut, binding, contract)?;
+        let XferPorts {
+            read,
+            write,
+            data_width,
+            cmd_addr_width,
+            cmd_size_width,
+        } = ports;
 
         let depth = declared.depth.unwrap_or(DEFAULT_DEPTH);
         if depth < 2 || !depth.is_power_of_two() {
@@ -1221,15 +1328,19 @@ pub struct SlavePlan {
     pub addr: String,
     pub addr_width: usize,
 
-    /// Read data (a DUT output).
+    /// Read data (a DUT output), at most one window word. A narrower one
+    /// reads back with zeros above it.
     pub rdata: String,
     pub width: usize,
 
-    /// The write side. None for a read-only interface.
+    /// The write side. None for a read-only interface. A narrower `wdata`
+    /// takes the low bits of the window word.
     pub wdata: Option<String>,
+    pub wdata_width: usize,
     pub we: Option<String>,
 
-    /// The declared latency. The decoder waits exactly this long.
+    /// The declared latency. The decoder waits exactly this long; with 0 it
+    /// holds the answer itself.
     pub latency: u32,
 }
 
@@ -1392,6 +1503,11 @@ pub fn resolve_slaves(
             .iter()
             .find(|contract| contract.bundle == binding.bundle)
             .expect("every bundle gets a contract");
+        // An APB slave goes to `resolve_apbs`, an AXI4 one to
+        // `resolve_axi_slaves`.
+        if matches!(contract.contract, Contract::Apb | Contract::Axi) {
+            continue;
+        }
         let role_port = |role: Role| {
             contract
                 .roles
@@ -1452,10 +1568,10 @@ pub fn resolve_slaves(
                 port: rdata.clone(),
             })?;
 
-        // The window is 32 bits. Slicing for wider or narrower reads is not
-        // implemented yet.
-        if width != crate::regmap::WORD_BITS {
-            return Err(TerminatorError::SlaveWidthNotAWord {
+        // The window is 32 bits. A narrower port reads with zeros above it;
+        // splitting a wider one is not implemented yet.
+        if width > crate::regmap::WORD_BITS {
+            return Err(TerminatorError::SlaveWiderThanAWord {
                 bundle: binding.bundle.clone(),
                 port: rdata.clone(),
                 width,
@@ -1464,6 +1580,7 @@ pub fn resolve_slaves(
 
         let wdata = role_port(Role::WData);
         let we = role_port(Role::We);
+        let mut wdata_width = 0;
         // Write ports come in pairs. With only one, either when to write or
         // what to write is unknown.
         if wdata.is_some() != we.is_some() {
@@ -1484,18 +1601,18 @@ pub fn resolve_slaves(
                 )?;
             }
             expect_single_bit(&binding.bundle, we_port, Role::We.as_str())?;
-            // emit connects the window write data (32 bits) directly.
-            let wwidth = wdata_port
+            // emit gives it the low bits of the window write data.
+            wdata_width = wdata_port
                 .width()
                 .ok_or_else(|| TerminatorError::UnresolvedWidth {
                     bundle: binding.bundle.clone(),
                     port: wdata.clone(),
                 })?;
-            if wwidth != crate::regmap::WORD_BITS {
-                return Err(TerminatorError::SlaveWidthNotAWord {
+            if wdata_width > crate::regmap::WORD_BITS {
+                return Err(TerminatorError::SlaveWiderThanAWord {
                     bundle: binding.bundle.clone(),
                     port: wdata.clone(),
-                    width: wwidth,
+                    width: wdata_width,
                 });
             }
         }
@@ -1507,6 +1624,7 @@ pub fn resolve_slaves(
             rdata,
             width,
             wdata,
+            wdata_width,
             we,
             latency,
         });
@@ -1515,11 +1633,14 @@ pub fn resolve_slaves(
     Ok(plans)
 }
 
-/// A `dmi` bundle: the APB slave of a RISC-V Debug Module, mapped whole into
-/// the window. The harness is the APB master (`hns::apb_host`).
+/// An APB slave in the DUT, mapped whole into the window: a `dmi` bundle (the
+/// DMI of a RISC-V Debug Module) or a `slave` bundle with APB roles. The
+/// harness is the APB master (`hns::apb_host`).
 #[derive(Debug, Clone)]
-pub struct DmiPlan {
+pub struct ApbPlan {
     pub bundle: String,
+    /// A `dmi` bundle. Its region is marked for `hio cpu`.
+    pub debug_module: bool,
     pub psel: String,
     pub penable: String,
     pub pwrite: String,
@@ -1530,12 +1651,15 @@ pub struct DmiPlan {
     pub prdata: String,
     /// None when the slave always answers in the access phase.
     pub pready: Option<String>,
+    /// The error answer (`slave` only). The harness counts the transfers it
+    /// ends in `<bundle>_slverr`.
+    pub pslverr: Option<String>,
     /// The Debug Module's reset port, which gets the harness reset. None:
     /// the Debug Module is on the DUT reset, and `hio reset` resets it too.
     pub reset: Option<String>,
 }
 
-impl DmiPlan {
+impl ApbPlan {
     /// The bytes it takes in the window: the whole address range.
     pub fn size_bytes(&self) -> usize {
         1 << self.addr_width
@@ -1547,27 +1671,52 @@ impl DmiPlan {
 pub const DMI_MIN_ADDR_BITS: usize = 9;
 /// Far more than one Debug Module, and still a small part of the window.
 pub const DMI_MAX_ADDR_BITS: usize = 16;
+/// An APB `slave`: one 32-bit register at least, and the same 2^29 words as a
+/// `slave` with a RAM port at most.
+pub const APB_SLAVE_MIN_ADDR_BITS: usize = 2;
+pub const APB_SLAVE_MAX_ADDR_BITS: usize = 31;
 
-/// Resolves the `dmi` bundles, in bundle name order.
-pub fn resolve_dmis(
+/// Resolves the APB bundles (`dmi`, and `slave` with APB roles), in bundle
+/// name order.
+pub fn resolve_apbs(
     dut: &Dut,
     manifest: &Manifest,
     bindings: &[Binding],
     contracts: &[BundleContract],
-) -> Result<Vec<DmiPlan>, TerminatorError> {
+) -> Result<Vec<ApbPlan>, TerminatorError> {
     let mut plans = Vec::new();
     for binding in bindings {
-        if manifest.bundle[&binding.bundle].backing != crate::manifest::Backing::Dmi {
-            continue;
-        }
         let contract = contracts
             .iter()
             .find(|contract| contract.bundle == binding.bundle)
             .expect("every bundle gets a contract");
-        if let Some(stray) = contract.roles.iter().find(|r| !r.role.is_apb()) {
-            return Err(TerminatorError::DmiStrayPort {
-                bundle: binding.bundle.clone(),
-                port: stray.port.clone(),
+        let debug_module = match manifest.bundle[&binding.bundle].backing {
+            crate::manifest::Backing::Dmi => true,
+            crate::manifest::Backing::Slave if contract.contract == Contract::Apb => false,
+            _ => continue,
+        };
+        let shape = if debug_module {
+            Shape::Dmi
+        } else {
+            Shape::ApbSlave
+        };
+        // A Debug Module reports its errors in its own registers, so `dmi`
+        // takes no `pslverr`.
+        if let Some(stray) = contract
+            .roles
+            .iter()
+            .find(|r| !r.role.is_apb() || (debug_module && r.role == Role::Pslverr))
+        {
+            return Err(if debug_module {
+                TerminatorError::DmiStrayPort {
+                    bundle: binding.bundle.clone(),
+                    port: stray.port.clone(),
+                }
+            } else {
+                TerminatorError::ApbSlaveStrayPort {
+                    bundle: binding.bundle.clone(),
+                    port: stray.port.clone(),
+                }
             });
         }
         // `contract::check_apb` made sure the needed roles are there.
@@ -1590,7 +1739,7 @@ pub fn resolve_dmis(
         for role in inputs {
             let port = port_of(dut, &needed(role));
             expect_direction(
-                Shape::Dmi,
+                shape,
                 &binding.bundle,
                 port,
                 role.as_str(),
@@ -1598,14 +1747,16 @@ pub fn resolve_dmis(
             )?;
         }
         let pready = role_port(Role::Pready);
+        let pslverr = role_port(Role::Pslverr);
         for (role, name) in [
             (Role::Prdata, Some(needed(Role::Prdata))),
             (Role::Pready, pready.clone()),
+            (Role::Pslverr, pslverr.clone()),
         ] {
             if let Some(name) = name {
                 let port = port_of(dut, &name);
                 expect_direction(
-                    Shape::Dmi,
+                    shape,
                     &binding.bundle,
                     port,
                     role.as_str(),
@@ -1616,8 +1767,10 @@ pub fn resolve_dmis(
         for role in [Role::Psel, Role::Penable, Role::Pwrite] {
             expect_single_bit(&binding.bundle, port_of(dut, &needed(role)), role.as_str())?;
         }
-        if let Some(pready) = &pready {
-            expect_single_bit(&binding.bundle, port_of(dut, pready), Role::Pready.as_str())?;
+        for (role, name) in [(Role::Pready, &pready), (Role::Pslverr, &pslverr)] {
+            if let Some(name) = name {
+                expect_single_bit(&binding.bundle, port_of(dut, name), role.as_str())?;
+            }
         }
         // The window is 32 bits, and the Debug Module registers are too.
         for role in [Role::Pwdata, Role::Prdata] {
@@ -1645,22 +1798,42 @@ pub fn resolve_dmis(
                     bundle: binding.bundle.clone(),
                     port: paddr.clone(),
                 })?;
-        let what = if addr_width < DMI_MIN_ADDR_BITS {
-            Some("is too few to reach every Debug Module register")
-        } else if addr_width > DMI_MAX_ADDR_BITS {
-            Some("is more than the window gives one Debug Module")
+        if debug_module {
+            let what = if addr_width < DMI_MIN_ADDR_BITS {
+                Some("is too few to reach every Debug Module register")
+            } else if addr_width > DMI_MAX_ADDR_BITS {
+                Some("is more than the window gives one Debug Module")
+            } else {
+                None
+            };
+            if let Some(what) = what {
+                return Err(TerminatorError::DmiAddressWidth {
+                    bundle: binding.bundle.clone(),
+                    port: paddr,
+                    addr_width,
+                    what,
+                    min: DMI_MIN_ADDR_BITS,
+                    max: DMI_MAX_ADDR_BITS,
+                });
+            }
         } else {
-            None
-        };
-        if let Some(what) = what {
-            return Err(TerminatorError::DmiAddressWidth {
-                bundle: binding.bundle.clone(),
-                port: paddr,
-                addr_width,
-                what,
-                min: DMI_MIN_ADDR_BITS,
-                max: DMI_MAX_ADDR_BITS,
-            });
+            let what = if addr_width < APB_SLAVE_MIN_ADDR_BITS {
+                Some("is too few to reach one 32-bit register")
+            } else if addr_width > APB_SLAVE_MAX_ADDR_BITS {
+                Some("does not fit the host window")
+            } else {
+                None
+            };
+            if let Some(what) = what {
+                return Err(TerminatorError::ApbSlaveAddressWidth {
+                    bundle: binding.bundle.clone(),
+                    port: paddr,
+                    addr_width,
+                    what,
+                    min: APB_SLAVE_MIN_ADDR_BITS,
+                    max: APB_SLAVE_MAX_ADDR_BITS,
+                });
+            }
         }
 
         let reset = manifest.bundle[&binding.bundle].reset.clone();
@@ -1687,8 +1860,9 @@ pub fn resolve_dmis(
             }
         }
 
-        plans.push(DmiPlan {
+        plans.push(ApbPlan {
             bundle: binding.bundle.clone(),
+            debug_module,
             psel: needed(Role::Psel),
             penable: needed(Role::Penable),
             pwrite: needed(Role::Pwrite),
@@ -1697,6 +1871,7 @@ pub fn resolve_dmis(
             pwdata: needed(Role::Pwdata),
             prdata: needed(Role::Prdata),
             pready,
+            pslverr,
             reset,
         });
     }
@@ -2308,6 +2483,10 @@ pub struct AxiMemPlan {
     /// The DUT address of the first byte, 0 without `dut_base`. With one,
     /// `hns::axi_range` takes it off and answers the rest with DECERR.
     pub dut_base: u64,
+
+    /// A `dram` whose DUT side is a transfer-level port. `hns::xfer2axi`
+    /// turns it into the AXI4 master, and `port` is empty.
+    pub xfer: Option<XferPorts>,
 }
 
 impl AxiMemPlan {
@@ -2364,6 +2543,99 @@ fn dram_not_on_target(bundle: &str, target: &hns_targets::Target) -> TerminatorE
     }
 }
 
+/// An AXI4 slave port of the DUT (`slave`), which the host reads and writes
+/// through `hns::axi_host`, one word at a time.
+#[derive(Debug)]
+pub struct AxiSlavePlan {
+    pub bundle: String,
+    /// The DUT port name (a `::slave` modport port).
+    pub port: String,
+    /// `std::axi4_pkg::<..>`, with the same arguments the DUT used.
+    pub pkg: String,
+    pub addr_width: u32,
+    pub data_bytes: u32,
+    /// The bytes shown in the window. Smaller than the address space means a
+    /// moving window.
+    pub aperture_bytes: Option<usize>,
+}
+
+impl AxiSlavePlan {
+    /// The 32-bit words of the whole address space. `hns::axi_host` picks the
+    /// word inside a wider beat.
+    pub fn region_words(&self) -> u64 {
+        1u64 << (self.addr_width - 2)
+    }
+
+    /// The width of the word index.
+    pub fn word_addr_width(&self) -> usize {
+        self.addr_width as usize - 2
+    }
+}
+
+/// The widest address an AXI4 `slave` maps whole into the window, as for a
+/// `slave` RAM port (2^29 words).
+pub const AXI_SLAVE_MAX_ADDR_BITS: u32 = 31;
+
+/// Resolves the `slave` bundles with an AXI4 port.
+pub fn resolve_axi_slaves(
+    dut: &Dut,
+    manifest: &Manifest,
+    bindings: &[Binding],
+) -> Result<Vec<AxiSlavePlan>, TerminatorError> {
+    let mut plans = Vec::new();
+    for binding in bindings {
+        let declared = &manifest.bundle[&binding.bundle];
+        if declared.backing != Backing::Slave {
+            continue;
+        }
+        let Some((port, axi4)) = binding.ports.iter().find_map(|name| {
+            let port = port_of(dut, name);
+            port.axi4.as_ref().map(|axi4| (port, axi4))
+        }) else {
+            continue;
+        };
+        if axi4.modport != "slave" {
+            return Err(TerminatorError::AxiSlaveNotASlave {
+                bundle: binding.bundle.clone(),
+                port: port.name.clone(),
+                modport: axi4.modport.clone(),
+            });
+        }
+        // The window is 32 bits, so a word must not span two beats.
+        if axi4.data_bytes() < 4 || !axi4.data_bytes().is_power_of_two() {
+            return Err(TerminatorError::AxiMemWidthNotAWordMultiple {
+                bundle: binding.bundle.clone(),
+                port: port.name.clone(),
+                bits: axi4.data_width(),
+            });
+        }
+        let addr_width = axi4.addr_width();
+        if declared.aperture.is_none() && addr_width > AXI_SLAVE_MAX_ADDR_BITS {
+            return Err(TerminatorError::AxiSlaveTooLarge {
+                bundle: binding.bundle.clone(),
+                port: port.name.clone(),
+                addr_width,
+                max: AXI_SLAVE_MAX_ADDR_BITS,
+            });
+        }
+        let aperture_bytes = aperture_of(
+            &binding.bundle,
+            declared.aperture,
+            1u64 << addr_width.min(63),
+            4,
+        )?;
+        plans.push(AxiSlavePlan {
+            bundle: binding.bundle.clone(),
+            port: port.name.clone(),
+            pkg: axi4.pkg(),
+            addr_width,
+            data_bytes: axi4.data_bytes(),
+            aperture_bytes,
+        });
+    }
+    Ok(plans)
+}
+
 /// The number of words the controller can reach, only from a measured value.
 ///
 /// The address width is `axi_addr_bits` in the target description, read from
@@ -2389,6 +2661,7 @@ pub fn resolve_axi_mems(
     dut: &Dut,
     manifest: &Manifest,
     bindings: &[Binding],
+    contracts: &[BundleContract],
     target: Option<&hns_targets::Target>,
 ) -> Result<Vec<AxiMemPlan>, TerminatorError> {
     let mut plans = Vec::new();
@@ -2398,36 +2671,75 @@ pub fn resolve_axi_mems(
         if !declared.backing.is_memory() && declared.backing != Backing::Dram {
             continue;
         }
-        let Some((port, axi4)) = binding.ports.iter().find_map(|name| {
+        let contract = contracts
+            .iter()
+            .find(|contract| contract.bundle == binding.bundle)
+            .expect("every bundle gets a contract");
+        let axi = binding.ports.iter().find_map(|name| {
             let port = port_of(dut, name);
             port.axi4.as_ref().map(|axi4| (port, axi4))
-        }) else {
-            // `bram` has other shapes. The `dram` controller accepts only AXI4.
-            if declared.backing == Backing::Dram {
-                return Err(TerminatorError::DramNeedsAxi4 {
-                    bundle: binding.bundle.clone(),
-                });
-            }
-            continue;
+        });
+        // A `dram` with a transfer-level port gets `hns::xfer2axi` in front.
+        // `bram` serves that port itself (`resolve_host_mem`).
+        let xfer = if axi.is_none()
+            && declared.backing == Backing::Dram
+            && contract.roles.iter().any(|r| r.role.is_host_mem())
+        {
+            Some(resolve_xfer_ports(dut, binding, contract)?)
+        } else {
+            None
         };
-
-        // The harness is always the slave, so the DUT must be the master. A
-        // one-sided modport (`write_master` / `read_master`) would leave the
-        // other channels undriven while they only look connected, so reject it.
-        if axi4.modport != "master" {
-            return Err(TerminatorError::AxiMemNotAMaster {
-                bundle: binding.bundle.clone(),
-                port: port.name.clone(),
-                modport: axi4.modport.clone(),
-            });
-        }
-        // `bram_preload` on AXI4 is not built yet. Accepting only
-        // `read_master` would need a read-only form of `hns::axi_mem`.
-        if declared.backing == Backing::BramPreload {
-            return Err(TerminatorError::AxiPreloadUnsupported {
-                bundle: binding.bundle.clone(),
-            });
-        }
+        let (port_name, data_bytes, data_port) = match (&axi, &xfer) {
+            (Some((port, axi4)), _) => {
+                // The harness is always the slave, so the DUT must be the
+                // master. A one-sided modport (`write_master` /
+                // `read_master`) would leave the other channels undriven while
+                // they only look connected, so reject it.
+                if axi4.modport != "master" {
+                    return Err(TerminatorError::AxiMemNotAMaster {
+                        bundle: binding.bundle.clone(),
+                        port: port.name.clone(),
+                        modport: axi4.modport.clone(),
+                    });
+                }
+                // `bram_preload` on AXI4 is not built yet. Accepting only
+                // `read_master` would need a read-only form of `hns::axi_mem`.
+                if declared.backing == Backing::BramPreload {
+                    return Err(TerminatorError::AxiPreloadUnsupported {
+                        bundle: binding.bundle.clone(),
+                    });
+                }
+                (port.name.clone(), axi4.data_bytes(), port.name.clone())
+            }
+            (None, Some(xfer)) => {
+                // A command address is already an offset into the memory.
+                if declared.dut_base.is_some() {
+                    return Err(TerminatorError::KeyNotApplicable {
+                        bundle: binding.bundle.clone(),
+                        key: "dut_base",
+                        shape: "a transfer-level `dram` port",
+                        takes: "`depth`, `aperture`".to_string(),
+                    });
+                }
+                let data_port = xfer
+                    .read
+                    .as_ref()
+                    .map(|r| r.data.clone())
+                    .or_else(|| xfer.write.as_ref().map(|w| w.data.clone()))
+                    .expect("a transfer-level port has a side");
+                (String::new(), (xfer.data_width / 8) as u32, data_port)
+            }
+            (None, None) => {
+                // `bram` has other shapes. The `dram` controller takes AXI4,
+                // or a transfer-level port through `hns::xfer2axi`.
+                if declared.backing == Backing::Dram {
+                    return Err(TerminatorError::DramNeedsAxi4 {
+                        bundle: binding.bundle.clone(),
+                    });
+                }
+                continue;
+            }
+        };
 
         // For `dram` without `depth`, the default is everything the controller
         // can reach. The row and bank pins for the upper part of the chip never
@@ -2442,7 +2754,7 @@ pub fn resolve_axi_mems(
         let depth = match declared.depth {
             Some(depth) => depth,
             None if declared.backing == Backing::Dram => {
-                let Some(reach) = controller_reach(target, axi4.data_bytes()) else {
+                let Some(reach) = controller_reach(target, data_bytes) else {
                     return Err(match target {
                         Some(target) => dram_not_on_target(&binding.bundle, target),
                         None => TerminatorError::DramDepthNeedsATarget {
@@ -2470,13 +2782,29 @@ pub fn resolve_axi_mems(
         // The bus must be a power-of-two multiple of 32 bits. The window is
         // 32 bits, so otherwise one word would span two bus words, and that
         // slicing is not implemented.
-        if axi4.data_bytes() < 4 || !axi4.data_bytes().is_power_of_two() {
+        if data_bytes < 4 || !data_bytes.is_power_of_two() {
             return Err(TerminatorError::AxiMemWidthNotAWordMultiple {
                 bundle: binding.bundle.clone(),
-                port: port.name.clone(),
-                bits: axi4.data_width(),
+                port: data_port,
+                bits: data_bytes * 8,
             });
         }
+
+        // The AXI4 type. A transfer-level port has none, so `hns::xfer2axi`
+        // gets one just wide enough for the memory, at least 4 KB, the span
+        // of a burst.
+        let (pkg, addr_width, id_width) = match &axi {
+            Some((_, axi4)) => (axi4.pkg(), axi4.addr_width(), axi4.id_width()),
+            None => {
+                let bytes = u64::from(depth) * u64::from(data_bytes);
+                let bits = bytes.trailing_zeros().max(12);
+                (
+                    format!("$std::axi4_pkg::<{bits}, {data_bytes}, 1, 1, 1, 1, 1, 1>"),
+                    bits,
+                    1,
+                )
+            }
+        };
 
         // `dram` requires `aperture`. It is known not to fit in the window, so
         // the default "whole memory" would silently build a 256 MB window, and
@@ -2489,7 +2817,7 @@ pub fn resolve_axi_mems(
         let aperture_bytes = aperture_of(
             &binding.bundle,
             declared.aperture,
-            depth as u64 * axi4.data_bytes() as u64,
+            depth as u64 * data_bytes as u64,
             4,
         )?;
 
@@ -2504,14 +2832,14 @@ pub fn resolve_axi_mems(
                     above: dut_base - dut_base % PAGE + PAGE,
                 });
             }
-            let end = u128::from(dut_base) + depth as u128 * axi4.data_bytes() as u128;
-            if end > 1u128 << axi4.addr_width().min(127) {
+            let end = u128::from(dut_base) + depth as u128 * data_bytes as u128;
+            if end > 1u128 << addr_width.min(127) {
                 return Err(TerminatorError::DutBasePastAddress {
                     bundle: binding.bundle.clone(),
-                    port: port.name.clone(),
+                    port: port_name.clone(),
                     base: dut_base,
                     end,
-                    bits: axi4.addr_width() as usize,
+                    bits: addr_width as usize,
                 });
             }
         }
@@ -2519,15 +2847,16 @@ pub fn resolve_axi_mems(
         plans.push(AxiMemPlan {
             bundle: binding.bundle.clone(),
             backing: declared.backing,
-            port: port.name.clone(),
-            pkg: axi4.pkg(),
-            addr_width: axi4.addr_width(),
-            data_bytes: axi4.data_bytes(),
-            id_width: axi4.id_width(),
+            port: port_name,
+            pkg,
+            addr_width,
+            data_bytes,
+            id_width,
             depth,
             depth_defaulted: declared.depth.is_none(),
             aperture_bytes,
             dut_base,
+            xfer,
         });
     }
 
@@ -2595,8 +2924,9 @@ pub fn check_claimed(
     memories: &[MemPlan],
     host_mems: &[HostMemPlan],
     slaves: &[SlavePlan],
-    dmis: &[DmiPlan],
+    apbs: &[ApbPlan],
     axi_mems: &[AxiMemPlan],
+    axi_slaves: &[AxiSlavePlan],
     irqs: &[IrqPlan],
     flrs: &[FlrPlan],
 ) -> Result<(), TerminatorError> {
@@ -2632,14 +2962,33 @@ pub fn check_claimed(
                 &[][..],
             ),
             (
-                dmis.iter().any(|p| p.bundle == name),
+                apbs.iter().any(|p| p.bundle == name && p.debug_module),
                 "a `dmi`",
                 &[RESET][..],
             ),
             (
-                axi_mems.iter().any(|p| p.bundle == name),
+                apbs.iter().any(|p| p.bundle == name && !p.debug_module),
+                "an APB `slave`",
+                &[][..],
+            ),
+            (
+                axi_mems
+                    .iter()
+                    .any(|p| p.bundle == name && p.xfer.is_none()),
                 "an AXI4 memory port",
                 &[DEPTH, APERTURE, DUT_BASE][..],
+            ),
+            (
+                axi_mems
+                    .iter()
+                    .any(|p| p.bundle == name && p.xfer.is_some()),
+                "a transfer-level `dram` port",
+                &[DEPTH, APERTURE][..],
+            ),
+            (
+                axi_slaves.iter().any(|p| p.bundle == name),
+                "an AXI4 `slave`",
+                &[APERTURE][..],
             ),
             (
                 irqs.iter().any(|p| p.bundle == name),
@@ -2733,6 +3082,7 @@ enum Shape {
     TransferLevel,
     Slave,
     Dmi,
+    ApbSlave,
 }
 
 impl Shape {
@@ -2758,6 +3108,11 @@ impl Shape {
                 "a `dmi`",
                 "In a `dmi` bundle the harness is the APB master: it drives `psel`, `penable`, `pwrite`, `paddr` and `pwdata`, and the Debug Module answers on `prdata` and `pready`.",
                 "Check the role of the port in `ports`, or use the Debug Module's own APB ports.",
+            ),
+            Shape::ApbSlave => (
+                "an APB `slave`",
+                "In an APB slave the harness is the APB master: it drives `psel`, `penable`, `pwrite`, `paddr` and `pwdata`, and the DUT answers on `prdata`, `pready` and `pslverr`.",
+                "Check the role of the port in `ports`.",
             ),
             Shape::Slave => (
                 "a `slave`",

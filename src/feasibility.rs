@@ -1174,6 +1174,7 @@ mod tests {
             depth_defaulted: false,
             aperture_bytes: Some(256),
             dut_base: 0,
+            xfer: None,
         }];
         let err = check(
             &manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n"),
@@ -1220,6 +1221,7 @@ mod tests {
             depth_defaulted: false,
             aperture_bytes: Some(256),
             dut_base: 0,
+            xfer: None,
         }];
         let manifest = manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n");
         let err = check(&manifest, &[], &[], &plans, &target, Some("pcie")).unwrap_err();
@@ -1259,6 +1261,7 @@ mod tests {
             depth_defaulted: false,
             aperture_bytes: Some(256),
             dut_base: 0,
+            xfer: None,
         }];
         let manifest = manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n");
         let err = check(&manifest, &[], &[], &plans, &target, Some("jtag")).unwrap_err();
@@ -1294,6 +1297,7 @@ mod tests {
             depth_defaulted: false,
             aperture_bytes: Some(256),
             dut_base: 0,
+            xfer: None,
         };
         let m = manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n");
 
@@ -1382,6 +1386,7 @@ mod tests {
             depth_defaulted: true,
             aperture_bytes: None,
             dut_base: 0,
+            xfer: None,
         };
         let run = |p: AxiMemPlan| {
             check(
@@ -1583,6 +1588,7 @@ mod tests {
             depth_defaulted: false,
             aperture_bytes: None,
             dut_base: 0,
+            xfer: None,
         };
         let one = [mem("a")];
         assert!(check_capacity(&arty(), &[], &one, &[], &[]).is_ok());

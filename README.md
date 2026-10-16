@@ -67,9 +67,10 @@ Each one in `examples/hw/` is a project with a `Harness.toml` and a
 |---|---|
 | `fifo` | `std::fifo`, nothing else: does a board still work? |
 | `all` | every backing at once: `reg`, `slave`, `bram`, `host_poll_fifo` |
+| `slave` | register files in the DUT: RAM ports of other latencies and widths, APB, AXI4 |
 | `axi` | an AXI4 master, its memory in the FPGA (`bram`) |
 | `dram` | the same master on the board's DDR (`dram`) |
-| `dma` | a small DMA engine that copies within a memory |
+| `dma` | a small DMA engine that copies within a memory; `Harness.dram.toml` puts it on the board's DDR |
 | `rocket` | a rocket-chip RISC-V core running a program from DRAM |
 
 ## Build

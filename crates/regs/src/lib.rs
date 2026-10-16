@@ -203,6 +203,12 @@ pub struct Region {
     /// (`size_bytes` is everything).
     #[serde(default)]
     pub total_bytes: Option<u64>,
+
+    /// The harness drives nothing here while the DUT is held in reset (an
+    /// APB or AXI4 slave of the DUT). An access then is not answered until
+    /// the window times out. Absent when false.
+    #[serde(default)]
+    pub held_in_dut_reset: bool,
 }
 
 impl RegisterMap {

@@ -1,0 +1,276 @@
+/// `hns::xfer2axi` in front of `hns::axi_mem`: transfers become AXI4 bursts
+/// of at most 256 beats that never cross 4 KB, and what is out of range is
+/// served as `hns::hmem` serves it.
+#[test(xfer2axi_serves_transfers_over_axi4)]
+module test_xfer2axi {
+    const DEPTH: u32 = 2048;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    inst bus: $std::axi4_if::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>>;
+
+    var rc_valid: logic    ;
+    var rc_ready: logic    ;
+    var rc_addr : logic<32>;
+    var rc_size : logic<32>;
+    var r_valid : logic    ;
+    var r_ready : logic    ;
+    var r_data  : logic<32>;
+    var r_last  : logic    ;
+    var wc_valid: logic    ;
+    var wc_ready: logic    ;
+    var wc_addr : logic<32>;
+    var wc_size : logic<32>;
+    var w_valid : logic    ;
+    var w_ready : logic    ;
+    var w_data  : logic<32>;
+    var w_strb  : logic<4> ;
+    var w_last  : logic    ;
+    var w_done  : logic    ;
+    var oor     : logic<32>;
+
+    inst u: xfer2axi::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>> #(
+        HAS_STRB: true ,
+        DEPTH   : DEPTH,
+        ADDR_W  : 32   ,
+        SIZE_W  : 32   ,
+    ) (
+        i_clk          : clk     ,
+        i_rst          : rst     ,
+        i_rd_cmd_valid : rc_valid,
+        o_rd_cmd_ready : rc_ready,
+        i_rd_cmd_addr  : rc_addr ,
+        i_rd_cmd_size  : rc_size ,
+        o_rd_valid     : r_valid ,
+        i_rd_ready     : r_ready ,
+        o_rd_data      : r_data  ,
+        o_rd_last      : r_last  ,
+        i_wr_cmd_valid : wc_valid,
+        o_wr_cmd_ready : wc_ready,
+        i_wr_cmd_addr  : wc_addr ,
+        i_wr_cmd_size  : wc_size ,
+        i_wr_valid     : w_valid ,
+        o_wr_ready     : w_ready ,
+        i_wr_data      : w_data  ,
+        i_wr_strb      : w_strb  ,
+        i_wr_last      : w_last  ,
+        o_wr_done_valid: w_done  ,
+        axi            : bus     ,
+        o_oor          : oor     ,
+    );
+
+    inst u_mem: axi_mem::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>> #(
+        DEPTH: DEPTH,
+    ) (
+        i_clk   : clk,
+        i_rst   : rst,
+        axi     : bus,
+        i_haddr : '0 ,
+        i_hwdata: '0 ,
+        i_hwstrb: '0 ,
+        i_hwe   : '0 ,
+        o_hrdata: _  ,
+    );
+
+    // Every burst, as the memory sees it: at most 256 beats, inside 4 KB.
+    var ars   : logic<32>;
+    var aws   : logic<32>;
+    var broken: logic<32>;
+
+    let ar_end: logic<32> = bus.araddr + ({24'h0, bus.arlen} + 1) * 4 - 1;
+    let aw_end: logic<32> = bus.awaddr + ({24'h0, bus.awlen} + 1) * 4 - 1;
+
+    always_ff (clk, rst) {
+        if_reset {
+            ars    = 0;
+            aws    = 0;
+            broken = 0;
+        } else {
+            if bus.arvalid && bus.arready {
+                ars += 1;
+                if bus.araddr[31:12] != ar_end[31:12] {
+                    broken += 1;
+                }
+            }
+            if bus.awvalid && bus.awready {
+                aws += 1;
+                if bus.awaddr[31:12] != aw_end[31:12] {
+                    broken += 1;
+                }
+            }
+        }
+    }
+
+    // What the DUT side got back, beat by beat.
+    var beats: logic<32>;
+    var lasts: logic<32>;
+    var bad  : logic<32>;
+    var want : logic<32>;
+    var stride : logic<32>;
+    var from : logic<32>; // `beats` when the expected pattern started
+    var dones: logic<32>;
+
+    always_ff (clk, rst) {
+        if_reset {
+            beats = 0;
+            lasts = 0;
+            bad   = 0;
+            dones = 0;
+        } else {
+            if r_valid && r_ready {
+                if r_data != want + (beats - from) * stride {
+                    bad += 1;
+                }
+                beats += 1;
+                if r_last {
+                    lasts += 1;
+                }
+            }
+            if w_done {
+                dones += 1;
+            }
+        }
+    }
+
+    /// Posts a read of `size` bytes from byte `addr`.
+    function read (
+        addr: input logic<32>,
+        size: input logic<32>,
+    ) {
+        rc_addr  = addr;
+        rc_size  = size;
+        rc_valid = 1;
+        for _i in 0..32 {
+            if rc_ready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        rc_valid = 0;
+    }
+
+    /// Writes `count` beats of `first + i * 3` to byte `addr`, with `strb`.
+    function write (
+        addr : input logic<32>,
+        count: input logic<32>,
+        first: input logic<32>,
+        strb : input logic<4> ,
+    ) {
+        wc_addr  = addr;
+        wc_size  = count * 4;
+        wc_valid = 1;
+        for _i in 0..32 {
+            if wc_ready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        wc_valid = 0;
+        for i in 0..count {
+            w_data  = first + i * 3;
+            w_strb  = strb;
+            w_last  = i == count - 1;
+            w_valid = 1;
+            for _j in 0..64 {
+                if w_ready {
+                    break;
+                }
+                clk.next(1);
+            }
+            clk.next(1);
+        }
+        w_valid = 0;
+    }
+
+    /// Waits until `n` writes have been answered.
+    function wait_done (
+        n: input logic<32>,
+    ) {
+        for _i in 0..2000 {
+            if dones == n {
+                break;
+            }
+            clk.next(1);
+        }
+    }
+
+    /// Waits until `n` beats have come back since `from`.
+    function wait_beats (
+        n: input logic<32>,
+    ) {
+        for _i in 0..4000 {
+            if beats - from == n {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(4);
+    }
+
+    initial {
+        rc_valid = 0;
+        wc_valid = 0;
+        w_valid  = 0;
+        w_last   = 0;
+        w_strb   = 0;
+        r_ready  = 1;
+        stride     = 3;
+        want     = 0;
+        from     = 0;
+        rst.assert(4);
+        clk.next(4);
+
+        // 300 beats from beat 1000: across the 4 KB edge at beat 1024 and
+        // longer than 256, so 3 bursts.
+        write(32'd4000, 300, 32'h100, 4'hf);
+        wait_done(1);
+        $display("write: %d bursts, done %d", aws, dones);
+        $assert(aws == 3 && dones == 1);
+
+        want = 32'h100;
+        read(32'd4000, 32'd1200);
+        wait_beats(300);
+        $display("read: %d bursts, %d beats, %d last, %d bad", ars, beats, lasts, bad);
+        $assert(ars == 3 && beats == 300 && lasts == 1 && bad == 0);
+        $assert(broken == 0 && oor == 0);
+
+        // A byte write keeps the other bytes.
+        write(32'd4000, 1, 32'haabb_ccdd, 4'b0001);
+        wait_done(2);
+        from = beats;
+        stride = 0;
+        want = 32'h0000_01dd;
+        read(32'd4000, 32'd4);
+        wait_beats(1);
+        $assert(beats - from == 1 && lasts == 2 && bad == 0);
+
+        // Off the end: 16 beats asked from beat 2040, 8 inside. The last of
+        // those carries `last`.
+        write(32'd8160, 8, 32'h500, 4'hf);
+        wait_done(3);
+        from = beats;
+        stride = 3;
+        want = 32'h500;
+        read(32'd8160, 32'd64);
+        wait_beats(8);
+        $display("off the end: %d beats, %d last, oor %d", beats - from, lasts, oor);
+        $assert(beats - from == 8 && lasts == 3 && bad == 0 && oor == 1);
+
+        // A write off the end takes every beat and answers.
+        write(32'd8176, 8, 32'h600, 4'hf);
+        wait_done(4);
+        $assert(dones == 4 && oor == 2);
+
+        // Nothing at all: no beat, counted.
+        from = beats;
+        read(32'd16, 32'd0);
+        clk.next(32);
+        $assert(beats == from && oor == 3);
+
+        $assert(broken == 0);
+        $finish();
+    }
+}

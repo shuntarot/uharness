@@ -1,0 +1,307 @@
+/// The transfer-level port as an AXI4 master, so a DUT built against `bram`'s
+/// transfer level (`hns::hmem`) runs on `dram` unchanged.
+///
+/// A command means what it means to `hns::hmem`: the address is cut down to
+/// a whole beat, the size is rounded up to whole beats, and the memory holds
+/// `DEPTH` beats from address 0.
+///
+/// - A read that runs off the end delivers the beats that are inside, and
+///   `o_rd_last` marks the last of them. A read with no beat inside ends
+///   nothing: there is no `last` without a beat to carry it.
+/// - A write consumes every beat it was promised and stores the ones inside.
+///   `o_wr_done_valid` comes once the memory has answered every burst, so a
+///   read after it sees the data.
+/// - What cannot be served as asked is counted in `o_oor`, and so is every
+///   response the memory gives with an error.
+///
+/// Each command becomes bursts of at most 256 beats that do not cross a 4 KB
+/// boundary, as AXI4 requires. Reading and writing run independently, each a
+/// command at a time; `QUEUE` more can be posted before the DUT waits.
+pub module xfer2axi::<PKG: $std::axi4_prototype> #(
+    /// Whether byte writes are carried. Without them every beat is written
+    /// whole.
+    param HAS_STRB: bbool = false,
+    /// Beats the memory holds.
+    param DEPTH: u32 = 512,
+    /// Width of the command address.
+    param ADDR_W: u32 = 64,
+    /// Width of the command size.
+    param SIZE_W: u32 = 32,
+    /// Commands that can be posted before the DUT waits.
+    param QUEUE: u32 = 2,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    // read command (DUT -> here)
+    i_rd_cmd_valid: input  logic        ,
+    o_rd_cmd_ready: output logic        ,
+    i_rd_cmd_addr : input  logic<ADDR_W>,
+    i_rd_cmd_size : input  logic<SIZE_W>,
+
+    // read data (here -> DUT)
+    o_rd_valid: output logic                           ,
+    i_rd_ready: input  logic                           ,
+    o_rd_data : output logic<PKG::DATA_WIDTH_BYTES * 8>,
+    o_rd_last : output logic                           ,
+
+    // write command (DUT -> here)
+    i_wr_cmd_valid: input  logic        ,
+    o_wr_cmd_ready: output logic        ,
+    i_wr_cmd_addr : input  logic<ADDR_W>,
+    i_wr_cmd_size : input  logic<SIZE_W>,
+
+    // write data (DUT -> here), and the completion that ends the transfer
+    i_wr_valid: input  logic                           ,
+    o_wr_ready: output logic                           ,
+    i_wr_data : input  logic<PKG::DATA_WIDTH_BYTES * 8>,
+    /// Bytes to write. Ignored when `HAS_STRB` is false.
+    i_wr_strb      : input  logic<PKG::DATA_WIDTH_BYTES>,
+    i_wr_last      : input  logic                       ,
+    o_wr_done_valid: output logic                       ,
+
+    axi: modport $std::axi4_if::<PKG>::master,
+
+    /// Commands that could not be served as asked, and responses with an
+    /// error. Saturating.
+    o_oor: output logic<32>,
+) {
+    const BYTES: u32 = PKG::DATA_WIDTH_BYTES;
+    const SHIFT: u32 = $clog2(BYTES);
+    /// Beats in 4 KB, the span a burst must not cross.
+    const PAGE : u32 = 4096 / BYTES;
+    const CMD_W: u32 = ADDR_W + SIZE_W;
+
+    // --- command queues ---
+    var rq_pop  : logic                   ;
+    var rq_data : logic<CMD_W>            ;
+    var rq_level: logic<$clog2(QUEUE) + 1>;
+    var wq_pop  : logic                   ;
+    var wq_data : logic<CMD_W>            ;
+    var wq_level: logic<$clog2(QUEUE) + 1>;
+
+    inst rq: fifo #(
+        WIDTH: CMD_W,
+        DEPTH: QUEUE,
+    ) (
+        i_clk                                   ,
+        i_rst                                   ,
+        i_push : i_rd_cmd_valid & o_rd_cmd_ready,
+        i_data : {i_rd_cmd_addr, i_rd_cmd_size} ,
+        o_ready: o_rd_cmd_ready                 ,
+        i_pop  : rq_pop                         ,
+        o_data : rq_data                        ,
+        o_level: rq_level                       ,
+        o_drops: _                              ,
+    );
+
+    inst wq: fifo #(
+        WIDTH: CMD_W,
+        DEPTH: QUEUE,
+    ) (
+        i_clk                                   ,
+        i_rst                                   ,
+        i_push : i_wr_cmd_valid & o_wr_cmd_ready,
+        i_data : {i_wr_cmd_addr, i_wr_cmd_size} ,
+        o_ready: o_wr_cmd_ready                 ,
+        i_pop  : wq_pop                         ,
+        o_data : wq_data                        ,
+        o_level: wq_level                       ,
+        o_drops: _                              ,
+    );
+
+    // --- what a queued command means, as in `hns::hmem` ---
+    let rq_first: logic<ADDR_W> = rq_data[CMD_W - 1:SIZE_W] >> SHIFT;
+    let rq_beats: logic<SIZE_W> = (rq_data[SIZE_W - 1:0] + (BYTES - 1)) >> SHIFT;
+    let rq_room : logic<SIZE_W> = if rq_first <: DEPTH ? (DEPTH - rq_first[SIZE_W - 1:0]) : 0;
+    let rq_serve: logic<SIZE_W> = if rq_beats <: rq_room ? rq_beats : rq_room;
+    let rq_short: logic         = rq_serve != rq_beats || rq_beats == 0;
+
+    let wq_first: logic<ADDR_W> = wq_data[CMD_W - 1:SIZE_W] >> SHIFT;
+    let wq_beats: logic<SIZE_W> = (wq_data[SIZE_W - 1:0] + (BYTES - 1)) >> SHIFT;
+    let wq_room : logic<SIZE_W> = if wq_first <: DEPTH ? (DEPTH - wq_first[SIZE_W - 1:0]) : 0;
+    let wq_serve: logic<SIZE_W> = if wq_beats <: wq_room ? wq_beats : wq_room;
+    let wq_short: logic         = wq_serve != wq_beats || wq_beats == 0;
+
+    // --- the read side ---
+    var r_active: logic        ;
+    var ar_next : logic<ADDR_W>; // beat index of the next AR
+    var ar_left : logic<SIZE_W>; // beats not asked for yet
+    var r_left  : logic<SIZE_W>; // beats not handed back yet
+
+    // The next burst: what is left, at most 256 beats, up to the 4 KB edge.
+    let ar_page : logic<SIZE_W> = PAGE - (ar_next % PAGE);
+    let ar_cap  : logic<SIZE_W> = if ar_page <: 256 ? ar_page : 256;
+    let ar_burst: logic<SIZE_W> = if ar_left <: ar_cap ? ar_left : ar_cap;
+
+    // --- the write side ---
+    var w_active: logic        ;
+    var aw_next : logic<ADDR_W>; // beat index of the next AW
+    var aw_left : logic<SIZE_W>; // beats not announced yet
+    var w_next  : logic<ADDR_W>; // beat index of the next W beat
+    var w_store : logic<SIZE_W>; // beats still to send to the memory
+    var w_left  : logic<SIZE_W>; // beats still to take from the DUT
+    var w_burst : logic<SIZE_W>; // beats left in the current W burst
+    var b_wait  : logic<SIZE_W>; // bursts announced and not answered
+
+    let aw_page : logic<SIZE_W> = PAGE - (aw_next % PAGE);
+    let aw_cap  : logic<SIZE_W> = if aw_page <: 256 ? aw_page : 256;
+    let aw_burst: logic<SIZE_W> = if aw_left <: aw_cap ? aw_left : aw_cap;
+
+    // The W burst follows the same cut as the AW burst for the same beats.
+    let w_page : logic<SIZE_W> = PAGE - (w_next % PAGE);
+    let w_cap  : logic<SIZE_W> = if w_page <: 256 ? w_page : 256;
+    let w_start: logic<SIZE_W> = if w_store <: w_cap ? w_store : w_cap;
+    let w_len  : logic<SIZE_W> = if w_burst == 0 ? w_start : w_burst;
+
+    let aw_go: logic = axi.awvalid && axi.awready;
+    let w_go : logic = axi.wvalid && axi.wready;
+    let b_go : logic = axi.bvalid && axi.bready;
+
+    var oor  : logic<32>;
+    var wdone: logic    ;
+
+    always_comb {
+        rq_pop = !r_active && rq_level != 0;
+        wq_pop = !w_active && wq_level != 0;
+
+        o_rd_valid = r_active && axi.rvalid;
+        o_rd_data  = axi.rdata;
+        o_rd_last  = r_left == 1;
+
+        // Beats inside go to the memory; the rest are taken and dropped.
+        o_wr_ready = w_active && w_left != 0 && (w_store == 0 || axi.wready);
+
+        o_wr_done_valid = wdone;
+        o_oor           = oor;
+    }
+
+    always_comb {
+        axi.awvalid  = w_active && aw_left != 0;
+        axi.awaddr   = aw_next << SHIFT;
+        axi.awlen    = aw_burst - 1;
+        axi.awsize   = SHIFT;
+        axi.awburst  = 2'b01;
+        axi.awcache  = 0;
+        axi.awprot   = 0;
+        axi.awid     = 0;
+        axi.awlock   = 0;
+        axi.awqos    = 0;
+        axi.awregion = 0;
+        axi.awuser   = 0;
+
+        axi.wvalid = w_active && w_store != 0 && i_wr_valid;
+        axi.wdata  = i_wr_data;
+        axi.wstrb  = if HAS_STRB ? i_wr_strb : {1'b1 repeat BYTES};
+        axi.wlast  = w_len == 1;
+        axi.wuser  = 0;
+
+        axi.bready = 1;
+
+        axi.arvalid  = r_active && ar_left != 0;
+        axi.araddr   = ar_next << SHIFT;
+        axi.arlen    = ar_burst - 1;
+        axi.arsize   = SHIFT;
+        axi.arburst  = 2'b01;
+        axi.arcache  = 0;
+        axi.arprot   = 0;
+        axi.arid     = 0;
+        axi.arlock   = 0;
+        axi.arqos    = 0;
+        axi.arregion = 0;
+        axi.aruser   = 0;
+
+        axi.rready = r_active && i_rd_ready;
+    }
+
+    always_ff {
+        if_reset {
+            r_active = 0;
+            ar_next  = 0;
+            ar_left  = 0;
+            r_left   = 0;
+            w_active = 0;
+            aw_next  = 0;
+            aw_left  = 0;
+            w_next   = 0;
+            w_store  = 0;
+            w_left   = 0;
+            w_burst  = 0;
+            b_wait   = 0;
+            oor      = 0;
+            wdone    = 0;
+        } else {
+            wdone = 0;
+
+            // --- read ---
+            if r_active {
+                if axi.arvalid && axi.arready {
+                    ar_next = ar_next + ar_burst;
+                    ar_left = ar_left - ar_burst;
+                }
+                if axi.rvalid && axi.rready {
+                    if axi.rresp != 0 && oor != 32'hffff_ffff {
+                        oor += 1;
+                    }
+                    r_left = r_left - 1;
+                    if r_left == 1 {
+                        r_active = 0;
+                    }
+                }
+            } else if rq_level != 0 {
+                ar_next = rq_first;
+                ar_left = rq_serve;
+                r_left  = rq_serve;
+                if rq_short && oor != 32'hffff_ffff {
+                    oor += 1;
+                }
+                // Nothing inside means nothing to hand back.
+                r_active = rq_serve != 0;
+            }
+
+            // --- write ---
+            if w_active {
+                if aw_go {
+                    aw_next = aw_next + aw_burst;
+                    aw_left = aw_left - aw_burst;
+                }
+                if w_go {
+                    w_next  = w_next + 1;
+                    w_store = w_store - 1;
+                    w_burst = w_len - 1;
+                }
+                if o_wr_ready && i_wr_valid {
+                    w_left = w_left - 1;
+                }
+                if b_go && axi.bresp != 0 && oor != 32'hffff_ffff {
+                    oor += 1;
+                }
+                // Bursts announced this cycle, less those answered.
+                b_wait = b_wait + (if aw_go ? 1 : 0) - (if b_go ? 1 : 0);
+                // Done once every beat is taken and every burst answered.
+                if w_left == 0 && aw_left == 0 && b_wait == 0 && !aw_go {
+                    w_active = 0;
+                    wdone    = 1;
+                }
+            } else if wq_level != 0 {
+                aw_next = wq_first;
+                aw_left = wq_serve;
+                w_next  = wq_first;
+                w_store = wq_serve;
+                w_burst = 0;
+                // A write takes every beat it was promised, so the DUT never
+                // stalls on beats that have nowhere to go.
+                w_left = wq_beats;
+                b_wait = 0;
+                if wq_short && oor != 32'hffff_ffff {
+                    oor += 1;
+                }
+                if wq_beats == 0 {
+                    wdone = 1;
+                } else {
+                    w_active = 1;
+                }
+            }
+        }
+    }
+}

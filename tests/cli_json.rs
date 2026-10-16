@@ -661,14 +661,14 @@ fn ports_in_the_wrong_direction_or_width_are_refused() {
             let (d, m) = slave("i_s_rdata: input logic<32>", "", "rdata = \"i_s_rdata\"");
             (d, m, "harness::terminator::wrong_direction", "a `slave`")
         },
-        // Slave: write data takes the 32-bit window word as is.
+        // Slave: write data wider than a window word is not split.
         {
             let (d, m) = slave(
                 "o_s_rdata: output logic<32>",
-                "    i_s_wdata: input logic<16>,\n    i_s_we: input logic,\n",
+                "    i_s_wdata: input logic<64>,\n    i_s_we: input logic,\n",
                 "rdata = \"o_s_rdata\", wdata = \"i_s_wdata\", we = \"i_s_we\"",
             );
-            (d, m, "harness::terminator::slave_width_not_a_word", "32 bits")
+            (d, m, "harness::terminator::slave_wider_than_a_word", "32-bit registers")
         },
         // Slave: too large for the window.
         (

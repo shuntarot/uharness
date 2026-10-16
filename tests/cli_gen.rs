@@ -902,6 +902,8 @@ fn a_dmi_becomes_an_apb_master_in_a_region_of_its_own() {
     let top = fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap();
     let squashed: String = top.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(squashed.contains("i_rst:rst_"), "{top}");
+    // A DUT reset does not reach it, so its transfers are never held.
+    assert!(squashed.contains("i_hold:1'b0,"), "{top}");
 }
 
 /// What `dmi` refuses, each with its own code.
@@ -961,6 +963,180 @@ fn a_dmi_that_is_not_a_whole_apb_slave_is_refused() {
         "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.dmi]\nbacking = \"reg\"\nreset = \"i_rst\"\n",
         9,
         "",
+        "harness::terminator::key_not_applicable",
+    );
+}
+
+const APB_SLAVE_HARNESS_TOML: &str = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.dmi]\nbacking = \"slave\"\n";
+
+/// A `slave` with APB roles becomes an APB slave: the same `hns::apb_host`
+/// as `dmi`, a plain DUT region, and `<bundle>_slverr` when it has `pslverr`.
+#[test]
+fn a_slave_with_apb_roles_is_driven_as_an_apb_slave() {
+    let dir = dmi_fixture(
+        APB_SLAVE_HARNESS_TOML,
+        4,
+        "o_dmi_pready: output logic, o_dmi_pslverr: output logic,",
+    );
+    let output = run_gen(&dir, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let top = fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap();
+    let squashed: String = top.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        squashed.contains("instu_apb_dmi:hns::apb_host#(ADDR_BITS:4,)"),
+        "{top}"
+    );
+    assert!(squashed.contains("i_pslverr:w_o_dmi_pslverr,"), "{top}");
+    // While the DUT is reset, nothing waits for the slave.
+    assert!(squashed.contains("i_hold:dut_fence,"), "{top}");
+    let map: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("hns/regs.json")).unwrap())
+            .unwrap();
+    assert_eq!(map["regions"][0]["kind"], "dut", "{map:#}");
+    assert!(
+        map["registers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == "dmi_slverr"),
+        "{map:#}"
+    );
+}
+
+/// What an APB `slave` refuses, each with its own code.
+#[test]
+fn an_apb_slave_that_does_not_fit_is_refused() {
+    let refused = |harness: &str, addr: u32, extra: &str, code: &str| {
+        let dir = dmi_fixture(harness, addr, extra);
+        let output = run_gen(&dir, &["--json"]);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{extra}: {value}");
+        assert_eq!(value["error"]["code"], code, "{extra}: {value}");
+    };
+    // Not even one 32-bit register.
+    refused(
+        APB_SLAVE_HARNESS_TOML,
+        1,
+        "",
+        "harness::terminator::apb_slave_address_width",
+    );
+    // A port that is no APB port.
+    refused(
+        APB_SLAVE_HARNESS_TOML,
+        4,
+        "o_dmi_irq: output logic,",
+        "harness::terminator::apb_slave_stray_port",
+    );
+    // `reset` is for `dmi` only.
+    refused(
+        &format!("{APB_SLAVE_HARNESS_TOML}reset = \"i_rst\"\n"),
+        4,
+        "",
+        "harness::terminator::key_not_applicable",
+    );
+}
+
+fn axi_slave_fixture(harness_toml: &str, addr: u32, modport: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("Veryl.toml"), veryl_toml()).unwrap();
+    fs::write(dir.path().join("Harness.toml"), harness_toml).unwrap();
+    fs::create_dir(dir.path().join("src")).unwrap();
+    let body = if modport == "slave" {
+        "    always_comb {\n        csr.awready = 0;\n        csr.wready = 0;\n        csr.bvalid = 0;\n        csr.bresp = 0;\n        csr.bid = 0;\n        csr.buser = 0;\n        csr.arready = 0;\n        csr.rvalid = 0;\n        csr.rdata = 0;\n        csr.rresp = 0;\n        csr.rid = 0;\n        csr.rlast = 0;\n        csr.ruser = 0;\n    }\n"
+    } else {
+        ""
+    };
+    fs::write(
+        dir.path().join("src").join("fixture.veryl"),
+        format!(
+            "module dut_top (\n    i_clk: input clock,\n    i_rst: input reset,\n    csr  : modport $std::axi4_if::<$std::axi4_pkg::<{addr}, 4, 1, 1, 1, 1, 1, 1>>::{modport},\n) {{\n{body}}}\n"
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+const AXI_SLAVE_HARNESS_TOML: &str = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.csr]\nbacking = \"slave\"\nports = [\"csr\"]\n";
+
+/// A `slave` on a `::slave` AXI4 port: `hns::axi_host` drives it, held while
+/// the DUT is reset, in a plain DUT region. A 32-bit address takes a moving
+/// window.
+#[test]
+fn an_axi4_slave_is_driven_by_the_host_master() {
+    let dir = axi_slave_fixture(AXI_SLAVE_HARNESS_TOML, 12, "slave");
+    let output = run_gen(&dir, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let top = fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap();
+    let squashed: String = top.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        squashed.contains("instu_haxi_csr:hns::axi_host::<"),
+        "{top}"
+    );
+    assert!(squashed.contains("i_hold:dut_fence,"), "{top}");
+    assert!(squashed.contains("csr:axi_csr,"), "{top}");
+    let map: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("hns/regs.json")).unwrap())
+            .unwrap();
+    assert_eq!(map["regions"][0]["kind"], "dut", "{map:#}");
+    assert_eq!(map["regions"][0]["size_bytes"], 4096, "{map:#}");
+
+    let dir = axi_slave_fixture(
+        &format!("{AXI_SLAVE_HARNESS_TOML}aperture = \"64k\"\n"),
+        32,
+        "slave",
+    );
+    let output = run_gen(&dir, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let map: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("hns/regs.json")).unwrap())
+            .unwrap();
+    assert_eq!(map["regions"][0]["size_bytes"], 65536, "{map:#}");
+}
+
+/// What an AXI4 `slave` refuses, each with its own code.
+#[test]
+fn an_axi4_slave_that_does_not_fit_is_refused() {
+    let refused = |harness: &str, addr: u32, modport: &str, code: &str| {
+        let dir = axi_slave_fixture(harness, addr, modport);
+        let output = run_gen(&dir, &["--json"]);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{modport}: {value}");
+        assert_eq!(value["error"]["code"], code, "{modport}: {value}");
+    };
+    // The DUT reads a memory: that is `bram` or `dram`.
+    refused(
+        AXI_SLAVE_HARNESS_TOML,
+        12,
+        "master",
+        "harness::terminator::axi_slave_not_a_slave",
+    );
+    // 4 GB does not fit the window without a moving one.
+    refused(
+        AXI_SLAVE_HARNESS_TOML,
+        32,
+        "slave",
+        "harness::terminator::axi_slave_too_large",
+    );
+    // `dut_base` is for memories.
+    refused(
+        &format!("{AXI_SLAVE_HARNESS_TOML}dut_base = 0x1000\n"),
+        12,
+        "slave",
         "harness::terminator::key_not_applicable",
     );
 }
@@ -1980,6 +2156,64 @@ module dut_top (
     )
     .unwrap();
     dir
+}
+
+/// A `dram` with a transfer-level port gets `hns::xfer2axi` in front of the
+/// same AXI4 path an AXI4 DUT would use. The adapter is on the DUT reset, and
+/// `dut_base` is for AXI4 ports only.
+#[test]
+fn a_transfer_level_dram_goes_through_the_adapter() {
+    let dir = dram_fixture();
+    fs::write(
+        dir.path().join("src").join("fixture.veryl"),
+        r#"
+module dut_top (
+    i_clk     : input  clock    ,
+    i_rst     : input  reset    ,
+    o_rc_valid: output logic    ,
+    i_rc_ready: input  logic    ,
+    o_rc_addr : output logic<32>,
+    o_rc_size : output logic<16>,
+    i_r_valid : input  logic    ,
+    o_r_ready : output logic    ,
+    i_r_data  : input  logic<64>,
+    i_r_last  : input  logic    ,
+) {
+    assign o_rc_valid = 0;
+    assign o_rc_addr  = 0;
+    assign o_rc_size  = 0;
+    assign o_r_ready  = 1;
+}
+"#,
+    )
+    .unwrap();
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 100\n\n[bundle.mem]\nbacking = \"dram\"\naperture = 256\nports = { rd_cmd_valid = \"o_rc_valid\", rd_cmd_ready = \"i_rc_ready\", rd_cmd_addr = \"o_rc_addr\", rd_cmd_size = \"o_rc_size\", rd_valid = \"i_r_valid\", rd_ready = \"o_r_ready\", rd_data = \"i_r_data\", rd_last = \"i_r_last\" }\n";
+    fs::write(dir.path().join("Harness.toml"), manifest).unwrap();
+    let output = run_gen(&dir, &["--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{value}");
+    let top = fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap();
+    let squashed: String = top.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        squashed.contains("instu_xfer_mem:hns::xfer2axi::<$std::axi4_pkg::<"),
+        "{top}"
+    );
+    assert!(squashed.contains("i_rst:drst_"), "{top}");
+    assert!(squashed.contains("axi:axi_mem,"), "{top}");
+    assert!(squashed.contains("o_oor:t_mem_oor,"), "{top}");
+
+    fs::write(
+        dir.path().join("Harness.toml"),
+        format!("{manifest}dut_base = 0x1000\n"),
+    )
+    .unwrap();
+    let output = run_gen(&dir, &["--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{value}");
+    assert_eq!(
+        value["error"]["code"], "harness::terminator::key_not_applicable",
+        "{value}"
+    );
 }
 
 /// A clock only the memory controller takes has no DUT port, so `check` names

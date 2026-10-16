@@ -496,20 +496,32 @@ fn print_bundles(plan: &crate::plan::Plan) {
                     " read-only"
                 }
             )
-        } else if let Some(dmi) = plan.dmis.iter().find(|d| d.bundle == binding.bundle) {
-            format!(
-                " paddr={} bits APB{} reset={}",
-                dmi.addr_width,
-                if dmi.pready.is_some() {
-                    ""
-                } else {
-                    " (no pready)"
-                },
-                match &dmi.reset {
-                    Some(port) => format!("{port} (harness)"),
-                    None => "DUT (hio reset clears it)".to_string(),
-                }
-            )
+        } else if let Some(apb) = plan.apbs.iter().find(|d| d.bundle == binding.bundle) {
+            let pready = if apb.pready.is_some() {
+                ""
+            } else {
+                " (no pready)"
+            };
+            if apb.debug_module {
+                format!(
+                    " paddr={} bits APB{pready} reset={}",
+                    apb.addr_width,
+                    match &apb.reset {
+                        Some(port) => format!("{port} (harness)"),
+                        None => "DUT (hio reset clears it)".to_string(),
+                    }
+                )
+            } else {
+                format!(
+                    " paddr={} bits APB{pready}{}",
+                    apb.addr_width,
+                    if apb.pslverr.is_some() {
+                        format!(", errors counted in {}_slverr", apb.bundle)
+                    } else {
+                        String::new()
+                    }
+                )
+            }
         } else if let Some(mem) = plan.axi_mems.iter().find(|m| m.bundle == binding.bundle) {
             let aperture = mem
                 .aperture_bytes
@@ -525,9 +537,23 @@ fn print_bundles(plan: &crate::plan::Plan) {
             } else {
                 format!(" dut_base={:#x}", mem.dut_base)
             };
+            let shape = if mem.xfer.is_some() {
+                "transfer-level via axi4"
+            } else {
+                "axi4"
+            };
             format!(
-                " depth={}{source} axi4 data={} bytes{aperture}{dut_base}",
+                " depth={}{source} {shape} data={} bytes{aperture}{dut_base}",
                 mem.depth, mem.data_bytes
+            )
+        } else if let Some(axi) = plan.axi_slaves.iter().find(|a| a.bundle == binding.bundle) {
+            let aperture = axi
+                .aperture_bytes
+                .map(|bytes| format!(" aperture={}", size_str(bytes as u64)))
+                .unwrap_or_default();
+            format!(
+                " addr={} bits axi4 slave data={} bytes{aperture}",
+                axi.addr_width, axi.data_bytes
             )
         } else {
             String::new()

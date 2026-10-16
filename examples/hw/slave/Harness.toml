@@ -1,0 +1,42 @@
+[dut]
+module = "dut_top"
+
+[clock.i_clk]
+freq_mhz = 100
+
+# Four ways a register file inside the DUT can look. `backing = "slave"` says
+# the data lives in the DUT; the shape of the port says how the harness
+# reaches it.
+
+# RAM ports. `latency` is how many cycles after `addr` the answer is on
+# `rdata`. Roles are never guessed for a RAM port, so they are all named.
+[bundle.comb]
+backing = "slave"
+latency = 0
+ports   = { addr = "i_comb_addr", wdata = "i_comb_wdata", we = "i_comb_we", rdata = "o_comb_rdata" }
+
+[bundle.pipe]
+backing = "slave"
+latency = 3
+ports   = { addr = "i_pipe_addr", wdata = "i_pipe_wdata", we = "i_pipe_we", rdata = "o_pipe_rdata" }
+
+[bundle.nar]
+backing = "slave"
+latency = 1
+ports   = { addr = "i_nar_addr", wdata = "i_nar_wdata", we = "i_nar_we", rdata = "o_nar_rdata" }
+
+# An APB slave, found by the `p*` suffixes. It says itself when it answers
+# (`pready`), so there is no `latency`, and the transfers it ends with
+# `pslverr` are counted in `apb_slverr`.
+[bundle.apb]
+backing = "slave"
+
+# An AXI4 slave, found by its type. The host reaches it one 32-bit word at a
+# time; on this 64-bit bus each word is half a beat.
+[bundle.axi]
+backing = "slave"
+ports   = ["axi"]
+
+# Heartbeat UART. Readable even when the transport is not working.
+[heartbeat]
+pin = "uart_tx"

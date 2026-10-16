@@ -1,0 +1,178 @@
+/// Register files inside the DUT, one of each shape a `slave` bundle takes.
+///
+/// - `comb`: a RAM port that answers in the same cycle (`latency = 0`).
+/// - `pipe`: a RAM port whose read goes through 3 stages (`latency = 3`).
+///   Each stage adds 1 to the value, so an answer taken a cycle early or late
+///   reads differently: a word written as `x` reads back as `x + 2`.
+/// - `nar`: an 8-bit RAM port. A write keeps the low byte; a read has zeros
+///   above it.
+/// - `apb`: an APB slave that waits one cycle with `pready` and ends every
+///   transfer to its last word with `pslverr`.
+/// - `axi`: an AXI4 slave on a 64-bit bus that answers reads 2 cycles late.
+///   The low word of its last register counts the reads it answered.
+module dut_top (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    i_comb_addr : input  logic<3> ,
+    i_comb_wdata: input  logic<32>,
+    i_comb_we   : input  logic    ,
+    o_comb_rdata: output logic<32>,
+
+    i_pipe_addr : input  logic<3> ,
+    i_pipe_wdata: input  logic<32>,
+    i_pipe_we   : input  logic    ,
+    o_pipe_rdata: output logic<32>,
+
+    i_nar_addr : input  logic<2>,
+    i_nar_wdata: input  logic<8>,
+    i_nar_we   : input  logic   ,
+    o_nar_rdata: output logic<8>,
+
+    i_apb_psel   : input  logic    ,
+    i_apb_penable: input  logic    ,
+    i_apb_pwrite : input  logic    ,
+    i_apb_paddr  : input  logic<6> ,
+    i_apb_pwdata : input  logic<32>,
+    o_apb_prdata : output logic<32>,
+    o_apb_pready : output logic    ,
+    o_apb_pslverr: output logic    ,
+
+    axi: modport $std::axi4_if::<$std::axi4_pkg::<8, 8, 4, 1, 1, 1, 1, 1>>::slave,
+) {
+    // --- comb and pipe ---
+    var comb: logic<32> [8];
+    var pipe: logic<32> [8];
+    var p1  : logic<32>     ;
+    var p2  : logic<32>     ;
+
+    assign o_comb_rdata = comb[i_comb_addr];
+
+    always_ff {
+        if i_comb_we {
+            comb[i_comb_addr] = i_comb_wdata;
+        }
+        if i_pipe_we {
+            pipe[i_pipe_addr] = i_pipe_wdata;
+        }
+        p1           = pipe[i_pipe_addr];
+        p2           = p1 + 1;
+        o_pipe_rdata = p2 + 1;
+    }
+
+    // --- nar ---
+    var nar: logic<8> [4];
+
+    always_ff {
+        if i_nar_we {
+            nar[i_nar_addr] = i_nar_wdata;
+        }
+        o_nar_rdata = nar[i_nar_addr];
+    }
+
+    // --- apb ---
+    var apb  : logic<32> [16];
+    var stall: logic         ;
+    let word : logic<4>      = i_apb_paddr[5:2];
+
+    assign o_apb_pready  = stall;
+    assign o_apb_prdata  = apb[word];
+    assign o_apb_pslverr = word == 4'hf;
+
+    always_ff {
+        if_reset {
+            stall = 0;
+        } else if i_apb_psel && i_apb_penable {
+            stall = !stall;
+        }
+    }
+    always_ff {
+        if i_apb_psel && i_apb_penable && o_apb_pready && i_apb_pwrite {
+            apb[word] = i_apb_pwdata;
+        }
+    }
+
+    // --- axi ---
+    var regs : logic<64> [31];
+    var reads: logic<32>      ;
+
+    var w_open: logic    ;
+    var w_addr: logic<5> ;
+    var b_out : logic    ;
+    var r_wait: logic<2> ;
+    var r_addr: logic<5> ;
+    var r_out : logic    ;
+    var r_data: logic<64>;
+    var bid   : logic<4> ;
+    var rid   : logic<4> ;
+
+    // Storage has no reset, as in a real register file.
+    always_ff {
+        if axi.wvalid && axi.wready {
+            for i in 0..8 {
+                if axi.wstrb[i] {
+                    regs[w_addr][i * 8+:8] = axi.wdata[i * 8+:8];
+                }
+            }
+        }
+    }
+
+    always_comb {
+        axi.awready = !w_open && !b_out;
+        axi.wready  = w_open;
+        axi.bvalid  = b_out;
+        axi.bresp   = 2'b00;
+        axi.bid     = bid;
+        axi.buser   = 0;
+        axi.arready = r_wait == 0 && !r_out;
+        axi.rvalid  = r_out;
+        axi.rdata   = r_data;
+        axi.rresp   = 2'b00;
+        axi.rid     = rid;
+        axi.rlast   = 1;
+        axi.ruser   = 0;
+    }
+
+    always_ff {
+        if_reset {
+            reads  = 0;
+            w_open = 0;
+            w_addr = 0;
+            b_out  = 0;
+            r_wait = 0;
+            r_addr = 0;
+            r_out  = 0;
+            r_data = 0;
+            bid    = 0;
+            rid    = 0;
+        } else {
+            if axi.awvalid && axi.awready {
+                w_open = 1;
+                w_addr = axi.awaddr[7:3];
+                bid    = axi.awid;
+            }
+            if axi.wvalid && axi.wready {
+                w_open = 0;
+                b_out  = 1;
+            }
+            if axi.bvalid && axi.bready {
+                b_out = 0;
+            }
+            if axi.arvalid && axi.arready {
+                r_wait = 2;
+                r_addr = axi.araddr[7:3];
+                rid    = axi.arid;
+            } else if r_wait != 0 {
+                r_wait -= 1;
+                if r_wait == 1 {
+                    r_out  = 1;
+                    r_data = if r_addr == 31 ? {32'h0, reads} : regs[r_addr];
+                    reads += 1;
+                }
+            }
+            if axi.rvalid && axi.rready {
+                r_out = 0;
+            }
+        }
+    }
+}

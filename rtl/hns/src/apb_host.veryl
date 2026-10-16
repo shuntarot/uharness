@@ -1,4 +1,5 @@
-/// The window bus as an APB master, for the DMI of a RISC-V Debug Module.
+/// The window bus as an APB master: for the DMI of a RISC-V Debug Module, and
+/// for an APB slave in the DUT.
 ///
 /// One window access is one APB transfer, never more. A Debug Module read can
 /// change state (reading `data0` runs the next command under `abstractauto`),
@@ -6,12 +7,20 @@
 ///
 /// The window has one read open at a time. A read that comes while a write is
 /// on the bus waits for it; a write waits until the bus is free (`o_wready`).
+///
+/// While `i_hold` is high the slave is being reset, and it may never answer.
+/// No transfer starts, the one on the bus is dropped, and window accesses are
+/// not taken: the window times out on them instead. Nothing waits for the
+/// slave, so a late answer cannot be taken for a later read.
 pub module apb_host #(
     /// Bits of the slave's byte address.
     param ADDR_BITS: u32 = 9,
 ) (
     i_clk: input clock,
     i_rst: input reset,
+
+    /// The slave is being reset. Tie to 0 for a slave on the harness reset.
+    i_hold: input logic,
 
     // --- the window side: `i_re` and `i_we` last one cycle ---
     i_addr : input logic<ADDR_BITS>,
@@ -34,17 +43,23 @@ pub module apb_host #(
     i_prdata : input  logic<32>       ,
     /// Tie to 1 for a slave that always answers in the access phase.
     i_pready: input logic,
+    /// Tie to 0 for a slave without it.
+    i_pslverr: input logic,
+    /// Transfers that ended with `i_pslverr`. It saturates instead of
+    /// wrapping. A write is taken before its transfer ends, so an error
+    /// cannot come back with it; the host reads this instead.
+    o_slverrs: output logic<32>,
 ) {
     // A read that came while the bus was busy.
     var rd_wait: logic           ;
     var rd_addr: logic<ADDR_BITS>;
 
     let idle: logic = !o_psel;
-    let done: logic = o_psel && o_penable && i_pready;
+    let done: logic = o_psel && o_penable && i_pready && !i_hold;
     // A read starts now: one just asked for, or one that waited.
-    let rd_now: logic = idle && (i_re || rd_wait);
+    let rd_now: logic = idle && !i_hold && (i_re || rd_wait);
 
-    assign o_wready = idle && !rd_wait && !i_re;
+    assign o_wready = idle && !rd_wait && !i_re && !i_hold;
 
     always_ff {
         if_reset {
@@ -57,13 +72,18 @@ pub module apb_host #(
             o_pwdata  = 0;
             o_rdata   = 0;
             o_rvalid  = 0;
+            o_slverrs = 0;
         } else {
             o_rvalid = 0;
             if i_re && !idle {
                 rd_wait = 1;
                 rd_addr = i_addr;
             }
-            if rd_now {
+            if i_hold {
+                rd_wait   = 0;
+                o_psel    = 0;
+                o_penable = 0;
+            } else if rd_now {
                 // Setup phase.
                 rd_wait  = 0;
                 o_psel   = 1;
@@ -80,6 +100,9 @@ pub module apb_host #(
             } else if done {
                 o_psel    = 0;
                 o_penable = 0;
+                if i_pslverr && o_slverrs != '1 {
+                    o_slverrs += 1;
+                }
                 if !o_pwrite {
                     o_rdata  = i_prdata;
                     o_rvalid = 1;

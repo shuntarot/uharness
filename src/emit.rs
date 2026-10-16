@@ -1725,8 +1725,12 @@ fn core_body(
     out.push_str(&format!("    var bus_we: {domain}logic;\n"));
     out.push_str(&format!("    var bus_re: {domain}logic;\n"));
     out.push_str(&format!(
-        "    var bus_rdata: {domain}logic<{WORD_BITS}>;\n    var bus_rvalid: {domain}logic;\n    var bus_wready: {domain}logic;\n    var bus_timeouts: {domain}logic<{WORD_BITS}>;\n    var bus_clear_timeouts: {domain}logic;\n\n"
+        "    var bus_rdata: {domain}logic<{WORD_BITS}>;\n    var bus_rvalid: {domain}logic;\n    var bus_wready: {domain}logic;\n    var bus_timeouts: {domain}logic<{WORD_BITS}>;\n    var bus_clear_timeouts: {domain}logic;\n"
     ));
+    // High while the DUT is being reset (`hns::reset_ctl`). Declared here
+    // because the parts that drive the DUT's slaves use it before the reset
+    // controller is emitted.
+    out.push_str(&format!("    var dut_fence: {domain}logic;\n\n"));
 
     // The window can have two masters: JTAG (or the testbench) and the PCIe
     // BAR. The arbiter is always present, so adding PCIe changes nothing else.
@@ -1983,11 +1987,60 @@ fn core_body(
         if axi_mem.backing == crate::manifest::Backing::Dram {
             out.push_str(&format!("    var t_{bundle}_calib: {domain}logic;\n"));
         }
-        if axi_mem.dut_base != 0 {
+        if axi_mem.dut_base != 0 || axi_mem.xfer.is_some() {
             out.push_str(&format!(
                 "    var t_{bundle}_oor: {domain}logic<{WORD_BITS}>;\n"
             ));
         }
+        // A transfer-level port: the DUT side of `hns::xfer2axi`.
+        if let Some(xfer) = &axi_mem.xfer {
+            for (port, width) in xfer_wires(xfer) {
+                out.push_str(&format!("    var w_{port}: {domain}logic<{width}>;\n"));
+            }
+        }
+    }
+
+    // An AXI4 slave of the DUT: the window drives it through `hns::axi_host`,
+    // which says itself when it answers and when it takes a write.
+    for axi in &plan.axi_slaves {
+        let bundle = &axi.bundle;
+        out.push_str(&format!(
+            "    var t_{bundle}_maddr: {domain}logic<{}>;\n",
+            axi.word_addr_width()
+        ));
+        out.push_str(&format!(
+            "    var t_{bundle}_mdata: {domain}logic<{WORD_BITS}>;\n"
+        ));
+        out.push_str(&format!("    var t_{bundle}_mwe: {domain}logic;\n"));
+        out.push_str(&format!("    var t_{bundle}_mre: {domain}logic;\n"));
+        out.push_str(&format!(
+            "    var t_{bundle}_mrdata: {domain}logic<{WORD_BITS}>;\n"
+        ));
+        out.push_str(&format!("    var t_{bundle}_mrvalid: {domain}logic;\n"));
+        out.push_str(&format!("    var t_{bundle}_mwready: {domain}logic;\n"));
+        out.push_str(&format!(
+            "    inst axi_{bundle}: {domain}$std::axi4_if::<{}>;\n\n",
+            axi.pkg
+        ));
+        out.push_str(&format!(
+            "    inst u_haxi_{bundle}: hns::axi_host::<{}> #(\n",
+            axi.pkg
+        ));
+        out.push_str(&format!("        ADDR_W: {},\n", axi.word_addr_width()));
+        out.push_str("    ) (\n");
+        out.push_str(&format!("        i_clk: {clk},\n"));
+        out.push_str(&format!("        i_rst: {rst},\n"));
+        // A DUT slave may stop answering when it is reset.
+        out.push_str("        i_hold: dut_fence,\n");
+        out.push_str(&format!("        axi: axi_{bundle},\n"));
+        out.push_str(&format!("        i_haddr: t_{bundle}_maddr,\n"));
+        out.push_str(&format!("        i_hwdata: t_{bundle}_mdata,\n"));
+        out.push_str(&format!("        i_hwe: t_{bundle}_mwe,\n"));
+        out.push_str(&format!("        i_hre: t_{bundle}_mre,\n"));
+        out.push_str(&format!("        o_hrdata: t_{bundle}_mrdata,\n"));
+        out.push_str(&format!("        o_hrvalid: t_{bundle}_mrvalid,\n"));
+        out.push_str(&format!("        o_hwready: t_{bundle}_mwready,\n"));
+        out.push_str("    );\n\n");
     }
     for axi_mem in &plan.axi_mems {
         // State the clock domain. An interface instance has no domain of its
@@ -2158,9 +2211,10 @@ fn core_body(
     }
     out.push('\n');
 
-    // A Debug Module's DMI: the window drives it as an APB master. Like
-    // axi_mem, it says itself when it answers and when it takes a write.
-    for dmi in &plan.dmis {
+    // An APB slave (a Debug Module's DMI, or a `slave`): the window drives it
+    // as an APB master. Like axi_mem, it says itself when it answers and when
+    // it takes a write.
+    for dmi in &plan.apbs {
         let bundle = &dmi.bundle;
         let aw = dmi.addr_width;
         out.push_str(&format!("    var t_{bundle}_maddr: {domain}logic<{aw}>;\n"));
@@ -2184,14 +2238,27 @@ fn core_body(
         ] {
             out.push_str(&format!("    var w_{port}: {domain}logic<{width}>;\n"));
         }
-        if let Some(pready) = &dmi.pready {
-            out.push_str(&format!("    var w_{pready}: {domain}logic;\n"));
+        for port in [&dmi.pready, &dmi.pslverr].into_iter().flatten() {
+            out.push_str(&format!("    var w_{port}: {domain}logic;\n"));
+        }
+        if dmi.pslverr.is_some() {
+            out.push_str(&format!(
+                "    var t_{bundle}_slverr: {domain}logic<{WORD_BITS}>;\n"
+            ));
         }
         out.push_str(&format!(
             "\n    inst u_apb_{bundle}: hns::apb_host #(\n        ADDR_BITS: {aw},\n    ) (\n"
         ));
         out.push_str(&format!("        i_clk    : {clk},\n"));
         out.push_str(&format!("        i_rst    : {rst},\n"));
+        // A slave on the DUT reset may stop answering when it is reset. A
+        // Debug Module with a `reset` of its own is never reset with the DUT.
+        let hold = if dmi.reset.is_some() {
+            "1'b0"
+        } else {
+            "dut_fence"
+        };
+        out.push_str(&format!("        i_hold   : {hold},\n"));
         out.push_str(&format!("        i_addr   : t_{bundle}_maddr,\n"));
         out.push_str(&format!("        i_wdata  : t_{bundle}_mdata,\n"));
         out.push_str(&format!("        i_we     : t_{bundle}_mwe,\n"));
@@ -2212,6 +2279,16 @@ fn core_body(
             .map(|port| format!("w_{port}"))
             .unwrap_or_else(|| "1'b1".to_string());
         out.push_str(&format!("        i_pready : {pready},\n"));
+        match &dmi.pslverr {
+            Some(port) => {
+                out.push_str(&format!("        i_pslverr: w_{port},\n"));
+                out.push_str(&format!("        o_slverrs: t_{bundle}_slverr,\n"));
+            }
+            None => {
+                out.push_str("        i_pslverr: 1'b0,\n");
+                out.push_str("        o_slverrs: _,\n");
+            }
+        }
         out.push_str("    );\n\n");
     }
 
@@ -2228,7 +2305,8 @@ fn core_body(
         // enough.
         let answers_itself = |bundle: &str| {
             plan.axi_mems.iter().any(|d| d.bundle == bundle)
-                || plan.dmis.iter().any(|d| d.bundle == bundle)
+                || plan.axi_slaves.iter().any(|d| d.bundle == bundle)
+                || plan.apbs.iter().any(|d| d.bundle == bundle)
         };
         let word = WORD_BITS / 8;
         out.push_str(&format!("    var csr_addr: {domain}logic<{addr_bits}>;\n"));
@@ -2264,12 +2342,29 @@ fn core_body(
                     slave.addr, slave.addr_width
                 ));
                 out.push_str(&format!(
-                    "    var w_{}: {domain}logic<{WORD_BITS}>;\n",
-                    slave.rdata
+                    "    var w_{}: {domain}logic<{}>;\n",
+                    slave.rdata, slave.width
                 ));
                 if let (Some(wdata), Some(we)) = (&slave.wdata, &slave.we) {
-                    out.push_str(&format!("    var w_{wdata}: {domain}logic<{WORD_BITS}>;\n"));
+                    out.push_str(&format!(
+                        "    var w_{wdata}: {domain}logic<{}>;\n",
+                        slave.wdata_width
+                    ));
                     out.push_str(&format!("    var w_{we}: {domain}logic;\n"));
+                }
+                // With `latency = 0` the answer is gone when the window looks
+                // for it, so it is held. With 2 or more, `re` is delayed by a
+                // shift register.
+                match slave.latency {
+                    0 => out.push_str(&format!(
+                        "    var hold_{bundle}: {domain}logic<{}>;\n",
+                        slave.width
+                    )),
+                    1 => {}
+                    n => out.push_str(&format!(
+                        "    var ansp_{bundle}: {domain}logic<{}>;\n",
+                        n - 1
+                    )),
                 }
                 continue;
             }
@@ -2335,8 +2430,8 @@ fn core_body(
                     inner
                 }
             };
-            // A DMI takes the byte address as it is.
-            if plan.dmis.iter().any(|d| d.bundle == *bundle) {
+            // An APB slave takes the byte address as it is.
+            if plan.apbs.iter().any(|d| d.bundle == *bundle) {
                 out.push_str(&format!(
                     "    assign t_{bundle}_maddr = bus_addr[{entry_hi}:0];\n"
                 ));
@@ -2349,7 +2444,9 @@ fn core_body(
                 ));
                 continue;
             }
-            if plan.axi_mems.iter().any(|d| d.bundle == *bundle) {
+            if plan.axi_mems.iter().any(|d| d.bundle == *bundle)
+                || plan.axi_slaves.iter().any(|d| d.bundle == *bundle)
+            {
                 out.push_str(&format!(
                     "    assign t_{bundle}_maddr = {};\n",
                     paged(format!("bus_addr[{entry_hi}:{shift}]"))
@@ -2371,7 +2468,12 @@ fn core_body(
                     slave.addr
                 ));
                 if let (Some(wdata), Some(we)) = (&slave.wdata, &slave.we) {
-                    out.push_str(&format!("    assign w_{wdata} = bus_wdata;\n"));
+                    let low = if slave.wdata_width == WORD_BITS {
+                        String::new()
+                    } else {
+                        format!("[{}:0]", slave.wdata_width - 1)
+                    };
+                    out.push_str(&format!("    assign w_{wdata} = bus_wdata{low};\n"));
                     out.push_str(&format!("    assign w_{we}    = bus_we & sel_{bundle};\n"));
                 }
                 continue;
@@ -2426,6 +2528,13 @@ fn core_body(
                 continue;
             }
             out.push_str(&format!("            ans_{bundle} = 0;\n"));
+            if let Some(slave) = plan.slaves.iter().find(|s| s.bundle == *bundle) {
+                match slave.latency {
+                    0 => out.push_str(&format!("            hold_{bundle} = 0;\n")),
+                    1 => {}
+                    _ => out.push_str(&format!("            ansp_{bundle} = 0;\n")),
+                }
+            }
             // Same condition as in the `else` below. Without a reset,
             // `veryl check` warns, and a warning fails the check.
             if plan.slaves.iter().all(|s| s.bundle != *bundle)
@@ -2440,9 +2549,46 @@ fn core_body(
             if answers_itself(bundle) {
                 continue;
             }
-            out.push_str(&format!(
-                "            ans_{bundle} = bus_re & sel_{bundle};\n"
-            ));
+            match plan
+                .slaves
+                .iter()
+                .find(|s| s.bundle == *bundle)
+                .map(|s| s.latency)
+            {
+                Some(0) => {
+                    out.push_str(&format!(
+                        "            ans_{bundle} = bus_re & sel_{bundle};\n"
+                    ));
+                    let rdata = &plan
+                        .slaves
+                        .iter()
+                        .find(|s| s.bundle == *bundle)
+                        .expect("found above")
+                        .rdata;
+                    out.push_str(&format!(
+                        "            if bus_re & sel_{bundle} {{\n                hold_{bundle} = w_{rdata};\n            }}\n"
+                    ));
+                }
+                Some(2) => {
+                    out.push_str(&format!(
+                        "            ansp_{bundle} = bus_re & sel_{bundle};\n"
+                    ));
+                    out.push_str(&format!("            ans_{bundle} = ansp_{bundle};\n"));
+                }
+                Some(n) if n > 2 => {
+                    out.push_str(&format!(
+                        "            ansp_{bundle} = {{ansp_{bundle}[{}:0], bus_re & sel_{bundle}}};\n",
+                        n - 3
+                    ));
+                    out.push_str(&format!(
+                        "            ans_{bundle} = ansp_{bundle}[{}];\n",
+                        n - 2
+                    ));
+                }
+                _ => out.push_str(&format!(
+                    "            ans_{bundle} = bus_re & sel_{bundle};\n"
+                )),
+            }
             // A wide entry also needs to remember which word to return.
             // A slave interface is exactly one word, so it does not.
             if plan.slaves.iter().all(|s| s.bundle != *bundle)
@@ -2467,7 +2613,17 @@ fn core_body(
         for region in map.regions.iter().rev() {
             let bundle = &region.bundle;
             let from = if let Some(slave) = plan.slaves.iter().find(|s| s.bundle == *bundle) {
-                format!("w_{}", slave.rdata)
+                let read = if slave.latency == 0 {
+                    format!("hold_{bundle}")
+                } else {
+                    format!("w_{}", slave.rdata)
+                };
+                // A narrower register reads back with zeros above it.
+                if slave.width == WORD_BITS {
+                    read
+                } else {
+                    format!("{{{}'h0, {read}}}", WORD_BITS - slave.width)
+                }
             } else if plan.axi_mems.iter().all(|d| d.bundle != *bundle)
                 && region.entry_bytes / (WORD_BITS / 8) > 1
             {
@@ -2578,7 +2734,6 @@ fn core_body(
         out.push_str(&format!("    var fence_closed_{bundle}: {domain}logic;\n"));
         out.push_str(&format!("    var fence_idle_{bundle}: {domain}logic;\n"));
     }
-    out.push_str(&format!("    var dut_fence: {domain}logic;\n"));
     let closed = if plan.axi_mems.is_empty() {
         "1".to_string()
     } else {
@@ -2903,6 +3058,13 @@ fn core_body(
 
         let (hpkg, widen) = host_pkg(plan, axi_mem);
 
+        // A transfer-level port becomes the AXI4 master here. The adapter
+        // holds the DUT's transfers, so it is reset with the DUT, and the
+        // fence behind it finishes what a reset cuts off.
+        if let Some(xfer) = &axi_mem.xfer {
+            xfer_adapter(out, clocks, clk, rst, axi_mem, xfer);
+        }
+
         // With `dut_base`, only what is inside the memory goes on, with the
         // base taken off. The rest is answered with DECERR and counted. It
         // also sets the address width, so no `hns::axi_aw` is needed.
@@ -2944,6 +3106,8 @@ fn core_body(
         out.push_str("    ) (\n");
         out.push_str(&format!("        i_clk: {clk},\n"));
         out.push_str(&format!("        i_rst: {rst},\n"));
+        // The memory is the harness's, never reset with the DUT.
+        out.push_str("        i_hold: 1'b0,\n");
         out.push_str(&format!("        axi: haxi_{bundle},\n"));
         out.push_str(&format!("        i_haddr: t_{bundle}_maddr,\n"));
         out.push_str(&format!("        i_hwdata: t_{bundle}_mdata,\n"));
@@ -4548,6 +4712,118 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
     out
 }
 
+/// The DUT-side wires of a transfer-level port, `(port, width)`.
+fn xfer_wires(xfer: &crate::terminator::XferPorts) -> Vec<(String, usize)> {
+    let mut wires: Vec<(String, usize)> = Vec::new();
+    if let Some(read) = &xfer.read {
+        wires.extend([
+            (read.cmd_valid.clone(), 1),
+            (read.cmd_ready.clone(), 1),
+            (read.cmd_addr.clone(), xfer.cmd_addr_width),
+            (read.cmd_size.clone(), xfer.cmd_size_width),
+            (read.valid.clone(), 1),
+            (read.ready.clone(), 1),
+            (read.data.clone(), xfer.data_width),
+            (read.last.clone(), 1),
+        ]);
+    }
+    if let Some(write) = &xfer.write {
+        wires.extend([
+            (write.cmd_valid.clone(), 1),
+            (write.cmd_ready.clone(), 1),
+            (write.cmd_addr.clone(), xfer.cmd_addr_width),
+            (write.cmd_size.clone(), xfer.cmd_size_width),
+            (write.valid.clone(), 1),
+            (write.ready.clone(), 1),
+            (write.data.clone(), xfer.data_width),
+            (write.last.clone(), 1),
+        ]);
+        if let Some(strb) = &write.strb {
+            wires.push((strb.clone(), xfer.data_width / 8));
+        }
+        if let Some(done) = &write.done_valid {
+            wires.push((done.clone(), 1));
+        }
+    }
+    wires
+}
+
+/// `hns::xfer2axi`: a `dram` with a transfer-level port. It drives
+/// `axi_<bundle>`, where an AXI4 DUT would be connected.
+fn xfer_adapter(
+    out: &mut String,
+    clocks: Option<&ClockPlan>,
+    clk: &str,
+    rst: &str,
+    axi_mem: &crate::terminator::AxiMemPlan,
+    xfer: &crate::terminator::XferPorts,
+) {
+    let bundle = &axi_mem.bundle;
+    // The DUT reset of the window's clock, as the DUT gets it. Without a DUT
+    // reset there, the harness reset.
+    let dut_reset = match clocks {
+        None => "dut_rst".to_string(),
+        Some(clocks) => {
+            let ident = rst.strip_prefix("rst_").unwrap_or("c0");
+            if clocks.resets.iter().any(|(_, owner)| owner == ident) {
+                format!("drst_{ident}")
+            } else {
+                rst.to_string()
+            }
+        }
+    };
+    let side = |port: Option<&String>, input: bool| -> String {
+        match port {
+            Some(name) => format!("w_{name}"),
+            None if input => "0".to_string(),
+            None => "_".to_string(),
+        }
+    };
+    let read = xfer.read.as_ref();
+    let write = xfer.write.as_ref();
+    let has_strb = write.is_some_and(|w| w.strb.is_some());
+    out.push_str(&format!(
+        "    inst u_xfer_{bundle}: hns::xfer2axi::<{}> #(\n",
+        axi_mem.pkg
+    ));
+    out.push_str(&format!("        HAS_STRB: {has_strb},\n"));
+    out.push_str(&format!("        DEPTH: {},\n", axi_mem.depth));
+    out.push_str(&format!("        ADDR_W: {},\n", xfer.cmd_addr_width));
+    out.push_str(&format!("        SIZE_W: {},\n", xfer.cmd_size_width));
+    out.push_str("    ) (\n");
+    out.push_str(&format!("        i_clk: {clk},\n"));
+    out.push_str(&format!("        i_rst: {dut_reset},\n"));
+    for (port, chosen, input) in [
+        ("i_rd_cmd_valid", read.map(|r| &r.cmd_valid), true),
+        ("o_rd_cmd_ready", read.map(|r| &r.cmd_ready), false),
+        ("i_rd_cmd_addr", read.map(|r| &r.cmd_addr), true),
+        ("i_rd_cmd_size", read.map(|r| &r.cmd_size), true),
+        ("o_rd_valid", read.map(|r| &r.valid), false),
+        ("i_rd_ready", read.map(|r| &r.ready), true),
+        ("o_rd_data", read.map(|r| &r.data), false),
+        ("o_rd_last", read.map(|r| &r.last), false),
+        ("i_wr_cmd_valid", write.map(|w| &w.cmd_valid), true),
+        ("o_wr_cmd_ready", write.map(|w| &w.cmd_ready), false),
+        ("i_wr_cmd_addr", write.map(|w| &w.cmd_addr), true),
+        ("i_wr_cmd_size", write.map(|w| &w.cmd_size), true),
+        ("i_wr_valid", write.map(|w| &w.valid), true),
+        ("o_wr_ready", write.map(|w| &w.ready), false),
+        ("i_wr_data", write.map(|w| &w.data), true),
+        ("i_wr_strb", write.and_then(|w| w.strb.as_ref()), true),
+        ("i_wr_last", write.map(|w| &w.last), true),
+        (
+            "o_wr_done_valid",
+            write.and_then(|w| w.done_valid.as_ref()),
+            false,
+        ),
+    ] {
+        out.push_str(&format!("        {port}: {},\n", side(chosen, input)));
+    }
+    out.push_str(&format!("        axi: axi_{bundle},\n"));
+    out.push_str(&format!("        o_oor: t_{bundle}_oor,\n"));
+    out.push_str("    );\n\n");
+}
+
 /// What to connect to one DUT port.
 fn connection(
     plan: &Plan,
@@ -4584,7 +4860,7 @@ fn connection(
         // A Debug Module's reset gets the harness reset, which `hio reset`
         // does not touch, so the debugger keeps its state.
         let debug_module = plan
-            .dmis
+            .apbs
             .iter()
             .any(|dmi| dmi.reset.as_deref() == Some(port.name.as_str()));
         // The DUT gets the DUT reset. Unlike the harness `rst_*`, the host
@@ -4622,6 +4898,9 @@ fn connection(
         .find(|axi_mem| axi_mem.port == port.name)
     {
         return format!("axi_{}", axi_mem.bundle);
+    }
+    if let Some(axi) = plan.axi_slaves.iter().find(|axi| axi.port == port.name) {
+        return format!("axi_{}", axi.bundle);
     }
 
     // A `reg` register.
@@ -5752,6 +6031,9 @@ fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
         Some("depth") => notes.push("entries the terminator holds".to_string()),
         Some("drops") => notes.push(
             "beats lost because the FIFO was full; saturates instead of wrapping".to_string(),
+        ),
+        Some("slverr") => notes.push(
+            "APB transfers the DUT ended with `pslverr`; saturates instead of wrapping".to_string(),
         ),
         Some("pop") => notes.push(format!(
             "write 1 to take one entry; stays 1 while `{bundle}_level` is 0 and takes the next one that arrives"
