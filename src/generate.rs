@@ -535,6 +535,11 @@ fn sim_files(plan: &plan::Plan, out: &Path) -> miette::Result<Vec<Pending>> {
         "socket component package (Cargo)",
     )?);
     written.push(write(
+        &link.join(".cargo").join("config.toml"),
+        &emit::sim_link_cargo_config(),
+        "socket component build target (Cargo)",
+    )?);
+    written.push(write(
         &link.join("veryl.manifest.json"),
         &emit::sim_link_manifest(),
         "socket component ports (Veryl)",

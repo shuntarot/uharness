@@ -3928,10 +3928,15 @@ fn mem_batch(port: &MemPort<'_>) -> Batch {
     b
 }
 
-/// Refuses a region the harness does not drive while the DUT is held in
-/// reset. The window would wait out its timeout and answer with an error,
-/// which the JTAG bridge keeps until the FPGA is configured again.
+/// Makes sure a region can answer before it is touched. Otherwise the window
+/// waits out its timeout and answers with an error, which the JTAG bridge
+/// keeps until the FPGA is configured again.
+///
+/// - A `dram` answers only once its controller has calibrated, which takes
+///   a while after configuration. It is waited for, then refused.
+/// - A slave of the DUT is not driven while the DUT is held in reset.
 fn not_held(bus: &mut Bus, map: &RegisterMap, region: &hns_regs::Region) -> Result<(), String> {
+    calibrated(bus, map, &region.name)?;
     if !region.held_in_dut_reset {
         return Ok(());
     }
@@ -3947,6 +3952,35 @@ fn not_held(bus: &mut Bus, map: &RegisterMap, region: &hns_regs::Region) -> Resu
         ));
     }
     Ok(())
+}
+
+/// How long a `dram` is given to calibrate. The VCU118's DDR4 was done within
+/// 2 s of `program`; the Arty's DDR3 before `program` returned.
+const CALIBRATION_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Waits until the memory controller behind `bundle` has calibrated, if the
+/// bundle has one (`<bundle>_calib`).
+fn calibrated(bus: &mut Bus, map: &RegisterMap, bundle: &str) -> Result<(), String> {
+    let Ok(calib) = map.get(&format!("{bundle}_calib")) else {
+        return Ok(());
+    };
+    let offset = calib.offset as u32;
+    let start = std::time::Instant::now();
+    loop {
+        if rd(bus, offset)? & 1 == 1 {
+            return Ok(());
+        }
+        if start.elapsed() > CALIBRATION_WAIT {
+            return Err(format!(
+                "`{bundle}` is not calibrated yet ({bundle}_calib is 0 after {} s): its memory \
+                 controller answers nothing until it is. The access was not made.\n\
+                 Calibration runs once after configuration. If it never ends, check the \
+                 memory clock and the board reset.",
+                CALIBRATION_WAIT.as_secs()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Reads a region, one round trip per window page.
@@ -5586,6 +5620,10 @@ fn boot(
         }
     }
 
+    // The program goes into memories that may still be calibrating.
+    for span in &spans {
+        calibrated(bus, map, &span.bundle)?;
+    }
     let mut mem = WindowMem { bus, map, spans };
     if load {
         reset(mem.bus, map, true, false)?;

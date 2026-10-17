@@ -657,3 +657,25 @@ fn a_transfer_level_dma_engine_runs_on_dram() {
     link.finish().unwrap();
     assert!(child.wait().unwrap().success());
 }
+
+/// A project that also holds firmware names its CPU in its own cargo config.
+/// Veryl builds the socket component inside the project, so that config would
+/// apply to it too; the component's own config keeps it on the host.
+#[test]
+fn a_cpu_target_in_the_project_does_not_reach_the_component() {
+    let dir = fixture(DUT, HARNESS_TOML);
+    fs::create_dir(dir.path().join(".cargo")).unwrap();
+    fs::write(
+        dir.path().join(".cargo").join("config.toml"),
+        "[build]\ntarget = \"riscv32im-unknown-none-elf\"\n",
+    )
+    .unwrap();
+    let out = harness(dir.path(), &["gen", "--target", "sim"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let config = fs::read_to_string(dir.path().join("hns/link/.cargo/config.toml")).unwrap();
+    assert!(config.contains("host-tuple"), "{config}");
+
+    let (mut child, link) = start(dir.path());
+    link.finish().unwrap();
+    assert!(child.wait().unwrap().success());
+}
