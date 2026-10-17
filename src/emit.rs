@@ -1625,6 +1625,22 @@ pub fn sim_link_cargo_toml() -> String {
     out
 }
 
+/// `link/.cargo/config.toml`: builds the component for the machine that runs
+/// the simulation. Veryl runs cargo in `link/`, so a project's own cargo
+/// config is read too, and a firmware project names its CPU there
+/// (`[build] target = "riscv32im-unknown-none-elf"`), where no cdylib can be
+/// built. A config nearer the package wins.
+pub fn sim_link_cargo_config() -> String {
+    let mut out = header_tcl();
+    out.push_str(
+        "
+[build]
+target = \"host-tuple\"
+",
+    );
+    out
+}
+
 /// `link/veryl.manifest.json`: the component's ports, so that Veryl can
 /// analyze the testbench before cargo has built the component. The crate's
 /// tests keep it equal to what the library exports.

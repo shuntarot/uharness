@@ -129,7 +129,8 @@ Two things it will stop for: memory decoding turned off (it prints the
 
 `timeouts` in `hio id` counts the times the window had to answer for a
 terminator that would not. Anything but 0 means a value read then was 0 rather
-than data — with `dram`, read `<bundle>_calib` first. Clear it with
+than data. `hio` itself waits up to 3 s for `<bundle>_calib` before it touches
+a `dram`, and does not touch a slave in a DUT held in reset. Clear it with
 `hio write harness_timeout 1`; writing 0 does not clear it.
 
 A PCIe design also counts the TLPs that reach its BAR, and the completions it
