@@ -11,6 +11,7 @@
 //! The split lets tests catch mistakes that would otherwise show up only on
 //! real hardware.
 
+pub mod adi;
 pub mod bitstream;
 pub mod bridge;
 pub mod config;
@@ -21,6 +22,7 @@ pub mod frame;
 pub mod ftdi;
 pub mod mpsse;
 pub mod pcie;
+pub mod ps7;
 pub mod rtt;
 pub mod semihosting;
 pub mod sim;

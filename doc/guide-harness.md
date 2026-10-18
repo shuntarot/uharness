@@ -486,11 +486,11 @@ to fix it.
 |---|---|---|
 | `digilent/arty-a7-35` | `jtag` | DDR3L, 256 MB |
 | `digilent/arty-a7-100` | `jtag` | DDR3L, 256 MB |
+| `digilent/pynq-z1` | `jtag` | DDR3 through the PS, 256 MB |
 | `xilinx/vcu118` | `jtag`, `pcie` | DDR4 |
 | `xilinx/kcu105` | `jtag`, `pcie` | DDR4, 2 GB, with `:dr` or `:062` |
 | `xilinx/kc705` | `jtag` | DDR3, 1 GB |
 | `alibaba/as02mc04` | `jtag` | — (no DRAM; not yet tried on a card) |
-| `digilent/pynq-z1` | `jtag` | — (PL only) |
 | `sim` | `sim` | — (no board; see [Without a board](#without-a-board)) |
 
 The AS02MC04 has no USB JTAG of its own. Its description names a Digilent
@@ -498,10 +498,13 @@ JTAG-HS2 wired to the card's 6-pin header; another FTDI adapter works through
 `hio --vid/--pid/--product/--layout-init`. It has no USB-UART either, so
 `[heartbeat]` has no pin there.
 
-The PYNQ-Z1 description uses the PL only. Its DDR3 and its USB-UART belong to
-the PS, so the harness has neither. Set the boot jumper to JTAG, so a bitstream
-from the SD card does not replace yours. The ARM DAP shares the JTAG chain with
-the PL; `hio` holds it in BYPASS.
+On the PYNQ-Z1 the DDR3 belongs to the Zynq's PS. A `dram` bundle reaches it
+through the PS's S_AXI_HP0 port: the upper 256 MB, on the harness clock. No
+program runs on the CPUs; the PS is set up over JTAG instead, and `hio program`
+does that after the bitstream (`ps7_init.tcl`, beside the bitstream, from the
+PS settings that ship with the target). The USB-UART is the PS's too, so
+`[heartbeat]` has no pin. Set the boot jumper to JTAG, so a bitstream from the
+SD card does not replace yours.
 
 The KCU105 carries one of two DDR4 parts, and the memory controller must know
 which. Add the config that matches the chips: `:dr` for EDY4016AABG-DR-F
@@ -561,7 +564,9 @@ For a 7-series DDR3 board (the Arty), the memory controller is generated from
 `syn/mig.prj`, a copy of the board file that ships with the target. With
 `--target-file`, `[vivado] mig_prj` names a file beside your description; the
 board files in `github.com/Xilinx/XilinxBoardStore` have one for each such
-board (`boards/<vendor>/<board>/<revision>/mig.prj`).
+board (`boards/<vendor>/<board>/<revision>/mig.prj`). A Zynq board's PS is
+built the same way, from the `CONFIG.PCW_*` settings `[vivado] ps7_preset`
+names.
 
 **No Tcl is generated for reaching the window.** The harness uses its own
 BSCANE2 bridge, which Vivado cannot see; use `hio`.

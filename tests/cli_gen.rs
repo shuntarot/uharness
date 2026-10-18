@@ -2384,6 +2384,105 @@ fn the_simulation_stand_in_for_dram_does_not_carry_the_whole_chip() {
     assert!(!board.contains("create_clock"), "{board}");
 }
 
+/// A Zynq PS's memory: the PS7 and the AXI3 converter sit on the harness
+/// clock, with no crossing, the window is set to the PS address `base`, and
+/// the PS setup file goes beside the bitstream and into `make zip`.
+#[test]
+fn a_ps7_memory_goes_through_hp0_on_the_harness_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("Veryl.toml"), veryl_toml()).unwrap();
+    fs::create_dir(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src").join("fixture.veryl"),
+        r#"
+module dut_top (
+    i_clk: input clock,
+    i_rst: input reset,
+    mem  : modport $std::axi4_if::<$std::axi4_pkg::<28, 4, 8, 1, 1, 1, 1, 1>>::master,
+) {
+    // Tie every master output. `veryl check` on the output analyzes the DUT
+    // too, and an unassigned-signal warning fails it.
+    always_comb {
+        mem.awvalid = 0;
+        mem.awaddr = 0;
+        mem.awsize = 0;
+        mem.awburst = 0;
+        mem.awcache = 0;
+        mem.awprot = 0;
+        mem.awid = 0;
+        mem.awlen = 0;
+        mem.awlock = 0;
+        mem.awqos = 0;
+        mem.awregion = 0;
+        mem.awuser = 0;
+        mem.wvalid = 0;
+        mem.wlast = 0;
+        mem.wdata = 0;
+        mem.wstrb = 0;
+        mem.wuser = 0;
+        mem.bready = 0;
+        mem.arvalid = 0;
+        mem.araddr = 0;
+        mem.arsize = 0;
+        mem.arburst = 0;
+        mem.arcache = 0;
+        mem.arprot = 0;
+        mem.arid = 0;
+        mem.arlen = 0;
+        mem.arlock = 0;
+        mem.arqos = 0;
+        mem.arregion = 0;
+        mem.aruser = 0;
+        mem.rready = 0;
+    }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("Harness.toml"),
+        "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 100\n\n[bundle.mem]\nbacking = \"dram\"\ndepth = \"64M\"\naperture = 256\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+        .args(["gen", "--target", "digilent/pynq-z1"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if let Err(why) = common::veryl_check(&dir.path().join("hns")) {
+        panic!("the PS7 harness does not check:\n{why}");
+    }
+    let hns = dir.path().join("hns");
+    let read = |path: &str| fs::read_to_string(hns.join(path)).unwrap();
+    let top = read("src/top.veryl");
+    assert!(top.contains("inst u_ps7_mem: $sv::hns_ps7"), "{top}");
+    assert!(top.contains("inst u_pc_mem: $sv::hns_axi_pc"), "{top}");
+    // 256 MB from 0x1000_0000: the high address bits are set.
+    assert!(
+        tight(&top).contains("{4'h1, saxi_mem.awaddr[27:0]}")
+            || tight(&top).contains("{4'h1, waxi_mem.awaddr[27:0]}"),
+        "{top}"
+    );
+    // No controller clock, so nothing crosses.
+    assert!(!top.contains("u_cdc_mem"), "{top}");
+    assert!(!top.contains("i_mig_clk"), "{top}");
+    assert!(!read("syn/harness.xdc").contains("u_cdc_mem"));
+    assert!(read("syn/ps7.tcl").contains("processing_system7"));
+    assert!(read("syn/ps7_preset.tcl").contains("CONFIG.PCW_UIPARAM_DDR_PARTNO"));
+    let ip = read("syn/ip.tcl");
+    assert!(has_command(&ip, "source ps7.tcl"), "{ip}");
+    assert!(!has_command(&ip, "source mig.tcl"), "{ip}");
+    assert!(ip.contains("ps7_init.tcl"), "{ip}");
+    assert!(read("syn/Makefile").contains("output/ps7_init.tcl"));
+    assert!(read("regs.md").contains("the PS is set up"));
+}
+
 /// A PCIe design with `dram` gets a path where the card is the requester.
 ///
 /// Reads through the window cannot go below 1.30 us per word, so to go faster

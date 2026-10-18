@@ -1,26 +1,27 @@
 # Digilent PYNQ-Z1 (Zynq-7000 XC7Z020)
 #
-# Only the PL is used. The harness sits in the PL and is reached over the
-# on-board USB JTAG, like on the Arty. The PS is left alone: nothing here needs
-# it to boot, so set the boot jumper (JP4) to JTAG. Booted from SD, the PYNQ
-# image may load its own bitstream over yours.
+# The harness sits in the PL and is reached over the on-board USB JTAG, like
+# on the Arty. No program runs on the PS's CPUs, so set the boot jumper (JP4)
+# to JTAG. Booted from SD, the PYNQ image may load its own bitstream over yours.
 #
 # Values come from the master XDC (Rev C), the PYNQ base design constraints
 # (Xilinx/PYNQ v2.7.0, boards/Pynq-Z1/base/vivado/constraints/base.xdc) and the
 # BSDL Vivado ships.
 #
-# **JTAG only.** The 512 MB DDR3 belongs to the PS: the PL reaches it only
-# through the PS (processing_system7 and its HP ports), after software has set
-# up the DDR controller. The USB-UART is wired to the PS (MIO) too, so the PL
-# has no UART.
+# **JTAG only.** The 512 MB DDR3 belongs to the PS. `dram` reaches it through
+# the PS's S_AXI_HP0 port, and `hio program` sets the PS up over JTAG after
+# the bitstream (`hio dap ps7-init`); see `[provides] dram`. The USB-UART is
+# wired to the PS (MIO), so the PL has no UART.
 #
 # Programmed and reached over JTAG on a board (2026-10-18): `hio probe`
 # showed the two TAPs as described below, `hio program` and `hio id` passed.
+# The PS's DDR, through `dram`, passed `examples/hw/dram`'s bring-up on a board
+# (2026-10-19).
 
 [board]
 provider    = "digilent"
 name        = "pynq-z1"
-description = "Digilent PYNQ-Z1 (Zynq-7000 XC7Z020, PL only)"
+description = "Digilent PYNQ-Z1 (Zynq-7000 XC7Z020)"
 url         = "https://digilent.com/reference/programmable-logic/pynq-z1/start"
 
 [device]
@@ -32,8 +33,19 @@ part   = "xc7z020clg400-1"
 # also shows `arm_dap_0`, which this does not match.
 hw_pattern = "xc7z020"
 
+[vivado]
+# The PS7 settings, beside this file (provenance in README.md). `gen` copies
+# them, and the PS7 IP is built from them, with no board files.
+ps7_preset = "ps7_preset.tcl"
+
 [provides]
 transport = ["jtag"]
+
+# The PS's DDR3, through S_AXI_HP0: 64-bit AXI3 with 6-bit IDs, at the PS
+# address `base`. The harness shows the upper 256 MB (0x1000_0000 up): the
+# window must be a power of two, and this keeps clear of the low 1 MB, where
+# the PS may map its on-chip memory.
+dram = {kind = "ddr3", device = "MT41J256M16 RE-125", channels = 1, mb = 512, controller = "ps7", axi_data_bits = 64, axi_addr_bits = 28, axi_id_bits = 6, base = 0x1000_0000}
 
 # 36Kb x 140 = 5,040 Kbit on the XC7Z020. From the datasheet.
 bram_kb = 630
@@ -41,6 +53,8 @@ bram_kb = 630
 # The 125 MHz clock to the PL, from the Ethernet PHY (RTL8211E). Users report
 # it is unstable while no Ethernet cable is plugged in (the PHY powers down
 # without a link). **Not checked here**: keep a cable in until it is measured.
+# Setting the PS up rewrites the PHY's MIO pins: the window stopped for a
+# moment right after ps7_init (measured), so `hio program` waits for it.
 [clocks.sys]
 freq_mhz = 125
 diff     = false
@@ -80,6 +94,11 @@ layout_init = [0x0088, 0x008b]
 # 0x4ba00477).
 chain_tdo_side = []
 chain_tdi_side = [4]
+
+# The ARM DAP is that TAP. `hio dap` reaches the PS's memory through it, with
+# no program on the CPUs. Its access ports, read on a board: 0 is the AHB
+# MEM-AP (system memory), 1 the APB MEM-AP (CoreSight), 2 a JTAG-AP.
+dap = { side = "tdi", index = 0, mem_ap = 0 }
 
 # The PL TAP's IDCODE. The BSDL leaves the top 4 bits (the silicon revision)
 # open; the board read 0x23727093.

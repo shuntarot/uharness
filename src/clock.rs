@@ -325,6 +325,10 @@ fn controller_clocks(manifest: &Manifest, target: &Target) -> Vec<ClockOutput> {
     let Some(dram) = hns_targets::dram(target) else {
         return Vec::new();
     };
+    // A Zynq PS's memory runs on the harness clock: the PS has its own.
+    if dram.is_ps7() {
+        return Vec::new();
+    }
     // A named source means the IP takes the system clock from a board pin, so
     // the MMCM does not make it.
     let from_board = dram.sys_clk.is_some();
@@ -664,7 +668,11 @@ fn input_reset(target: &Target) -> Result<InputReset, ClockError> {
 /// It must be named. Matching a 250 MHz controller to a 250 MHz source would be
 /// a guess.
 fn controller_clock_name(target: &Target) -> Option<String> {
-    hns_targets::dram(target)?.sys_clk
+    let dram = hns_targets::dram(target)?;
+    if dram.is_ps7() {
+        return None;
+    }
+    dram.sys_clk
 }
 
 /// The target clock source for the MMCM. Exactly one is used.
