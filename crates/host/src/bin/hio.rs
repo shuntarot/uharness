@@ -663,6 +663,24 @@ struct AttachArgs {
     /// How long to wait for the program to set up RTT, in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 3000)]
     wait_ms: u64,
+    /// Give up when the program has not exited after this many seconds.
+    ///
+    /// The exit status is then 124, as from `timeout(1)`. Without it, `hio`
+    /// waits until Ctrl-A x, which a test run cannot press.
+    #[arg(long, value_name = "SECONDS", value_parser = parse_seconds)]
+    timeout: Option<std::time::Duration>,
+}
+
+/// The exit status when `--timeout` runs out.
+const TIMED_OUT: i32 = 124;
+
+fn parse_seconds(s: &str) -> Result<std::time::Duration, String> {
+    let secs: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{s}` is not a number of seconds"))?;
+    std::time::Duration::try_from_secs_f64(secs)
+        .map_err(|_| format!("`{s}` is not a time hio can wait (it must be 0 or more)"))
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy)]
@@ -811,6 +829,10 @@ fn resolve_probe(cli: &Cli) -> Result<ProbeConfig, String> {
             .user1_ir
             .or(from_target.user1_ir)
             .unwrap_or(DEFAULT_USER1_IR),
+        chain: hns_host::mpsse::Chain::new(
+            &from_target.chain_tdo_side,
+            &from_target.chain_tdi_side,
+        ),
     })
 }
 
@@ -1192,31 +1214,84 @@ fn probe(cli: &Cli) -> Result<(), String> {
              differ between Digilent modules."
             .to_string());
     }
+    // The device nearest TDO answers first.
+    let ours = cfg.chain.dr.tdo;
     for (i, d) in chain.iter().enumerate() {
+        let near = if i == 0 && chain.len() > 1 {
+            "  (nearest TDO)"
+        } else {
+            ""
+        };
+        let fpga = if i == ours && chain.len() > 1 {
+            "  <- the FPGA hio talks to"
+        } else {
+            ""
+        };
         match d {
-            hns_host::mpsse::Device::Id(id) => println!("device  {i}: idcode {id:#010x}"),
-            hns_host::mpsse::Device::Bypass => println!("device  {i}: no idcode (bypass)"),
+            hns_host::mpsse::Device::Id(id) => {
+                println!("device  {i}: idcode {id:#010x}{near}{fpga}")
+            }
+            hns_host::mpsse::Device::Bypass => {
+                println!("device  {i}: no idcode (bypass){near}{fpga}")
+            }
         }
     }
-    if chain.len() > 1 {
-        // Code that assumes one device silently reaches the wrong one.
+    let expected = cfg.chain.dr.tdo + cfg.chain.dr.tdi + 1;
+    if chain.len() != expected {
+        // Scans padded for the wrong chain silently reach the wrong device.
+        if cfg.chain.is_alone() {
+            println!(
+                "        note: {} devices are in the chain, and the target says the FPGA is \
+                 alone. List the IR lengths of the other devices in its [jtag], as \
+                 `chain_tdo_side` (between the FPGA and TDO) and `chain_tdi_side` (between \
+                 the FPGA and TDI).",
+                chain.len()
+            );
+        } else {
+            println!(
+                "        note: {} devices are in the chain, but `chain_tdo_side` and \
+                 `chain_tdi_side` in the target describe {expected}. Fix them to match.",
+                chain.len()
+            );
+        }
+    } else if let Some(want) = load_target(cli)?.idcode
+        && let Some(hns_host::mpsse::Device::Id(got)) = chain.get(ours)
+        // The top 4 bits are the silicon revision.
+        && got & 0x0fff_ffff != want & 0x0fff_ffff
+    {
         println!(
-            "        note: {} devices are in the chain. hio supports only one device in \
-             the chain for now.",
-            chain.len()
+            "        note: device {ours} has idcode {got:#010x}, and the target expects \
+             {want:#010x}. Check `chain_tdo_side` in the target, or the board."
         );
     }
 
     // Measure on the chain instead of looking it up, so unknown boards work.
+    // This covers the whole chain, so the other devices' IRs add to ours.
+    let others = cfg.chain.ir.tdo + cfg.chain.ir.tdi;
     match m.measure_ir_length().map_err(|e| e.to_string())? {
         Some(len) => {
-            println!("ir      {len} bits (measured)");
-            if len != cfg.ir_length {
-                println!(
-                    "        note: {} bits is being used instead. Set `ir_length = {len}` \
-                     in the target, or pass --ir-length {len}.",
-                    cfg.ir_length
-                );
+            if others > 0 {
+                println!("ir      {len} bits on the whole chain (measured)");
+            } else {
+                println!("ir      {len} bits (measured)");
+            }
+            if len as usize != cfg.ir_length as usize + others {
+                if others > 0 {
+                    println!(
+                        "        note: the target gives {} bits: {} for the FPGA and {others} \
+                         for the other devices. Fix `ir_length`, `chain_tdo_side` or \
+                         `chain_tdi_side` in the target.",
+                        cfg.ir_length as usize + others,
+                        cfg.ir_length
+                    );
+                } else {
+                    println!(
+                        "        note: {} bits is being used instead. Set `ir_length = {len}` \
+                         in the target, or pass --ir-length {len}. With more than one \
+                         device, the bits are shared between them.",
+                        cfg.ir_length
+                    );
+                }
             }
         }
         None => println!("ir      could not be measured (longer than 64 bits?)"),
@@ -5332,6 +5407,26 @@ impl Span {
     }
 }
 
+/// Bytes of zeros to write after a segment's file bytes.
+///
+/// Past the file bytes the program expects zeros. A loader clears them, and
+/// riscv-tests (`-v`) relies on it: what the last program left there makes it
+/// fail. Only the tail of a segment with file bytes is cleared (`.bss` after
+/// `.data`). A segment that is all zero-fill is often the stack, megabytes
+/// that the startup code does not need cleared and that take long to clear
+/// over JTAG. The tail stops where a memory it goes to ends.
+fn zero_fill(segment: &hns_host::elf::Segment, into: &[&Span]) -> u64 {
+    let filled = segment.paddr + segment.bytes.len() as u64;
+    if segment.bytes.is_empty() {
+        return 0;
+    }
+    into.iter()
+        .map(|s| (s.base + s.bytes).min(segment.paddr + segment.memsz))
+        .min()
+        .unwrap_or(filled)
+        .saturating_sub(filled)
+}
+
 /// Every memory bundle in the map, with its DUT address.
 fn spans(map: &RegisterMap) -> Result<Vec<Span>, String> {
     let mut names: Vec<String> = map
@@ -5610,9 +5705,11 @@ fn boot(
                     );
                 }
             }
+            let zeros = zero_fill(segment, &into);
             plan.push((
                 segment,
                 into.iter().map(|s| s.bundle.clone()).collect::<Vec<_>>(),
+                zeros,
             ));
         }
         if plan.is_empty() {
@@ -5627,7 +5724,7 @@ fn boot(
     let mut mem = WindowMem { bus, map, spans };
     if load {
         reset(mem.bus, map, true, false)?;
-        for (segment, names) in &plan {
+        for (segment, names, zeros) in &plan {
             hns_host::rtt::Memory::write(&mut mem, segment.paddr, &segment.bytes)?;
             println!(
                 "  {:#012x} -> {}  {} bytes",
@@ -5635,6 +5732,14 @@ fn boot(
                 names.join(", "),
                 segment.bytes.len()
             );
+            if *zeros > 0 {
+                let at = segment.paddr + segment.bytes.len() as u64;
+                hns_host::rtt::Memory::write(&mut mem, at, &vec![0; *zeros as usize])?;
+                println!(
+                    "  {at:#012x} -> {}  {zeros} bytes of zeros",
+                    names.join(", ")
+                );
+            }
         }
         // A control block left by the last program would be taken for a live
         // one before the new program sets up its own. Clearing just the block
@@ -5683,7 +5788,7 @@ fn boot(
 
     let Some((rtt_addr, rtt_size)) = rtt_at else {
         return match tohost {
-            Some(addr) => wait_tohost(&mut mem, addr, ptr),
+            Some(addr) => wait_tohost(&mut mem, addr, ptr, attach.timeout),
             None => {
                 println!("no `_SEGGER_RTT` and no `tohost` in the ELF: nothing to wait for");
                 Ok(0)
@@ -5751,13 +5856,32 @@ impl Link {
 }
 
 /// Polls `tohost` until the program reports.
-fn wait_tohost(mem: &mut WindowMem, addr: u64, ptr: u64) -> Result<i32, String> {
+fn wait_tohost(
+    mem: &mut WindowMem,
+    addr: u64,
+    ptr: u64,
+    timeout: Option<std::time::Duration>,
+) -> Result<i32, String> {
+    let started = std::time::Instant::now();
     loop {
         if let Some(code) = read_tohost(mem, addr, ptr)? {
             return Ok(code);
         }
+        if let Some(limit) = timeout
+            && started.elapsed() >= limit
+        {
+            eprintln!("{}", timed_out(limit));
+            return Ok(TIMED_OUT);
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+fn timed_out(limit: std::time::Duration) -> String {
+    format!(
+        "hio: the program did not exit within {} s (--timeout); exit status {TIMED_OUT}",
+        limit.as_secs_f64()
+    )
 }
 
 fn read_tohost(mem: &mut WindowMem, addr: u64, ptr: u64) -> Result<Option<i32>, String> {
@@ -5855,6 +5979,14 @@ fn console(
     }
     loop {
         let mut worked = false;
+
+        if let Some(limit) = program.attach.timeout
+            && started.elapsed() >= limit
+        {
+            drop(raw);
+            eprintln!("\n{}", timed_out(limit));
+            return Ok(TIMED_OUT);
+        }
 
         // Keys first, so typing is not held up behind a busy output.
         for key in raw.keys() {
@@ -7259,6 +7391,55 @@ mod tests {
             vec![0x5566_7788, 0x1122_3344]
         );
         assert_eq!(wide_words(0x1234, 1), vec![0x1234]);
+    }
+
+    fn span(base: u64, bytes: u64) -> Span {
+        Span {
+            bundle: "mem".to_string(),
+            base,
+            bytes,
+            dut_writes: true,
+        }
+    }
+
+    fn segment(paddr: u64, file: usize, memsz: u64) -> hns_host::elf::Segment {
+        hns_host::elf::Segment {
+            paddr,
+            memsz,
+            bytes: vec![0xaa; file],
+        }
+    }
+
+    /// riscv-tests `-v`: `.data` with `.bss` after it in one segment. The
+    /// tail is cleared, up to where the smallest memory it goes to ends.
+    #[test]
+    fn the_bss_after_the_data_is_cleared() {
+        let mem = span(0x8000_0000, 0x10_0000);
+        let seg = segment(0x8000_1000, 0x2124, 0x8010);
+        assert_eq!(zero_fill(&seg, &[&mem]), 0x8010 - 0x2124);
+        let small = span(0x8000_0000, 0x4000);
+        assert_eq!(zero_fill(&seg, &[&mem, &small]), 0x4000 - 0x3124);
+        // Nothing past the file bytes: nothing to clear.
+        assert_eq!(zero_fill(&segment(0x8000_0000, 0x100, 0x100), &[&mem]), 0);
+    }
+
+    /// A segment that is all zero-fill (a Rust firmware's stack can be tens
+    /// of megabytes) is left alone: its startup code clears what it needs.
+    #[test]
+    fn a_segment_with_no_file_bytes_is_not_cleared() {
+        let mem = span(0x8000_0000, 0x200_0000);
+        assert_eq!(zero_fill(&segment(0x8000_24e8, 0, 0x1ff_db18), &[&mem]), 0);
+    }
+
+    #[test]
+    fn a_timeout_is_given_in_seconds() {
+        assert_eq!(parse_seconds("30"), Ok(std::time::Duration::from_secs(30)));
+        assert_eq!(
+            parse_seconds("0.5"),
+            Ok(std::time::Duration::from_millis(500))
+        );
+        assert!(parse_seconds("-1").is_err());
+        assert!(parse_seconds("ten").is_err());
     }
 
     /// riscv-tests' convention: 1 passes, an odd value fails with value >> 1,

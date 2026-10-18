@@ -184,6 +184,7 @@ pub fn program<C: Chan>(
             // Send the sync word first and stop in Pause-DR, as Vivado does.
             let mut cmds = Vec::new();
             crate::mpsse::push_enter(&mut cmds, false);
+            crate::mpsse::push_pad(&mut cmds, m.chain().dr.tdo);
             let flipped: Vec<u8> = SYNC.iter().map(|b| b.reverse_bits()).collect();
             shift_out(m, &mut cmds, &flipped, crate::mpsse::Exit::Pause).map_err(Error::Io)?;
             shift_in(m, &data[c.at..c.at + c.bytes], true).map_err(Error::Io)?;
@@ -244,7 +245,8 @@ fn poll<C: Chan>(
     }
 }
 
-/// Shifts out `bytes` and stops in `exit`.
+/// Shifts out `bytes` and stops in `exit`. The DR goes on after it, so no pad
+/// bits follow.
 fn shift_out<C: Chan>(
     m: &mut Mpsse<C>,
     cmds: &mut Vec<u8>,
@@ -254,7 +256,7 @@ fn shift_out<C: Chan>(
     let last_byte = bytes[bytes.len() - 1];
     crate::mpsse::push_write_bytes(cmds, &bytes[..bytes.len() - 1]);
     crate::mpsse::push_write_bits(cmds, last_byte, 7);
-    crate::mpsse::push_tail_quiet(cmds, last_byte & 0x80 != 0, exit);
+    crate::mpsse::push_tail_quiet(cmds, last_byte & 0x80 != 0, exit, 0);
     m.send(cmds)?;
     cmds.clear();
     Ok(())
@@ -267,11 +269,13 @@ fn shift_out<C: Chan>(
 fn shift_in<C: Chan>(m: &mut Mpsse<C>, data: &[u8], resume: bool) -> Result<(), C::Error> {
     let (last, body) = data.split_last().expect("checked non-empty");
 
+    let pad = m.chain().dr;
     let mut cmds = Vec::new();
     if resume {
         crate::mpsse::push_resume_from_pause(&mut cmds);
     } else {
         push_enter(&mut cmds, false);
+        crate::mpsse::push_pad(&mut cmds, pad.tdo);
     }
 
     for part in body.chunks(CHUNK) {
@@ -285,7 +289,12 @@ fn shift_in<C: Chan>(m: &mut Mpsse<C>, data: &[u8], resume: bool) -> Result<(), 
     // TMS=1, then walk Exit1 -> Update -> Run-Test/Idle.
     let flipped = last.reverse_bits();
     crate::mpsse::push_write_bits(&mut cmds, flipped, 7);
-    crate::mpsse::push_tail_quiet(&mut cmds, flipped & 0x80 != 0, crate::mpsse::Exit::Idle);
+    crate::mpsse::push_tail_quiet(
+        &mut cmds,
+        flipped & 0x80 != 0,
+        crate::mpsse::Exit::Idle,
+        pad.tdi,
+    );
     m.send(&cmds)?;
     Ok(())
 }

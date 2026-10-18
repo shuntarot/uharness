@@ -76,6 +76,54 @@ pub struct ProbeConfig {
     pub ir_length: u8,
     /// IR value that selects BSCANE2 `JTAG_CHAIN 1`.
     pub user1_ir: u32,
+    /// The other TAPs on the chain. Empty when the FPGA is alone.
+    pub chain: Chain,
+}
+
+/// Pad bits around our part of a scan, for the other TAPs on the chain.
+///
+/// The bits shifted first end up nearest TDO. So a scan sends `tdo` pad bits,
+/// then ours, then `tdi` pad bits. On the way back, the first `tdo` bits belong
+/// to the other TAPs, so they are clocked without reading.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pad {
+    /// Bits between our TAP and TDO.
+    pub tdo: usize,
+    /// Bits between our TAP and TDI.
+    pub tdi: usize,
+}
+
+/// The other TAPs on the chain, held in BYPASS while we talk to ours.
+///
+/// In an IR scan each of them takes its IR length, filled with 1s (BYPASS on
+/// every IEEE 1149.1 TAP). In a DR scan each takes 1 bit, its BYPASS register.
+/// Without the padding, scans reach the wrong TAP and nothing says so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Chain {
+    pub ir: Pad,
+    pub dr: Pad,
+}
+
+impl Chain {
+    /// From the IR lengths of the other TAPs on each side of ours.
+    pub fn new(tdo_side: &[u8], tdi_side: &[u8]) -> Chain {
+        let sum = |s: &[u8]| s.iter().map(|&n| n as usize).sum();
+        Chain {
+            ir: Pad {
+                tdo: sum(tdo_side),
+                tdi: sum(tdi_side),
+            },
+            dr: Pad {
+                tdo: tdo_side.len(),
+                tdi: tdi_side.len(),
+            },
+        }
+    }
+
+    /// Whether our TAP is alone on the chain.
+    pub fn is_alone(&self) -> bool {
+        *self == Chain::default()
+    }
 }
 
 /// Value for `SET_TCK_DIVISOR`, rounded so TCK does not exceed `max_tck_hz`.
@@ -210,12 +258,42 @@ pub fn push_body(out: &mut Vec<u8>, body: &[bool]) -> usize {
     read_len
 }
 
+/// Shift `n` 1s in the Shift state without reading back. These are the pad
+/// bits for the other TAPs on the chain.
+pub fn push_pad(out: &mut Vec<u8>, n: usize) {
+    let mut left = n;
+    while left > 0 {
+        let k = left.min(8);
+        push_write_bits(out, 0xff, k);
+        left -= k;
+    }
+}
+
+/// Send our last bit with a read, then all but the last of `pad` pad bits. The
+/// last pad bit goes out with the exit. Returns the same as `push_tail`.
+///
+/// A 1-bit read comes back at the top of its byte, as the TMS read would, so
+/// `scan_decode` sees it with `tail_bits` 1.
+fn push_last_then_pad(out: &mut Vec<u8>, last: bool, pad: usize) -> (usize, usize) {
+    out.push(CMD_BITS);
+    out.push(0);
+    out.push(u8::from(last));
+    push_pad(out, pad - 1);
+    (1, 1)
+}
+
 /// Send the last bit and leave Shift. Returns (bytes to read back, TMS bits).
 ///
 /// JTAG sends the last bit of Shift-DR on the same clock as TMS=1, so the exit
-/// and the last bit are one command.
-pub fn push_tail(out: &mut Vec<u8>, last: bool, exit: Exit) -> (usize, usize) {
+/// and the last bit are one command. With `pad` bits for the TAPs between ours
+/// and TDI, the last pad bit goes with the exit instead.
+pub fn push_tail(out: &mut Vec<u8>, last: bool, exit: Exit, pad: usize) -> (usize, usize) {
     let tms = tail_tms(exit);
+    if pad > 0 {
+        let got = push_last_then_pad(out, last, pad);
+        push_tms(out, tms, false, true);
+        return got;
+    }
     push_tms(out, tms, true, last);
     (1, tms.len())
 }
@@ -238,17 +316,27 @@ fn tail_tms(exit: Exit) -> &'static [bool] {
 /// synchronizer. TCK runs only 3 cycles before the next Capture. After the 2
 /// synchronizer cycles, the window side has 1 cycle (+ `gap`) to finish, or the
 /// result is lost (see `update_gap`). With `gap` 0 this equals `TAIL_TO_SHIFT`.
-pub fn push_tail_gap(out: &mut Vec<u8>, last: bool, gap: usize) -> (usize, usize) {
+///
+/// `pad` is as in `push_tail`. The next scan starts in Shift, so it sends its
+/// own `tdo` pad bits first.
+pub fn push_tail_gap(out: &mut Vec<u8>, last: bool, gap: usize, pad: usize) -> (usize, usize) {
     if gap == 0 {
-        return push_tail(out, last, Exit::Shift);
+        return push_tail(out, last, Exit::Shift, pad);
     }
     // Read the last bit on Exit1 → Update → Run-Test/Idle, wait there, then
     // Select-DR → Capture-DR → Shift-DR.
     let head = &TAIL_TO_SHIFT[..3];
-    push_tms(out, head, true, last);
+    let got = if pad > 0 {
+        let got = push_last_then_pad(out, last, pad);
+        push_tms(out, head, false, true);
+        got
+    } else {
+        push_tms(out, head, true, last);
+        (1, head.len())
+    };
     push_idle_clocks(out, gap);
     push_tms(out, &TAIL_TO_SHIFT[3..], false, false);
-    (1, head.len())
+    got
 }
 
 /// Extra TCK cycles to add between Update and the next Capture.
@@ -268,7 +356,14 @@ pub fn update_gap(tck_hz: u32, window_clock_mhz: f64, window_cycles: u32) -> usi
 }
 
 /// Leave Shift without reading back, so a long scan needs no round trip.
-pub fn push_tail_quiet(out: &mut Vec<u8>, last: bool, exit: Exit) {
+/// `pad` is as in `push_tail`.
+pub fn push_tail_quiet(out: &mut Vec<u8>, last: bool, exit: Exit, pad: usize) {
+    if pad > 0 {
+        push_write_bits(out, u8::from(last), 1);
+        push_pad(out, pad - 1);
+        push_tms(out, tail_tms(exit), false, true);
+        return;
+    }
     push_tms(out, tail_tms(exit), false, last);
 }
 
@@ -294,13 +389,14 @@ pub fn push_tms(out: &mut Vec<u8>, tms: &[bool], read: bool, tdi: bool) {
     out.push(byte);
 }
 
-/// Queue a single scan that starts and ends in Run-Test/Idle.
-/// Returns (bytes to read back, TMS bits).
-pub fn push_scan(out: &mut Vec<u8>, bits: &[bool], ir: bool) -> (usize, usize) {
+/// Queue a single scan that starts and ends in Run-Test/Idle, with `pad` for
+/// the other TAPs on the chain. Returns (bytes to read back, TMS bits).
+pub fn push_scan(out: &mut Vec<u8>, bits: &[bool], ir: bool, pad: Pad) -> (usize, usize) {
     assert!(!bits.is_empty(), "a scan needs at least one bit");
     push_enter(out, ir);
+    push_pad(out, pad.tdo);
     let mut read_len = push_body(out, &bits[..bits.len() - 1]);
-    let (n, tail_bits) = push_tail(out, bits[bits.len() - 1], Exit::Idle);
+    let (n, tail_bits) = push_tail(out, bits[bits.len() - 1], Exit::Idle, pad.tdi);
     read_len += n;
     (read_len, tail_bits)
 }
@@ -453,6 +549,8 @@ pub struct Mpsse<C: Chan> {
     tck_hz: u32,
     /// Extra TCK between Update and Capture of back-to-back scans (`update_gap`).
     gap: usize,
+    /// The other TAPs on the chain.
+    chain: Chain,
 }
 
 impl<C: Chan> Mpsse<C> {
@@ -466,6 +564,11 @@ impl<C: Chan> Mpsse<C> {
         self.gap = gap;
     }
 
+    /// The other TAPs on the chain. Code that builds its own scans pads with it.
+    pub fn chain(&self) -> Chain {
+        self.chain
+    }
+
     /// Set up MPSSE and put the TAP in Run-Test/Idle. No IR is selected.
     ///
     /// Use this to find out what is connected: IDCODE reads work without
@@ -475,6 +578,7 @@ impl<C: Chan> Mpsse<C> {
             chan,
             tck_hz: tck_hz(tck_divisor(cfg.max_tck_hz)),
             gap: 0,
+            chain: cfg.chain,
         };
         let mut cmds = init_cmds(cfg);
         push_tap_reset(&mut cmds);
@@ -502,7 +606,13 @@ impl<C: Chan> Mpsse<C> {
     pub fn scan_chain(&mut self, max: usize) -> Result<Vec<Device>, C::Error> {
         // Shift in 1s. What comes out after the chain is what we shifted in, so
         // 0s would look like an endless row of BYPASS devices.
-        Ok(parse_chain(&self.scan_dr(&vec![true; 32 * max + 32])?))
+        // Every TAP holds its IDCODE or BYPASS here, so this scan is not padded.
+        let bits = vec![true; 32 * max + 32];
+        let mut cmds = Vec::new();
+        let (read_len, tail) = push_scan(&mut cmds, &bits, false, Pad::default());
+        cmds.push(CMD_SEND_IMMEDIATE);
+        let raw = self.chan.xfer(&cmds, read_len)?;
+        Ok(parse_chain(&scan_decode(&raw, bits.len(), tail)))
     }
 
     /// Whether an IR capture value is valid. IEEE 1149.1 fixes the low 2 bits
@@ -511,10 +621,10 @@ impl<C: Chan> Mpsse<C> {
         capture & 0b11 == 0b01
     }
 
-    /// Shift the IR with any bits. Returns TDO.
+    /// Shift the whole IR chain with any bits, without padding. Returns TDO.
     pub fn scan_ir_bits(&mut self, bits: &[bool]) -> Result<Vec<bool>, C::Error> {
         let mut cmds = Vec::new();
-        let (read_len, tail) = push_scan(&mut cmds, bits, true);
+        let (read_len, tail) = push_scan(&mut cmds, bits, true, Pad::default());
         cmds.push(CMD_SEND_IMMEDIATE);
         let raw = self.chan.xfer(&cmds, read_len)?;
         Ok(scan_decode(&raw, bits.len(), tail))
@@ -543,12 +653,12 @@ impl<C: Chan> Mpsse<C> {
             .map(|(i, _)| (i - FLUSH) as u8))
     }
 
-    /// Shift the IR once. Returns the IR capture value (low 2 bits are `01` when
-    /// the chain is right).
+    /// Shift our IR once; the other TAPs on the chain get BYPASS. Returns our
+    /// IR capture value (low 2 bits are `01` when the chain is right).
     pub fn scan_ir(&mut self, ir: u32, len: u8) -> Result<u32, C::Error> {
         let bits: Vec<bool> = (0..len).map(|i| (ir >> i) & 1 == 1).collect();
         let mut cmds = Vec::new();
-        let (read_len, tail) = push_scan(&mut cmds, &bits, true);
+        let (read_len, tail) = push_scan(&mut cmds, &bits, true, self.chain.ir);
         cmds.push(CMD_SEND_IMMEDIATE);
         let raw = self.chan.xfer(&cmds, read_len)?;
         let got = scan_decode(&raw, bits.len(), tail);
@@ -593,7 +703,7 @@ impl<C: Chan> JtagIo for Mpsse<C> {
 
     fn scan_dr(&mut self, bits: &[bool]) -> Result<Vec<bool>, C::Error> {
         let mut cmds = Vec::new();
-        let (read_len, tail) = push_scan(&mut cmds, bits, false);
+        let (read_len, tail) = push_scan(&mut cmds, bits, false, self.chain.dr);
         cmds.push(CMD_SEND_IMMEDIATE);
         let raw = self.chan.xfer(&cmds, read_len)?;
         Ok(scan_decode(&raw, bits.len(), tail))
@@ -610,7 +720,9 @@ impl<C: Chan> JtagIo for Mpsse<C> {
         let mut out: Vec<Vec<bool>> = Vec::with_capacity(frames.len());
         let limit = self.chan.read_limit();
         // Also limit the scan count, so one chunk stays within `CHUNK_MS`.
-        let per_scan = frames.first().map_or(48, |f| f.len() as u64 + 7) + self.gap as u64;
+        let pad = self.chain.dr;
+        let per_scan = frames.first().map_or(48, |f| f.len() as u64 + 7)
+            + (self.gap + pad.tdo + pad.tdi) as u64;
         let max_scans = ((self.tck_hz as u64 * CHUNK_MS / 1000) / per_scan).max(1) as usize;
         let mut at = 0;
 
@@ -626,11 +738,12 @@ impl<C: Chan> JtagIo for Mpsse<C> {
             while at + sizes.len() < frames.len() {
                 let bits = &frames[at + sizes.len()];
                 let before = cmds.len();
+                push_pad(&mut cmds, pad.tdo);
                 let mut n = push_body(&mut cmds, &bits[..bits.len() - 1]);
                 // We do not know yet whether another scan follows. Queue a tail
                 // that stays in Shift; the last one is rewritten below.
                 let here = cmds.len();
-                let (tn, tail) = push_tail_gap(&mut cmds, bits[bits.len() - 1], self.gap);
+                let (tn, tail) = push_tail_gap(&mut cmds, bits[bits.len() - 1], self.gap, pad.tdi);
                 n += tn;
                 if !sizes.is_empty()
                     && (cmds.len() > CHUNK_BYTES || total + n > limit || sizes.len() >= max_scans)
@@ -649,7 +762,7 @@ impl<C: Chan> JtagIo for Mpsse<C> {
             // Cut back to the recorded tail position, not a fixed length.
             cmds.truncate(tail_at);
             let last = &frames[at + sizes.len() - 1];
-            let (_, tail) = push_tail(&mut cmds, last[last.len() - 1], Exit::Idle);
+            let (_, tail) = push_tail(&mut cmds, last[last.len() - 1], Exit::Idle, pad.tdi);
             sizes.last_mut().unwrap().1 = tail;
 
             cmds.push(CMD_SEND_IMMEDIATE);
@@ -751,9 +864,83 @@ pub mod tests {
         tck: u32,
         /// USB round trips. This shows whether batching works.
         pub xfers: u32,
+        /// Other TAPs between ours and TDO, nearest TDO first.
+        tdo_side: Vec<OtherTap>,
+        /// Other TAPs between ours and TDI, nearest TDI first.
+        tdi_side: Vec<OtherTap>,
+    }
+
+    /// A TAP that is not ours, as on a Zynq-7000 (the ARM DAP). It has only
+    /// IDCODE (selected at reset) and BYPASS (all 1s in the IR).
+    struct OtherTap {
+        ir_len: u8,
+        idcode: u32,
+        bypass: bool,
+        ir_sr: Vec<bool>,
+        dr: Vec<bool>,
+    }
+
+    impl OtherTap {
+        fn new(ir_len: u8, idcode: u32) -> Self {
+            OtherTap {
+                ir_len,
+                idcode,
+                bypass: false,
+                ir_sr: Vec::new(),
+                dr: Vec::new(),
+            }
+        }
+
+        /// One clock in the state `st`, before the state changes.
+        fn shift(&mut self, st: St, tdi: bool) -> bool {
+            let reg = match st {
+                St::DrShift => &mut self.dr,
+                St::IrShift => &mut self.ir_sr,
+                _ => return false,
+            };
+            let tdo = *reg.first().unwrap_or(&false);
+            if !reg.is_empty() {
+                reg.remove(0);
+            }
+            reg.push(tdi);
+            tdo
+        }
+
+        /// Entering the state `st`.
+        fn enter(&mut self, st: St) {
+            match st {
+                St::Reset => self.bypass = false,
+                St::DrCapture => {
+                    self.dr = if self.bypass {
+                        vec![false]
+                    } else {
+                        (0..32).map(|i| (self.idcode >> i) & 1 == 1).collect()
+                    };
+                }
+                St::IrCapture => self.ir_sr = (0..self.ir_len).map(|i| i == 0).collect(),
+                St::IrUpdate => {
+                    assert_eq!(self.ir_sr.len(), self.ir_len as usize);
+                    self.bypass = self.ir_sr.iter().all(|&b| b);
+                }
+                _ => {}
+            }
+        }
     }
 
     impl FakeFtdi {
+        /// Put other TAPs on the chain, each as (IR length, IDCODE).
+        pub fn with_chain(mut self, tdo_side: &[(u8, u32)], tdi_side: &[(u8, u32)]) -> Self {
+            self.tdo_side = tdo_side
+                .iter()
+                .map(|&(l, id)| OtherTap::new(l, id))
+                .collect();
+            self.tdi_side = tdi_side
+                .iter()
+                .map(|&(l, id)| OtherTap::new(l, id))
+                .collect();
+            self
+        }
+
         pub fn new(aw: u32, latency: u32, user1_ir: u32, ir_len: u8) -> Self {
             FakeFtdi {
                 // Start outside Run-Test/Idle on purpose, so a missing TAP
@@ -768,7 +955,28 @@ pub mod tests {
                 configured: false,
                 tck: 0,
                 xfers: 0,
+                tdo_side: Vec::new(),
+                tdi_side: Vec::new(),
             }
+        }
+
+        /// One clock through the whole chain: TDI, the TAPs on the TDI side,
+        /// ours, the TAPs on the TDO side, TDO.
+        fn clock(&mut self, tms: bool, tdi: bool) -> bool {
+            let st = self.st;
+            let mut bit = tdi;
+            for o in self.tdi_side.iter_mut() {
+                bit = o.shift(st, bit);
+            }
+            bit = self.clock_ours(tms, bit);
+            for o in self.tdo_side.iter_mut().rev() {
+                bit = o.shift(st, bit);
+            }
+            let next = self.st;
+            for o in self.tdi_side.iter_mut().chain(self.tdo_side.iter_mut()) {
+                o.enter(next);
+            }
+            bit
         }
 
         /// Length of the selected DR: 1 bit (BYPASS) unless the IR is USER1.
@@ -780,7 +988,7 @@ pub mod tests {
             }
         }
 
-        fn clock(&mut self, tms: bool, tdi: bool) -> bool {
+        fn clock_ours(&mut self, tms: bool, tdi: bool) -> bool {
             let tdo = match self.st {
                 St::DrShift => *self.dr.first().unwrap_or(&false),
                 St::IrShift => *self.ir_sr.first().unwrap_or(&false),
@@ -955,6 +1163,7 @@ pub mod tests {
             max_tck_hz,
             ir_length,
             user1_ir,
+            chain: Chain::default(),
         }
     }
 
@@ -976,7 +1185,7 @@ pub mod tests {
     fn an_eight_n_plus_one_scan_uses_whole_bytes() {
         let bits = vec![false; 41];
         let mut out = Vec::new();
-        let (read_len, _) = push_scan(&mut out, &bits, false);
+        let (read_len, _) = push_scan(&mut out, &bits, false, Pad::default());
         assert_eq!(read_len, 6, "5 whole bytes + the TMS byte");
         assert!(!out.contains(&CMD_BITS), "no ragged bit command is needed");
     }
@@ -1449,7 +1658,7 @@ mod chaining_tests {
 
         // Single: enter + body + tail = 3.
         let mut one = Vec::new();
-        push_scan(&mut one, &bits, false);
+        push_scan(&mut one, &bits, false, Pad::default());
         assert_eq!(count_commands(&one), 3);
 
         // 10 chained: 1 enter + (body + tail) × 10 = 21.
@@ -1458,7 +1667,7 @@ mod chaining_tests {
         for i in 0..10 {
             push_body(&mut many, &bits[..bits.len() - 1]);
             let exit = if i == 9 { Exit::Idle } else { Exit::Shift };
-            push_tail(&mut many, false, exit);
+            push_tail(&mut many, false, exit, 0);
         }
         assert_eq!(count_commands(&many), 21, "1 enter + 2 per scan");
     }
@@ -1507,5 +1716,84 @@ mod chaining_tests {
         let many = b.scan_many(&frames).unwrap();
 
         assert_eq!(one, many, "chaining must not change what comes back");
+    }
+}
+
+#[cfg(test)]
+mod other_tap_tests {
+    use super::tests::*;
+    use super::*;
+    use crate::bridge::Bridge;
+
+    /// The ARM DAP of a Zynq-7000: IR 4 bits.
+    const DAP: (u8, u32) = (4, 0x4ba0_0477);
+
+    /// Other TAPs on one side, each as (IR length, IDCODE).
+    type Side<'a> = &'a [(u8, u32)];
+
+    fn padded(tdo_side: &[(u8, u32)], tdi_side: &[(u8, u32)]) -> ProbeConfig {
+        let mut c = probe_cfg();
+        let len = |s: &[(u8, u32)]| s.iter().map(|t| t.0).collect::<Vec<_>>();
+        c.chain = Chain::new(&len(tdo_side), &len(tdi_side));
+        c
+    }
+
+    /// Single scans and chained scans (with and without a gap) reach our TAP
+    /// past the others, wherever they sit.
+    #[test]
+    fn the_window_is_reached_past_other_taps() {
+        let chains: [(Side, Side); 3] = [
+            (&[], &[DAP]),
+            (&[DAP], &[]),
+            (&[(8, 0x1234_5679)], &[DAP, (5, 0x0abc_def1)]),
+        ];
+        for (tdo, tdi) in chains {
+            for gap in [0, 2] {
+                let ftdi = new_ftdi(7, 0).with_chain(tdo, tdi);
+                let mut io = Mpsse::open(ftdi, &padded(tdo, tdi)).unwrap();
+                io.set_update_gap(gap);
+                let mut b = Bridge::new(io, 7);
+                b.write32(0x10, 0xa5a5_1234).unwrap();
+                assert_eq!(b.read32(0x10).unwrap(), 0xa5a5_1234, "{tdo:?} {tdi:?}");
+                b.write_burst(0x20, &[1, 2, 3, 4]).unwrap();
+                let mut got = [0u32; 4];
+                b.read_burst(0x20, &mut got).unwrap();
+                assert_eq!(got, [1, 2, 3, 4], "{tdo:?} {tdi:?} gap {gap}");
+            }
+        }
+    }
+
+    /// Our IR capture comes back, not a neighbour's bits. Unpadded, the DAP's
+    /// 4 bits would come first and give 0x11.
+    #[test]
+    fn the_ir_capture_is_ours() {
+        let ftdi = new_ftdi(7, 0).with_chain(&[DAP], &[]);
+        let mut io = Mpsse::attach(ftdi, &padded(&[DAP], &[])).unwrap();
+        assert_eq!(io.scan_ir(0x02, 6).unwrap(), 0x01);
+    }
+
+    /// The device list does not depend on the padding, and comes nearest TDO
+    /// first.
+    #[test]
+    fn the_chain_lists_every_device_nearest_tdo_first() {
+        let ftdi = new_ftdi(7, 0).with_chain(&[DAP], &[(6, 0x0372_7093)]);
+        let mut io = Mpsse::attach(ftdi, &probe_cfg()).unwrap();
+        // Our TAP comes up with BYPASS in this model, so it has no IDCODE.
+        assert_eq!(
+            io.scan_chain(8).unwrap(),
+            vec![
+                Device::Id(0x4ba0_0477),
+                Device::Bypass,
+                Device::Id(0x0372_7093)
+            ]
+        );
+    }
+
+    /// The measured IR length covers the whole chain.
+    #[test]
+    fn the_measured_ir_length_is_the_sum() {
+        let ftdi = new_ftdi(7, 0).with_chain(&[], &[DAP]);
+        let mut io = Mpsse::attach(ftdi, &padded(&[], &[DAP])).unwrap();
+        assert_eq!(io.measure_ir_length().unwrap(), Some(10));
     }
 }

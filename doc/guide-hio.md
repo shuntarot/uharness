@@ -254,13 +254,25 @@ HIO_REGS = { value = "../hns/regs.json", relative = true }
 ```
 
 It holds the DUT in reset, puts each segment into every memory that covers its
-address (`dut_base`), clears the `_SEGGER_RTT` block, and releases the DUT. Up
+address (`dut_base`), clears the `_SEGGER_RTT` block, and releases the DUT.
+The zeros after a segment's file bytes (`.bss` after `.data`) are written
+too; a segment with no file bytes, usually the stack, is left to the startup
+code. Up
 channel 0 goes to the terminal and keys go to down channel 0; Ctrl-A x
 leaves. `hio cpu console <elf>` connects without loading, so leaving and
 coming back is harmless.
 
 The exit status is the program's: from `tohost` (1 passes, `(code << 1) | 1`
 fails with `code`), or from the first byte on an up channel named `hio-exit`.
+`--timeout <seconds>` gives up on a program that does not exit, with status
+124. That is enough to run [riscv-tests](https://github.com/riscv-software-src/riscv-tests)'
+`isa` tests one by one:
+
+```bash
+hio cpu boot --timeout 60 rv64ui-p-add   # 0 passes
+```
+
+Their `benchmarks` print through HTIF system calls, which `hio` does not serve.
 
 `hio cpu boot --halt` stops at the first instruction instead, at the debug
 prompt ([The prompt](#the-prompt)), so breakpoints can go in before anything runs; `resume` lets
@@ -351,3 +363,18 @@ handled from the target description. `hio program <file>.svf` replays an SVF,
 which works on devices this build does not know.
 
 Stop Vivado's `hw_server` first (`pkill hw_server`); it takes the same channel.
+
+When the board is on a machine without Vivado, `make -C hns/syn zip` packs
+`regs.json`, the bitstream, the SVF (if `make svf` wrote one) and the reports
+into `syn/output/<top>.zip`. The paths inside start at the harness directory,
+so on the other machine:
+
+```bash
+unzip <top>.zip && cd hns
+hio program
+hio id
+```
+
+A chain with other devices on it (the ARM DAP of a Zynq-7000) is handled from
+the target description: `hio` holds them in BYPASS. `hio probe` lists the chain
+and marks the device it talks to.

@@ -1,0 +1,116 @@
+# Digilent PYNQ-Z1 (Zynq-7000 XC7Z020)
+#
+# Only the PL is used. The harness sits in the PL and is reached over the
+# on-board USB JTAG, like on the Arty. The PS is left alone: nothing here needs
+# it to boot, so set the boot jumper (JP4) to JTAG. Booted from SD, the PYNQ
+# image may load its own bitstream over yours.
+#
+# Values come from the master XDC (Rev C), the PYNQ base design constraints
+# (Xilinx/PYNQ v2.7.0, boards/Pynq-Z1/base/vivado/constraints/base.xdc) and the
+# BSDL Vivado ships.
+#
+# **JTAG only.** The 512 MB DDR3 belongs to the PS: the PL reaches it only
+# through the PS (processing_system7 and its HP ports), after software has set
+# up the DDR controller. The USB-UART is wired to the PS (MIO) too, so the PL
+# has no UART.
+#
+# Programmed and reached over JTAG on a board (2026-10-18): `hio probe`
+# showed the two TAPs as described below, `hio program` and `hio id` passed.
+
+[board]
+provider    = "digilent"
+name        = "pynq-z1"
+description = "Digilent PYNQ-Z1 (Zynq-7000 XC7Z020, PL only)"
+url         = "https://digilent.com/reference/programmable-logic/pynq-z1/start"
+
+[device]
+vendor = "xilinx"
+family = "zynq"
+part   = "xc7z020clg400-1"
+
+# Regex matched against the device names hw_manager lists. On a Zynq the chain
+# also shows `arm_dap_0`, which this does not match.
+hw_pattern = "xc7z020"
+
+[provides]
+transport = ["jtag"]
+
+# 36Kb x 140 = 5,040 Kbit on the XC7Z020. From the datasheet.
+bram_kb = 630
+
+# The 125 MHz clock to the PL, from the Ethernet PHY (RTL8211E). Users report
+# it is unstable while no Ethernet cable is plugged in (the PHY powers down
+# without a link). **Not checked here**: keep a cable in until it is measured.
+[clocks.sys]
+freq_mhz = 125
+diff     = false
+pin      = "H16"
+standard = "LVCMOS33"
+
+# BTN0. Pressed is high, as on Digilent's other boards (not measured).
+[resets.sys]
+pin      = "D19"
+standard = "LVCMOS33"
+active   = "high"
+
+[jtag]
+# The ceiling constrained on the bridge's TCK. **A choice, not a
+# measurement**, the same as the other boards.
+max_tck_mhz = 30
+
+# The TCK `hio` runs, measured on a board with the fifo example: 15 MHz reads
+# 0.76 MB/s; 30 MHz (the divider's only faster step) reads a wrong magic.
+host_tck_mhz = 15
+
+# The on-board FT2232H, channel A. Measured on a board: it calls itself
+# "Digilent Adept USB Device" (the Arty's on-board one says "Digilent USB
+# Device"), and the Arty's level-shifter enable works.
+vid         = 0x0403
+pid         = 0x6010
+interface   = 0
+product     = "Digilent Adept USB Device"
+layout_init = [0x0088, 0x008b]
+
+# --- The chain ---
+#
+# A Zynq-7000 has two TAPs in series: TDI -> ARM DAP -> PL TAP -> TDO (the
+# BSDL's design warning; UG585, "JTAG and DAP Subsystem"). `hio` talks to the
+# PL TAP and holds the DAP in BYPASS. Its IR is 4 bits
+# (<Vivado>/data/parts/xilinx/zynq/public/bsdl/zynq7000_arm_dap.bsd, IDCODE
+# 0x4ba00477).
+chain_tdo_side = []
+chain_tdi_side = [4]
+
+# The PL TAP's IDCODE. The BSDL leaves the top 4 bits (the silicon revision)
+# open; the board read 0x23727093.
+idcode = 0x23727093
+
+# --- JTAG instructions of the PL TAP (from the BSDL) ---
+#
+#   <Vivado>/data/parts/xilinx/zynq/public/bsdl/xc7z020_clg400.bsd
+#
+# `INSTRUCTION_LENGTH` is 6, and the codes are those of the 7-series.
+ir_length   = 6
+user1_ir    = 0x02
+jprogram_ir = 0x0b
+cfg_in_ir   = 0x05
+jstart_ir   = 0x0c
+bypass_ir   = 0x3f
+
+# --- Status checks (from the SVF `make svf` writes) ---
+#
+# The same as the Arty's. That SVF also carries `TIR 4` and `TDR 1`: Vivado
+# puts the DAP on the TDI side too.
+[jtag.ready]
+ir     = 0x14   # ISC_NOOP
+expect = 0x11
+mask   = 0x31
+
+[jtag.done]
+ir     = 0x09   # IDCODE
+expect = 0x31
+mask   = 0x11
+
+[topology]
+nodes = 1
+links = []
