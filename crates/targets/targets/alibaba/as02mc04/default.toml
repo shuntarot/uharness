@@ -1,0 +1,117 @@
+# Alibaba Cloud AS02MC04 (Kintex UltraScale+ KU3P, a former cloud NIC card)
+#
+# There are no vendor board files. Values come from the community notes
+# collected in https://github.com/dkozel/Alibaba-Cloud-FPGA, from the AS02MC04
+# XDC of taxi (fpganinja/taxi, src/cndm/board/AS02MC04, which runs Corundum on
+# this card), from https://essenceia.github.io/projects/alibaba_cloud_fpga/,
+# and from the BSDL Vivado ships. Where they disagree, the choice and the
+# reason are written next to the value.
+#
+# **JTAG only for now.** The card has PCIe gen3 x8 (see the notes at the end),
+# but the PCIe IP must be told which GT quad lane 0 starts in, and the
+# generator has no key for that yet. It has no DRAM.
+#
+# **Not confirmed on hardware.**
+
+[board]
+provider    = "alibaba"
+name        = "as02mc04"
+description = "Alibaba Cloud AS02MC04 (Kintex UltraScale+ KU3P)"
+url         = "https://github.com/dkozel/Alibaba-Cloud-FPGA"
+
+[device]
+vendor = "xilinx"
+family = "kintexuplus"
+# The speed grade differs between sources: a Device DNA lookup of one card
+# and taxi say -1, TiferKing's board files and essenceia say -2. -1 is the
+# safe side: a -1 bitstream also runs on a -2 part, and not the other way.
+part   = "xcku3p-ffvb676-1-e"
+
+# Regex matched against the device names hw_manager lists.
+hw_pattern = "xcku3p"
+
+[provides]
+transport = ["jtag"]
+
+# 36Kb x 360 = 12,960 Kbit on the XCKU3P. From the datasheet. The 48 UltraRAM
+# blocks are not counted.
+bram_kb = 1620
+
+# The 100 MHz LVDS oscillator (Y2), bank 67. All sources agree.
+[clocks.sys]
+freq_mhz = 100
+diff     = true
+pin_p    = "E18"
+pin_n    = "D18"
+standard = "LVDS"
+
+# The SW1 push button. taxi resets its MMCM with `!reset`, so pressed is low.
+# LVCMOS33 as in taxi: Alex Forencich found the HD banks 86/87 at 3.3 V, where
+# the earlier notes said LVCMOS18.
+[resets.sys]
+pin      = "F12"
+standard = "LVCMOS33"
+active   = "low"
+
+# There is no USB-UART on the card.
+
+[jtag]
+# The ceiling constrained on the bridge's TCK. **A choice, not a
+# measurement**, the same as the other boards.
+max_tck_mhz = 30
+
+# The adapter `hio` opens: a Digilent JTAG-HS2, an FT232H. VID/PID, product
+# and the level-shifter enable (data, direction) are from OpenOCD's
+# tcl/interface/ftdi/digilent-hs2.cfg; the enable is the one measured on the
+# VCU118 and the KCU105. **Not measured on this card.** Vivado's hw_server
+# drives the HS2 too, so `make program` works as well as `hio program`.
+#
+# The card's JTAG header is a 6-pin layout of its own (VREF, GND, TCK, TMS,
+# TDI, TDO), so the HS2's flying leads have to be wired to it pin by pin. The
+# card's VREF is about 1.8 V (essenceia, measured with a J-Link), inside the
+# HS2's range.
+#
+# Another FTDI adapter works through `hio --vid/--pid/--product/--layout-init`,
+# e.g. a TinCanTools Flyswatter2 (FT2232H, channel A): 0x0403:0x6010,
+# "Flyswatter2", 0x0538:0x057b (OpenOCD's flyswatter2.cfg).
+vid         = 0x0403
+pid         = 0x6014
+interface   = 0
+product     = "Digilent Adept USB Device"
+layout_init = [0x00e8, 0x60eb]
+
+# The device IDCODE, as essenceia read it over JTAG (version 0). One device in
+# the chain.
+idcode = 0x04a63093
+
+# --- JTAG instructions (from the BSDL) ---
+#
+#   <Vivado>/data/parts/xilinx/kintexuplus/public/bsdl/xcku3p_ffvb676.bsd
+#
+# `INSTRUCTION_LENGTH` is 6 and there is one SLR: the same values as the
+# KCU105's XCKU040.
+ir_length   = 6
+user1_ir    = 0x02
+jprogram_ir = 0x0b
+cfg_in_ir   = 0x05
+jstart_ir   = 0x0c
+bypass_ir   = 0x3f
+
+[topology]
+nodes = 1
+links = []
+
+# --- PCIe (not used yet) ---
+#
+# For when the generator can place the IP. Facts about the board only, from
+# taxi's pcie.xdc and pcie4_uscale_plus_0.tcl, which train gen3 x8:
+#
+#   lanes 8, gen 3, refclk 100 MHz at T7 (MGTREFCLK1P_225), PERST# at A9
+#   (LVCMOS33, pull-up). Lane 0 is at the top of quad 225 and the lanes run
+#   down into quad 224:
+#     rx_p = P2 T2 V2 Y2 AB2 AD2 AE4 AF2
+#     tx_p = R5 U5 W5 AA5 AC5 AD7 AE9 AF7
+#   The IP needs `mode_selection Advanced`, `en_gt_selection true` and
+#   `select_quad GTY_Quad_225`. Without them it places lane 0 at the bottom
+#   of quad 224, and the link trains reversed at x4 at best (Chester Gillon's
+#   notes in the repository above).

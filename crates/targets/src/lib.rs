@@ -662,6 +662,12 @@ pub struct Jtag {
     /// the device; the lengths are not, so `hio` reads those from the file.
     /// Empty for a single SLR.
     pub slr_cfg_in_ir: Vec<u32>,
+    /// The other TAPs on the chain, by IR length: those between the FPGA and
+    /// TDO, and those between the FPGA and TDI. The host holds them in BYPASS.
+    /// Both are empty when the FPGA is alone (a Zynq-7000 has its ARM DAP
+    /// there).
+    pub chain_tdo_side: Vec<u8>,
+    pub chain_tdi_side: Vec<u8>,
 }
 
 /// One check that reads the IR capture.
@@ -849,6 +855,16 @@ pub fn jtag(target: &Target) -> Jtag {
         }
         Some((a[0].as_integer()? as u16, a[1].as_integer()? as u16))
     };
+    let lengths = |key: &str| -> Vec<u8> {
+        t.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_integer().map(|i| i as u8))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     Jtag {
         vid: int("vid").map(|v| v as u16),
         pid: int("pid").map(|v| v as u16),
@@ -874,6 +890,8 @@ pub fn jtag(target: &Target) -> Jtag {
                     .collect()
             })
             .unwrap_or_default(),
+        chain_tdo_side: lengths("chain_tdo_side"),
+        chain_tdi_side: lengths("chain_tdi_side"),
         jprogram_ir: int("jprogram_ir").map(|v| v as u32),
         cfg_in_ir: int("cfg_in_ir").map(|v| v as u32),
         jstart_ir: int("jstart_ir").map(|v| v as u32),
@@ -1342,6 +1360,18 @@ mod jtag_tests {
             assert!(j.ready.is_some(), "{name}: ready check");
             assert!(j.done.is_some(), "{name}: done check");
         }
+    }
+
+    /// A Zynq-7000 has its ARM DAP (IR 4 bits) between the PL and TDI.
+    #[test]
+    fn the_pynq_z1_names_the_arm_dap_on_the_chain() {
+        let t = resolve("digilent/pynq-z1", &[]).unwrap();
+        let j = jtag(&t);
+        assert!(j.chain_tdo_side.is_empty());
+        assert_eq!(j.chain_tdi_side, [4]);
+        // A board alone on its chain says nothing.
+        let arty = jtag(&resolve("digilent/arty-a7-35", &[]).unwrap());
+        assert!(arty.chain_tdo_side.is_empty() && arty.chain_tdi_side.is_empty());
     }
 
     /// VU9P has three SLRs, and the master (SLR1) comes first in a `.bit`.

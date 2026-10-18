@@ -189,6 +189,34 @@ fn the_output_is_a_project_of_its_own() {
     assert!(toml.contains("hns = {"), "{toml}");
 }
 
+/// The output analyses the DUT and its dependencies again, so it needs the
+/// limits and the dependency permissions the DUT set. Only what differs from
+/// Veryl's default is written.
+#[test]
+fn the_output_keeps_the_analysis_settings_of_the_dut() {
+    let veryl_toml = "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\nevaluate_size_limit = 16777216\n\n[dependencies]\nhns = { path = \"HNS\" }\n\n[lint.portability]\nallow_in_dependencies = [\"initial_assign\"]\n"
+        .replace("HNS", &format!("{}/rtl/hns", env!("CARGO_MANIFEST_DIR")));
+    let dir = fixture(&veryl_toml, HARNESS_TOML);
+
+    let output = run_gen(&dir, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let toml = fs::read_to_string(dir.path().join("hns/Veryl.toml")).unwrap();
+    assert!(toml.contains("evaluate_size_limit = 16777216"), "{toml}");
+    assert!(!toml.contains("evaluate_array_limit"), "{toml}");
+    assert!(
+        toml.contains("[lint.portability]\nallow_in_dependencies = [\"initial_assign\"]"),
+        "{toml}"
+    );
+    let metadata = veryl_metadata::Metadata::load(dir.path().join("hns/Veryl.toml")).unwrap();
+    assert_eq!(metadata.build.evaluate_size_limit, 16777216);
+}
+
 /// A different out-dir gives a different module name. This lets one DUT keep
 /// harnesses for several boards side by side.
 #[test]
@@ -203,6 +231,71 @@ fn a_different_out_dir_gives_a_different_module_name() {
     );
     let synth = fs::read_to_string(dir.path().join("harness_arty/syn/synth.tcl")).unwrap();
     assert!(synth.contains("fixture_harness_arty_top"), "{synth}");
+}
+
+/// `make zip` packs what `hio` needs, at the paths `hio` looks in: the map,
+/// and the bitstream under `syn/output/` beside it.
+#[test]
+fn make_zip_packs_the_map_and_the_bitstream_where_hio_looks() {
+    let have = |tool: &str| {
+        std::process::Command::new("sh")
+            .args(["-c", &format!("command -v {tool}")])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !(have("make") && have("zip") && have("unzip")) {
+        eprintln!("skipped: make, zip and unzip are needed");
+        return;
+    }
+    let dir = fixture(&veryl_toml(), HARNESS_TOML);
+    let output = run_gen(&dir, &["--out-dir", "arty"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let syn = dir.path().join("arty/syn");
+    let top = "fixture_arty_top";
+
+    // Nothing to pack before synthesis.
+    let early = std::process::Command::new("make")
+        .args(["-s", "zip"])
+        .current_dir(&syn)
+        .output()
+        .unwrap();
+    assert!(!early.status.success());
+    assert!(String::from_utf8_lossy(&early.stdout).contains("run make first"));
+
+    fs::create_dir_all(syn.join("output")).unwrap();
+    fs::write(syn.join(format!("output/{top}.bit")), b"bit").unwrap();
+    let made = std::process::Command::new("make")
+        .args(["-s", "zip"])
+        .current_dir(&syn)
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+
+    let listed = std::process::Command::new("unzip")
+        .arg("-Z1")
+        .arg(syn.join(format!("output/{top}.zip")))
+        .output()
+        .unwrap();
+    let names = String::from_utf8_lossy(&listed.stdout);
+    let mut names: Vec<&str> = names.lines().collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "arty/regs.json",
+            "arty/regs.md",
+            &format!("arty/syn/output/{top}.bit"),
+        ]
+    );
 }
 
 /// An out-dir name that is not a Veryl identifier is refused. Otherwise Veryl

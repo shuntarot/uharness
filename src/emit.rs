@@ -5015,6 +5015,9 @@ fn veryl_ident(name: &str) -> String {
 /// - `[build]` is copied from the DUT. The top project's `reset_type` also
 ///   applies to its dependencies, so a mismatch emits the DUT SV with another
 ///   reset polarity (confirmed on hardware).
+/// - The analysis limits and `[lint.portability]` are copied too: the harness
+///   project analyses the DUT and everything it depends on again, so it fails
+///   wherever the DUT needed a larger limit or allowed a dependency something.
 /// - `[dependencies]` has `hns` (as the DUT declares it) and a path to the DUT.
 pub fn veryl_toml(plan: &Plan, hns: &str, dut_path: &str) -> String {
     let build = &plan.metadata.build;
@@ -5032,6 +5035,45 @@ pub fn veryl_toml(plan: &Plan, hns: &str, dut_path: &str) -> String {
     if build.omit_project_prefix {
         out.push_str("omit_project_prefix = true\n");
     }
+    // Only what differs from Veryl's default, so a plain DUT gets a plain file.
+    let default: veryl_metadata::Build =
+        toml::from_str("").expect("every [build] key has a default");
+    for (key, value, default) in [
+        (
+            "instance_depth_limit",
+            build.instance_depth_limit,
+            default.instance_depth_limit,
+        ),
+        (
+            "instance_total_limit",
+            build.instance_total_limit,
+            default.instance_total_limit,
+        ),
+        (
+            "function_instance_depth_limit",
+            build.function_instance_depth_limit,
+            default.function_instance_depth_limit,
+        ),
+        (
+            "symbol_eval_depth_limit",
+            build.symbol_eval_depth_limit,
+            default.symbol_eval_depth_limit,
+        ),
+        (
+            "evaluate_size_limit",
+            build.evaluate_size_limit,
+            default.evaluate_size_limit,
+        ),
+        (
+            "evaluate_array_limit",
+            build.evaluate_array_limit,
+            default.evaluate_array_limit,
+        ),
+    ] {
+        if value != default {
+            out.push_str(&format!("{key} = {value}\n"));
+        }
+    }
     out.push('\n');
     out.push_str("[dependencies]\n");
     out.push_str(&format!("hns = {hns}\n"));
@@ -5039,6 +5081,14 @@ pub fn veryl_toml(plan: &Plan, hns: &str, dut_path: &str) -> String {
         "{} = {{ path = \"{dut_path}\" }}\n",
         plan.metadata.project.name
     ));
+    let allowed = &plan.metadata.lint.portability.allow_in_dependencies;
+    if !allowed.is_empty() {
+        let items: Vec<String> = allowed.iter().map(|item| format!("\"{item}\"")).collect();
+        out.push_str(&format!(
+            "\n[lint.portability]\nallow_in_dependencies = [{}]\n",
+            items.join(", ")
+        ));
+    }
     if plan.target().is_some_and(|target| target.is_sim()) {
         out.push_str(&format!("\n[[components]]\npath = \"{SIM_LINK_DIR}\"\n"));
     }
@@ -5584,6 +5634,7 @@ pub fn makefile(plan: &Plan) -> String {
     out.push_str("# make program program the device\n");
     out.push_str("# make svf     write the programming sequence out as SVF\n");
     out.push_str("# make area    what the harness costs next to the DUT\n");
+    out.push_str("# make zip     pack what hio needs, for a machine without Vivado\n");
     out.push_str("# make rtl     veryl build only\n#\n");
     // No `make verify`: reading the window needs the USB probe details, which
     // are not known here. `hio id` does the same check.
@@ -5598,7 +5649,7 @@ pub fn makefile(plan: &Plan) -> String {
     out.push_str("VIVADO_BIN ?= vivado\n");
     out.push_str("ROOT       := ..\n");
     out.push_str(&format!("TOP        := {top}\n\n"));
-    out.push_str(".PHONY: all bit rtl ip program svf area clean\n\n");
+    out.push_str(".PHONY: all bit rtl ip program svf area zip clean\n\n");
     out.push_str("all: bit\n\n");
     out.push_str("# RTL. Both the harness and the DUT are Veryl, so the SV appears here.\n");
     out.push_str("rtl:\n\tcd $(ROOT) && $(VERYL_BIN) build\n\n");
@@ -5617,9 +5668,31 @@ pub fn makefile(plan: &Plan) -> String {
     // `bit` also runs this, so it is rarely needed by hand.
     out.push_str("# Area by top-level instance, from the routed checkpoint.\n");
     out.push_str("area:\n\t$(VIVADO_BIN) -mode batch -source area.tcl\n\n");
+    out.push_str(ZIP_RULE);
     out.push_str("clean:\n\t-rm -rf output *.jou *.log .Xil\n");
     out
 }
+
+/// `make zip`: what `hio` needs when the board is on another machine.
+///
+/// Paths in the zip start at the harness directory, as they are here: `hio`
+/// looks for `regs.json` in the current directory and for the bitstream in
+/// `syn/output/` beside it. So after unzipping, `cd` into the directory and
+/// `hio program` and `hio id` work with no arguments. It only packs; it does
+/// not build, because `bit` reruns synthesis.
+const ZIP_RULE: &str = r#"# What hio needs on a machine without Vivado: the map, the bitstream, the
+# SVF if `make svf` wrote one, and the reports. There:
+#   unzip <top>.zip && cd <dir> && hio program && hio id
+NAME := $(notdir $(abspath $(ROOT)))
+SHIP := regs.json $(notdir $(wildcard $(ROOT)/regs.md)) syn/output/$(TOP).bit \
+        $(addprefix syn/,$(wildcard output/$(TOP).svf output/timing.rpt output/util.rpt))
+zip:
+	@test -f output/$(TOP).bit || { echo "no output/$(TOP).bit yet: run make first"; exit 1; }
+	rm -f output/$(TOP).zip
+	cd $(ROOT)/.. && zip -q $(NAME)/syn/output/$(TOP).zip $(addprefix $(NAME)/,$(SHIP))
+	@echo "wrote output/$(TOP).zip: $(SHIP)"
+
+"#;
 
 /// `hns/syn/board.tcl`: board-specific data.
 ///
@@ -5693,7 +5766,14 @@ foreach old [get_hw_targets -quiet *hns_svf] {
 create_hw_target hns_svf
 open_hw_target [get_hw_targets *hns_svf]
 create_hw_device -part $::hns::part
-set dev [lindex [get_hw_devices] 0]
+# On a Zynq-7000 Vivado puts the ARM DAP on the chain too, first in the list.
+set dev ""
+foreach d [get_hw_devices] {
+    if {[regexp $::hns::device_pattern $d]} { set dev $d; break }
+}
+if {$dev eq ""} {
+    error "no device matching '$::hns::device_pattern' on the SVF target: [get_hw_devices]"
+}
 set_property PROGRAM.FILE $::hns::bitstream $dev
 program_hw_devices $dev
 # The last run's SVF is replaced: it belongs to the last bitstream.

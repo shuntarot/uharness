@@ -489,7 +489,19 @@ to fix it.
 | `xilinx/vcu118` | `jtag`, `pcie` | DDR4 |
 | `xilinx/kcu105` | `jtag`, `pcie` | DDR4, 2 GB, with `:dr` or `:062` |
 | `xilinx/kc705` | `jtag` | DDR3, 1 GB |
+| `alibaba/as02mc04` | `jtag` | — (no DRAM; not yet tried on a card) |
+| `digilent/pynq-z1` | `jtag` | — (PL only) |
 | `sim` | `sim` | — (no board; see [Without a board](#without-a-board)) |
+
+The AS02MC04 has no USB JTAG of its own. Its description names a Digilent
+JTAG-HS2 wired to the card's 6-pin header; another FTDI adapter works through
+`hio --vid/--pid/--product/--layout-init`. It has no USB-UART either, so
+`[heartbeat]` has no pin there.
+
+The PYNQ-Z1 description uses the PL only. Its DDR3 and its USB-UART belong to
+the PS, so the harness has neither. Set the boot jumper to JTAG, so a bitstream
+from the SD card does not replace yours. The ARM DAP shares the JTAG chain with
+the PL; `hio` holds it in BYPASS.
 
 The KCU105 carries one of two DDR4 parts, and the memory controller must know
 which. Add the config that matches the chips: `:dr` for EDY4016AABG-DR-F

@@ -31,6 +31,14 @@ pub enum Error<E> {
         line: usize,
         command: String,
     },
+    /// The SVF pads for other TAPs (`HIR`, `TIR`, `HDR`, `TDR`) differently
+    /// from the target description.
+    Padded {
+        line: usize,
+        command: &'static str,
+        svf: usize,
+        target: usize,
+    },
     /// TDO differs from the expected value: the device reports a failed step.
     Mismatch {
         line: usize,
@@ -53,6 +61,19 @@ impl<E: std::fmt::Debug> std::fmt::Display for Error<E> {
                  implement.\n\
                  hio stops here. Skipping it would report a step as replayed when it was \
                  not replayed."
+            ),
+            Error::Padded {
+                line,
+                command,
+                svf,
+                target,
+            } => write!(
+                f,
+                "line {line} of the SVF pads for other devices on the chain with \
+                 `{command} {svf}`, but the target description gives {target} bits there.
+\
+                 The SVF was written for another chain. Check `chain_tdo_side` and \
+                 `chain_tdi_side` in the target, or write the SVF again with `make svf`."
             ),
             Error::Mismatch {
                 line,
@@ -168,6 +189,12 @@ enum Op {
         clocks: Option<u64>,
         seconds: Option<f64>,
     },
+    /// `HIR`, `TIR`, `HDR` or `TDR`: the pad bits the SVF expects for other
+    /// TAPs on the chain.
+    Pad {
+        command: &'static str,
+        bits: usize,
+    },
     /// Parsed but has no effect (`FREQUENCY`, `TRST OFF`).
     Ignore,
 }
@@ -190,7 +217,20 @@ fn parse_op<E>(text: &str, line: usize) -> Result<Op, Error<E>> {
     let head = words.first().copied().unwrap_or("");
 
     match head {
-        "TRST" | "FREQUENCY" | "HDR" | "HIR" | "TDR" | "TIR" => Ok(Op::Ignore),
+        "TRST" | "FREQUENCY" => Ok(Op::Ignore),
+        "HDR" | "HIR" | "TDR" | "TIR" => {
+            let bits: usize = words
+                .get(1)
+                .and_then(|w| w.trim_end_matches(';').parse().ok())
+                .ok_or_else(|| bad("no bit count"))?;
+            let command = match head {
+                "HIR" => "HIR",
+                "TIR" => "TIR",
+                "HDR" => "HDR",
+                _ => "TDR",
+            };
+            Ok(Op::Pad { command, bits })
+        }
         "ENDIR" | "ENDDR" | "STATE" => {
             // STATE may list several states. Only the last one matters: the
             // others are only passed through.
@@ -265,6 +305,9 @@ pub struct Player<'a, C: Chan> {
     enddr: Rest,
     /// Current TAP state. Needed to continue a scan from Pause.
     at: Rest,
+    /// Pad bits still owed to the TAPs between ours and TDI. A DR that stops in
+    /// Pause usually goes on, so they are sent only when it really ends.
+    owed: usize,
     /// Bits scanned so far, for progress output.
     pub scanned_bits: u64,
 }
@@ -279,6 +322,7 @@ impl<'a, C: Chan> Player<'a, C> {
             endir: Rest::Idle,
             enddr: Rest::Idle,
             at: Rest::Reset,
+            owed: 0,
             scanned_bits: 0,
         }
     }
@@ -335,6 +379,28 @@ impl<'a, C: Chan> Player<'a, C> {
                 Ok(())
             }
             Op::Scan { ir, bits, tdi, tdo } => self.scan(ir, bits, &tdi, tdo.as_ref(), line),
+            Op::Pad { command, bits } => {
+                // hio pads every scan from the target description, so an SVF
+                // that agrees needs nothing more. Its pad values do not matter:
+                // the other TAPs get BYPASS either way.
+                let c = self.m.chain();
+                let target = match command {
+                    "HIR" => c.ir.tdo,
+                    "TIR" => c.ir.tdi,
+                    "HDR" => c.dr.tdo,
+                    _ => c.dr.tdi,
+                };
+                if bits == target {
+                    Ok(())
+                } else {
+                    Err(Error::Padded {
+                        line,
+                        command,
+                        svf: bits,
+                        target,
+                    })
+                }
+            }
         }
     }
 
@@ -344,6 +410,18 @@ impl<'a, C: Chan> Player<'a, C> {
             return Ok(());
         }
         let mut cmds = Vec::new();
+        if self.at == Rest::Pause && self.owed > 0 {
+            // Finish the DR with its pad bits before leaving it.
+            crate::mpsse::push_resume_from_pause(&mut cmds);
+            crate::mpsse::push_pad(&mut cmds, self.owed - 1);
+            crate::mpsse::push_tail_quiet(&mut cmds, true, Exit::Idle, 0);
+            self.owed = 0;
+            self.at = Rest::Idle;
+            if to == Rest::Idle {
+                self.m.send(&cmds).map_err(Error::Io)?;
+                return Ok(());
+            }
+        }
         match to {
             Rest::Reset => crate::mpsse::push_tap_reset(&mut cmds),
             Rest::Idle => match self.at {
@@ -385,15 +463,26 @@ impl<C: Chan> Player<'_, C> {
         }
         let rest = if ir { self.endir } else { self.enddr };
         let exit = rest.exit();
+        let chain = self.m.chain();
+        let pad = if ir { chain.ir } else { chain.dr };
 
         let mut cmds = Vec::new();
         // Continuing from Pause must not pass Capture, or the DR contents change.
         if self.at == Rest::Pause && !ir {
             crate::mpsse::push_resume_from_pause(&mut cmds);
+            self.owed = 0;
         } else {
             self.goto(Rest::Idle)?;
             crate::mpsse::push_enter(&mut cmds, ir);
+            crate::mpsse::push_pad(&mut cmds, pad.tdo);
         }
+        // A DR stopping in Pause goes on later, so its pad bits wait.
+        let tail_pad = if !ir && rest == Rest::Pause {
+            self.owed = pad.tdi;
+            0
+        } else {
+            pad.tdi
+        };
 
         let body = bits - 1;
         let whole = body / 8;
@@ -406,7 +495,7 @@ impl<C: Chan> Player<'_, C> {
                 .map(|i| (tdi[i / 8] >> (i % 8)) & 1 == 1)
                 .collect();
             let read_len = crate::mpsse::push_body(&mut cmds, &bodybits) + 1;
-            let (_, tail_bits) = crate::mpsse::push_tail(&mut cmds, last, exit);
+            let (_, tail_bits) = crate::mpsse::push_tail(&mut cmds, last, exit, tail_pad);
             cmds.push(crate::mpsse::CMD_SEND_IMMEDIATE);
             let raw = self.m.exchange(&cmds, read_len).map_err(Error::Io)?;
             let got = crate::mpsse::scan_decode(&raw, bits, tail_bits);
@@ -440,7 +529,7 @@ impl<C: Chan> Player<'_, C> {
             if ragged > 0 {
                 crate::mpsse::push_write_bits(&mut cmds, tdi[whole], ragged);
             }
-            crate::mpsse::push_tail_quiet(&mut cmds, last, exit);
+            crate::mpsse::push_tail_quiet(&mut cmds, last, exit, tail_pad);
             self.m.send(&cmds).map_err(Error::Io)?;
         }
 
@@ -524,6 +613,71 @@ mod tests {
             0x1234,
             "the SVF must have reached the window"
         );
+    }
+
+    /// With a TAP on each side of ours, a DR split by Pause still reaches the
+    /// window as one scan: the pad bits go only at its very start and end.
+    #[test]
+    fn a_dr_split_by_pause_is_padded_once() {
+        let dap = (4, 0x4ba0_0477);
+        let ftdi = new_ftdi(7, 0).with_chain(&[dap], &[dap]);
+        let mut cfg = probe_cfg();
+        cfg.chain = crate::mpsse::Chain::new(&[4], &[4]);
+        let mut io = crate::mpsse::Mpsse::attach(ftdi, &cfg).unwrap();
+
+        let hex = |bits: &[bool]| {
+            let v = bits
+                .iter()
+                .enumerate()
+                .fold(0u64, |a, (i, &b)| if b { a | 1 << i } else { a });
+            format!("{v:x}")
+        };
+        let frame = crate::frame::Frame::write(0x08, 0x1234).to_bits(7);
+        let (head, tail) = frame.split_at(20);
+        let svf = format!(
+            "STATE RESET;\nSTATE IDLE;\nSIR 6 TDI (02);\nENDDR DRPAUSE;\n\
+             SDR 20 TDI ({});\nENDDR IDLE;\nSDR 21 TDI ({});\n",
+            hex(head),
+            hex(tail)
+        );
+        Player::new(&mut io).run(&svf, |_| {}).unwrap();
+
+        let mut b = crate::bridge::Bridge::new(io, 7);
+        assert_eq!(
+            b.read32(0x08).unwrap(),
+            0x1234,
+            "the split DR must land whole"
+        );
+    }
+
+    /// Vivado states the padding for a Zynq-7000 (`TIR 4`, `TDR 1`). It must
+    /// agree with the target, or the SVF was written for another chain.
+    #[test]
+    fn the_svf_padding_must_agree_with_the_target() {
+        let dap = (4, 0x4ba0_0477);
+        let mut cfg = probe_cfg();
+        cfg.chain = crate::mpsse::Chain::new(&[], &[4]);
+        let ftdi = new_ftdi(7, 0).with_chain(&[], &[dap]);
+        let mut io = crate::mpsse::Mpsse::attach(ftdi, &cfg).unwrap();
+        let zynq = "HIR 0 ;
+TIR 4 TDI (0f) SMASK (0f) ;
+HDR 0 ;
+TDR 1 TDI (00) SMASK (01) ;
+";
+        Player::new(&mut io).run(zynq, |_| {}).unwrap();
+
+        let mut alone = crate::mpsse::Mpsse::attach(new_ftdi(7, 0), &probe_cfg()).unwrap();
+        Player::new(&mut alone)
+            .run(
+                "HIR 0;
+TDR 0;
+",
+                |_| {},
+            )
+            .unwrap();
+        let err = Player::new(&mut alone).run(zynq, |_| {}).unwrap_err();
+        assert!(matches!(err, Error::Padded { .. }), "{err:?}");
+        assert!(err.to_string().contains("chain_tdi_side"), "{err}");
     }
 
     /// A TDO mismatch stops the replay instead of going on.
