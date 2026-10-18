@@ -306,6 +306,20 @@ pub fn run(
                 "memory controller settings (board file)",
             )?);
         }
+        if let Some(tcl) = emit::ps7_tcl(&plan) {
+            written.push(write(
+                &out.join("syn").join("ps7.tcl"),
+                &tcl,
+                "Zynq PS and AXI3 converter IP (Tcl)",
+            )?);
+        }
+        if let Some(preset) = emit::ps7_preset(&plan) {
+            written.push(write(
+                &out.join("syn").join("ps7_preset.tcl"),
+                &preset,
+                "Zynq PS settings (board)",
+            )?);
+        }
 
         let tck_mhz = crate::target::max_tck_mhz(&plan.board().target)
             .expect("plan::build checks max_tck_mhz");

@@ -247,7 +247,7 @@ pub fn clock_module(clocks: &ClockPlan, dut_reset: ResetType, window: &str) -> S
 /// (`CONFIG.XML_INPUT_FILE`), which `gen` writes beside this script. It holds
 /// pin locations and timing, so the generator does not restate them.
 pub fn mig_tcl(plan: &Plan) -> Option<String> {
-    if dram_pins(plan).is_empty() {
+    if dram_pins(plan).is_empty() || is_ps7(plan) {
         return None;
     }
     let target = plan.target()?;
@@ -271,6 +271,64 @@ pub fn mig_tcl(plan: &Plan) -> Option<String> {
         "set_property CONFIG.XML_INPUT_FILE [file normalize mig.prj] [get_ips {MIG_MODULE}]
 "
     ));
+    Some(out)
+}
+
+/// The module names Vivado gives the Zynq PS and the AXI4 to AXI3 converter.
+pub const PS7_MODULE: &str = "hns_ps7";
+pub const AXI_PC_MODULE: &str = "hns_axi_pc";
+
+/// Whether `dram` is a Zynq-7000 PS's memory (`controller = "ps7"`).
+pub fn is_ps7(plan: &Plan) -> bool {
+    plan.axi_mems
+        .iter()
+        .any(|m| m.backing == crate::manifest::Backing::Dram)
+        && target_dram(plan).is_some_and(|d| d.is_ps7())
+}
+
+/// `hns/syn/ps7.tcl`: the Zynq PS with S_AXI_HP0, and the converter in
+/// front of it.
+pub fn ps7_tcl(plan: &Plan) -> Option<String> {
+    if !is_ps7(plan) {
+        return None;
+    }
+    let mut out = header_tcl();
+    out.push_str(&format!(
+        r#"#
+# The Zynq PS and the AXI4 to AXI3 converter in front of its S_AXI_HP0.
+# The PS settings are the board's (ps7_preset.tcl). Only HP0 and
+# FCLK_RESET0_N reach the PL: the harness drives HP0 on its own clock, and
+# FCLK_RESET0_N rises once the host has set the PS up (ps7_init).
+
+source [file join [file dirname [info script]] ps7_preset.tcl]
+create_ip -vendor xilinx.com -library ip -name processing_system7 -module_name {PS7_MODULE} -dir $ip_dir -force
+set_property -dict $hns_ps7_config [get_ips {PS7_MODULE}]
+set_property -dict [list     CONFIG.PCW_USE_S_AXI_HP0 {{1}} CONFIG.PCW_S_AXI_HP0_DATA_WIDTH {{64}}     CONFIG.PCW_USE_S_AXI_HP1 {{0}} CONFIG.PCW_USE_S_AXI_HP2 {{0}} CONFIG.PCW_USE_S_AXI_HP3 {{0}}     CONFIG.PCW_USE_S_AXI_ACP {{0}} CONFIG.PCW_USE_S_AXI_GP0 {{0}} CONFIG.PCW_USE_S_AXI_GP1 {{0}}     CONFIG.PCW_USE_M_AXI_GP0 {{0}} CONFIG.PCW_USE_M_AXI_GP1 {{0}}     CONFIG.PCW_EN_CLK0_PORT {{0}} CONFIG.PCW_EN_CLK1_PORT {{0}} CONFIG.PCW_EN_CLK2_PORT {{0}} CONFIG.PCW_EN_CLK3_PORT {{0}}     CONFIG.PCW_EN_RST0_PORT {{1}} CONFIG.PCW_EN_RST1_PORT {{0}} CONFIG.PCW_EN_RST2_PORT {{0}} CONFIG.PCW_EN_RST3_PORT {{0}}     CONFIG.PCW_USE_FABRIC_INTERRUPT {{0}} CONFIG.PCW_GPIO_EMIO_GPIO_ENABLE {{0}} ] [get_ips {PS7_MODULE}]
+
+create_ip -vendor xilinx.com -library ip -name axi_protocol_converter -module_name {AXI_PC_MODULE} -dir $ip_dir -force
+set_property -dict [list     CONFIG.SI_PROTOCOL {{AXI4}} CONFIG.MI_PROTOCOL {{AXI3}} CONFIG.TRANSLATION_MODE {{2}}     CONFIG.DATA_WIDTH {{64}} CONFIG.ADDR_WIDTH {{32}} CONFIG.ID_WIDTH {{6}} ] [get_ips {AXI_PC_MODULE}]
+"#
+    ));
+    Some(out)
+}
+
+/// `hns/syn/ps7_preset.tcl`: copied from beside the target description.
+/// `feasibility::check` has made sure it is there.
+pub fn ps7_preset(plan: &Plan) -> Option<String> {
+    if !is_ps7(plan) {
+        return None;
+    }
+    let target = plan.target()?;
+    let name = ps7_preset_name(target)?;
+    let body = crate::target::read_beside(target, name)?;
+    let mut out = header_tcl();
+    out.push_str(&format!(
+        "# Copied from {}
+#
+",
+        target.source.beside(name)
+    ));
+    out.push_str(&body);
     Some(out)
 }
 
@@ -312,6 +370,16 @@ pub fn mig_prj_name(target: &crate::target::Target) -> Option<&str> {
         .get("vivado")
         .and_then(|x| x.as_table())
         .and_then(|v| v.get("mig_prj"))
+        .and_then(|x| x.as_str())
+}
+
+/// The file of PS7 settings a Zynq target names in `[vivado] ps7_preset`.
+pub fn ps7_preset_name(target: &crate::target::Target) -> Option<&str> {
+    target
+        .table
+        .get("vivado")
+        .and_then(|x| x.as_table())
+        .and_then(|v| v.get("ps7_preset"))
         .and_then(|x| x.as_str())
 }
 
@@ -3165,7 +3233,11 @@ fn core_body(
         // `dram` goes to the real controller. Only this differs from the
         // stand-in.
         if axi_mem.backing == crate::manifest::Backing::Dram && clocks.is_some() {
-            mig_instance(out, plan, axi_mem, domain);
+            if is_ps7(plan) {
+                ps7_instance(out, plan, axi_mem, domain);
+            } else {
+                mig_instance(out, plan, axi_mem, domain);
+            }
             continue;
         }
 
@@ -3582,6 +3654,36 @@ pub fn dram_pins(plan: &Plan) -> Vec<(String, &'static str, usize)> {
     let Some(dram) = hns_targets::dram(target) else {
         return Vec::new();
     };
+    // The PS's fixed pins: the DDR, the MIO and the PS clock and resets. They
+    // are the PS7 IP's port names (measured), and its own XDC places them.
+    if dram.is_ps7() {
+        let mut pins = vec![("MIO".to_string(), "inout", 54)];
+        for (name, width) in [
+            ("DDR_CAS_n", 1),
+            ("DDR_CKE", 1),
+            ("DDR_Clk_n", 1),
+            ("DDR_Clk", 1),
+            ("DDR_CS_n", 1),
+            ("DDR_DRSTB", 1),
+            ("DDR_ODT", 1),
+            ("DDR_RAS_n", 1),
+            ("DDR_WEB", 1),
+            ("DDR_BankAddr", 3),
+            ("DDR_Addr", 15),
+            ("DDR_VRN", 1),
+            ("DDR_VRP", 1),
+            ("DDR_DM", 4),
+            ("DDR_DQ", 32),
+            ("DDR_DQS_n", 4),
+            ("DDR_DQS", 4),
+            ("PS_SRSTB", 1),
+            ("PS_CLK", 1),
+            ("PS_PORB", 1),
+        ] {
+            pins.push((name.to_string(), "inout", width));
+        }
+        return pins;
+    }
     // No defaults. `feasibility` already rejects a target that lacks a key, so
     // every key is present here. A default would let a wrong width pass until
     // synthesis.
@@ -3637,6 +3739,245 @@ pub fn dram_pins(plan: &Plan) -> Vec<(String, &'static str, usize)> {
         ("ddr3_dqs_p".to_string(), "inout", lanes),
         ("ddr3_dqs_n".to_string(), "inout", lanes),
     ]
+}
+
+/// Places the Zynq PS and reaches its memory through S_AXI_HP0.
+///
+/// Unlike a MIG, the PS has no clock to give: HP0 runs on the harness clock,
+/// so there is no crossing. Vivado's converter turns AXI4 into the AXI3 that
+/// HP0 takes (16-beat bursts, WID). The window is `2^axi_addr_bits` bytes at
+/// the PS address `base`, which `feasibility` has made aligned, so the high
+/// address bits are just set.
+///
+/// Nothing passes until the PS is set up. Touching its DDR before then hangs
+/// the bus until a power cycle (measured), so valid and ready wait for
+/// FCLK_RESET0_N, which rises when the host's ps7_init releases the PL reset.
+fn ps7_instance(
+    out: &mut String,
+    plan: &Plan,
+    axi_mem: &crate::terminator::AxiMemPlan,
+    domain: &str,
+) {
+    let bundle = &axi_mem.bundle;
+    let host = plan.board().clocks.window.clone();
+    let controller = controller_axi(plan, axi_mem);
+    let cpkg = &controller.pkg;
+    let aw = controller.addr_width;
+    let dw = controller.data_bytes * 8;
+    let idw = controller.id_width;
+    let base = target_dram(plan)
+        .and_then(|d| d.base)
+        .expect("feasibility refuses a ps7 target without `base`");
+    let high = format!("{}'h{:x}", 32 - aw, base >> aw);
+
+    // Convert the width when it differs, as for a MIG.
+    let into = if controller.needs_dw {
+        out.push_str(&format!(
+            "    inst waxi_{bundle}: {domain}$std::axi4_if::<{cpkg}>;\n\n"
+        ));
+        out.push_str(&format!(
+            "    inst u_dw_{bundle}: hns::axi_dw::<\n        {},\n        {cpkg},\n    > (\n",
+            host_pkg(plan, axi_mem).0
+        ));
+        out.push_str(&format!("        i_clk: clk_{host},\n"));
+        out.push_str(&format!("        i_rst: rst_{host},\n"));
+        out.push_str(&format!("        s_axi: saxi_{bundle},\n"));
+        out.push_str(&format!("        m_axi: waxi_{bundle},\n"));
+        out.push_str("    );\n\n");
+        format!("waxi_{bundle}")
+    } else {
+        format!("saxi_{bundle}")
+    };
+
+    // From the converter. They go through the gate, not straight on.
+    let back = [
+        ("awready", 1),
+        ("wready", 1),
+        ("bvalid", 1),
+        ("bresp", 2),
+        ("bid", idw),
+        ("arready", 1),
+        ("rvalid", 1),
+        ("rlast", 1),
+        ("rresp", 2),
+        ("rid", idw),
+        ("rdata", dw),
+    ];
+    for (name, width) in back {
+        out.push_str(&format!(
+            "    var pc_{name}_{bundle}: {domain}logic<{width}>;\n"
+        ));
+    }
+    // AXI3 between the converter and HP0.
+    let hp = [
+        ("awid", idw),
+        ("awaddr", 32),
+        ("awlen", 4),
+        ("awsize", 3),
+        ("awburst", 2),
+        ("awlock", 2),
+        ("awcache", 4),
+        ("awprot", 3),
+        ("awqos", 4),
+        ("awvalid", 1),
+        ("awready", 1),
+        ("wid", idw),
+        ("wdata", dw),
+        ("wstrb", dw / 8),
+        ("wlast", 1),
+        ("wvalid", 1),
+        ("wready", 1),
+        ("bid", idw),
+        ("bresp", 2),
+        ("bvalid", 1),
+        ("bready", 1),
+        ("arid", idw),
+        ("araddr", 32),
+        ("arlen", 4),
+        ("arsize", 3),
+        ("arburst", 2),
+        ("arlock", 2),
+        ("arcache", 4),
+        ("arprot", 3),
+        ("arqos", 4),
+        ("arvalid", 1),
+        ("arready", 1),
+        ("rid", idw),
+        ("rdata", dw),
+        ("rresp", 2),
+        ("rlast", 1),
+        ("rvalid", 1),
+        ("rready", 1),
+    ];
+    for (name, width) in hp {
+        out.push_str(&format!(
+            "    var hp_{name}_{bundle}: {domain}logic<{width}>;\n"
+        ));
+    }
+    // FCLK_RESET0_N comes from the PS, on no clock of the harness.
+    out.push_str(&format!("    var ps_ready_{bundle}: logic;\n\n"));
+
+    // Nothing passes until the PS is set up. With ready low, valid waits.
+    out.push_str("    always_comb {\n");
+    for name in ["awready", "wready", "arready", "bvalid", "rvalid"] {
+        out.push_str(&format!(
+            "        {into}.{name} = pc_{name}_{bundle} & t_{bundle}_calib;\n"
+        ));
+    }
+    for name in ["bresp", "bid", "rlast", "rresp", "rid", "rdata"] {
+        out.push_str(&format!("        {into}.{name} = pc_{name}_{bundle};\n"));
+    }
+    for name in ["buser", "ruser"] {
+        out.push_str(&format!("        {into}.{name} = 0;\n"));
+    }
+    out.push_str("    }\n\n");
+
+    let asserted_value = asserted(plan.metadata.build.reset_type);
+    let aresetn = if asserted_value == 0 {
+        format!("rst_{host}")
+    } else {
+        format!("~rst_{host}")
+    };
+    let gated = |sig: &str| format!("{into}.{sig} & t_{bundle}_calib");
+    out.push_str("    // Vivado black boxes, so the analyser cannot check them.\n");
+    out.push_str("    unsafe (cdc) {\n");
+    out.push_str(&format!(
+        "        inst u_pc_{bundle}: $sv::{AXI_PC_MODULE} (\n"
+    ));
+    out.push_str(&format!("            aclk   : clk_{host},\n"));
+    out.push_str(&format!("            aresetn: {aresetn},\n"));
+    for (port, expr) in [
+        ("s_axi_awid", format!("{into}.awid")),
+        (
+            "s_axi_awaddr",
+            format!("{{{high}, {into}.awaddr[{}:0]}}", aw - 1),
+        ),
+        ("s_axi_awlen", format!("{into}.awlen")),
+        ("s_axi_awsize", format!("{into}.awsize")),
+        ("s_axi_awburst", format!("{into}.awburst")),
+        ("s_axi_awlock", format!("{into}.awlock")),
+        ("s_axi_awcache", format!("{into}.awcache")),
+        ("s_axi_awprot", format!("{into}.awprot")),
+        ("s_axi_awregion", format!("{into}.awregion")),
+        ("s_axi_awqos", format!("{into}.awqos")),
+        ("s_axi_awvalid", gated("awvalid")),
+        ("s_axi_awready", format!("pc_awready_{bundle}")),
+        ("s_axi_wdata", format!("{into}.wdata")),
+        ("s_axi_wstrb", format!("{into}.wstrb")),
+        ("s_axi_wlast", format!("{into}.wlast")),
+        ("s_axi_wvalid", gated("wvalid")),
+        ("s_axi_wready", format!("pc_wready_{bundle}")),
+        ("s_axi_bid", format!("pc_bid_{bundle}")),
+        ("s_axi_bresp", format!("pc_bresp_{bundle}")),
+        ("s_axi_bvalid", format!("pc_bvalid_{bundle}")),
+        ("s_axi_bready", gated("bready")),
+        ("s_axi_arid", format!("{into}.arid")),
+        (
+            "s_axi_araddr",
+            format!("{{{high}, {into}.araddr[{}:0]}}", aw - 1),
+        ),
+        ("s_axi_arlen", format!("{into}.arlen")),
+        ("s_axi_arsize", format!("{into}.arsize")),
+        ("s_axi_arburst", format!("{into}.arburst")),
+        ("s_axi_arlock", format!("{into}.arlock")),
+        ("s_axi_arcache", format!("{into}.arcache")),
+        ("s_axi_arprot", format!("{into}.arprot")),
+        ("s_axi_arregion", format!("{into}.arregion")),
+        ("s_axi_arqos", format!("{into}.arqos")),
+        ("s_axi_arvalid", gated("arvalid")),
+        ("s_axi_arready", format!("pc_arready_{bundle}")),
+        ("s_axi_rid", format!("pc_rid_{bundle}")),
+        ("s_axi_rdata", format!("pc_rdata_{bundle}")),
+        ("s_axi_rresp", format!("pc_rresp_{bundle}")),
+        ("s_axi_rlast", format!("pc_rlast_{bundle}")),
+        ("s_axi_rvalid", format!("pc_rvalid_{bundle}")),
+        ("s_axi_rready", gated("rready")),
+    ] {
+        out.push_str(&format!("            {port}: {expr},\n"));
+    }
+    for (name, _) in hp {
+        out.push_str(&format!("            m_axi_{name}: hp_{name}_{bundle},\n"));
+    }
+    out.push_str("        );\n");
+
+    out.push_str(&format!(
+        "        inst u_ps7_{bundle}: $sv::{PS7_MODULE} (\n"
+    ));
+    for (name, _dir, _width) in dram_pins(plan) {
+        out.push_str(&format!("            {name}: {name},\n"));
+    }
+    // The board's USB0 is in the PS settings; its PL-side ports are not used.
+    out.push_str("            USB0_PORT_INDCTL   : _,\n");
+    out.push_str("            USB0_VBUS_PWRSELECT: _,\n");
+    out.push_str("            USB0_VBUS_PWRFAULT : 1'b0,\n");
+    out.push_str(&format!(
+        "            FCLK_RESET0_N      : ps_ready_{bundle},\n"
+    ));
+    out.push_str(&format!("            S_AXI_HP0_ACLK     : clk_{host},\n"));
+    for name in ["RDISSUECAP1_EN", "WRISSUECAP1_EN"] {
+        out.push_str(&format!("            S_AXI_HP0_{name}: 1'b0,\n"));
+    }
+    for name in ["RCOUNT", "WCOUNT", "RACOUNT", "WACOUNT"] {
+        out.push_str(&format!("            S_AXI_HP0_{name}: _,\n"));
+    }
+    for (name, _) in hp {
+        out.push_str(&format!(
+            "            S_AXI_HP0_{}: hp_{name}_{bundle},\n",
+            name.to_uppercase()
+        ));
+    }
+    out.push_str("        );\n\n");
+
+    // Bring the PS's "set up" to the window clock: it gates the bus, and the
+    // host reads it as `<bundle>_calib`.
+    out.push_str(&format!(
+        "        inst u_calib_{bundle}: $std::synchronizer_basic #(\n            WIDTH: 1,\n        ) (\n"
+    ));
+    out.push_str(&format!("            i_clk: clk_{host},\n"));
+    out.push_str(&format!("            i_rst: rst_{host},\n"));
+    out.push_str(&format!("            i_d: ps_ready_{bundle},\n"));
+    out.push_str(&format!("            o_d: t_{bundle}_calib,\n"));
+    out.push_str("        );\n    }\n\n");
 }
 
 /// Places the Vivado MIG and connects AXI4 to it through a CDC.
@@ -4282,26 +4623,33 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
     // Memory controller pins: names and widths only. The MIG writes the pin
     // locations in its own XDC.
     let dram = dram_pins(plan);
-    if !dram.is_empty() {
+    if !dram.is_empty() && is_ps7(plan) {
+        out.push_str(
+            "\n    // The PS's own pins: its DDR, MIO, clock and resets. The harness only\n",
+        );
+        out.push_str(
+            "    // passes them through, and the PS7 IP writes their constraints itself.\n",
+        );
+    } else if !dram.is_empty() {
         out.push_str(
             "\n    // The DDR3 end. The controller drives these; the harness only passes\n",
         );
         out.push_str("    // them through, and MIG writes their pin constraints itself.\n");
-        for (name, dir, width) in &dram {
-            // Veryl requires `tri` on a bidirectional port: it has more than
-            // one driver. `tri` is a modifier, not a type.
-            let base = if *dir == "inout" {
-                "tri logic"
-            } else {
-                "logic"
-            };
-            let ty = if *width == 1 {
-                base.to_string()
-            } else {
-                format!("{base}<{width}>")
-            };
-            out.push_str(&format!("    {name}: {dir} 'mig {ty},\n"));
-        }
+    }
+    for (name, dir, width) in &dram {
+        // Veryl requires `tri` on a bidirectional port: it has more than one
+        // driver. `tri` is a modifier, not a type.
+        let base = if *dir == "inout" {
+            "tri logic"
+        } else {
+            "logic"
+        };
+        let ty = if *width == 1 {
+            base.to_string()
+        } else {
+            format!("{base}<{width}>")
+        };
+        out.push_str(&format!("    {name}: {dir} 'mig {ty},\n"));
     }
     out.push_str(") {\n");
 
@@ -5252,10 +5600,11 @@ pub fn cdc_instances(plan: &Plan) -> Vec<(String, f64, &'static str)> {
     };
     let dram_mhz = target_dram(plan).and_then(|d| d.ui_clk_mhz);
     let mut out = Vec::new();
+    // A Zynq PS's memory is on the harness clock: nothing crosses.
     for m in plan
         .axi_mems
         .iter()
-        .filter(|m| m.backing == crate::manifest::Backing::Dram)
+        .filter(|m| m.backing == crate::manifest::Backing::Dram && !is_ps7(plan))
     {
         let host_mhz = clocks.window_output().freq_mhz;
         let fastest = dram_mhz.map_or(host_mhz, |ui| ui.max(host_mhz));
@@ -5524,13 +5873,22 @@ pub fn ip_tcl(plan: &Plan) -> String {
     if has_pcie(plan) {
         out.push_str("source pcie.tcl\n");
     }
-    if !dram_pins(plan).is_empty() {
+    if is_ps7(plan) {
+        out.push_str("source ps7.tcl\n");
+    } else if !dram_pins(plan).is_empty() {
         out.push_str("source mig.tcl\n");
     }
     out.push_str("# No out-of-context synthesis: the IP RTL is synthesised with the design, and\n");
     out.push_str("# `synth_ip` is therefore not called (it fails with 12-3437 in this mode).\n");
     out.push_str("foreach f [get_files -all {*.xci}] { set_property GENERATE_SYNTH_CHECKPOINT {false} -quiet $f }\n");
     out.push_str("generate_target all [get_ips]\n");
+    if is_ps7(plan) {
+        out.push_str(&format!(
+            "\n# The PS setup `hio program` runs over JTAG, from the PS7 IP. It sits\n\
+             # beside the bitstream, so `make zip` takes it along.\n\
+             file copy -force [file join $ip_dir {PS7_MODULE} ps7_init.tcl] [file join $ip_dir ps7_init.tcl]\n"
+        ));
+    }
     out
 }
 
@@ -5685,7 +6043,7 @@ const ZIP_RULE: &str = r#"# What hio needs on a machine without Vivado: the map,
 #   unzip <top>.zip && cd <dir> && hio program && hio id
 NAME := $(notdir $(abspath $(ROOT)))
 SHIP := regs.json $(notdir $(wildcard $(ROOT)/regs.md)) syn/output/$(TOP).bit \
-        $(addprefix syn/,$(wildcard output/$(TOP).svf output/timing.rpt output/util.rpt))
+        $(addprefix syn/,$(wildcard output/$(TOP).svf output/ps7_init.tcl output/timing.rpt output/util.rpt))
 zip:
 	@test -f output/$(TOP).bit || { echo "no output/$(TOP).bit yet: run make first"; exit 1; }
 	rm -f output/$(TOP).zip
@@ -6183,6 +6541,9 @@ fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
                 "cycles the DUT held an address at or above the depth (the port has no read enable, so an access cannot be told from an idle cycle); those reads return 0 and their writes are dropped. The address is never folded back into range".to_string()
             });
         }
+        Some("calib") if is_ps7(plan) => notes.push(
+            "1 once the PS is set up (`hio program` runs ps7_init after the bitstream). Nothing reaches the memory before that".to_string(),
+        ),
         Some("calib") => notes.push(
             "1 once the memory controller has calibrated. Nothing reaches the memory before that".to_string(),
         ),

@@ -34,6 +34,7 @@ use thiserror::Error;
 #[folder = "targets"]
 #[include = "*.toml"]
 #[include = "*.prj"]
+#[include = "*.tcl"]
 struct Public;
 
 /// Private targets. They are not in the repository; they live on the machine
@@ -43,6 +44,7 @@ struct Public;
 #[folder = "targets-private"]
 #[include = "*.toml"]
 #[include = "*.prj"]
+#[include = "*.tcl"]
 struct Private;
 
 const DEFAULT_CONFIG: &str = "default";
@@ -668,6 +670,19 @@ pub struct Jtag {
     /// there).
     pub chain_tdo_side: Vec<u8>,
     pub chain_tdi_side: Vec<u8>,
+    /// Where an ARM DAP sits on the chain, if there is one (a Zynq-7000's).
+    pub dap: Option<Dap>,
+}
+
+/// `dap` in `[jtag]`: one of the other TAPs, which is an ARM DAP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dap {
+    /// Which list it is in: `chain_tdi_side` (true) or `chain_tdo_side`.
+    pub tdi_side: bool,
+    /// Its place in that list, 0 nearest the FPGA.
+    pub index: usize,
+    /// The MEM-AP that reaches the system memory, once it is known.
+    pub mem_ap: Option<u8>,
 }
 
 /// One check that reads the IR capture.
@@ -760,7 +775,9 @@ pub fn pcie(target: &Target) -> Pcie {
 pub struct Dram {
     /// `ddr3`, `ddr3l` or `ddr4`. It decides the pin list.
     pub kind: Option<String>,
-    /// `ddr4` is the UltraScale+ DDR4 IP; anything else is the 7-series MIG.
+    /// `ddr4` is the UltraScale+ DDR4 IP, `ps7` the DDR controller in a
+    /// Zynq-7000's PS (reached through its S_AXI_HP0 port); anything else is
+    /// the 7-series MIG.
     pub controller: Option<String>,
     pub channels: Option<u32>,
     /// The memory part, shown when a board has several configs to pick from.
@@ -786,12 +803,20 @@ pub struct Dram {
     pub sys_clk_ps: Option<u32>,
     pub cas_latency: Option<u32>,
     pub cas_write_latency: Option<u32>,
+    /// `ps7`: the PS address the harness's memory starts at. The harness
+    /// reaches `2^axi_addr_bits` bytes from there.
+    pub base: Option<u64>,
 }
 
 impl Dram {
     /// Whether the controller is the UltraScale+ DDR4 IP.
     pub fn is_ddr4_ip(&self) -> bool {
         self.controller.as_deref() == Some("ddr4")
+    }
+
+    /// Whether the memory is a Zynq-7000 PS's, reached through S_AXI_HP0.
+    pub fn is_ps7(&self) -> bool {
+        self.controller.as_deref() == Some("ps7")
     }
 }
 
@@ -836,6 +861,10 @@ pub fn dram(target: &Target) -> Option<Dram> {
         sys_clk_ps: int("sys_clk_ps"),
         cas_latency: int("cas_latency"),
         cas_write_latency: int("cas_write_latency"),
+        base: t
+            .get("base")
+            .and_then(|v| v.as_integer())
+            .and_then(|i| u64::try_from(i).ok()),
     })
 }
 
@@ -892,6 +921,21 @@ pub fn jtag(target: &Target) -> Jtag {
             .unwrap_or_default(),
         chain_tdo_side: lengths("chain_tdo_side"),
         chain_tdi_side: lengths("chain_tdi_side"),
+        dap: t.get("dap").and_then(|v| v.as_table()).and_then(|d| {
+            let tdi_side = match d.get("side")?.as_str()? {
+                "tdi" => true,
+                "tdo" => false,
+                _ => return None,
+            };
+            Some(Dap {
+                tdi_side,
+                index: d.get("index")?.as_integer()? as usize,
+                mem_ap: d
+                    .get("mem_ap")
+                    .and_then(|v| v.as_integer())
+                    .map(|v| v as u8),
+            })
+        }),
         jprogram_ir: int("jprogram_ir").map(|v| v as u32),
         cfg_in_ir: int("cfg_in_ir").map(|v| v as u32),
         jstart_ir: int("jstart_ir").map(|v| v as u32),
@@ -1372,6 +1416,18 @@ mod jtag_tests {
         // A board alone on its chain says nothing.
         let arty = jtag(&resolve("digilent/arty-a7-35", &[]).unwrap());
         assert!(arty.chain_tdo_side.is_empty() && arty.chain_tdi_side.is_empty());
+    }
+
+    /// The PYNQ-Z1's memory is the PS's, described by the PS settings that
+    /// ship beside it.
+    #[test]
+    fn the_pynq_z1_carries_its_ps7_preset() {
+        let t = resolve("digilent/pynq-z1", &[]).unwrap();
+        let d = dram(&t).unwrap();
+        assert!(d.is_ps7() && !d.is_ddr4_ip());
+        assert_eq!(d.base, Some(0x1000_0000));
+        let preset = read_beside(&t, "ps7_preset.tcl").expect("shipped beside the target");
+        assert!(preset.contains("CONFIG.PCW_UIPARAM_DDR_PARTNO {MT41J256M16 RE-125}"));
     }
 
     /// VU9P has three SLRs, and the master (SLR1) comes first in a `.bit`.

@@ -378,3 +378,23 @@ hio id
 A chain with other devices on it (the ARM DAP of a Zynq-7000) is handled from
 the target description: `hio` holds them in BYPASS. `hio probe` lists the chain
 and marks the device it talks to.
+
+## A Zynq-7000's PS
+
+A Zynq-7000 has an ARM DAP on the JTAG chain beside the PL. `hio dap` reaches
+the PS's memory and registers through it, with no program on the CPUs; `dap`
+in the target's `[jtag]` says where the DAP is.
+
+```bash
+hio dap info                      # the DAP's IDCODE and its access ports
+hio dap read 0xf8000530           # SLCR PSS_IDCODE
+hio dap write 0x00100000 0x1234   # DDR, once the PS is set up
+```
+
+`read` and `write` go through the access port `mem_ap` in the target's `dap`,
+or the one `--ap` names.
+
+The PS's DDR, PLLs and the level shifters to the PL are set by software after
+every power-up. `hio dap ps7-init ps7_init.tcl` does it from the file Vivado
+writes with the PS7 IP. When the harness's `dram` is the PS's, `hio program`
+runs it after the bitstream, from the `ps7_init.tcl` beside it.

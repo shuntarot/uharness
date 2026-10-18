@@ -260,6 +260,54 @@ impl Requirement {
 /// JTAG is always there.
 pub const DEFAULT_TRANSPORT: &str = "jtag";
 
+/// A Zynq-7000 PS's memory (`controller = "ps7"`). It has no clocks, pins or
+/// geometry of its own to state: the PS settings come from `[vivado]
+/// ps7_preset`, and the harness meets S_AXI_HP0 on its own clock.
+fn ps7_described(
+    bundle: &str,
+    target: &crate::target::Target,
+    dram: &hns_targets::Dram,
+) -> Result<(), FeasibilityError> {
+    let name = crate::emit::ps7_preset_name(target);
+    let missing: Vec<&str> = [
+        ("axi_data_bits", dram.axi_data_bits.is_some()),
+        ("axi_addr_bits", dram.axi_addr_bits.is_some()),
+        ("axi_id_bits", dram.axi_id_bits.is_some()),
+        ("base", dram.base.is_some()),
+        ("[vivado] ps7_preset", name.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, present)| !present)
+    .map(|(key, _)| key)
+    .collect();
+    if !missing.is_empty() {
+        return Err(FeasibilityError::DramNotDescribed {
+            bundle: bundle.to_string(),
+            target: target.name.clone(),
+            missing: missing.join(", "),
+        });
+    }
+    let (Some(base), Some(bits), Some(name)) = (dram.base, dram.axi_addr_bits, name) else {
+        unreachable!("checked above");
+    };
+    let bytes = 1u64 << bits.min(63);
+    if base % bytes != 0 || base + bytes > 1 << 32 {
+        return Err(FeasibilityError::Ps7BaseUnaligned {
+            target: target.name.clone(),
+            base,
+            bytes,
+        });
+    }
+    if crate::target::read_beside(target, name).is_none() {
+        return Err(FeasibilityError::Ps7PresetMissing {
+            target: target.name.clone(),
+            name: name.to_string(),
+            looked: target.source.beside(name),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error, Diagnostic)]
 pub enum FeasibilityError {
     #[error("`{target}` does not describe its memory controller fully enough to build against")]
@@ -298,6 +346,34 @@ pub enum FeasibilityError {
         target: String,
         name: String,
         looked: String,
+    },
+
+    /// `gen` copies the file into `hns/syn/`; the PS7 IP is built from it.
+    #[error("`{target}` names `{name}` in `[vivado] ps7_preset`, but the file is not there")]
+    #[diagnostic(
+        code(harness::feasibility::ps7_preset_missing),
+        help(
+            "It is looked for beside the target description:\n\n    {looked}\n\nThe file sets the board's PS (`CONFIG.PCW_*` of processing_system7): its DDR, MIO and clocks. Take them from a Vivado design made for the board, not from a datasheet: a wrong DDR setting leaves the PS hanging when the harness touches it."
+        )
+    )]
+    Ps7PresetMissing {
+        target: String,
+        name: String,
+        looked: String,
+    },
+
+    /// The harness ORs `base` into the address, so it must be aligned.
+    #[error("`{target}` puts its PS memory at {base:#x}, which is not a multiple of its size")]
+    #[diagnostic(
+        code(harness::feasibility::ps7_base_unaligned),
+        help(
+            "The harness reaches 2^axi_addr_bits = {bytes:#x} bytes of the PS's memory from `base`, and joins the two by setting the high address bits. So `base` must be a multiple of {bytes:#x}, and the window must end below 4 GB.\n\nFix `base` or `axi_addr_bits` in `[provides] dram`."
+        )
+    )]
+    Ps7BaseUnaligned {
+        target: String,
+        base: u64,
+        bytes: u64,
     },
 
     #[error("target `{target}` does not provide transport `{requested}`")]
@@ -572,74 +648,80 @@ pub fn check(
             // missing key means the board's controller was not measured yet.
             // `sys_clk_mhz` is not needed when the clock comes from a board pin;
             // the frequency is then in `[clocks.<name>]`.
-            let from_board = dram.sys_clk.is_some();
-            let mut wanted = vec![
-                ("axi_data_bits", dram.axi_data_bits.is_some()),
-                ("axi_addr_bits", dram.axi_addr_bits.is_some()),
-                ("axi_id_bits", dram.axi_id_bits.is_some()),
-                ("ui_clk_mhz", dram.ui_clk_mhz.is_some()),
-                ("width", dram.width.is_some()),
-                ("row_bits", dram.row_bits.is_some()),
-                ("bank_bits", dram.bank_bits.is_some()),
-            ];
-            if !from_board {
-                wanted.push(("sys_clk_mhz", dram.sys_clk_mhz.is_some()));
-            }
-            // DDR4 also needs the bank group width: its pin list differs from
-            // DDR3 (`emit::dram_pins`). Without `kind`, the pins cannot be chosen.
-            if dram
-                .kind
-                .as_deref()
-                .is_some_and(|kind| kind.starts_with("ddr4"))
-            {
-                wanted.push(("bank_group_bits", dram.bank_group_bits.is_some()));
-            }
-            let mut missing: Vec<&str> = wanted
-                .into_iter()
-                .filter(|(_, present)| !present)
-                .map(|(key, _)| key)
-                .collect();
-            if dram.kind.is_none() {
-                missing.insert(0, "kind");
-            }
-            // A 7-series MIG takes its reference clock from the harness MMCM too.
-            if !dram.is_ddr4_ip() && !from_board && dram.ref_clk_mhz.is_none() {
-                missing.push("ref_clk_mhz");
-            }
-            // The reset polarity differs between controllers; it is not guessed.
-            if !matches!(dram.sys_rst_active.as_deref(), Some("low" | "high")) {
-                missing.push("sys_rst_active (\"low\" or \"high\")");
-            }
-            if !missing.is_empty() {
-                return Err(FeasibilityError::DramNotDescribed {
-                    bundle: plan.bundle.clone(),
-                    target: target.name.clone(),
-                    missing: missing.join(", "),
-                });
-            }
-            // Generation also needs a recipe for the IP, in one of two forms: a
-            // `mig.prj` (7-series), or the controller settings (UltraScale+ DDR4
-            // has no prj).
-            let prj = crate::emit::mig_prj_name(target);
-            if let Some(name) = prj
-                && crate::target::read_beside(target, name).is_none()
-            {
-                return Err(FeasibilityError::MigPrjMissing {
-                    target: target.name.clone(),
-                    name: name.to_string(),
-                    looked: target.source.beside(name),
-                });
-            }
-            let has_prj = prj.is_some();
-            // The settings are either a board-file interface, or the part and
-            // both clock periods.
-            let has_settings = dram.board_interface.is_some()
-                || (dram.part.is_some() && dram.mem_clk_ps.is_some() && dram.sys_clk_ps.is_some());
-            if !has_prj && !has_settings {
-                return Err(FeasibilityError::DramHasNoIpRecipe {
-                    bundle: plan.bundle.clone(),
-                    target: target.name.clone(),
-                });
+            if dram.is_ps7() {
+                ps7_described(&plan.bundle, target, &dram)?;
+            } else {
+                let from_board = dram.sys_clk.is_some();
+                let mut wanted = vec![
+                    ("axi_data_bits", dram.axi_data_bits.is_some()),
+                    ("axi_addr_bits", dram.axi_addr_bits.is_some()),
+                    ("axi_id_bits", dram.axi_id_bits.is_some()),
+                    ("ui_clk_mhz", dram.ui_clk_mhz.is_some()),
+                    ("width", dram.width.is_some()),
+                    ("row_bits", dram.row_bits.is_some()),
+                    ("bank_bits", dram.bank_bits.is_some()),
+                ];
+                if !from_board {
+                    wanted.push(("sys_clk_mhz", dram.sys_clk_mhz.is_some()));
+                }
+                // DDR4 also needs the bank group width: its pin list differs from
+                // DDR3 (`emit::dram_pins`). Without `kind`, the pins cannot be chosen.
+                if dram
+                    .kind
+                    .as_deref()
+                    .is_some_and(|kind| kind.starts_with("ddr4"))
+                {
+                    wanted.push(("bank_group_bits", dram.bank_group_bits.is_some()));
+                }
+                let mut missing: Vec<&str> = wanted
+                    .into_iter()
+                    .filter(|(_, present)| !present)
+                    .map(|(key, _)| key)
+                    .collect();
+                if dram.kind.is_none() {
+                    missing.insert(0, "kind");
+                }
+                // A 7-series MIG takes its reference clock from the harness MMCM too.
+                if !dram.is_ddr4_ip() && !from_board && dram.ref_clk_mhz.is_none() {
+                    missing.push("ref_clk_mhz");
+                }
+                // The reset polarity differs between controllers; it is not guessed.
+                if !matches!(dram.sys_rst_active.as_deref(), Some("low" | "high")) {
+                    missing.push("sys_rst_active (\"low\" or \"high\")");
+                }
+                if !missing.is_empty() {
+                    return Err(FeasibilityError::DramNotDescribed {
+                        bundle: plan.bundle.clone(),
+                        target: target.name.clone(),
+                        missing: missing.join(", "),
+                    });
+                }
+                // Generation also needs a recipe for the IP, in one of two forms: a
+                // `mig.prj` (7-series), or the controller settings (UltraScale+ DDR4
+                // has no prj).
+                let prj = crate::emit::mig_prj_name(target);
+                if let Some(name) = prj
+                    && crate::target::read_beside(target, name).is_none()
+                {
+                    return Err(FeasibilityError::MigPrjMissing {
+                        target: target.name.clone(),
+                        name: name.to_string(),
+                        looked: target.source.beside(name),
+                    });
+                }
+                let has_prj = prj.is_some();
+                // The settings are either a board-file interface, or the part and
+                // both clock periods.
+                let has_settings = dram.board_interface.is_some()
+                    || (dram.part.is_some()
+                        && dram.mem_clk_ps.is_some()
+                        && dram.sys_clk_ps.is_some());
+                if !has_prj && !has_settings {
+                    return Err(FeasibilityError::DramHasNoIpRecipe {
+                        bundle: plan.bundle.clone(),
+                        target: target.name.clone(),
+                    });
+                }
             }
 
             // A narrower data width is fine: the harness inserts `hns::axi_dw`. It
@@ -1273,6 +1355,55 @@ mod tests {
         // With the file in place, the same target passes.
         std::fs::write(dir.path().join("mig.prj"), "<Project/>").unwrap();
         assert!(check(&manifest, &[], &[], &plans, &target, Some("jtag")).is_ok());
+    }
+
+    /// A Zynq PS's memory needs `base` aligned to its window and the PS
+    /// settings beside the description; nothing else of a MIG's.
+    #[test]
+    fn a_ps7_memory_needs_an_aligned_base_and_its_preset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.toml");
+        let write = |base: &str| {
+            std::fs::write(
+                &path,
+                format!("[board]\nprovider = \"acme\"\nname = \"proto\"\n\n[device]\nvendor = \"xilinx\"\nfamily = \"zynq\"\npart = \"xc7z020clg400-1\"\n\n[provides]\ntransport = [\"jtag\"]\ndram = {{kind = \"ddr3\", channels = 1, controller = \"ps7\", axi_data_bits = 64, axi_addr_bits = 28, axi_id_bits = 6, base = {base}}}\n\n[vivado]\nps7_preset = \"ps7.tcl\"\n"),
+            )
+            .unwrap();
+            target::load_file(&path, &[]).unwrap()
+        };
+        let plans = vec![crate::terminator::AxiMemPlan {
+            bundle: "mem".to_string(),
+            backing: Backing::Dram,
+            port: "axi".to_string(),
+            pkg: "$std::axi4_pkg::<28, 8, 6, 1, 1, 1, 1, 1>".to_string(),
+            addr_width: 28,
+            data_bytes: 8,
+            id_width: 6,
+            depth: 256,
+            depth_defaulted: false,
+            aperture_bytes: Some(256),
+            dut_base: 0,
+            xfer: None,
+        }];
+        let manifest = manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n");
+        let run = |t: &crate::target::Target| check(&manifest, &[], &[], &plans, t, Some("jtag"));
+
+        // 128 MB is not a multiple of the 256 MB window.
+        let err = run(&write("0x0800_0000")).unwrap_err();
+        assert!(
+            matches!(err, FeasibilityError::Ps7BaseUnaligned { .. }),
+            "{err:?}"
+        );
+
+        let target = write("0x1000_0000");
+        let err = run(&target).unwrap_err();
+        let FeasibilityError::Ps7PresetMissing { looked, .. } = &err else {
+            panic!("expected Ps7PresetMissing, got {err:?}");
+        };
+        assert!(looked.ends_with("ps7.tcl"), "{looked}");
+
+        std::fs::write(dir.path().join("ps7.tcl"), "set hns_ps7_config [list]\n").unwrap();
+        assert!(run(&target).is_ok());
     }
 
     /// A region beyond the controller's reach is refused.

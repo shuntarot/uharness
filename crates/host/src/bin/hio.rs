@@ -183,6 +183,13 @@ enum Cmd {
     /// List the FTDI probes that are plugged in.
     Probe,
 
+    /// Read and write memory through the ARM DAP on the JTAG chain.
+    ///
+    /// A Zynq-7000 has one. It reaches the PS's memory and registers with no
+    /// program on the CPUs. `dap` in the target's [jtag] says where it is.
+    #[command(subcommand)]
+    Dap(DapCmd),
+
     /// Write a .bit to the device over JTAG, without Vivado.
     Program {
         /// The .bit that Vivado wrote, or a .svf.
@@ -456,6 +463,81 @@ enum Cmd {
         /// bash, zsh, fish, elvish or powershell.
         shell: Shell,
     },
+}
+
+/// `hio dap`: the ARM DAP on the JTAG chain.
+#[derive(Subcommand)]
+enum DapCmd {
+    /// Show the DAP's IDCODE and every access port it has.
+    Info,
+    /// Read 32-bit words through a memory access port.
+    Read {
+        /// The address, in the system's address map (not a bundle offset).
+        #[arg(value_parser = parse_u32)]
+        addr: u32,
+        /// How many words.
+        #[arg(default_value_t = 1)]
+        words: u32,
+        #[command(flatten)]
+        ap: ApArg,
+    },
+    /// Write 32-bit words through a memory access port, one after another.
+    Write {
+        #[arg(value_parser = parse_u32)]
+        addr: u32,
+        #[arg(value_parser = parse_u32, required = true)]
+        values: Vec<u32>,
+        #[command(flatten)]
+        ap: ApArg,
+    },
+    /// Set up a Zynq-7000 PS from the `ps7_init.tcl` Vivado wrote.
+    ///
+    /// Runs its MIO, PLL, clock, DDR and peripheral steps for the silicon
+    /// version it finds, then the post-configuration step, which turns on the
+    /// level shifters between the PS and the PL. Run it after programming
+    /// the PL, once per power-up.
+    Ps7Init {
+        /// The `ps7_init.tcl` from the PS7 IP's output products.
+        file: PathBuf,
+        /// Leave out the post-configuration step (level shifters, PL reset).
+        #[arg(long)]
+        no_post: bool,
+        #[command(flatten)]
+        ap: ApArg,
+    },
+}
+
+/// The DAP and the access port the `ps7` steps run through.
+struct DapMem<'a> {
+    dap: &'a mut DapLink,
+    ap: u8,
+}
+
+impl hns_host::ps7::Mem for DapMem<'_> {
+    type Error = String;
+    fn read32(&mut self, addr: u32) -> Result<u32, String> {
+        self.dap.read32(self.ap, addr).map_err(|e| e.to_string())
+    }
+    fn write32(&mut self, addr: u32, value: u32) -> Result<(), String> {
+        self.dap
+            .write32(self.ap, addr, value)
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[derive(clap::Args, Debug, Clone)]
+struct ApArg {
+    /// The access port to use.
+    ///
+    /// Without it, `mem_ap` in the target's `dap`. `hio dap info` lists them.
+    #[arg(long)]
+    ap: Option<u8>,
+    /// The CSW the access port uses, instead of the one it holds.
+    ///
+    /// Its protection bits decide what kind of master the access looks like
+    /// (privileged, secure, debug). The size is always set to 32 bits.
+    #[arg(long, value_parser = parse_u32)]
+    csw: Option<u32>,
 }
 
 /// `hio cpu`: what needs a CPU in the DUT and an ELF for it.
@@ -1002,7 +1084,7 @@ fn parse_step(line: &str) -> Result<Step, String> {
             "`cpu boot` and `cpu console` take over the terminal; run them on their own."
                 .to_string(),
         ),
-        Cmd::Probe | Cmd::Targets | Cmd::Check | Cmd::Completions { .. } => {
+        Cmd::Probe | Cmd::Dap(_) | Cmd::Targets | Cmd::Check | Cmd::Completions { .. } => {
             Err("that only makes sense before the link is open; run it on its own.".to_string())
         }
         cmd => Ok(Step::Window(cmd)),
@@ -1028,6 +1110,7 @@ fn run_step(cli: &Cli, bus: &mut Bus, map: &RegisterMap, step: Step) -> Result<(
         | Cmd::Run { .. }
         | Cmd::Cpu(CpuCmd::Boot { .. } | CpuCmd::Console { .. })
         | Cmd::Probe
+        | Cmd::Dap(_)
         | Cmd::Targets
         | Cmd::Completions { .. } => {
             unreachable!("refused when the script was read")
@@ -1316,6 +1399,233 @@ fn probe(cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
+type DapLink = hns_host::adi::Dap<Mpsse<Ftdi>>;
+
+/// Opens the probe with the scans padded for the DAP instead of the FPGA.
+///
+/// Every other TAP, the FPGA included, gets BYPASS. Returns the DAP and the
+/// target's `mem_ap`.
+fn open_dap(cli: &Cli) -> Result<(DapLink, Option<u8>), String> {
+    let jtag = load_target(cli)?;
+    let Some(dap) = jtag.dap.clone() else {
+        return Err(
+            "the target does not say where an ARM DAP is on the JTAG chain.\n\
+             Add `dap = { side = \"tdi\", index = 0 }` to its [jtag] (side: which of \
+             `chain_tdi_side` / `chain_tdo_side` holds it; index: 0 nearest the FPGA)."
+                .to_string(),
+        );
+    };
+    let mut cfg = resolve_probe(cli)?;
+    let (tdo, tdi) = dap_sides(&jtag, &dap, cfg.ir_length)?;
+    cfg.chain = hns_host::mpsse::Chain::new(&tdo, &tdi);
+    cfg.ir_length = hns_host::adi::IR_LEN;
+    let m = Mpsse::attach(Ftdi::open(&cfg).map_err(|e| e.to_string())?, &cfg)
+        .map_err(|e| e.to_string())?;
+    Ok((hns_host::adi::Dap::new(m), dap.mem_ap))
+}
+
+/// The IR lengths of the other TAPs on each side of the DAP: (TDO side, TDI
+/// side). The lists in the target count from the FPGA outwards.
+fn dap_sides(
+    jtag: &hns_targets::Jtag,
+    dap: &hns_targets::Dap,
+    fpga_ir: u8,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let (own, other) = if dap.tdi_side {
+        (&jtag.chain_tdi_side, &jtag.chain_tdo_side)
+    } else {
+        (&jtag.chain_tdo_side, &jtag.chain_tdi_side)
+    };
+    let Some(&len) = own.get(dap.index) else {
+        return Err(format!(
+            "`dap` says index {} on the {} side, and that side lists {} TAP(s).",
+            dap.index,
+            if dap.tdi_side { "TDI" } else { "TDO" },
+            own.len()
+        ));
+    };
+    if len != hns_host::adi::IR_LEN {
+        return Err(format!(
+            "the TAP that `dap` names has a {len}-bit IR; an ARM DAP has {}.",
+            hns_host::adi::IR_LEN
+        ));
+    }
+    // Toward the FPGA: the other side, the FPGA, and this side up to the DAP.
+    let mut inner = other.clone();
+    inner.push(fpga_ir);
+    inner.extend_from_slice(&own[..dap.index]);
+    let outer = own[dap.index + 1..].to_vec();
+    Ok(if dap.tdi_side {
+        (inner, outer)
+    } else {
+        (outer, inner)
+    })
+}
+
+fn dap_cmd(cli: &Cli, cmd: &DapCmd) -> Result<(), String> {
+    let (mut dap, mem_ap) = open_dap(cli)?;
+    let e = |e: hns_host::adi::Error<_>| e.to_string();
+    let idcode = dap.idcode().map_err(e)?;
+    let pick = |arg: &ApArg| {
+        arg.ap.or(mem_ap).ok_or_else(|| {
+            "which access port reaches the memory is not known.\n\
+             Pass --ap <n>, or add `mem_ap = <n>` to `dap` in the target. \
+             `hio dap info` lists the ports."
+                .to_string()
+        })
+    };
+    match cmd {
+        DapCmd::Info => {
+            println!("dp      idcode {idcode:#010x}");
+            dap.power_up().map_err(e)?;
+            println!("        debug and system domains powered up");
+            // APs are numbered from 0 with no gaps; the first empty IDR ends them.
+            for ap in 0..=255u8 {
+                let idr = dap.ap_read(ap, hns_host::adi::AP_IDR).map_err(e)?;
+                if idr == 0 {
+                    break;
+                }
+                let mark = if Some(ap) == mem_ap {
+                    "  <- mem_ap"
+                } else {
+                    ""
+                };
+                println!("ap {ap:<4} {}{mark}", hns_host::adi::describe_idr(idr));
+                // A MEM-AP's CSW says how its accesses look on the bus.
+                if (idr >> 13) & 0xf == 8 {
+                    let csw = dap.ap_read(ap, hns_host::adi::AP_CSW).map_err(e)?;
+                    println!("        csw {csw:#010x}");
+                }
+            }
+        }
+        DapCmd::Read {
+            addr,
+            words,
+            ap: arg,
+        } => {
+            let ap = pick(arg)?;
+            dap.power_up().map_err(e)?;
+            if let Some(csw) = arg.csw {
+                dap.set_csw(ap, csw).map_err(e)?;
+            }
+            for row in (0..*words).step_by(4) {
+                let at = addr.wrapping_add(row * 4);
+                let mut line = format!("{at:#010x} ");
+                for i in row..(*words).min(row + 4) {
+                    let v = dap.read32(ap, addr.wrapping_add(i * 4)).map_err(e)?;
+                    line.push_str(&format!(" {v:08x}"));
+                }
+                println!("{line}");
+            }
+        }
+        DapCmd::Write {
+            addr,
+            values,
+            ap: arg,
+        } => {
+            let ap = pick(arg)?;
+            dap.power_up().map_err(e)?;
+            if let Some(csw) = arg.csw {
+                dap.set_csw(ap, csw).map_err(e)?;
+            }
+            for (i, v) in values.iter().enumerate() {
+                dap.write32(ap, addr.wrapping_add(i as u32 * 4), *v)
+                    .map_err(e)?;
+            }
+        }
+        DapCmd::Ps7Init {
+            file,
+            no_post,
+            ap: ap_arg,
+        } => {
+            let ap = pick(ap_arg)?;
+            dap.power_up().map_err(e)?;
+            if let Some(csw) = ap_arg.csw {
+                dap.set_csw(ap, csw).map_err(e)?;
+            }
+            ps7_init(&mut dap, ap, file, !no_post)?;
+        }
+    }
+    Ok(())
+}
+
+/// Runs a `ps7_init.tcl` through the DAP: the init stages, then, with
+/// `post`, the post-configuration step (level shifters, PL reset).
+fn ps7_init(dap: &mut DapLink, ap: u8, file: &std::path::Path, post: bool) -> Result<(), String> {
+    let text = std::fs::read_to_string(file).map_err(|e| read_error(file, e))?;
+    let init = hns_host::ps7::Ps7Init::parse(&text)?;
+    let code = dap
+        .read32(ap, hns_host::ps7::PS_VERSION_ADDR)
+        .map_err(|e| e.to_string())?
+        >> 28;
+    let ver = init.version(code).to_string();
+    println!("silicon version code {code}: running the {ver} steps");
+    let mut stages: Vec<&str> = hns_host::ps7::INIT.to_vec();
+    if post {
+        stages.push(hns_host::ps7::POST);
+    }
+    let mut mem = DapMem { dap, ap };
+    for stage in stages {
+        let steps = init.stage(stage, &ver)?;
+        let started = std::time::Instant::now();
+        hns_host::ps7::run(&mut mem, steps).map_err(|err| match err {
+            hns_host::ps7::RunError::Mem(m) => format!("ps7_{stage}: {m}"),
+            hns_host::ps7::RunError::Poll { addr, mask, last } => format!(
+                "ps7_{stage}: {addr:#010x} never showed {mask:#x} (last {last:#010x}).\n\
+                 A PLL did not lock or the DDR did not finish initialising: \
+                 is this ps7_init.tcl for this board?"
+            ),
+        })?;
+        println!(
+            "  ps7_{stage:<22} {:>4} steps  {:.2} s",
+            steps.len(),
+            started.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+/// Whether the target's `dram` is a Zynq PS's memory, which the host sets
+/// up after every programming.
+fn uses_ps7(target: Option<&hns_targets::Target>) -> bool {
+    target
+        .and_then(hns_targets::dram)
+        .is_some_and(|d| d.is_ps7())
+}
+
+/// Sets the PS up after programming, from the `ps7_init.tcl` beside the
+/// bitstream (`make` puts it there, and `make zip` takes it along).
+///
+/// The PS is set up only by software, after every power-up. Until then its
+/// DDR hangs the bus when touched, so programming is not done without it.
+fn ps7_after_program(cli: &Cli, bitstream: &std::path::Path) -> Result<(), String> {
+    let file = bitstream
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("ps7_init.tcl");
+    if !file.is_file() {
+        return Err(format!(
+            "the bitstream is in, but the PS is not set up: {} is not there.\n\
+             The harness reaches its memory through the Zynq's PS, which software sets up \
+             after every power-up. `make` writes ps7_init.tcl beside the bitstream, and \
+             `make zip` takes it along. Put it there, or run \
+             `hio dap ps7-init <ps7_init.tcl>` yourself.",
+            file.display()
+        ));
+    }
+    let (mut dap, mem_ap) = open_dap(cli)?;
+    let Some(ap) = mem_ap else {
+        return Err(
+            "the PS must be set up, and the target's `dap` has no `mem_ap`.\n\
+             Add the access port of the system memory (`hio dap info` lists them)."
+                .to_string(),
+        );
+    };
+    dap.power_up().map_err(|e| e.to_string())?;
+    println!("setting the PS up from {}", file.display());
+    ps7_init(&mut dap, ap, &file, true)
+}
+
 /// Only clears the configuration memory. This checks the JPROGRAM IR value on
 /// its own.
 fn erase(cli: &Cli) -> Result<(), String> {
@@ -1504,6 +1814,18 @@ fn program(
         start.elapsed().as_secs_f64()
     );
 
+    // A Zynq's PS memory needs the PS set up, through the DAP. The probe is
+    // released for that and opened again after.
+    let ps7 = uses_ps7(target.as_ref());
+    let mut m = if ps7 {
+        drop(m);
+        ps7_after_program(cli, file)?;
+        Mpsse::attach(Ftdi::open(&cfg).map_err(|e| e.to_string())?, &cfg)
+            .map_err(|e| e.to_string())?
+    } else {
+        m
+    };
+
     // If the bitstream is a harness, the window returning the magic is the
     // strongest proof that it worked.
     //
@@ -1519,11 +1841,37 @@ fn program(
                 .map_err(|e| e.to_string())?;
             set_update_gap(cli, &map, &mut m);
             let mut bus = Bus::Jtag(Bridge::new(m, map.addr_bits() as u32));
-            id(&mut bus, &map)
+            if ps7 {
+                id_after_ps7(&mut bus, &map)
+            } else {
+                id(&mut bus, &map)
+            }
         }
         None => Ok(()),
     }
 }
+
+/// `id`, given a moment to come back after the PS was set up.
+///
+/// Setting the PS up rewrites its MIO, and on the PYNQ-Z1 the PL clock comes
+/// from the Ethernet PHY on those pins: the window stopped for a moment
+/// after ps7_init and the first read was dropped as busy (measured). So it
+/// is tried again for a short while before it counts as a failure.
+fn id_after_ps7(bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        match id(bus, map) {
+            Ok(()) => return Ok(()),
+            Err(_) if started.elapsed() < PS7_SETTLE => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// How long the window may take to come back after ps7_init.
+const PS7_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Finds the map used to check the board after configuration.
 ///
@@ -1642,6 +1990,17 @@ fn play_svf(cli: &Cli, file: &PathBuf) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     eprintln!("\r  done in {:.1} s", start.elapsed().as_secs_f64());
 
+    // As after a `.bit`: a Zynq's PS memory needs the PS set up.
+    let ps7 = uses_ps7(resolve_target(cli).ok().flatten().as_ref());
+    let mut m = if ps7 {
+        drop(m);
+        ps7_after_program(cli, file)?;
+        Mpsse::attach(Ftdi::open(&cfg).map_err(|e| e.to_string())?, &cfg)
+            .map_err(|e| e.to_string())?
+    } else {
+        m
+    };
+
     // Check that the harness answers.
     match after_config_map(cli, "the SVF replayed without complaint") {
         Some(map) => {
@@ -1652,7 +2011,11 @@ fn play_svf(cli: &Cli, file: &PathBuf) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             set_update_gap(cli, &map, &mut m);
             let mut bus = Bus::Jtag(Bridge::new(m, map.addr_bits() as u32));
-            id(&mut bus, &map)
+            if ps7 {
+                id_after_ps7(&mut bus, &map)
+            } else {
+                id(&mut bus, &map)
+            }
         }
         None => Ok(()),
     }
@@ -1996,6 +2359,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
     if cli.transport_name() == "pcie" {
         let only_jtag = match &cmd {
             Cmd::Probe => Some("probe"),
+            Cmd::Dap(_) => Some("dap"),
             Cmd::Program { .. } => Some("program"),
             Cmd::Erase => Some("erase"),
             _ => None,
@@ -2013,6 +2377,9 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
 
     if matches!(cmd, Cmd::Probe) {
         return probe(&cli);
+    }
+    if let Cmd::Dap(dap) = &cmd {
+        return dap_cmd(&cli, dap);
     }
     if let Cmd::Program {
         file,
@@ -2056,6 +2423,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
     match cmd {
         Cmd::Targets
         | Cmd::Probe
+        | Cmd::Dap(_)
         | Cmd::Program { .. }
         | Cmd::Erase
         | Cmd::Run { .. }
@@ -4045,6 +4413,15 @@ fn calibrated(bus: &mut Bus, map: &RegisterMap, bundle: &str) -> Result<(), Stri
         if rd(bus, offset)? & 1 == 1 {
             return Ok(());
         }
+        if start.elapsed() > CALIBRATION_WAIT && map_uses_ps7(map) {
+            return Err(format!(
+                "`{bundle}` is not ready ({bundle}_calib is 0): its memory is the Zynq PS's, \
+                 and the PS is not set up. The access was not made.\n\
+                 The PS is set up by software after every power-up. `hio program` does it \
+                 after the bitstream; otherwise run `hio dap ps7-init <ps7_init.tcl>` \
+                 (the file is beside the bitstream)."
+            ));
+        }
         if start.elapsed() > CALIBRATION_WAIT {
             return Err(format!(
                 "`{bundle}` is not calibrated yet ({bundle}_calib is 0 after {} s): its memory \
@@ -4056,6 +4433,16 @@ fn calibrated(bus: &mut Bus, map: &RegisterMap, bundle: &str) -> Result<(), Stri
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+/// Whether the map's target reaches its memory through a Zynq PS.
+fn map_uses_ps7(map: &RegisterMap) -> bool {
+    map.target
+        .as_deref()
+        .and_then(|name| hns_targets::resolve(name, &[]).ok())
+        .as_ref()
+        .and_then(hns_targets::dram)
+        .is_some_and(|d| d.is_ps7())
 }
 
 /// Reads a region, one round trip per window page.
@@ -7391,6 +7778,54 @@ mod tests {
             vec![0x5566_7788, 0x1122_3344]
         );
         assert_eq!(wide_words(0x1234, 1), vec![0x1234]);
+    }
+
+    fn jtag(tdo: &[u8], tdi: &[u8]) -> hns_targets::Jtag {
+        hns_targets::Jtag {
+            chain_tdo_side: tdo.to_vec(),
+            chain_tdi_side: tdi.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn dap(tdi_side: bool, index: usize) -> hns_targets::Dap {
+        hns_targets::Dap {
+            tdi_side,
+            index,
+            mem_ap: None,
+        }
+    }
+
+    /// A Zynq-7000: TDI -> DAP -> PL -> TDO. Talking to the DAP, the PL is
+    /// the one TAP on its TDO side.
+    #[test]
+    fn the_dap_of_a_zynq_has_the_fpga_on_its_tdo_side() {
+        assert_eq!(
+            dap_sides(&jtag(&[], &[4]), &dap(true, 0), 6),
+            Ok((vec![6], vec![]))
+        );
+    }
+
+    /// Lists count from the FPGA outwards, on either side.
+    #[test]
+    fn the_other_taps_move_to_the_right_side_of_the_dap() {
+        let j = jtag(&[8], &[5, 4, 7]);
+        assert_eq!(
+            dap_sides(&j, &dap(true, 1), 6),
+            Ok((vec![8, 6, 5], vec![7]))
+        );
+        let j = jtag(&[5, 4], &[7]);
+        assert_eq!(
+            dap_sides(&j, &dap(false, 1), 6),
+            Ok((vec![], vec![7, 6, 5]))
+        );
+    }
+
+    #[test]
+    fn a_dap_that_is_not_there_or_not_a_dap_is_refused() {
+        assert!(dap_sides(&jtag(&[], &[4]), &dap(true, 1), 6).is_err());
+        let err = dap_sides(&jtag(&[], &[5]), &dap(true, 0), 6).unwrap_err();
+        assert!(err.contains("4"), "{err}");
     }
 
     fn span(base: u64, bytes: u64) -> Span {
