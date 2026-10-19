@@ -16,7 +16,7 @@ use hns_regs::{Access, RegisterMap};
 #[derive(Parser)]
 #[command(
     name = "hio",
-    version,
+    version = env!("HNS_VERSION"),
     about = "Poke a veryl-harness window over JTAG or PCIe",
     long_about = None,
     disable_help_flag = true,

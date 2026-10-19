@@ -34,7 +34,7 @@ pub const DESCRIPTION: &str = "Generate an FPGA harness for a single RTL block: 
 const EXIT_DIAGNOSTIC: u8 = 1;
 
 #[derive(Debug, Parser)]
-#[command(name = "veryl-harness", version, about = DESCRIPTION, long_about = None)]
+#[command(name = "veryl-harness", version = env!("HNS_VERSION"), about = DESCRIPTION, long_about = None)]
 pub struct Cli {
     /// Print the one-line description used by `veryl --list`, then exit.
     #[arg(long)]
