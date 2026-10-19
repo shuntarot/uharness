@@ -482,16 +482,19 @@ to fix it.
 
 ### Boards
 
-| `--target` | transports | `dram` |
-|---|---|---|
-| `digilent/arty-a7-35` | `jtag` | DDR3L, 256 MB |
-| `digilent/arty-a7-100` | `jtag` | DDR3L, 256 MB |
-| `digilent/pynq-z1` | `jtag` | DDR3 through the PS, 256 MB |
-| `xilinx/vcu118` | `jtag`, `pcie` | DDR4 |
-| `xilinx/kcu105` | `jtag`, `pcie` | DDR4, 2 GB, with `:dr` or `:062` |
-| `xilinx/kc705` | `jtag` | DDR3, 1 GB |
-| `alibaba/as02mc04` | `jtag` | — (no DRAM; not yet tried on a card) |
-| `sim` | `sim` | — (no board; see [Without a board](#without-a-board)) |
+| `--target` | transports | `dram` | tested |
+|---|---|---|---|
+| `digilent/arty-a7-35` | `jtag` | DDR3L, 256 MB | ✓ |
+| `digilent/arty-a7-100` | `jtag` | DDR3L, 256 MB | not yet |
+| `digilent/pynq-z1` | `jtag` | DDR3 through the PS, 256 MB | ✓ |
+| `xilinx/vcu118` | `jtag`, `pcie` | DDR4 | ✓ |
+| `xilinx/kcu105` | `jtag`, `pcie` | DDR4, 2 GB, with `:dr` or `:062` | ✓ |
+| `xilinx/kc705` | `jtag` | DDR3, 1 GB | not yet |
+| `alibaba/as02mc04` | `jtag` | — (no DRAM) | not yet |
+| `sim` | `sim` | — (no board; see [Without a board](#without-a-board)) | — |
+
+**tested** means the board has run a harness. A board marked "not yet" builds,
+but `check` and `gen` print a note that it has not run on hardware.
 
 The AS02MC04 has no USB JTAG of its own. Its description names a Digilent
 JTAG-HS2 wired to the card's 6-pin header; another FTDI adapter works through

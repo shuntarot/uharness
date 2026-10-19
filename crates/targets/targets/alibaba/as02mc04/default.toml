@@ -18,6 +18,7 @@ provider    = "alibaba"
 name        = "as02mc04"
 description = "Alibaba Cloud AS02MC04 (Kintex UltraScale+ KU3P)"
 url         = "https://github.com/dkozel/Alibaba-Cloud-FPGA"
+untested    = true
 
 [device]
 vendor = "xilinx"
