@@ -19,7 +19,7 @@
 # flat namespace with vendor IP.
 [project]
 name    = "hns"
-version = "0.6.0"
+version = "0.6.1"
 
 [build]
 clock_type = "posedge"

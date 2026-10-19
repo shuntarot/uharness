@@ -25389,120 +25389,157 @@ module TLXbar_6(
   output        auto_in_a_ready,
   input         auto_in_a_valid,
   input  [2:0]  auto_in_a_bits_opcode,
-  input  [8:0]  auto_in_a_bits_address,
+  input  [2:0]  auto_in_a_bits_param,
+  input  [1:0]  auto_in_a_bits_size,
+  input         auto_in_a_bits_source,
+  input  [11:0] auto_in_a_bits_address,
+  input  [3:0]  auto_in_a_bits_mask,
   input  [31:0] auto_in_a_bits_data,
-  input         auto_in_d_ready,
+  input         auto_in_a_bits_corrupt,
   output        auto_in_d_valid,
-  output        auto_in_d_bits_denied,
   output [31:0] auto_in_d_bits_data,
-  output        auto_in_d_bits_corrupt,
+  input         auto_out_2_a_ready,
+  output        auto_out_2_a_valid,
+  output [2:0]  auto_out_2_a_bits_opcode,
+  output [6:0]  auto_out_2_a_bits_address,
+  output [3:0]  auto_out_2_a_bits_mask,
+  output [31:0] auto_out_2_a_bits_data,
+  output        auto_out_2_d_ready,
+  input         auto_out_2_d_valid,
+  input  [31:0] auto_out_2_d_bits_data,
   input         auto_out_1_a_ready,
   output        auto_out_1_a_valid,
   output [2:0]  auto_out_1_a_bits_opcode,
-  output [6:0]  auto_out_1_a_bits_address,
+  output [2:0]  auto_out_1_a_bits_param,
+  output [1:0]  auto_out_1_a_bits_size,
+  output        auto_out_1_a_bits_source,
+  output [8:0]  auto_out_1_a_bits_address,
+  output [3:0]  auto_out_1_a_bits_mask,
   output [31:0] auto_out_1_a_bits_data,
+  output        auto_out_1_a_bits_corrupt,
   output        auto_out_1_d_ready,
   input         auto_out_1_d_valid,
   input  [31:0] auto_out_1_d_bits_data,
   input         auto_out_0_a_ready,
   output        auto_out_0_a_valid,
-  output [2:0]  auto_out_0_a_bits_opcode,
-  output [8:0]  auto_out_0_a_bits_address,
-  output [31:0] auto_out_0_a_bits_data,
   output        auto_out_0_d_ready,
-  input         auto_out_0_d_valid,
-  input         auto_out_0_d_bits_denied,
-  input  [31:0] auto_out_0_d_bits_data,
-  input         auto_out_0_d_bits_corrupt
+  input         auto_out_0_d_valid
 );
-  wire [9:0] _requestAIO_T_1 = {1'b0,$signed(auto_in_a_bits_address)};
-  wire [9:0] _requestAIO_T_3 = $signed(_requestAIO_T_1) & 10'sh1c0;
-  wire [8:0] _requestAIO_T_5 = auto_in_a_bits_address ^ 9'h44;
-  wire [9:0] _requestAIO_T_6 = {1'b0,$signed(_requestAIO_T_5)};
-  wire [9:0] _requestAIO_T_8 = $signed(_requestAIO_T_6) & 10'sh1f4;
-  wire [8:0] _requestAIO_T_10 = auto_in_a_bits_address ^ 9'h58;
-  wire [9:0] _requestAIO_T_11 = {1'b0,$signed(_requestAIO_T_10)};
-  wire [9:0] _requestAIO_T_13 = $signed(_requestAIO_T_11) & 10'sh1f8;
-  wire [8:0] _requestAIO_T_15 = auto_in_a_bits_address ^ 9'h60;
-  wire [9:0] _requestAIO_T_16 = {1'b0,$signed(_requestAIO_T_15)};
-  wire [9:0] _requestAIO_T_18 = $signed(_requestAIO_T_16) & 10'sh1e0;
-  wire [8:0] _requestAIO_T_20 = auto_in_a_bits_address ^ 9'h80;
-  wire [9:0] _requestAIO_T_21 = {1'b0,$signed(_requestAIO_T_20)};
-  wire [9:0] _requestAIO_T_23 = $signed(_requestAIO_T_21) & 10'sh180;
-  wire [8:0] _requestAIO_T_25 = auto_in_a_bits_address ^ 9'h100;
-  wire [9:0] _requestAIO_T_26 = {1'b0,$signed(_requestAIO_T_25)};
-  wire [9:0] _requestAIO_T_28 = $signed(_requestAIO_T_26) & 10'sh100;
-  wire  requestAIO_0_0 = $signed(_requestAIO_T_3) == 10'sh0 | $signed(_requestAIO_T_8) == 10'sh0 | $signed(
-    _requestAIO_T_13) == 10'sh0 | $signed(_requestAIO_T_18) == 10'sh0 | $signed(_requestAIO_T_23) == 10'sh0 | $signed(
-    _requestAIO_T_28) == 10'sh0;
-  wire [8:0] _requestAIO_T_35 = auto_in_a_bits_address ^ 9'h40;
-  wire [9:0] _requestAIO_T_36 = {1'b0,$signed(_requestAIO_T_35)};
-  wire [9:0] _requestAIO_T_38 = $signed(_requestAIO_T_36) & 10'sh1f4;
-  wire [8:0] _requestAIO_T_40 = auto_in_a_bits_address ^ 9'h50;
-  wire [9:0] _requestAIO_T_41 = {1'b0,$signed(_requestAIO_T_40)};
-  wire [9:0] _requestAIO_T_43 = $signed(_requestAIO_T_41) & 10'sh1f8;
-  wire  requestAIO_0_1 = $signed(_requestAIO_T_38) == 10'sh0 | $signed(_requestAIO_T_43) == 10'sh0;
+  wire [11:0] _requestAIO_T = auto_in_a_bits_address ^ 12'h200;
+  wire [12:0] _requestAIO_T_1 = {1'b0,$signed(_requestAIO_T)};
+  wire [12:0] _requestAIO_T_3 = $signed(_requestAIO_T_1) & 13'she00;
+  wire [11:0] _requestAIO_T_5 = auto_in_a_bits_address ^ 12'h400;
+  wire [12:0] _requestAIO_T_6 = {1'b0,$signed(_requestAIO_T_5)};
+  wire [12:0] _requestAIO_T_8 = $signed(_requestAIO_T_6) & 13'shc00;
+  wire [11:0] _requestAIO_T_10 = auto_in_a_bits_address ^ 12'h800;
+  wire [12:0] _requestAIO_T_11 = {1'b0,$signed(_requestAIO_T_10)};
+  wire [12:0] _requestAIO_T_13 = $signed(_requestAIO_T_11) & 13'shc00;
+  wire [11:0] _requestAIO_T_15 = auto_in_a_bits_address ^ 12'hc00;
+  wire [12:0] _requestAIO_T_16 = {1'b0,$signed(_requestAIO_T_15)};
+  wire [12:0] _requestAIO_T_18 = $signed(_requestAIO_T_16) & 13'she00;
+  wire [11:0] _requestAIO_T_20 = auto_in_a_bits_address ^ 12'he00;
+  wire [12:0] _requestAIO_T_21 = {1'b0,$signed(_requestAIO_T_20)};
+  wire [12:0] _requestAIO_T_23 = $signed(_requestAIO_T_21) & 13'shf00;
+  wire  requestAIO_0_0 = $signed(_requestAIO_T_3) == 13'sh0 | $signed(_requestAIO_T_8) == 13'sh0 | $signed(
+    _requestAIO_T_13) == 13'sh0 | $signed(_requestAIO_T_18) == 13'sh0 | $signed(_requestAIO_T_23) == 13'sh0;
+  wire [12:0] _requestAIO_T_30 = {1'b0,$signed(auto_in_a_bits_address)};
+  wire [12:0] _requestAIO_T_32 = $signed(_requestAIO_T_30) & 13'shfc0;
+  wire [11:0] _requestAIO_T_34 = auto_in_a_bits_address ^ 12'h44;
+  wire [12:0] _requestAIO_T_35 = {1'b0,$signed(_requestAIO_T_34)};
+  wire [12:0] _requestAIO_T_37 = $signed(_requestAIO_T_35) & 13'shff4;
+  wire [11:0] _requestAIO_T_39 = auto_in_a_bits_address ^ 12'h58;
+  wire [12:0] _requestAIO_T_40 = {1'b0,$signed(_requestAIO_T_39)};
+  wire [12:0] _requestAIO_T_42 = $signed(_requestAIO_T_40) & 13'shff8;
+  wire [11:0] _requestAIO_T_44 = auto_in_a_bits_address ^ 12'h60;
+  wire [12:0] _requestAIO_T_45 = {1'b0,$signed(_requestAIO_T_44)};
+  wire [12:0] _requestAIO_T_47 = $signed(_requestAIO_T_45) & 13'shfe0;
+  wire [11:0] _requestAIO_T_49 = auto_in_a_bits_address ^ 12'h80;
+  wire [12:0] _requestAIO_T_50 = {1'b0,$signed(_requestAIO_T_49)};
+  wire [12:0] _requestAIO_T_52 = $signed(_requestAIO_T_50) & 13'shf80;
+  wire [11:0] _requestAIO_T_54 = auto_in_a_bits_address ^ 12'h100;
+  wire [12:0] _requestAIO_T_55 = {1'b0,$signed(_requestAIO_T_54)};
+  wire [12:0] _requestAIO_T_57 = $signed(_requestAIO_T_55) & 13'shf00;
+  wire  requestAIO_0_1 = $signed(_requestAIO_T_32) == 13'sh0 | $signed(_requestAIO_T_37) == 13'sh0 | $signed(
+    _requestAIO_T_42) == 13'sh0 | $signed(_requestAIO_T_47) == 13'sh0 | $signed(_requestAIO_T_52) == 13'sh0 | $signed(
+    _requestAIO_T_57) == 13'sh0;
+  wire [11:0] _requestAIO_T_64 = auto_in_a_bits_address ^ 12'h40;
+  wire [12:0] _requestAIO_T_65 = {1'b0,$signed(_requestAIO_T_64)};
+  wire [12:0] _requestAIO_T_67 = $signed(_requestAIO_T_65) & 13'shff4;
+  wire [11:0] _requestAIO_T_69 = auto_in_a_bits_address ^ 12'h50;
+  wire [12:0] _requestAIO_T_70 = {1'b0,$signed(_requestAIO_T_69)};
+  wire [12:0] _requestAIO_T_72 = $signed(_requestAIO_T_70) & 13'shff8;
+  wire  requestAIO_0_2 = $signed(_requestAIO_T_67) == 13'sh0 | $signed(_requestAIO_T_72) == 13'sh0;
   reg  beatsLeft;
   wire  idle = ~beatsLeft;
-  wire  latch = idle & auto_in_d_ready;
-  wire [1:0] readys_valid = {auto_out_1_d_valid,auto_out_0_d_valid};
-  reg [1:0] readys_mask;
-  wire [1:0] _readys_filter_T = ~readys_mask;
-  wire [1:0] _readys_filter_T_1 = readys_valid & _readys_filter_T;
-  wire [3:0] readys_filter = {_readys_filter_T_1,auto_out_1_d_valid,auto_out_0_d_valid};
-  wire [3:0] _GEN_1 = {{1'd0}, readys_filter[3:1]};
-  wire [3:0] _readys_unready_T_1 = readys_filter | _GEN_1;
-  wire [3:0] _readys_unready_T_4 = {readys_mask, 2'h0};
-  wire [3:0] _GEN_2 = {{1'd0}, _readys_unready_T_1[3:1]};
-  wire [3:0] readys_unready = _GEN_2 | _readys_unready_T_4;
-  wire [1:0] _readys_readys_T_2 = readys_unready[3:2] & readys_unready[1:0];
-  wire [1:0] readys_readys = ~_readys_readys_T_2;
-  wire [1:0] _readys_mask_T = readys_readys & readys_valid;
-  wire [2:0] _readys_mask_T_1 = {_readys_mask_T, 1'h0};
-  wire [1:0] _readys_mask_T_3 = _readys_mask_T | _readys_mask_T_1[1:0];
+  wire [2:0] readys_valid = {auto_out_2_d_valid,auto_out_1_d_valid,auto_out_0_d_valid};
+  reg [2:0] readys_mask;
+  wire [2:0] _readys_filter_T = ~readys_mask;
+  wire [2:0] _readys_filter_T_1 = readys_valid & _readys_filter_T;
+  wire [5:0] readys_filter = {_readys_filter_T_1,auto_out_2_d_valid,auto_out_1_d_valid,auto_out_0_d_valid};
+  wire [5:0] _GEN_1 = {{1'd0}, readys_filter[5:1]};
+  wire [5:0] _readys_unready_T_1 = readys_filter | _GEN_1;
+  wire [5:0] _GEN_2 = {{2'd0}, _readys_unready_T_1[5:2]};
+  wire [5:0] _readys_unready_T_3 = _readys_unready_T_1 | _GEN_2;
+  wire [5:0] _readys_unready_T_6 = {readys_mask, 3'h0};
+  wire [5:0] _GEN_3 = {{1'd0}, _readys_unready_T_3[5:1]};
+  wire [5:0] readys_unready = _GEN_3 | _readys_unready_T_6;
+  wire [2:0] _readys_readys_T_2 = readys_unready[5:3] & readys_unready[2:0];
+  wire [2:0] readys_readys = ~_readys_readys_T_2;
+  wire [2:0] _readys_mask_T = readys_readys & readys_valid;
+  wire [3:0] _readys_mask_T_1 = {_readys_mask_T, 1'h0};
+  wire [2:0] _readys_mask_T_3 = _readys_mask_T | _readys_mask_T_1[2:0];
+  wire [4:0] _readys_mask_T_4 = {_readys_mask_T_3, 2'h0};
+  wire [2:0] _readys_mask_T_6 = _readys_mask_T_3 | _readys_mask_T_4[2:0];
   wire  readys_0 = readys_readys[0];
   wire  readys_1 = readys_readys[1];
+  wire  readys_2 = readys_readys[2];
   wire  earlyWinner_0 = readys_0 & auto_out_0_d_valid;
   wire  earlyWinner_1 = readys_1 & auto_out_1_d_valid;
+  wire  earlyWinner_2 = readys_2 & auto_out_2_d_valid;
   reg  state_0;
-  wire  muxStateEarly_0 = idle ? earlyWinner_0 : state_0;
   reg  state_1;
   wire  muxStateEarly_1 = idle ? earlyWinner_1 : state_1;
-  wire  sink_ACancel_5_earlyValid = idle ? auto_out_0_d_valid | auto_out_1_d_valid : state_0 & auto_out_0_d_valid |
-    state_1 & auto_out_1_d_valid;
-  wire  _beatsLeft_T_2 = auto_in_d_ready & sink_ACancel_5_earlyValid;
-  wire  allowed_0 = idle ? readys_0 : state_0;
-  wire  allowed_1 = idle ? readys_1 : state_1;
-  wire [31:0] _T_27 = muxStateEarly_0 ? auto_out_0_d_bits_data : 32'h0;
-  wire [31:0] _T_28 = muxStateEarly_1 ? auto_out_1_d_bits_data : 32'h0;
-  assign auto_in_a_ready = requestAIO_0_0 & auto_out_0_a_ready | requestAIO_0_1 & auto_out_1_a_ready;
-  assign auto_in_d_valid = idle ? auto_out_0_d_valid | auto_out_1_d_valid : state_0 & auto_out_0_d_valid | state_1 &
-    auto_out_1_d_valid;
-  assign auto_in_d_bits_denied = muxStateEarly_0 & auto_out_0_d_bits_denied;
-  assign auto_in_d_bits_data = _T_27 | _T_28;
-  assign auto_in_d_bits_corrupt = muxStateEarly_0 & auto_out_0_d_bits_corrupt;
+  reg  state_2;
+  wire  muxStateEarly_2 = idle ? earlyWinner_2 : state_2;
+  wire  sink_ACancel_7_earlyValid = idle ? auto_out_0_d_valid | auto_out_1_d_valid | auto_out_2_d_valid : state_0 &
+    auto_out_0_d_valid | state_1 & auto_out_1_d_valid | state_2 & auto_out_2_d_valid;
+  wire [31:0] _T_38 = muxStateEarly_1 ? auto_out_1_d_bits_data : 32'h0;
+  wire [31:0] _T_39 = muxStateEarly_2 ? auto_out_2_d_bits_data : 32'h0;
+  assign auto_in_a_ready = requestAIO_0_0 & auto_out_0_a_ready | requestAIO_0_1 & auto_out_1_a_ready | requestAIO_0_2 &
+    auto_out_2_a_ready;
+  assign auto_in_d_valid = idle ? auto_out_0_d_valid | auto_out_1_d_valid | auto_out_2_d_valid : state_0 &
+    auto_out_0_d_valid | state_1 & auto_out_1_d_valid | state_2 & auto_out_2_d_valid;
+  assign auto_in_d_bits_data = _T_38 | _T_39;
+  assign auto_out_2_a_valid = auto_in_a_valid & requestAIO_0_2;
+  assign auto_out_2_a_bits_opcode = auto_in_a_bits_opcode;
+  assign auto_out_2_a_bits_address = auto_in_a_bits_address[6:0];
+  assign auto_out_2_a_bits_mask = auto_in_a_bits_mask;
+  assign auto_out_2_a_bits_data = auto_in_a_bits_data;
+  assign auto_out_2_d_ready = idle ? readys_2 : state_2;
   assign auto_out_1_a_valid = auto_in_a_valid & requestAIO_0_1;
   assign auto_out_1_a_bits_opcode = auto_in_a_bits_opcode;
-  assign auto_out_1_a_bits_address = auto_in_a_bits_address[6:0];
+  assign auto_out_1_a_bits_param = auto_in_a_bits_param;
+  assign auto_out_1_a_bits_size = auto_in_a_bits_size;
+  assign auto_out_1_a_bits_source = auto_in_a_bits_source;
+  assign auto_out_1_a_bits_address = auto_in_a_bits_address[8:0];
+  assign auto_out_1_a_bits_mask = auto_in_a_bits_mask;
   assign auto_out_1_a_bits_data = auto_in_a_bits_data;
-  assign auto_out_1_d_ready = auto_in_d_ready & allowed_1;
+  assign auto_out_1_a_bits_corrupt = auto_in_a_bits_corrupt;
+  assign auto_out_1_d_ready = idle ? readys_1 : state_1;
   assign auto_out_0_a_valid = auto_in_a_valid & requestAIO_0_0;
-  assign auto_out_0_a_bits_opcode = auto_in_a_bits_opcode;
-  assign auto_out_0_a_bits_address = auto_in_a_bits_address;
-  assign auto_out_0_a_bits_data = auto_in_a_bits_data;
-  assign auto_out_0_d_ready = auto_in_d_ready & allowed_0;
+  assign auto_out_0_d_ready = idle ? readys_0 : state_0;
   always @(posedge clock) begin
     if (reset) begin
       beatsLeft <= 1'h0;
-    end else if (latch) begin
+    end else if (idle) begin
       beatsLeft <= 1'h0;
     end else begin
-      beatsLeft <= beatsLeft - _beatsLeft_T_2;
+      beatsLeft <= beatsLeft - sink_ACancel_7_earlyValid;
     end
     if (reset) begin
-      readys_mask <= 2'h3;
-    end else if (latch & |readys_valid) begin
-      readys_mask <= _readys_mask_T_3;
+      readys_mask <= 3'h7;
+    end else if (idle & |readys_valid) begin
+      readys_mask <= _readys_mask_T_6;
     end
     if (reset) begin
       state_0 <= 1'h0;
@@ -25514,42 +25551,498 @@ module TLXbar_6(
     end else if (idle) begin
       state_1 <= earlyWinner_1;
     end
+    if (reset) begin
+      state_2 <= 1'h0;
+    end else if (idle) begin
+      state_2 <= earlyWinner_2;
+    end
   end
 endmodule
-module DMIToTL(
+module APBToTL(
+  input         clock,
+  input         reset,
+  input         auto_in_psel,
+  input         auto_in_pwrite,
+  input  [11:0] auto_in_paddr,
+  input  [31:0] auto_in_pwdata,
+  output        auto_in_pready,
+  output [31:0] auto_in_prdata,
   input         auto_out_a_ready,
   output        auto_out_a_valid,
   output [2:0]  auto_out_a_bits_opcode,
-  output [8:0]  auto_out_a_bits_address,
+  output [11:0] auto_out_a_bits_address,
   output [31:0] auto_out_a_bits_data,
-  output        auto_out_d_ready,
   input         auto_out_d_valid,
-  input         auto_out_d_bits_denied,
-  input  [31:0] auto_out_d_bits_data,
-  input         auto_out_d_bits_corrupt,
-  output        io_dmi_req_ready,
-  input         io_dmi_req_valid,
-  input  [6:0]  io_dmi_req_bits_addr,
-  input  [31:0] io_dmi_req_bits_data,
-  input  [1:0]  io_dmi_req_bits_op,
-  input         io_dmi_resp_ready,
-  output        io_dmi_resp_valid,
-  output [31:0] io_dmi_resp_bits_data,
-  output [1:0]  io_dmi_resp_bits_resp
+  input  [31:0] auto_out_d_bits_data
 );
-  wire [8:0] addr = {io_dmi_req_bits_addr, 2'h0};
-  wire [2:0] _GEN_0 = io_dmi_req_bits_op == 2'h1 ? 3'h4 : 3'h0;
-  wire [8:0] _GEN_4 = io_dmi_req_bits_op == 2'h1 ? addr : 9'h48;
-  wire  _io_dmi_resp_bits_resp_T = auto_out_d_bits_corrupt | auto_out_d_bits_denied;
-  assign auto_out_a_valid = io_dmi_req_valid;
-  assign auto_out_a_bits_opcode = io_dmi_req_bits_op == 2'h2 ? 3'h0 : _GEN_0;
-  assign auto_out_a_bits_address = io_dmi_req_bits_op == 2'h2 ? addr : _GEN_4;
-  assign auto_out_a_bits_data = io_dmi_req_bits_op == 2'h2 ? io_dmi_req_bits_data : 32'h0;
-  assign auto_out_d_ready = io_dmi_resp_ready;
-  assign io_dmi_req_ready = auto_out_a_ready;
-  assign io_dmi_resp_valid = auto_out_d_valid;
-  assign io_dmi_resp_bits_data = auto_out_d_bits_data;
-  assign io_dmi_resp_bits_resp = {{1'd0}, _io_dmi_resp_bits_resp_T};
+  wire [11:0] _aligned_addr_T = ~auto_in_paddr;
+  wire [11:0] _aligned_addr_T_1 = _aligned_addr_T | 12'h3;
+  wire [11:0] aligned_addr = ~_aligned_addr_T_1;
+  wire [12:0] _a_legal_T_3 = {1'b0,$signed(aligned_addr)};
+  wire [12:0] _a_legal_T_5 = $signed(_a_legal_T_3) & -13'sh800;
+  wire [11:0] _a_legal_T_7 = aligned_addr ^ 12'h800;
+  wire [12:0] _a_legal_T_8 = {1'b0,$signed(_a_legal_T_7)};
+  wire [12:0] _a_legal_T_10 = $signed(_a_legal_T_8) & -13'sh400;
+  wire [11:0] _a_legal_T_12 = aligned_addr ^ 12'hc00;
+  wire [12:0] _a_legal_T_13 = {1'b0,$signed(_a_legal_T_12)};
+  wire [12:0] _a_legal_T_15 = $signed(_a_legal_T_13) & -13'sh200;
+  wire [11:0] _a_legal_T_17 = aligned_addr ^ 12'he00;
+  wire [12:0] _a_legal_T_18 = {1'b0,$signed(_a_legal_T_17)};
+  wire [12:0] _a_legal_T_20 = $signed(_a_legal_T_18) & -13'sh100;
+  wire  a_legal = auto_in_pwrite ? $signed(_a_legal_T_5) == 13'sh0 | $signed(_a_legal_T_10) == 13'sh0 | $signed(
+    _a_legal_T_15) == 13'sh0 | $signed(_a_legal_T_20) == 13'sh0 : $signed(_a_legal_T_5) == 13'sh0 | $signed(
+    _a_legal_T_10) == 13'sh0 | $signed(_a_legal_T_15) == 13'sh0 | $signed(_a_legal_T_20) == 13'sh0;
+  reg  in_flight_reg;
+  reg  error_in_flight_reg;
+  wire  in_flight = in_flight_reg | error_in_flight_reg;
+  wire  bundleOut_0_a_valid = auto_in_psel & ~in_flight & a_legal;
+  assign auto_in_pready = auto_out_d_valid | error_in_flight_reg;
+  assign auto_in_prdata = auto_out_d_bits_data;
+  assign auto_out_a_valid = auto_in_psel & ~in_flight & a_legal;
+  assign auto_out_a_bits_opcode = auto_in_pwrite ? 3'h1 : 3'h4;
+  assign auto_out_a_bits_address = ~_aligned_addr_T_1;
+  assign auto_out_a_bits_data = auto_in_pwdata;
+  always @(posedge clock) begin
+    if (reset) begin
+      in_flight_reg <= 1'h0;
+    end else if (auto_out_d_valid) begin
+      in_flight_reg <= 1'h0;
+    end else begin
+      in_flight_reg <= auto_out_a_ready & bundleOut_0_a_valid | in_flight_reg;
+    end
+    if (reset) begin
+      error_in_flight_reg <= 1'h0;
+    end else begin
+      error_in_flight_reg <= auto_in_psel & ~in_flight & ~a_legal;
+    end
+  end
+endmodule
+module Queue_20(
+  input         clock,
+  input         reset,
+  output        io_enq_ready,
+  input         io_enq_valid,
+  input  [2:0]  io_enq_bits_opcode,
+  input  [11:0] io_enq_bits_address,
+  input  [31:0] io_enq_bits_data,
+  input         io_deq_ready,
+  output        io_deq_valid,
+  output [2:0]  io_deq_bits_opcode,
+  output [2:0]  io_deq_bits_param,
+  output [1:0]  io_deq_bits_size,
+  output        io_deq_bits_source,
+  output [11:0] io_deq_bits_address,
+  output [3:0]  io_deq_bits_mask,
+  output [31:0] io_deq_bits_data,
+  output        io_deq_bits_corrupt
+);
+  reg [2:0] ram_opcode [0:0];
+  wire  ram_opcode_io_deq_bits_MPORT_en;
+  wire  ram_opcode_io_deq_bits_MPORT_addr;
+  wire [2:0] ram_opcode_io_deq_bits_MPORT_data;
+  wire [2:0] ram_opcode_MPORT_data;
+  wire  ram_opcode_MPORT_addr;
+  wire  ram_opcode_MPORT_mask;
+  wire  ram_opcode_MPORT_en;
+  reg [2:0] ram_param [0:0];
+  wire  ram_param_io_deq_bits_MPORT_en;
+  wire  ram_param_io_deq_bits_MPORT_addr;
+  wire [2:0] ram_param_io_deq_bits_MPORT_data;
+  wire [2:0] ram_param_MPORT_data;
+  wire  ram_param_MPORT_addr;
+  wire  ram_param_MPORT_mask;
+  wire  ram_param_MPORT_en;
+  reg [1:0] ram_size [0:0];
+  wire  ram_size_io_deq_bits_MPORT_en;
+  wire  ram_size_io_deq_bits_MPORT_addr;
+  wire [1:0] ram_size_io_deq_bits_MPORT_data;
+  wire [1:0] ram_size_MPORT_data;
+  wire  ram_size_MPORT_addr;
+  wire  ram_size_MPORT_mask;
+  wire  ram_size_MPORT_en;
+  reg  ram_source [0:0];
+  wire  ram_source_io_deq_bits_MPORT_en;
+  wire  ram_source_io_deq_bits_MPORT_addr;
+  wire  ram_source_io_deq_bits_MPORT_data;
+  wire  ram_source_MPORT_data;
+  wire  ram_source_MPORT_addr;
+  wire  ram_source_MPORT_mask;
+  wire  ram_source_MPORT_en;
+  reg [11:0] ram_address [0:0];
+  wire  ram_address_io_deq_bits_MPORT_en;
+  wire  ram_address_io_deq_bits_MPORT_addr;
+  wire [11:0] ram_address_io_deq_bits_MPORT_data;
+  wire [11:0] ram_address_MPORT_data;
+  wire  ram_address_MPORT_addr;
+  wire  ram_address_MPORT_mask;
+  wire  ram_address_MPORT_en;
+  reg [3:0] ram_mask [0:0];
+  wire  ram_mask_io_deq_bits_MPORT_en;
+  wire  ram_mask_io_deq_bits_MPORT_addr;
+  wire [3:0] ram_mask_io_deq_bits_MPORT_data;
+  wire [3:0] ram_mask_MPORT_data;
+  wire  ram_mask_MPORT_addr;
+  wire  ram_mask_MPORT_mask;
+  wire  ram_mask_MPORT_en;
+  reg [31:0] ram_data [0:0];
+  wire  ram_data_io_deq_bits_MPORT_en;
+  wire  ram_data_io_deq_bits_MPORT_addr;
+  wire [31:0] ram_data_io_deq_bits_MPORT_data;
+  wire [31:0] ram_data_MPORT_data;
+  wire  ram_data_MPORT_addr;
+  wire  ram_data_MPORT_mask;
+  wire  ram_data_MPORT_en;
+  reg  ram_corrupt [0:0];
+  wire  ram_corrupt_io_deq_bits_MPORT_en;
+  wire  ram_corrupt_io_deq_bits_MPORT_addr;
+  wire  ram_corrupt_io_deq_bits_MPORT_data;
+  wire  ram_corrupt_MPORT_data;
+  wire  ram_corrupt_MPORT_addr;
+  wire  ram_corrupt_MPORT_mask;
+  wire  ram_corrupt_MPORT_en;
+  reg  maybe_full;
+  wire  empty = ~maybe_full;
+  wire  do_enq = io_enq_ready & io_enq_valid;
+  wire  do_deq = io_deq_ready & io_deq_valid;
+  assign ram_opcode_io_deq_bits_MPORT_en = 1'h1;
+  assign ram_opcode_io_deq_bits_MPORT_addr = 1'h0;
+  assign ram_opcode_io_deq_bits_MPORT_data = ram_opcode[ram_opcode_io_deq_bits_MPORT_addr];
+  assign ram_opcode_MPORT_data = io_enq_bits_opcode;
+  assign ram_opcode_MPORT_addr = 1'h0;
+  assign ram_opcode_MPORT_mask = 1'h1;
+  assign ram_opcode_MPORT_en = io_enq_ready & io_enq_valid;
+  assign ram_param_io_deq_bits_MPORT_en = 1'h1;
+  assign ram_param_io_deq_bits_MPORT_addr = 1'h0;
+  assign ram_param_io_deq_bits_MPORT_data = ram_param[ram_param_io_deq_bits_MPORT_addr];
+  assign ram_param_MPORT_data = 3'h0;
+  assign ram_param_MPORT_addr = 1'h0;
+  assign ram_param_MPORT_mask = 1'h1;
+  assign ram_param_MPORT_en = io_enq_ready & io_enq_valid;
+  assign ram_size_io_deq_bits_MPORT_en = 1'h1;
+  assign ram_size_io_deq_bits_MPORT_addr = 1'h0;
+  assign ram_size_io_deq_bits_MPORT_data = ram_size[ram_size_io_deq_bits_MPORT_addr];
+  assign ram_size_MPORT_data = 2'h2;
+  assign ram_size_MPORT_addr = 1'h0;
+  assign ram_size_MPORT_mask = 1'h1;
+  assign ram_size_MPORT_en = io_enq_ready & io_enq_valid;
+  assign ram_source_io_deq_bits_MPORT_en = 1'h1;
+  assign ram_source_io_deq_bits_MPORT_addr = 1'h0;
+  assign ram_source_io_deq_bits_MPORT_data = ram_source[ram_source_io_deq_bits_MPORT_addr];
+  assign ram_source_MPORT_data = 1'h0;
+  assign ram_source_MPORT_addr = 1'h0;
+  assign ram_source_MPORT_mask = 1'h1;
+  assign ram_source_MPORT_en = io_enq_ready & io_enq_valid;
+  assign ram_address_io_deq_bits_MPORT_en = 1'h1;
+  assign ram_address_io_deq_bits_MPORT_addr = 1'h0;
+  assign ram_address_io_deq_bits_MPORT_data = ram_address[ram_address_io_deq_bits_MPORT_addr];
+  assign ram_address_MPORT_data = io_enq_bits_address;
+  assign ram_address_MPORT_addr = 1'h0;
+  assign ram_address_MPORT_mask = 1'h1;
+  assign ram_address_MPORT_en = io_enq_ready & io_enq_valid;
+  assign ram_mask_io_deq_bits_MPORT_en = 1'h1;
+  assign ram_mask_io_deq_bits_MPORT_addr = 1'h0;
+  assign ram_mask_io_deq_bits_MPORT_data = ram_mask[ram_mask_io_deq_bits_MPORT_addr];
+  assign ram_mask_MPORT_data = 4'hf;
+  assign ram_mask_MPORT_addr = 1'h0;
+  assign ram_mask_MPORT_mask = 1'h1;
+  assign ram_mask_MPORT_en = io_enq_ready & io_enq_valid;
+  assign ram_data_io_deq_bits_MPORT_en = 1'h1;
+  assign ram_data_io_deq_bits_MPORT_addr = 1'h0;
+  assign ram_data_io_deq_bits_MPORT_data = ram_data[ram_data_io_deq_bits_MPORT_addr];
+  assign ram_data_MPORT_data = io_enq_bits_data;
+  assign ram_data_MPORT_addr = 1'h0;
+  assign ram_data_MPORT_mask = 1'h1;
+  assign ram_data_MPORT_en = io_enq_ready & io_enq_valid;
+  assign ram_corrupt_io_deq_bits_MPORT_en = 1'h1;
+  assign ram_corrupt_io_deq_bits_MPORT_addr = 1'h0;
+  assign ram_corrupt_io_deq_bits_MPORT_data = ram_corrupt[ram_corrupt_io_deq_bits_MPORT_addr];
+  assign ram_corrupt_MPORT_data = 1'h0;
+  assign ram_corrupt_MPORT_addr = 1'h0;
+  assign ram_corrupt_MPORT_mask = 1'h1;
+  assign ram_corrupt_MPORT_en = io_enq_ready & io_enq_valid;
+  assign io_enq_ready = io_deq_ready | empty;
+  assign io_deq_valid = ~empty;
+  assign io_deq_bits_opcode = ram_opcode_io_deq_bits_MPORT_data;
+  assign io_deq_bits_param = ram_param_io_deq_bits_MPORT_data;
+  assign io_deq_bits_size = ram_size_io_deq_bits_MPORT_data;
+  assign io_deq_bits_source = ram_source_io_deq_bits_MPORT_data;
+  assign io_deq_bits_address = ram_address_io_deq_bits_MPORT_data;
+  assign io_deq_bits_mask = ram_mask_io_deq_bits_MPORT_data;
+  assign io_deq_bits_data = ram_data_io_deq_bits_MPORT_data;
+  assign io_deq_bits_corrupt = ram_corrupt_io_deq_bits_MPORT_data;
+  always @(posedge clock) begin
+    if (ram_opcode_MPORT_en & ram_opcode_MPORT_mask) begin
+      ram_opcode[ram_opcode_MPORT_addr] <= ram_opcode_MPORT_data;
+    end
+    if (ram_param_MPORT_en & ram_param_MPORT_mask) begin
+      ram_param[ram_param_MPORT_addr] <= ram_param_MPORT_data;
+    end
+    if (ram_size_MPORT_en & ram_size_MPORT_mask) begin
+      ram_size[ram_size_MPORT_addr] <= ram_size_MPORT_data;
+    end
+    if (ram_source_MPORT_en & ram_source_MPORT_mask) begin
+      ram_source[ram_source_MPORT_addr] <= ram_source_MPORT_data;
+    end
+    if (ram_address_MPORT_en & ram_address_MPORT_mask) begin
+      ram_address[ram_address_MPORT_addr] <= ram_address_MPORT_data;
+    end
+    if (ram_mask_MPORT_en & ram_mask_MPORT_mask) begin
+      ram_mask[ram_mask_MPORT_addr] <= ram_mask_MPORT_data;
+    end
+    if (ram_data_MPORT_en & ram_data_MPORT_mask) begin
+      ram_data[ram_data_MPORT_addr] <= ram_data_MPORT_data;
+    end
+    if (ram_corrupt_MPORT_en & ram_corrupt_MPORT_mask) begin
+      ram_corrupt[ram_corrupt_MPORT_addr] <= ram_corrupt_MPORT_data;
+    end
+    if (reset) begin
+      maybe_full <= 1'h0;
+    end else if (do_enq != do_deq) begin
+      maybe_full <= do_enq;
+    end
+  end
+endmodule
+module Queue_21(
+  input         clock,
+  input         reset,
+  output        io_enq_ready,
+  input         io_enq_valid,
+  input  [31:0] io_enq_bits_data,
+  output        io_deq_valid,
+  output [31:0] io_deq_bits_data
+);
+  reg [31:0] ram_data [0:0];
+  wire  ram_data_io_deq_bits_MPORT_en;
+  wire  ram_data_io_deq_bits_MPORT_addr;
+  wire [31:0] ram_data_io_deq_bits_MPORT_data;
+  wire [31:0] ram_data_MPORT_data;
+  wire  ram_data_MPORT_addr;
+  wire  ram_data_MPORT_mask;
+  wire  ram_data_MPORT_en;
+  reg  maybe_full;
+  wire  empty = ~maybe_full;
+  wire  do_enq = io_enq_ready & io_enq_valid;
+  assign ram_data_io_deq_bits_MPORT_en = 1'h1;
+  assign ram_data_io_deq_bits_MPORT_addr = 1'h0;
+  assign ram_data_io_deq_bits_MPORT_data = ram_data[ram_data_io_deq_bits_MPORT_addr];
+  assign ram_data_MPORT_data = io_enq_bits_data;
+  assign ram_data_MPORT_addr = 1'h0;
+  assign ram_data_MPORT_mask = 1'h1;
+  assign ram_data_MPORT_en = io_enq_ready & io_enq_valid;
+  assign io_enq_ready = 1'h1;
+  assign io_deq_valid = ~empty;
+  assign io_deq_bits_data = ram_data_io_deq_bits_MPORT_data;
+  always @(posedge clock) begin
+    if (ram_data_MPORT_en & ram_data_MPORT_mask) begin
+      ram_data[ram_data_MPORT_addr] <= ram_data_MPORT_data;
+    end
+    if (reset) begin
+      maybe_full <= 1'h0;
+    end else if (do_enq != io_deq_valid) begin
+      maybe_full <= do_enq;
+    end
+  end
+endmodule
+module TLBuffer_7(
+  input         clock,
+  input         reset,
+  output        auto_in_a_ready,
+  input         auto_in_a_valid,
+  input  [2:0]  auto_in_a_bits_opcode,
+  input  [11:0] auto_in_a_bits_address,
+  input  [31:0] auto_in_a_bits_data,
+  output        auto_in_d_valid,
+  output [31:0] auto_in_d_bits_data,
+  input         auto_out_a_ready,
+  output        auto_out_a_valid,
+  output [2:0]  auto_out_a_bits_opcode,
+  output [2:0]  auto_out_a_bits_param,
+  output [1:0]  auto_out_a_bits_size,
+  output        auto_out_a_bits_source,
+  output [11:0] auto_out_a_bits_address,
+  output [3:0]  auto_out_a_bits_mask,
+  output [31:0] auto_out_a_bits_data,
+  output        auto_out_a_bits_corrupt,
+  input         auto_out_d_valid,
+  input  [31:0] auto_out_d_bits_data
+);
+  wire  bundleOut_0_a_q_clock;
+  wire  bundleOut_0_a_q_reset;
+  wire  bundleOut_0_a_q_io_enq_ready;
+  wire  bundleOut_0_a_q_io_enq_valid;
+  wire [2:0] bundleOut_0_a_q_io_enq_bits_opcode;
+  wire [11:0] bundleOut_0_a_q_io_enq_bits_address;
+  wire [31:0] bundleOut_0_a_q_io_enq_bits_data;
+  wire  bundleOut_0_a_q_io_deq_ready;
+  wire  bundleOut_0_a_q_io_deq_valid;
+  wire [2:0] bundleOut_0_a_q_io_deq_bits_opcode;
+  wire [2:0] bundleOut_0_a_q_io_deq_bits_param;
+  wire [1:0] bundleOut_0_a_q_io_deq_bits_size;
+  wire  bundleOut_0_a_q_io_deq_bits_source;
+  wire [11:0] bundleOut_0_a_q_io_deq_bits_address;
+  wire [3:0] bundleOut_0_a_q_io_deq_bits_mask;
+  wire [31:0] bundleOut_0_a_q_io_deq_bits_data;
+  wire  bundleOut_0_a_q_io_deq_bits_corrupt;
+  wire  bundleIn_0_d_q_clock;
+  wire  bundleIn_0_d_q_reset;
+  wire  bundleIn_0_d_q_io_enq_ready;
+  wire  bundleIn_0_d_q_io_enq_valid;
+  wire [31:0] bundleIn_0_d_q_io_enq_bits_data;
+  wire  bundleIn_0_d_q_io_deq_valid;
+  wire [31:0] bundleIn_0_d_q_io_deq_bits_data;
+  Queue_20 bundleOut_0_a_q (
+    .clock(bundleOut_0_a_q_clock),
+    .reset(bundleOut_0_a_q_reset),
+    .io_enq_ready(bundleOut_0_a_q_io_enq_ready),
+    .io_enq_valid(bundleOut_0_a_q_io_enq_valid),
+    .io_enq_bits_opcode(bundleOut_0_a_q_io_enq_bits_opcode),
+    .io_enq_bits_address(bundleOut_0_a_q_io_enq_bits_address),
+    .io_enq_bits_data(bundleOut_0_a_q_io_enq_bits_data),
+    .io_deq_ready(bundleOut_0_a_q_io_deq_ready),
+    .io_deq_valid(bundleOut_0_a_q_io_deq_valid),
+    .io_deq_bits_opcode(bundleOut_0_a_q_io_deq_bits_opcode),
+    .io_deq_bits_param(bundleOut_0_a_q_io_deq_bits_param),
+    .io_deq_bits_size(bundleOut_0_a_q_io_deq_bits_size),
+    .io_deq_bits_source(bundleOut_0_a_q_io_deq_bits_source),
+    .io_deq_bits_address(bundleOut_0_a_q_io_deq_bits_address),
+    .io_deq_bits_mask(bundleOut_0_a_q_io_deq_bits_mask),
+    .io_deq_bits_data(bundleOut_0_a_q_io_deq_bits_data),
+    .io_deq_bits_corrupt(bundleOut_0_a_q_io_deq_bits_corrupt)
+  );
+  Queue_21 bundleIn_0_d_q (
+    .clock(bundleIn_0_d_q_clock),
+    .reset(bundleIn_0_d_q_reset),
+    .io_enq_ready(bundleIn_0_d_q_io_enq_ready),
+    .io_enq_valid(bundleIn_0_d_q_io_enq_valid),
+    .io_enq_bits_data(bundleIn_0_d_q_io_enq_bits_data),
+    .io_deq_valid(bundleIn_0_d_q_io_deq_valid),
+    .io_deq_bits_data(bundleIn_0_d_q_io_deq_bits_data)
+  );
+  assign auto_in_a_ready = bundleOut_0_a_q_io_enq_ready;
+  assign auto_in_d_valid = bundleIn_0_d_q_io_deq_valid;
+  assign auto_in_d_bits_data = bundleIn_0_d_q_io_deq_bits_data;
+  assign auto_out_a_valid = bundleOut_0_a_q_io_deq_valid;
+  assign auto_out_a_bits_opcode = bundleOut_0_a_q_io_deq_bits_opcode;
+  assign auto_out_a_bits_param = bundleOut_0_a_q_io_deq_bits_param;
+  assign auto_out_a_bits_size = bundleOut_0_a_q_io_deq_bits_size;
+  assign auto_out_a_bits_source = bundleOut_0_a_q_io_deq_bits_source;
+  assign auto_out_a_bits_address = bundleOut_0_a_q_io_deq_bits_address;
+  assign auto_out_a_bits_mask = bundleOut_0_a_q_io_deq_bits_mask;
+  assign auto_out_a_bits_data = bundleOut_0_a_q_io_deq_bits_data;
+  assign auto_out_a_bits_corrupt = bundleOut_0_a_q_io_deq_bits_corrupt;
+  assign bundleOut_0_a_q_clock = clock;
+  assign bundleOut_0_a_q_reset = reset;
+  assign bundleOut_0_a_q_io_enq_valid = auto_in_a_valid;
+  assign bundleOut_0_a_q_io_enq_bits_opcode = auto_in_a_bits_opcode;
+  assign bundleOut_0_a_q_io_enq_bits_address = auto_in_a_bits_address;
+  assign bundleOut_0_a_q_io_enq_bits_data = auto_in_a_bits_data;
+  assign bundleOut_0_a_q_io_deq_ready = auto_out_a_ready;
+  assign bundleIn_0_d_q_clock = clock;
+  assign bundleIn_0_d_q_reset = reset;
+  assign bundleIn_0_d_q_io_enq_valid = auto_out_d_valid;
+  assign bundleIn_0_d_q_io_enq_bits_data = auto_out_d_bits_data;
+endmodule
+module TLError_1(
+  output  auto_in_a_ready,
+  input   auto_in_a_valid,
+  input   auto_in_d_ready,
+  output  auto_in_d_valid
+);
+  assign auto_in_a_ready = auto_in_d_ready;
+  assign auto_in_d_valid = auto_in_a_valid;
+endmodule
+module APBFanout(
+  input         auto_in_psel,
+  input         auto_in_penable,
+  input         auto_in_pwrite,
+  input  [11:0] auto_in_paddr,
+  input  [31:0] auto_in_pwdata,
+  output        auto_in_pready,
+  output [31:0] auto_in_prdata,
+  output        auto_out_1_psel,
+  output        auto_out_1_pwrite,
+  output [11:0] auto_out_1_paddr,
+  output [31:0] auto_out_1_pwdata,
+  input         auto_out_1_pready,
+  input  [31:0] auto_out_1_prdata,
+  output        auto_out_0_psel,
+  output        auto_out_0_penable,
+  input         auto_out_0_pready
+);
+  wire [11:0] _sel_T = auto_in_paddr ^ 12'hf00;
+  wire [12:0] _sel_T_1 = {1'b0,$signed(_sel_T)};
+  wire [12:0] _sel_T_3 = $signed(_sel_T_1) & 13'shf00;
+  wire  sel_0 = $signed(_sel_T_3) == 13'sh0;
+  wire [11:0] _sel_T_5 = auto_in_paddr ^ 12'h200;
+  wire [12:0] _sel_T_6 = {1'b0,$signed(_sel_T_5)};
+  wire [12:0] _sel_T_8 = $signed(_sel_T_6) & 13'she00;
+  wire [11:0] _sel_T_10 = auto_in_paddr ^ 12'h400;
+  wire [12:0] _sel_T_11 = {1'b0,$signed(_sel_T_10)};
+  wire [12:0] _sel_T_13 = $signed(_sel_T_11) & 13'shc00;
+  wire [11:0] _sel_T_15 = auto_in_paddr ^ 12'h800;
+  wire [12:0] _sel_T_16 = {1'b0,$signed(_sel_T_15)};
+  wire [12:0] _sel_T_18 = $signed(_sel_T_16) & 13'shc00;
+  wire [11:0] _sel_T_20 = auto_in_paddr ^ 12'hc00;
+  wire [12:0] _sel_T_21 = {1'b0,$signed(_sel_T_20)};
+  wire [12:0] _sel_T_23 = $signed(_sel_T_21) & 13'she00;
+  wire [11:0] _sel_T_25 = auto_in_paddr ^ 12'he00;
+  wire [12:0] _sel_T_26 = {1'b0,$signed(_sel_T_25)};
+  wire [12:0] _sel_T_28 = $signed(_sel_T_26) & 13'shf00;
+  wire [12:0] _sel_T_31 = {1'b0,$signed(auto_in_paddr)};
+  wire [12:0] _sel_T_33 = $signed(_sel_T_31) & 13'shfc0;
+  wire [11:0] _sel_T_35 = auto_in_paddr ^ 12'h40;
+  wire [12:0] _sel_T_36 = {1'b0,$signed(_sel_T_35)};
+  wire [12:0] _sel_T_38 = $signed(_sel_T_36) & 13'shff8;
+  wire [11:0] _sel_T_40 = auto_in_paddr ^ 12'h48;
+  wire [12:0] _sel_T_41 = {1'b0,$signed(_sel_T_40)};
+  wire [12:0] _sel_T_43 = $signed(_sel_T_41) & 13'shff8;
+  wire [11:0] _sel_T_45 = auto_in_paddr ^ 12'h58;
+  wire [12:0] _sel_T_46 = {1'b0,$signed(_sel_T_45)};
+  wire [12:0] _sel_T_48 = $signed(_sel_T_46) & 13'shff8;
+  wire [11:0] _sel_T_50 = auto_in_paddr ^ 12'h60;
+  wire [12:0] _sel_T_51 = {1'b0,$signed(_sel_T_50)};
+  wire [12:0] _sel_T_53 = $signed(_sel_T_51) & 13'shfe0;
+  wire [11:0] _sel_T_55 = auto_in_paddr ^ 12'h80;
+  wire [12:0] _sel_T_56 = {1'b0,$signed(_sel_T_55)};
+  wire [12:0] _sel_T_58 = $signed(_sel_T_56) & 13'shf80;
+  wire [11:0] _sel_T_60 = auto_in_paddr ^ 12'h100;
+  wire [12:0] _sel_T_61 = {1'b0,$signed(_sel_T_60)};
+  wire [12:0] _sel_T_63 = $signed(_sel_T_61) & 13'shf00;
+  wire [11:0] _sel_T_65 = auto_in_paddr ^ 12'h50;
+  wire [12:0] _sel_T_66 = {1'b0,$signed(_sel_T_65)};
+  wire [12:0] _sel_T_68 = $signed(_sel_T_66) & 13'shff8;
+  wire  sel_1 = $signed(_sel_T_8) == 13'sh0 | $signed(_sel_T_13) == 13'sh0 | $signed(_sel_T_18) == 13'sh0 | $signed(
+    _sel_T_23) == 13'sh0 | $signed(_sel_T_28) == 13'sh0 | $signed(_sel_T_33) == 13'sh0 | $signed(_sel_T_38) == 13'sh0 |
+    $signed(_sel_T_43) == 13'sh0 | $signed(_sel_T_48) == 13'sh0 | $signed(_sel_T_53) == 13'sh0 | $signed(_sel_T_58) == 13'sh0
+     | $signed(_sel_T_63) == 13'sh0 | $signed(_sel_T_68) == 13'sh0;
+  assign auto_in_pready = ~(sel_0 & ~auto_out_0_pready | sel_1 & ~auto_out_1_pready);
+  assign auto_in_prdata = sel_1 ? auto_out_1_prdata : 32'h0;
+  assign auto_out_1_psel = sel_1 & auto_in_psel;
+  assign auto_out_1_pwrite = auto_in_pwrite;
+  assign auto_out_1_paddr = auto_in_paddr;
+  assign auto_out_1_pwdata = auto_in_pwdata;
+  assign auto_out_0_psel = sel_0 & auto_in_psel;
+  assign auto_out_0_penable = sel_0 & auto_in_penable;
+endmodule
+module APBDebugRegisters(
+  input   clock,
+  input   reset,
+  input   auto_in_psel,
+  input   auto_in_penable,
+  output  auto_in_pready
+);
+  reg  taken;
+  wire  in_valid = auto_in_psel & ~taken;
+  assign auto_in_pready = auto_in_psel & ~taken;
+  always @(posedge clock) begin
+    if (reset) begin
+      taken <= 1'h0;
+    end else if (auto_in_penable & in_valid) begin
+      taken <= 1'h0;
+    end else begin
+      taken <= auto_in_penable & in_valid | taken;
+    end
+  end
 endmodule
 module TLDebugModuleOuter(
   input         clock,
@@ -25558,6 +26051,7 @@ module TLDebugModuleOuter(
   input         auto_dmi_in_a_valid,
   input  [2:0]  auto_dmi_in_a_bits_opcode,
   input  [6:0]  auto_dmi_in_a_bits_address,
+  input  [3:0]  auto_dmi_in_a_bits_mask,
   input  [31:0] auto_dmi_in_a_bits_data,
   input         auto_dmi_in_d_ready,
   output        auto_dmi_in_d_valid,
@@ -25584,20 +26078,39 @@ module TLDebugModuleOuter(
   wire [1:0] _out_backSel_T = 2'h1 << out_iindex;
   wire  out_backSel_0 = _out_backSel_T[0];
   wire  out_woready_1 = auto_dmi_in_a_valid & auto_dmi_in_d_ready & ~in_bits_read & out_backSel_0 & out_findex == 3'h0;
+  wire [7:0] _out_backMask_T_11 = auto_dmi_in_a_bits_mask[3] ? 8'hff : 8'h0;
+  wire [7:0] _out_backMask_T_9 = auto_dmi_in_a_bits_mask[2] ? 8'hff : 8'h0;
+  wire [7:0] _out_backMask_T_7 = auto_dmi_in_a_bits_mask[1] ? 8'hff : 8'h0;
+  wire [7:0] _out_backMask_T_5 = auto_dmi_in_a_bits_mask[0] ? 8'hff : 8'h0;
+  wire [31:0] out_backMask = {_out_backMask_T_11,_out_backMask_T_9,_out_backMask_T_7,_out_backMask_T_5};
+  wire  out_womask_1 = &out_backMask[1];
+  wire  out_f_woready_1 = out_woready_1 & out_womask_1;
   wire  DMCONTROLWrData_ndmreset = auto_dmi_in_a_bits_data[1];
+  wire  out_womask_12 = &out_backMask[31];
+  wire  out_f_woready_12 = out_woready_1 & out_womask_12;
   wire  DMCONTROLWrData_haltreq = auto_dmi_in_a_bits_data[31];
+  wire  out_womask = &out_backMask[0];
+  wire  out_f_woready = out_woready_1 & out_womask;
   wire  DMCONTROLWrData_dmactive = auto_dmi_in_a_bits_data[0];
   reg  hrmaskReg_0;
+  wire  out_womask_2 = &out_backMask[2];
+  wire  out_f_woready_2 = out_woready_1 & out_womask_2;
   wire  DMCONTROLWrData_clrresethaltreq = auto_dmi_in_a_bits_data[2];
+  wire  out_womask_3 = &out_backMask[3];
+  wire  out_f_woready_3 = out_woready_1 & out_womask_3;
   wire  DMCONTROLWrData_setresethaltreq = auto_dmi_in_a_bits_data[3];
-  wire  _GEN_24 = out_woready_1 & DMCONTROLWrData_clrresethaltreq & io_innerCtrl_bits_hartsel == 10'h0 ? 1'h0 :
-    out_woready_1 & DMCONTROLWrData_setresethaltreq & io_innerCtrl_bits_hartsel == 10'h0 | hrmaskReg_0;
+  wire  _GEN_24 = out_f_woready_2 & DMCONTROLWrData_clrresethaltreq & io_innerCtrl_bits_hartsel == 10'h0 ? 1'h0 :
+    out_f_woready_3 & DMCONTROLWrData_setresethaltreq & io_innerCtrl_bits_hartsel == 10'h0 | hrmaskReg_0;
   wire  _T_18 = DMCONTROLReg_dmactive & io_ctrl_dmactiveAck;
   wire [4:0] out_prepend_3 = {1'h0,1'h0,1'h0,DMCONTROLReg_ndmreset,_T_18};
   wire [15:0] _out_T_51 = {{11'd0}, out_prepend_3};
   wire [17:0] out_prepend_5 = {1'h0,1'h0,_out_T_51};
   wire [25:0] _out_T_69 = {{8'd0}, out_prepend_5};
+  wire  out_womask_9 = &out_backMask[28];
+  wire  out_f_woready_9 = out_woready_1 & out_womask_9;
   wire  DMCONTROLWrData_ackhavereset = auto_dmi_in_a_bits_data[28];
+  wire  out_womask_11 = &out_backMask[30];
+  wire  out_f_woready_11 = out_woready_1 & out_womask_11;
   wire  DMCONTROLWrData_resumereq = auto_dmi_in_a_bits_data[30];
   wire [31:0] out_prepend_11 = {DMCONTROLReg_haltreq,1'h0,1'h0,1'h0,1'h0,1'h0,_out_T_69};
   wire  _GEN_35 = out_iindex ? out_findex == 3'h0 : out_findex == 3'h0;
@@ -25606,23 +26119,24 @@ module TLDebugModuleOuter(
   reg  innerCtrlValidReg;
   reg  innerCtrlResumeReqReg;
   reg  innerCtrlAckHaveResetReg;
+  wire  innerCtrlValid = out_f_woready_11 | out_f_woready_9 | out_f_woready_3 | out_f_woready_2;
   assign auto_dmi_in_a_ready = auto_dmi_in_d_ready;
   assign auto_dmi_in_d_valid = auto_dmi_in_a_valid;
   assign auto_dmi_in_d_bits_data = _GEN_35 ? _GEN_37 : 32'h0;
   assign auto_int_out_0 = debugIntRegs_0 | io_hgDebugInt_0;
   assign io_ctrl_ndreset = DMCONTROLReg_ndmreset;
   assign io_ctrl_dmactive = DMCONTROLReg_dmactive;
-  assign io_innerCtrl_valid = out_woready_1 | innerCtrlValidReg;
-  assign io_innerCtrl_bits_resumereq = out_woready_1 & DMCONTROLWrData_resumereq | innerCtrlResumeReqReg;
+  assign io_innerCtrl_valid = innerCtrlValid | innerCtrlValidReg;
+  assign io_innerCtrl_bits_resumereq = out_f_woready_11 & DMCONTROLWrData_resumereq | innerCtrlResumeReqReg;
   assign io_innerCtrl_bits_hartsel = 10'h0;
-  assign io_innerCtrl_bits_ackhavereset = out_woready_1 & DMCONTROLWrData_ackhavereset | innerCtrlAckHaveResetReg;
+  assign io_innerCtrl_bits_ackhavereset = out_f_woready_9 & DMCONTROLWrData_ackhavereset | innerCtrlAckHaveResetReg;
   assign io_innerCtrl_bits_hrmask_0 = ~DMCONTROLReg_dmactive ? 1'h0 : _GEN_24;
   always @(posedge clock or posedge reset) begin
     if (reset) begin
       DMCONTROLReg_haltreq <= 1'h0;
     end else if (~DMCONTROLReg_dmactive) begin
       DMCONTROLReg_haltreq <= 1'h0;
-    end else if (out_woready_1) begin
+    end else if (out_f_woready_12) begin
       DMCONTROLReg_haltreq <= DMCONTROLWrData_haltreq;
     end
   end
@@ -25631,14 +26145,14 @@ module TLDebugModuleOuter(
       DMCONTROLReg_ndmreset <= 1'h0;
     end else if (~DMCONTROLReg_dmactive) begin
       DMCONTROLReg_ndmreset <= 1'h0;
-    end else if (out_woready_1) begin
+    end else if (out_f_woready_1) begin
       DMCONTROLReg_ndmreset <= DMCONTROLWrData_ndmreset;
     end
   end
   always @(posedge clock or posedge reset) begin
     if (reset) begin
       DMCONTROLReg_dmactive <= 1'h0;
-    end else if (out_woready_1) begin
+    end else if (out_f_woready) begin
       DMCONTROLReg_dmactive <= DMCONTROLWrData_dmactive;
     end else if (~DMCONTROLReg_dmactive) begin
       DMCONTROLReg_dmactive <= 1'h0;
@@ -25649,10 +26163,11 @@ module TLDebugModuleOuter(
       hrmaskReg_0 <= 1'h0;
     end else if (~DMCONTROLReg_dmactive) begin
       hrmaskReg_0 <= 1'h0;
-    end else if (out_woready_1 & DMCONTROLWrData_clrresethaltreq & io_innerCtrl_bits_hartsel == 10'h0) begin
+    end else if (out_f_woready_2 & DMCONTROLWrData_clrresethaltreq & io_innerCtrl_bits_hartsel == 10'h0) begin
       hrmaskReg_0 <= 1'h0;
     end else begin
-      hrmaskReg_0 <= out_woready_1 & DMCONTROLWrData_setresethaltreq & io_innerCtrl_bits_hartsel == 10'h0 | hrmaskReg_0;
+      hrmaskReg_0 <= out_f_woready_3 & DMCONTROLWrData_setresethaltreq & io_innerCtrl_bits_hartsel == 10'h0 |
+        hrmaskReg_0;
     end
   end
   always @(posedge clock or posedge reset) begin
@@ -25660,7 +26175,7 @@ module TLDebugModuleOuter(
       debugIntRegs_0 <= 1'h0;
     end else if (~DMCONTROLReg_dmactive) begin
       debugIntRegs_0 <= 1'h0;
-    end else if (out_woready_1) begin
+    end else if (out_f_woready_12) begin
       debugIntRegs_0 <= DMCONTROLWrData_haltreq;
     end
   end
@@ -25698,32 +26213,36 @@ module TLBusBypassBar(
   output        auto_in_a_ready,
   input         auto_in_a_valid,
   input  [2:0]  auto_in_a_bits_opcode,
+  input  [2:0]  auto_in_a_bits_param,
+  input  [1:0]  auto_in_a_bits_size,
+  input         auto_in_a_bits_source,
   input  [8:0]  auto_in_a_bits_address,
+  input  [3:0]  auto_in_a_bits_mask,
   input  [31:0] auto_in_a_bits_data,
+  input         auto_in_a_bits_corrupt,
   input         auto_in_d_ready,
   output        auto_in_d_valid,
-  output        auto_in_d_bits_denied,
   output [31:0] auto_in_d_bits_data,
-  output        auto_in_d_bits_corrupt,
   input         auto_out_1_a_ready,
   output        auto_out_1_a_valid,
   output [2:0]  auto_out_1_a_bits_opcode,
+  output [2:0]  auto_out_1_a_bits_param,
+  output [1:0]  auto_out_1_a_bits_size,
+  output        auto_out_1_a_bits_source,
   output [8:0]  auto_out_1_a_bits_address,
+  output [3:0]  auto_out_1_a_bits_mask,
   output [31:0] auto_out_1_a_bits_data,
+  output        auto_out_1_a_bits_corrupt,
   output        auto_out_1_d_ready,
   input         auto_out_1_d_valid,
   input  [2:0]  auto_out_1_d_bits_opcode,
-  input         auto_out_1_d_bits_denied,
   input  [31:0] auto_out_1_d_bits_data,
-  input         auto_out_1_d_bits_corrupt,
   input         auto_out_0_a_ready,
   output        auto_out_0_a_valid,
   output [2:0]  auto_out_0_a_bits_opcode,
   output        auto_out_0_d_ready,
   input         auto_out_0_d_valid,
   input  [2:0]  auto_out_0_d_bits_opcode,
-  input         auto_out_0_d_bits_denied,
-  input         auto_out_0_d_bits_corrupt,
   input         io_bypass
 );
   reg  in_reset;
@@ -25756,13 +26275,16 @@ module TLBusBypassBar(
   wire  stall_counter1 = stall_counter - 1'h1;
   assign auto_in_a_ready = ~stall & _bundleIn_0_a_ready_T_1;
   assign auto_in_d_valid = bypass ? auto_out_0_d_valid : auto_out_1_d_valid;
-  assign auto_in_d_bits_denied = bypass ? auto_out_0_d_bits_denied : auto_out_1_d_bits_denied;
   assign auto_in_d_bits_data = bypass ? 32'h0 : auto_out_1_d_bits_data;
-  assign auto_in_d_bits_corrupt = bypass ? auto_out_0_d_bits_corrupt : auto_out_1_d_bits_corrupt;
   assign auto_out_1_a_valid = ~stall & auto_in_a_valid & ~bypass;
   assign auto_out_1_a_bits_opcode = auto_in_a_bits_opcode;
+  assign auto_out_1_a_bits_param = auto_in_a_bits_param;
+  assign auto_out_1_a_bits_size = auto_in_a_bits_size;
+  assign auto_out_1_a_bits_source = auto_in_a_bits_source;
   assign auto_out_1_a_bits_address = auto_in_a_bits_address;
+  assign auto_out_1_a_bits_mask = auto_in_a_bits_mask;
   assign auto_out_1_a_bits_data = auto_in_a_bits_data;
+  assign auto_out_1_a_bits_corrupt = auto_in_a_bits_corrupt;
   assign auto_out_1_d_ready = auto_in_d_ready & ~bypass;
   assign auto_out_0_a_valid = ~stall & auto_in_a_valid & bypass;
   assign auto_out_0_a_bits_opcode = auto_in_a_bits_opcode;
@@ -25806,7 +26328,7 @@ module TLBusBypassBar(
     end
   end
 endmodule
-module TLError_1(
+module TLError_2(
   input        clock,
   input        reset,
   output       auto_in_a_ready,
@@ -25814,9 +26336,7 @@ module TLError_1(
   input  [2:0] auto_in_a_bits_opcode,
   input        auto_in_d_ready,
   output       auto_in_d_valid,
-  output [2:0] auto_in_d_bits_opcode,
-  output       auto_in_d_bits_denied,
-  output       auto_in_d_bits_corrupt
+  output [2:0] auto_in_d_bits_opcode
 );
   reg  idle;
   reg  beatsLeft;
@@ -25837,7 +26357,6 @@ module TLError_1(
   wire [2:0] _GEN_7 = 3'h5 == auto_in_a_bits_opcode ? 3'h2 : _GEN_6;
   wire [2:0] _GEN_8 = 3'h6 == auto_in_a_bits_opcode ? 3'h4 : _GEN_7;
   wire [2:0] da_bits_opcode = 3'h7 == auto_in_a_bits_opcode ? 3'h4 : _GEN_8;
-  wire  beats1_opdata = da_bits_opcode[0];
   wire  _GEN_12 = out_1_ready & da_valid & da_bits_opcode == 3'h4 ? 1'h0 : idle;
   wire  latch = idle_1 & auto_in_d_ready;
   wire  earlyWinner_1 = readys_1 & da_valid;
@@ -25847,8 +26366,6 @@ module TLError_1(
   assign auto_in_a_ready = out_1_ready & idle;
   assign auto_in_d_valid = idle_1 ? da_valid : state_1 & da_valid;
   assign auto_in_d_bits_opcode = muxStateEarly_1 ? da_bits_opcode : 3'h0;
-  assign auto_in_d_bits_denied = idle_1 ? earlyWinner_1 : state_1;
-  assign auto_in_d_bits_corrupt = muxStateEarly_1 & beats1_opdata;
   always @(posedge clock) begin
     idle <= reset | _GEN_12;
     if (reset) begin
@@ -25871,24 +26388,30 @@ module TLBusBypass(
   input         auto_node_out_out_a_ready,
   output        auto_node_out_out_a_valid,
   output [2:0]  auto_node_out_out_a_bits_opcode,
+  output [2:0]  auto_node_out_out_a_bits_param,
+  output [1:0]  auto_node_out_out_a_bits_size,
+  output        auto_node_out_out_a_bits_source,
   output [8:0]  auto_node_out_out_a_bits_address,
+  output [3:0]  auto_node_out_out_a_bits_mask,
   output [31:0] auto_node_out_out_a_bits_data,
+  output        auto_node_out_out_a_bits_corrupt,
   output        auto_node_out_out_d_ready,
   input         auto_node_out_out_d_valid,
   input  [2:0]  auto_node_out_out_d_bits_opcode,
-  input         auto_node_out_out_d_bits_denied,
   input  [31:0] auto_node_out_out_d_bits_data,
-  input         auto_node_out_out_d_bits_corrupt,
   output        auto_node_in_in_a_ready,
   input         auto_node_in_in_a_valid,
   input  [2:0]  auto_node_in_in_a_bits_opcode,
+  input  [2:0]  auto_node_in_in_a_bits_param,
+  input  [1:0]  auto_node_in_in_a_bits_size,
+  input         auto_node_in_in_a_bits_source,
   input  [8:0]  auto_node_in_in_a_bits_address,
+  input  [3:0]  auto_node_in_in_a_bits_mask,
   input  [31:0] auto_node_in_in_a_bits_data,
+  input         auto_node_in_in_a_bits_corrupt,
   input         auto_node_in_in_d_ready,
   output        auto_node_in_in_d_valid,
-  output        auto_node_in_in_d_bits_denied,
   output [31:0] auto_node_in_in_d_bits_data,
-  output        auto_node_in_in_d_bits_corrupt,
   input         io_bypass
 );
   wire  bar_clock;
@@ -25896,32 +26419,36 @@ module TLBusBypass(
   wire  bar_auto_in_a_ready;
   wire  bar_auto_in_a_valid;
   wire [2:0] bar_auto_in_a_bits_opcode;
+  wire [2:0] bar_auto_in_a_bits_param;
+  wire [1:0] bar_auto_in_a_bits_size;
+  wire  bar_auto_in_a_bits_source;
   wire [8:0] bar_auto_in_a_bits_address;
+  wire [3:0] bar_auto_in_a_bits_mask;
   wire [31:0] bar_auto_in_a_bits_data;
+  wire  bar_auto_in_a_bits_corrupt;
   wire  bar_auto_in_d_ready;
   wire  bar_auto_in_d_valid;
-  wire  bar_auto_in_d_bits_denied;
   wire [31:0] bar_auto_in_d_bits_data;
-  wire  bar_auto_in_d_bits_corrupt;
   wire  bar_auto_out_1_a_ready;
   wire  bar_auto_out_1_a_valid;
   wire [2:0] bar_auto_out_1_a_bits_opcode;
+  wire [2:0] bar_auto_out_1_a_bits_param;
+  wire [1:0] bar_auto_out_1_a_bits_size;
+  wire  bar_auto_out_1_a_bits_source;
   wire [8:0] bar_auto_out_1_a_bits_address;
+  wire [3:0] bar_auto_out_1_a_bits_mask;
   wire [31:0] bar_auto_out_1_a_bits_data;
+  wire  bar_auto_out_1_a_bits_corrupt;
   wire  bar_auto_out_1_d_ready;
   wire  bar_auto_out_1_d_valid;
   wire [2:0] bar_auto_out_1_d_bits_opcode;
-  wire  bar_auto_out_1_d_bits_denied;
   wire [31:0] bar_auto_out_1_d_bits_data;
-  wire  bar_auto_out_1_d_bits_corrupt;
   wire  bar_auto_out_0_a_ready;
   wire  bar_auto_out_0_a_valid;
   wire [2:0] bar_auto_out_0_a_bits_opcode;
   wire  bar_auto_out_0_d_ready;
   wire  bar_auto_out_0_d_valid;
   wire [2:0] bar_auto_out_0_d_bits_opcode;
-  wire  bar_auto_out_0_d_bits_denied;
-  wire  bar_auto_out_0_d_bits_corrupt;
   wire  bar_io_bypass;
   wire  error_clock;
   wire  error_reset;
@@ -25931,43 +26458,45 @@ module TLBusBypass(
   wire  error_auto_in_d_ready;
   wire  error_auto_in_d_valid;
   wire [2:0] error_auto_in_d_bits_opcode;
-  wire  error_auto_in_d_bits_denied;
-  wire  error_auto_in_d_bits_corrupt;
   TLBusBypassBar bar (
     .clock(bar_clock),
     .reset(bar_reset),
     .auto_in_a_ready(bar_auto_in_a_ready),
     .auto_in_a_valid(bar_auto_in_a_valid),
     .auto_in_a_bits_opcode(bar_auto_in_a_bits_opcode),
+    .auto_in_a_bits_param(bar_auto_in_a_bits_param),
+    .auto_in_a_bits_size(bar_auto_in_a_bits_size),
+    .auto_in_a_bits_source(bar_auto_in_a_bits_source),
     .auto_in_a_bits_address(bar_auto_in_a_bits_address),
+    .auto_in_a_bits_mask(bar_auto_in_a_bits_mask),
     .auto_in_a_bits_data(bar_auto_in_a_bits_data),
+    .auto_in_a_bits_corrupt(bar_auto_in_a_bits_corrupt),
     .auto_in_d_ready(bar_auto_in_d_ready),
     .auto_in_d_valid(bar_auto_in_d_valid),
-    .auto_in_d_bits_denied(bar_auto_in_d_bits_denied),
     .auto_in_d_bits_data(bar_auto_in_d_bits_data),
-    .auto_in_d_bits_corrupt(bar_auto_in_d_bits_corrupt),
     .auto_out_1_a_ready(bar_auto_out_1_a_ready),
     .auto_out_1_a_valid(bar_auto_out_1_a_valid),
     .auto_out_1_a_bits_opcode(bar_auto_out_1_a_bits_opcode),
+    .auto_out_1_a_bits_param(bar_auto_out_1_a_bits_param),
+    .auto_out_1_a_bits_size(bar_auto_out_1_a_bits_size),
+    .auto_out_1_a_bits_source(bar_auto_out_1_a_bits_source),
     .auto_out_1_a_bits_address(bar_auto_out_1_a_bits_address),
+    .auto_out_1_a_bits_mask(bar_auto_out_1_a_bits_mask),
     .auto_out_1_a_bits_data(bar_auto_out_1_a_bits_data),
+    .auto_out_1_a_bits_corrupt(bar_auto_out_1_a_bits_corrupt),
     .auto_out_1_d_ready(bar_auto_out_1_d_ready),
     .auto_out_1_d_valid(bar_auto_out_1_d_valid),
     .auto_out_1_d_bits_opcode(bar_auto_out_1_d_bits_opcode),
-    .auto_out_1_d_bits_denied(bar_auto_out_1_d_bits_denied),
     .auto_out_1_d_bits_data(bar_auto_out_1_d_bits_data),
-    .auto_out_1_d_bits_corrupt(bar_auto_out_1_d_bits_corrupt),
     .auto_out_0_a_ready(bar_auto_out_0_a_ready),
     .auto_out_0_a_valid(bar_auto_out_0_a_valid),
     .auto_out_0_a_bits_opcode(bar_auto_out_0_a_bits_opcode),
     .auto_out_0_d_ready(bar_auto_out_0_d_ready),
     .auto_out_0_d_valid(bar_auto_out_0_d_valid),
     .auto_out_0_d_bits_opcode(bar_auto_out_0_d_bits_opcode),
-    .auto_out_0_d_bits_denied(bar_auto_out_0_d_bits_denied),
-    .auto_out_0_d_bits_corrupt(bar_auto_out_0_d_bits_corrupt),
     .io_bypass(bar_io_bypass)
   );
-  TLError_1 error (
+  TLError_2 error (
     .clock(error_clock),
     .reset(error_reset),
     .auto_in_a_ready(error_auto_in_a_ready),
@@ -25975,38 +26504,40 @@ module TLBusBypass(
     .auto_in_a_bits_opcode(error_auto_in_a_bits_opcode),
     .auto_in_d_ready(error_auto_in_d_ready),
     .auto_in_d_valid(error_auto_in_d_valid),
-    .auto_in_d_bits_opcode(error_auto_in_d_bits_opcode),
-    .auto_in_d_bits_denied(error_auto_in_d_bits_denied),
-    .auto_in_d_bits_corrupt(error_auto_in_d_bits_corrupt)
+    .auto_in_d_bits_opcode(error_auto_in_d_bits_opcode)
   );
   assign auto_node_out_out_a_valid = bar_auto_out_1_a_valid;
   assign auto_node_out_out_a_bits_opcode = bar_auto_out_1_a_bits_opcode;
+  assign auto_node_out_out_a_bits_param = bar_auto_out_1_a_bits_param;
+  assign auto_node_out_out_a_bits_size = bar_auto_out_1_a_bits_size;
+  assign auto_node_out_out_a_bits_source = bar_auto_out_1_a_bits_source;
   assign auto_node_out_out_a_bits_address = bar_auto_out_1_a_bits_address;
+  assign auto_node_out_out_a_bits_mask = bar_auto_out_1_a_bits_mask;
   assign auto_node_out_out_a_bits_data = bar_auto_out_1_a_bits_data;
+  assign auto_node_out_out_a_bits_corrupt = bar_auto_out_1_a_bits_corrupt;
   assign auto_node_out_out_d_ready = bar_auto_out_1_d_ready;
   assign auto_node_in_in_a_ready = bar_auto_in_a_ready;
   assign auto_node_in_in_d_valid = bar_auto_in_d_valid;
-  assign auto_node_in_in_d_bits_denied = bar_auto_in_d_bits_denied;
   assign auto_node_in_in_d_bits_data = bar_auto_in_d_bits_data;
-  assign auto_node_in_in_d_bits_corrupt = bar_auto_in_d_bits_corrupt;
   assign bar_clock = clock;
   assign bar_reset = reset;
   assign bar_auto_in_a_valid = auto_node_in_in_a_valid;
   assign bar_auto_in_a_bits_opcode = auto_node_in_in_a_bits_opcode;
+  assign bar_auto_in_a_bits_param = auto_node_in_in_a_bits_param;
+  assign bar_auto_in_a_bits_size = auto_node_in_in_a_bits_size;
+  assign bar_auto_in_a_bits_source = auto_node_in_in_a_bits_source;
   assign bar_auto_in_a_bits_address = auto_node_in_in_a_bits_address;
+  assign bar_auto_in_a_bits_mask = auto_node_in_in_a_bits_mask;
   assign bar_auto_in_a_bits_data = auto_node_in_in_a_bits_data;
+  assign bar_auto_in_a_bits_corrupt = auto_node_in_in_a_bits_corrupt;
   assign bar_auto_in_d_ready = auto_node_in_in_d_ready;
   assign bar_auto_out_1_a_ready = auto_node_out_out_a_ready;
   assign bar_auto_out_1_d_valid = auto_node_out_out_d_valid;
   assign bar_auto_out_1_d_bits_opcode = auto_node_out_out_d_bits_opcode;
-  assign bar_auto_out_1_d_bits_denied = auto_node_out_out_d_bits_denied;
   assign bar_auto_out_1_d_bits_data = auto_node_out_out_d_bits_data;
-  assign bar_auto_out_1_d_bits_corrupt = auto_node_out_out_d_bits_corrupt;
   assign bar_auto_out_0_a_ready = error_auto_in_a_ready;
   assign bar_auto_out_0_d_valid = error_auto_in_d_valid;
   assign bar_auto_out_0_d_bits_opcode = error_auto_in_d_bits_opcode;
-  assign bar_auto_out_0_d_bits_denied = error_auto_in_d_bits_denied;
-  assign bar_auto_out_0_d_bits_corrupt = error_auto_in_d_bits_corrupt;
   assign bar_io_bypass = io_bypass;
   assign error_clock = clock;
   assign error_reset = reset;
@@ -26115,11 +26646,21 @@ module AsyncQueueSource(
   output        io_enq_ready,
   input         io_enq_valid,
   input  [2:0]  io_enq_bits_opcode,
+  input  [2:0]  io_enq_bits_param,
+  input  [1:0]  io_enq_bits_size,
+  input         io_enq_bits_source,
   input  [8:0]  io_enq_bits_address,
+  input  [3:0]  io_enq_bits_mask,
   input  [31:0] io_enq_bits_data,
+  input         io_enq_bits_corrupt,
   output [2:0]  io_async_mem_0_opcode,
+  output [2:0]  io_async_mem_0_param,
+  output [1:0]  io_async_mem_0_size,
+  output        io_async_mem_0_source,
   output [8:0]  io_async_mem_0_address,
+  output [3:0]  io_async_mem_0_mask,
   output [31:0] io_async_mem_0_data,
+  output        io_async_mem_0_corrupt,
   input         io_async_ridx,
   output        io_async_widx,
   input         io_async_safe_ridx_valid,
@@ -26148,8 +26689,13 @@ module AsyncQueueSource(
   wire  sink_valid_clock;
   wire  sink_valid_reset;
   reg [2:0] mem_0_opcode;
+  reg [2:0] mem_0_param;
+  reg [1:0] mem_0_size;
+  reg  mem_0_source;
   reg [8:0] mem_0_address;
+  reg [3:0] mem_0_mask;
   reg [31:0] mem_0_data;
+  reg  mem_0_corrupt;
   wire  _widx_T_1 = io_enq_ready & io_enq_valid;
   wire  sink_ready = sink_valid_io_out;
   reg  widx_widx_bin;
@@ -26189,8 +26735,13 @@ module AsyncQueueSource(
   );
   assign io_enq_ready = ready_reg & sink_ready;
   assign io_async_mem_0_opcode = mem_0_opcode;
+  assign io_async_mem_0_param = mem_0_param;
+  assign io_async_mem_0_size = mem_0_size;
+  assign io_async_mem_0_source = mem_0_source;
   assign io_async_mem_0_address = mem_0_address;
+  assign io_async_mem_0_mask = mem_0_mask;
   assign io_async_mem_0_data = mem_0_data;
+  assign io_async_mem_0_corrupt = mem_0_corrupt;
   assign io_async_widx = widx_gray;
   assign io_async_safe_widx_valid = source_valid_1_io_out;
   assign io_async_safe_source_reset_n = ~reset;
@@ -26214,10 +26765,25 @@ module AsyncQueueSource(
       mem_0_opcode <= io_enq_bits_opcode;
     end
     if (io_enq_ready & io_enq_valid) begin
+      mem_0_param <= io_enq_bits_param;
+    end
+    if (io_enq_ready & io_enq_valid) begin
+      mem_0_size <= io_enq_bits_size;
+    end
+    if (io_enq_ready & io_enq_valid) begin
+      mem_0_source <= io_enq_bits_source;
+    end
+    if (io_enq_ready & io_enq_valid) begin
       mem_0_address <= io_enq_bits_address;
     end
     if (io_enq_ready & io_enq_valid) begin
+      mem_0_mask <= io_enq_bits_mask;
+    end
+    if (io_enq_ready & io_enq_valid) begin
       mem_0_data <= io_enq_bits_data;
+    end
+    if (io_enq_ready & io_enq_valid) begin
+      mem_0_corrupt <= io_enq_bits_corrupt;
     end
   end
   always @(posedge clock or posedge reset) begin
@@ -26266,9 +26832,7 @@ module AsyncQueueSink(
   input         io_deq_ready,
   output        io_deq_valid,
   output [2:0]  io_deq_bits_opcode,
-  output        io_deq_bits_denied,
   output [31:0] io_deq_bits_data,
-  output        io_deq_bits_corrupt,
   input  [2:0]  io_async_mem_0_opcode,
   input  [1:0]  io_async_mem_0_size,
   input         io_async_mem_0_source,
@@ -26352,9 +26916,7 @@ module AsyncQueueSink(
   );
   assign io_deq_valid = valid_reg & source_ready;
   assign io_deq_bits_opcode = _io_deq_bits_WIRE_1[42:40];
-  assign io_deq_bits_denied = _io_deq_bits_WIRE_1[33];
   assign io_deq_bits_data = _io_deq_bits_WIRE_1[32:1];
-  assign io_deq_bits_corrupt = _io_deq_bits_WIRE_1[0];
   assign io_async_ridx = ridx_gray;
   assign io_async_safe_ridx_valid = sink_valid_1_io_out;
   assign io_async_safe_sink_reset_n = ~reset;
@@ -26408,17 +26970,25 @@ module TLAsyncCrossingSource(
   output        auto_in_a_ready,
   input         auto_in_a_valid,
   input  [2:0]  auto_in_a_bits_opcode,
+  input  [2:0]  auto_in_a_bits_param,
+  input  [1:0]  auto_in_a_bits_size,
+  input         auto_in_a_bits_source,
   input  [8:0]  auto_in_a_bits_address,
+  input  [3:0]  auto_in_a_bits_mask,
   input  [31:0] auto_in_a_bits_data,
+  input         auto_in_a_bits_corrupt,
   input         auto_in_d_ready,
   output        auto_in_d_valid,
   output [2:0]  auto_in_d_bits_opcode,
-  output        auto_in_d_bits_denied,
   output [31:0] auto_in_d_bits_data,
-  output        auto_in_d_bits_corrupt,
   output [2:0]  auto_out_a_mem_0_opcode,
+  output [2:0]  auto_out_a_mem_0_param,
+  output [1:0]  auto_out_a_mem_0_size,
+  output        auto_out_a_mem_0_source,
   output [8:0]  auto_out_a_mem_0_address,
+  output [3:0]  auto_out_a_mem_0_mask,
   output [31:0] auto_out_a_mem_0_data,
+  output        auto_out_a_mem_0_corrupt,
   input         auto_out_a_ridx,
   output        auto_out_a_widx,
   input         auto_out_a_safe_ridx_valid,
@@ -26441,11 +27011,21 @@ module TLAsyncCrossingSource(
   wire  bundleOut_0_a_source_io_enq_ready;
   wire  bundleOut_0_a_source_io_enq_valid;
   wire [2:0] bundleOut_0_a_source_io_enq_bits_opcode;
+  wire [2:0] bundleOut_0_a_source_io_enq_bits_param;
+  wire [1:0] bundleOut_0_a_source_io_enq_bits_size;
+  wire  bundleOut_0_a_source_io_enq_bits_source;
   wire [8:0] bundleOut_0_a_source_io_enq_bits_address;
+  wire [3:0] bundleOut_0_a_source_io_enq_bits_mask;
   wire [31:0] bundleOut_0_a_source_io_enq_bits_data;
+  wire  bundleOut_0_a_source_io_enq_bits_corrupt;
   wire [2:0] bundleOut_0_a_source_io_async_mem_0_opcode;
+  wire [2:0] bundleOut_0_a_source_io_async_mem_0_param;
+  wire [1:0] bundleOut_0_a_source_io_async_mem_0_size;
+  wire  bundleOut_0_a_source_io_async_mem_0_source;
   wire [8:0] bundleOut_0_a_source_io_async_mem_0_address;
+  wire [3:0] bundleOut_0_a_source_io_async_mem_0_mask;
   wire [31:0] bundleOut_0_a_source_io_async_mem_0_data;
+  wire  bundleOut_0_a_source_io_async_mem_0_corrupt;
   wire  bundleOut_0_a_source_io_async_ridx;
   wire  bundleOut_0_a_source_io_async_widx;
   wire  bundleOut_0_a_source_io_async_safe_ridx_valid;
@@ -26457,9 +27037,7 @@ module TLAsyncCrossingSource(
   wire  bundleIn_0_d_sink_io_deq_ready;
   wire  bundleIn_0_d_sink_io_deq_valid;
   wire [2:0] bundleIn_0_d_sink_io_deq_bits_opcode;
-  wire  bundleIn_0_d_sink_io_deq_bits_denied;
   wire [31:0] bundleIn_0_d_sink_io_deq_bits_data;
-  wire  bundleIn_0_d_sink_io_deq_bits_corrupt;
   wire [2:0] bundleIn_0_d_sink_io_async_mem_0_opcode;
   wire [1:0] bundleIn_0_d_sink_io_async_mem_0_size;
   wire  bundleIn_0_d_sink_io_async_mem_0_source;
@@ -26476,11 +27054,21 @@ module TLAsyncCrossingSource(
     .io_enq_ready(bundleOut_0_a_source_io_enq_ready),
     .io_enq_valid(bundleOut_0_a_source_io_enq_valid),
     .io_enq_bits_opcode(bundleOut_0_a_source_io_enq_bits_opcode),
+    .io_enq_bits_param(bundleOut_0_a_source_io_enq_bits_param),
+    .io_enq_bits_size(bundleOut_0_a_source_io_enq_bits_size),
+    .io_enq_bits_source(bundleOut_0_a_source_io_enq_bits_source),
     .io_enq_bits_address(bundleOut_0_a_source_io_enq_bits_address),
+    .io_enq_bits_mask(bundleOut_0_a_source_io_enq_bits_mask),
     .io_enq_bits_data(bundleOut_0_a_source_io_enq_bits_data),
+    .io_enq_bits_corrupt(bundleOut_0_a_source_io_enq_bits_corrupt),
     .io_async_mem_0_opcode(bundleOut_0_a_source_io_async_mem_0_opcode),
+    .io_async_mem_0_param(bundleOut_0_a_source_io_async_mem_0_param),
+    .io_async_mem_0_size(bundleOut_0_a_source_io_async_mem_0_size),
+    .io_async_mem_0_source(bundleOut_0_a_source_io_async_mem_0_source),
     .io_async_mem_0_address(bundleOut_0_a_source_io_async_mem_0_address),
+    .io_async_mem_0_mask(bundleOut_0_a_source_io_async_mem_0_mask),
     .io_async_mem_0_data(bundleOut_0_a_source_io_async_mem_0_data),
+    .io_async_mem_0_corrupt(bundleOut_0_a_source_io_async_mem_0_corrupt),
     .io_async_ridx(bundleOut_0_a_source_io_async_ridx),
     .io_async_widx(bundleOut_0_a_source_io_async_widx),
     .io_async_safe_ridx_valid(bundleOut_0_a_source_io_async_safe_ridx_valid),
@@ -26494,9 +27082,7 @@ module TLAsyncCrossingSource(
     .io_deq_ready(bundleIn_0_d_sink_io_deq_ready),
     .io_deq_valid(bundleIn_0_d_sink_io_deq_valid),
     .io_deq_bits_opcode(bundleIn_0_d_sink_io_deq_bits_opcode),
-    .io_deq_bits_denied(bundleIn_0_d_sink_io_deq_bits_denied),
     .io_deq_bits_data(bundleIn_0_d_sink_io_deq_bits_data),
-    .io_deq_bits_corrupt(bundleIn_0_d_sink_io_deq_bits_corrupt),
     .io_async_mem_0_opcode(bundleIn_0_d_sink_io_async_mem_0_opcode),
     .io_async_mem_0_size(bundleIn_0_d_sink_io_async_mem_0_size),
     .io_async_mem_0_source(bundleIn_0_d_sink_io_async_mem_0_source),
@@ -26511,12 +27097,15 @@ module TLAsyncCrossingSource(
   assign auto_in_a_ready = bundleOut_0_a_source_io_enq_ready;
   assign auto_in_d_valid = bundleIn_0_d_sink_io_deq_valid;
   assign auto_in_d_bits_opcode = bundleIn_0_d_sink_io_deq_bits_opcode;
-  assign auto_in_d_bits_denied = bundleIn_0_d_sink_io_deq_bits_denied;
   assign auto_in_d_bits_data = bundleIn_0_d_sink_io_deq_bits_data;
-  assign auto_in_d_bits_corrupt = bundleIn_0_d_sink_io_deq_bits_corrupt;
   assign auto_out_a_mem_0_opcode = bundleOut_0_a_source_io_async_mem_0_opcode;
+  assign auto_out_a_mem_0_param = bundleOut_0_a_source_io_async_mem_0_param;
+  assign auto_out_a_mem_0_size = bundleOut_0_a_source_io_async_mem_0_size;
+  assign auto_out_a_mem_0_source = bundleOut_0_a_source_io_async_mem_0_source;
   assign auto_out_a_mem_0_address = bundleOut_0_a_source_io_async_mem_0_address;
+  assign auto_out_a_mem_0_mask = bundleOut_0_a_source_io_async_mem_0_mask;
   assign auto_out_a_mem_0_data = bundleOut_0_a_source_io_async_mem_0_data;
+  assign auto_out_a_mem_0_corrupt = bundleOut_0_a_source_io_async_mem_0_corrupt;
   assign auto_out_a_widx = bundleOut_0_a_source_io_async_widx;
   assign auto_out_a_safe_widx_valid = bundleOut_0_a_source_io_async_safe_widx_valid;
   assign auto_out_a_safe_source_reset_n = bundleOut_0_a_source_io_async_safe_source_reset_n;
@@ -26527,8 +27116,13 @@ module TLAsyncCrossingSource(
   assign bundleOut_0_a_source_reset = reset;
   assign bundleOut_0_a_source_io_enq_valid = auto_in_a_valid;
   assign bundleOut_0_a_source_io_enq_bits_opcode = auto_in_a_bits_opcode;
+  assign bundleOut_0_a_source_io_enq_bits_param = auto_in_a_bits_param;
+  assign bundleOut_0_a_source_io_enq_bits_size = auto_in_a_bits_size;
+  assign bundleOut_0_a_source_io_enq_bits_source = auto_in_a_bits_source;
   assign bundleOut_0_a_source_io_enq_bits_address = auto_in_a_bits_address;
+  assign bundleOut_0_a_source_io_enq_bits_mask = auto_in_a_bits_mask;
   assign bundleOut_0_a_source_io_enq_bits_data = auto_in_a_bits_data;
+  assign bundleOut_0_a_source_io_enq_bits_corrupt = auto_in_a_bits_corrupt;
   assign bundleOut_0_a_source_io_async_ridx = auto_out_a_ridx;
   assign bundleOut_0_a_source_io_async_safe_ridx_valid = auto_out_a_safe_ridx_valid;
   assign bundleOut_0_a_source_io_async_safe_sink_reset_n = auto_out_a_safe_sink_reset_n;
@@ -26682,8 +27276,13 @@ module AsyncQueueSource_1(
 endmodule
 module TLDebugModuleOuterAsync(
   output [2:0]  auto_asource_out_a_mem_0_opcode,
+  output [2:0]  auto_asource_out_a_mem_0_param,
+  output [1:0]  auto_asource_out_a_mem_0_size,
+  output        auto_asource_out_a_mem_0_source,
   output [8:0]  auto_asource_out_a_mem_0_address,
+  output [3:0]  auto_asource_out_a_mem_0_mask,
   output [31:0] auto_asource_out_a_mem_0_data,
+  output        auto_asource_out_a_mem_0_corrupt,
   input         auto_asource_out_a_ridx,
   output        auto_asource_out_a_widx,
   input         auto_asource_out_a_safe_ridx_valid,
@@ -26701,17 +27300,15 @@ module TLDebugModuleOuterAsync(
   input         auto_asource_out_d_safe_source_reset_n,
   output        auto_asource_out_d_safe_sink_reset_n,
   output        auto_intsource_out_sync_0,
+  input         auto_apbXbar_in_psel,
+  input         auto_apbXbar_in_penable,
+  input         auto_apbXbar_in_pwrite,
+  input  [11:0] auto_apbXbar_in_paddr,
+  input  [31:0] auto_apbXbar_in_pwdata,
+  output        auto_apbXbar_in_pready,
+  output [31:0] auto_apbXbar_in_prdata,
   input         io_dmi_clock,
   input         io_dmi_reset,
-  output        io_dmi_req_ready,
-  input         io_dmi_req_valid,
-  input  [6:0]  io_dmi_req_bits_addr,
-  input  [31:0] io_dmi_req_bits_data,
-  input  [1:0]  io_dmi_req_bits_op,
-  input         io_dmi_resp_ready,
-  output        io_dmi_resp_valid,
-  output [31:0] io_dmi_resp_bits_data,
-  output [1:0]  io_dmi_resp_bits_resp,
   output        io_ctrl_ndreset,
   output        io_ctrl_dmactive,
   input         io_ctrl_dmactiveAck,
@@ -26731,56 +27328,109 @@ module TLDebugModuleOuterAsync(
   wire  dmiXbar_auto_in_a_ready;
   wire  dmiXbar_auto_in_a_valid;
   wire [2:0] dmiXbar_auto_in_a_bits_opcode;
-  wire [8:0] dmiXbar_auto_in_a_bits_address;
+  wire [2:0] dmiXbar_auto_in_a_bits_param;
+  wire [1:0] dmiXbar_auto_in_a_bits_size;
+  wire  dmiXbar_auto_in_a_bits_source;
+  wire [11:0] dmiXbar_auto_in_a_bits_address;
+  wire [3:0] dmiXbar_auto_in_a_bits_mask;
   wire [31:0] dmiXbar_auto_in_a_bits_data;
-  wire  dmiXbar_auto_in_d_ready;
+  wire  dmiXbar_auto_in_a_bits_corrupt;
   wire  dmiXbar_auto_in_d_valid;
-  wire  dmiXbar_auto_in_d_bits_denied;
   wire [31:0] dmiXbar_auto_in_d_bits_data;
-  wire  dmiXbar_auto_in_d_bits_corrupt;
+  wire  dmiXbar_auto_out_2_a_ready;
+  wire  dmiXbar_auto_out_2_a_valid;
+  wire [2:0] dmiXbar_auto_out_2_a_bits_opcode;
+  wire [6:0] dmiXbar_auto_out_2_a_bits_address;
+  wire [3:0] dmiXbar_auto_out_2_a_bits_mask;
+  wire [31:0] dmiXbar_auto_out_2_a_bits_data;
+  wire  dmiXbar_auto_out_2_d_ready;
+  wire  dmiXbar_auto_out_2_d_valid;
+  wire [31:0] dmiXbar_auto_out_2_d_bits_data;
   wire  dmiXbar_auto_out_1_a_ready;
   wire  dmiXbar_auto_out_1_a_valid;
   wire [2:0] dmiXbar_auto_out_1_a_bits_opcode;
-  wire [6:0] dmiXbar_auto_out_1_a_bits_address;
+  wire [2:0] dmiXbar_auto_out_1_a_bits_param;
+  wire [1:0] dmiXbar_auto_out_1_a_bits_size;
+  wire  dmiXbar_auto_out_1_a_bits_source;
+  wire [8:0] dmiXbar_auto_out_1_a_bits_address;
+  wire [3:0] dmiXbar_auto_out_1_a_bits_mask;
   wire [31:0] dmiXbar_auto_out_1_a_bits_data;
+  wire  dmiXbar_auto_out_1_a_bits_corrupt;
   wire  dmiXbar_auto_out_1_d_ready;
   wire  dmiXbar_auto_out_1_d_valid;
   wire [31:0] dmiXbar_auto_out_1_d_bits_data;
   wire  dmiXbar_auto_out_0_a_ready;
   wire  dmiXbar_auto_out_0_a_valid;
-  wire [2:0] dmiXbar_auto_out_0_a_bits_opcode;
-  wire [8:0] dmiXbar_auto_out_0_a_bits_address;
-  wire [31:0] dmiXbar_auto_out_0_a_bits_data;
   wire  dmiXbar_auto_out_0_d_ready;
   wire  dmiXbar_auto_out_0_d_valid;
-  wire  dmiXbar_auto_out_0_d_bits_denied;
-  wire [31:0] dmiXbar_auto_out_0_d_bits_data;
-  wire  dmiXbar_auto_out_0_d_bits_corrupt;
-  wire  dmi2tl_auto_out_a_ready;
-  wire  dmi2tl_auto_out_a_valid;
-  wire [2:0] dmi2tl_auto_out_a_bits_opcode;
-  wire [8:0] dmi2tl_auto_out_a_bits_address;
-  wire [31:0] dmi2tl_auto_out_a_bits_data;
-  wire  dmi2tl_auto_out_d_ready;
-  wire  dmi2tl_auto_out_d_valid;
-  wire  dmi2tl_auto_out_d_bits_denied;
-  wire [31:0] dmi2tl_auto_out_d_bits_data;
-  wire  dmi2tl_auto_out_d_bits_corrupt;
-  wire  dmi2tl_io_dmi_req_ready;
-  wire  dmi2tl_io_dmi_req_valid;
-  wire [6:0] dmi2tl_io_dmi_req_bits_addr;
-  wire [31:0] dmi2tl_io_dmi_req_bits_data;
-  wire [1:0] dmi2tl_io_dmi_req_bits_op;
-  wire  dmi2tl_io_dmi_resp_ready;
-  wire  dmi2tl_io_dmi_resp_valid;
-  wire [31:0] dmi2tl_io_dmi_resp_bits_data;
-  wire [1:0] dmi2tl_io_dmi_resp_bits_resp;
+  wire  apb2tl_clock;
+  wire  apb2tl_reset;
+  wire  apb2tl_auto_in_psel;
+  wire  apb2tl_auto_in_pwrite;
+  wire [11:0] apb2tl_auto_in_paddr;
+  wire [31:0] apb2tl_auto_in_pwdata;
+  wire  apb2tl_auto_in_pready;
+  wire [31:0] apb2tl_auto_in_prdata;
+  wire  apb2tl_auto_out_a_ready;
+  wire  apb2tl_auto_out_a_valid;
+  wire [2:0] apb2tl_auto_out_a_bits_opcode;
+  wire [11:0] apb2tl_auto_out_a_bits_address;
+  wire [31:0] apb2tl_auto_out_a_bits_data;
+  wire  apb2tl_auto_out_d_valid;
+  wire [31:0] apb2tl_auto_out_d_bits_data;
+  wire  apb2tlBuffer_clock;
+  wire  apb2tlBuffer_reset;
+  wire  apb2tlBuffer_auto_in_a_ready;
+  wire  apb2tlBuffer_auto_in_a_valid;
+  wire [2:0] apb2tlBuffer_auto_in_a_bits_opcode;
+  wire [11:0] apb2tlBuffer_auto_in_a_bits_address;
+  wire [31:0] apb2tlBuffer_auto_in_a_bits_data;
+  wire  apb2tlBuffer_auto_in_d_valid;
+  wire [31:0] apb2tlBuffer_auto_in_d_bits_data;
+  wire  apb2tlBuffer_auto_out_a_ready;
+  wire  apb2tlBuffer_auto_out_a_valid;
+  wire [2:0] apb2tlBuffer_auto_out_a_bits_opcode;
+  wire [2:0] apb2tlBuffer_auto_out_a_bits_param;
+  wire [1:0] apb2tlBuffer_auto_out_a_bits_size;
+  wire  apb2tlBuffer_auto_out_a_bits_source;
+  wire [11:0] apb2tlBuffer_auto_out_a_bits_address;
+  wire [3:0] apb2tlBuffer_auto_out_a_bits_mask;
+  wire [31:0] apb2tlBuffer_auto_out_a_bits_data;
+  wire  apb2tlBuffer_auto_out_a_bits_corrupt;
+  wire  apb2tlBuffer_auto_out_d_valid;
+  wire [31:0] apb2tlBuffer_auto_out_d_bits_data;
+  wire  tlError_auto_in_a_ready;
+  wire  tlError_auto_in_a_valid;
+  wire  tlError_auto_in_d_ready;
+  wire  tlError_auto_in_d_valid;
+  wire  apbXbar_auto_in_psel;
+  wire  apbXbar_auto_in_penable;
+  wire  apbXbar_auto_in_pwrite;
+  wire [11:0] apbXbar_auto_in_paddr;
+  wire [31:0] apbXbar_auto_in_pwdata;
+  wire  apbXbar_auto_in_pready;
+  wire [31:0] apbXbar_auto_in_prdata;
+  wire  apbXbar_auto_out_1_psel;
+  wire  apbXbar_auto_out_1_pwrite;
+  wire [11:0] apbXbar_auto_out_1_paddr;
+  wire [31:0] apbXbar_auto_out_1_pwdata;
+  wire  apbXbar_auto_out_1_pready;
+  wire [31:0] apbXbar_auto_out_1_prdata;
+  wire  apbXbar_auto_out_0_psel;
+  wire  apbXbar_auto_out_0_penable;
+  wire  apbXbar_auto_out_0_pready;
+  wire  apbRegs_clock;
+  wire  apbRegs_reset;
+  wire  apbRegs_auto_in_psel;
+  wire  apbRegs_auto_in_penable;
+  wire  apbRegs_auto_in_pready;
   wire  dmOuter_clock;
   wire  dmOuter_reset;
   wire  dmOuter_auto_dmi_in_a_ready;
   wire  dmOuter_auto_dmi_in_a_valid;
   wire [2:0] dmOuter_auto_dmi_in_a_bits_opcode;
   wire [6:0] dmOuter_auto_dmi_in_a_bits_address;
+  wire [3:0] dmOuter_auto_dmi_in_a_bits_mask;
   wire [31:0] dmOuter_auto_dmi_in_a_bits_data;
   wire  dmOuter_auto_dmi_in_d_ready;
   wire  dmOuter_auto_dmi_in_d_valid;
@@ -26803,41 +27453,55 @@ module TLDebugModuleOuterAsync(
   wire  dmiBypass_auto_node_out_out_a_ready;
   wire  dmiBypass_auto_node_out_out_a_valid;
   wire [2:0] dmiBypass_auto_node_out_out_a_bits_opcode;
+  wire [2:0] dmiBypass_auto_node_out_out_a_bits_param;
+  wire [1:0] dmiBypass_auto_node_out_out_a_bits_size;
+  wire  dmiBypass_auto_node_out_out_a_bits_source;
   wire [8:0] dmiBypass_auto_node_out_out_a_bits_address;
+  wire [3:0] dmiBypass_auto_node_out_out_a_bits_mask;
   wire [31:0] dmiBypass_auto_node_out_out_a_bits_data;
+  wire  dmiBypass_auto_node_out_out_a_bits_corrupt;
   wire  dmiBypass_auto_node_out_out_d_ready;
   wire  dmiBypass_auto_node_out_out_d_valid;
   wire [2:0] dmiBypass_auto_node_out_out_d_bits_opcode;
-  wire  dmiBypass_auto_node_out_out_d_bits_denied;
   wire [31:0] dmiBypass_auto_node_out_out_d_bits_data;
-  wire  dmiBypass_auto_node_out_out_d_bits_corrupt;
   wire  dmiBypass_auto_node_in_in_a_ready;
   wire  dmiBypass_auto_node_in_in_a_valid;
   wire [2:0] dmiBypass_auto_node_in_in_a_bits_opcode;
+  wire [2:0] dmiBypass_auto_node_in_in_a_bits_param;
+  wire [1:0] dmiBypass_auto_node_in_in_a_bits_size;
+  wire  dmiBypass_auto_node_in_in_a_bits_source;
   wire [8:0] dmiBypass_auto_node_in_in_a_bits_address;
+  wire [3:0] dmiBypass_auto_node_in_in_a_bits_mask;
   wire [31:0] dmiBypass_auto_node_in_in_a_bits_data;
+  wire  dmiBypass_auto_node_in_in_a_bits_corrupt;
   wire  dmiBypass_auto_node_in_in_d_ready;
   wire  dmiBypass_auto_node_in_in_d_valid;
-  wire  dmiBypass_auto_node_in_in_d_bits_denied;
   wire [31:0] dmiBypass_auto_node_in_in_d_bits_data;
-  wire  dmiBypass_auto_node_in_in_d_bits_corrupt;
   wire  dmiBypass_io_bypass;
   wire  asource_clock;
   wire  asource_reset;
   wire  asource_auto_in_a_ready;
   wire  asource_auto_in_a_valid;
   wire [2:0] asource_auto_in_a_bits_opcode;
+  wire [2:0] asource_auto_in_a_bits_param;
+  wire [1:0] asource_auto_in_a_bits_size;
+  wire  asource_auto_in_a_bits_source;
   wire [8:0] asource_auto_in_a_bits_address;
+  wire [3:0] asource_auto_in_a_bits_mask;
   wire [31:0] asource_auto_in_a_bits_data;
+  wire  asource_auto_in_a_bits_corrupt;
   wire  asource_auto_in_d_ready;
   wire  asource_auto_in_d_valid;
   wire [2:0] asource_auto_in_d_bits_opcode;
-  wire  asource_auto_in_d_bits_denied;
   wire [31:0] asource_auto_in_d_bits_data;
-  wire  asource_auto_in_d_bits_corrupt;
   wire [2:0] asource_auto_out_a_mem_0_opcode;
+  wire [2:0] asource_auto_out_a_mem_0_param;
+  wire [1:0] asource_auto_out_a_mem_0_size;
+  wire  asource_auto_out_a_mem_0_source;
   wire [8:0] asource_auto_out_a_mem_0_address;
+  wire [3:0] asource_auto_out_a_mem_0_mask;
   wire [31:0] asource_auto_out_a_mem_0_data;
+  wire  asource_auto_out_a_mem_0_corrupt;
   wire  asource_auto_out_a_ridx;
   wire  asource_auto_out_a_widx;
   wire  asource_auto_out_a_safe_ridx_valid;
@@ -26881,52 +27545,112 @@ module TLDebugModuleOuterAsync(
     .auto_in_a_ready(dmiXbar_auto_in_a_ready),
     .auto_in_a_valid(dmiXbar_auto_in_a_valid),
     .auto_in_a_bits_opcode(dmiXbar_auto_in_a_bits_opcode),
+    .auto_in_a_bits_param(dmiXbar_auto_in_a_bits_param),
+    .auto_in_a_bits_size(dmiXbar_auto_in_a_bits_size),
+    .auto_in_a_bits_source(dmiXbar_auto_in_a_bits_source),
     .auto_in_a_bits_address(dmiXbar_auto_in_a_bits_address),
+    .auto_in_a_bits_mask(dmiXbar_auto_in_a_bits_mask),
     .auto_in_a_bits_data(dmiXbar_auto_in_a_bits_data),
-    .auto_in_d_ready(dmiXbar_auto_in_d_ready),
+    .auto_in_a_bits_corrupt(dmiXbar_auto_in_a_bits_corrupt),
     .auto_in_d_valid(dmiXbar_auto_in_d_valid),
-    .auto_in_d_bits_denied(dmiXbar_auto_in_d_bits_denied),
     .auto_in_d_bits_data(dmiXbar_auto_in_d_bits_data),
-    .auto_in_d_bits_corrupt(dmiXbar_auto_in_d_bits_corrupt),
+    .auto_out_2_a_ready(dmiXbar_auto_out_2_a_ready),
+    .auto_out_2_a_valid(dmiXbar_auto_out_2_a_valid),
+    .auto_out_2_a_bits_opcode(dmiXbar_auto_out_2_a_bits_opcode),
+    .auto_out_2_a_bits_address(dmiXbar_auto_out_2_a_bits_address),
+    .auto_out_2_a_bits_mask(dmiXbar_auto_out_2_a_bits_mask),
+    .auto_out_2_a_bits_data(dmiXbar_auto_out_2_a_bits_data),
+    .auto_out_2_d_ready(dmiXbar_auto_out_2_d_ready),
+    .auto_out_2_d_valid(dmiXbar_auto_out_2_d_valid),
+    .auto_out_2_d_bits_data(dmiXbar_auto_out_2_d_bits_data),
     .auto_out_1_a_ready(dmiXbar_auto_out_1_a_ready),
     .auto_out_1_a_valid(dmiXbar_auto_out_1_a_valid),
     .auto_out_1_a_bits_opcode(dmiXbar_auto_out_1_a_bits_opcode),
+    .auto_out_1_a_bits_param(dmiXbar_auto_out_1_a_bits_param),
+    .auto_out_1_a_bits_size(dmiXbar_auto_out_1_a_bits_size),
+    .auto_out_1_a_bits_source(dmiXbar_auto_out_1_a_bits_source),
     .auto_out_1_a_bits_address(dmiXbar_auto_out_1_a_bits_address),
+    .auto_out_1_a_bits_mask(dmiXbar_auto_out_1_a_bits_mask),
     .auto_out_1_a_bits_data(dmiXbar_auto_out_1_a_bits_data),
+    .auto_out_1_a_bits_corrupt(dmiXbar_auto_out_1_a_bits_corrupt),
     .auto_out_1_d_ready(dmiXbar_auto_out_1_d_ready),
     .auto_out_1_d_valid(dmiXbar_auto_out_1_d_valid),
     .auto_out_1_d_bits_data(dmiXbar_auto_out_1_d_bits_data),
     .auto_out_0_a_ready(dmiXbar_auto_out_0_a_ready),
     .auto_out_0_a_valid(dmiXbar_auto_out_0_a_valid),
-    .auto_out_0_a_bits_opcode(dmiXbar_auto_out_0_a_bits_opcode),
-    .auto_out_0_a_bits_address(dmiXbar_auto_out_0_a_bits_address),
-    .auto_out_0_a_bits_data(dmiXbar_auto_out_0_a_bits_data),
     .auto_out_0_d_ready(dmiXbar_auto_out_0_d_ready),
-    .auto_out_0_d_valid(dmiXbar_auto_out_0_d_valid),
-    .auto_out_0_d_bits_denied(dmiXbar_auto_out_0_d_bits_denied),
-    .auto_out_0_d_bits_data(dmiXbar_auto_out_0_d_bits_data),
-    .auto_out_0_d_bits_corrupt(dmiXbar_auto_out_0_d_bits_corrupt)
+    .auto_out_0_d_valid(dmiXbar_auto_out_0_d_valid)
   );
-  DMIToTL dmi2tl (
-    .auto_out_a_ready(dmi2tl_auto_out_a_ready),
-    .auto_out_a_valid(dmi2tl_auto_out_a_valid),
-    .auto_out_a_bits_opcode(dmi2tl_auto_out_a_bits_opcode),
-    .auto_out_a_bits_address(dmi2tl_auto_out_a_bits_address),
-    .auto_out_a_bits_data(dmi2tl_auto_out_a_bits_data),
-    .auto_out_d_ready(dmi2tl_auto_out_d_ready),
-    .auto_out_d_valid(dmi2tl_auto_out_d_valid),
-    .auto_out_d_bits_denied(dmi2tl_auto_out_d_bits_denied),
-    .auto_out_d_bits_data(dmi2tl_auto_out_d_bits_data),
-    .auto_out_d_bits_corrupt(dmi2tl_auto_out_d_bits_corrupt),
-    .io_dmi_req_ready(dmi2tl_io_dmi_req_ready),
-    .io_dmi_req_valid(dmi2tl_io_dmi_req_valid),
-    .io_dmi_req_bits_addr(dmi2tl_io_dmi_req_bits_addr),
-    .io_dmi_req_bits_data(dmi2tl_io_dmi_req_bits_data),
-    .io_dmi_req_bits_op(dmi2tl_io_dmi_req_bits_op),
-    .io_dmi_resp_ready(dmi2tl_io_dmi_resp_ready),
-    .io_dmi_resp_valid(dmi2tl_io_dmi_resp_valid),
-    .io_dmi_resp_bits_data(dmi2tl_io_dmi_resp_bits_data),
-    .io_dmi_resp_bits_resp(dmi2tl_io_dmi_resp_bits_resp)
+  APBToTL apb2tl (
+    .clock(apb2tl_clock),
+    .reset(apb2tl_reset),
+    .auto_in_psel(apb2tl_auto_in_psel),
+    .auto_in_pwrite(apb2tl_auto_in_pwrite),
+    .auto_in_paddr(apb2tl_auto_in_paddr),
+    .auto_in_pwdata(apb2tl_auto_in_pwdata),
+    .auto_in_pready(apb2tl_auto_in_pready),
+    .auto_in_prdata(apb2tl_auto_in_prdata),
+    .auto_out_a_ready(apb2tl_auto_out_a_ready),
+    .auto_out_a_valid(apb2tl_auto_out_a_valid),
+    .auto_out_a_bits_opcode(apb2tl_auto_out_a_bits_opcode),
+    .auto_out_a_bits_address(apb2tl_auto_out_a_bits_address),
+    .auto_out_a_bits_data(apb2tl_auto_out_a_bits_data),
+    .auto_out_d_valid(apb2tl_auto_out_d_valid),
+    .auto_out_d_bits_data(apb2tl_auto_out_d_bits_data)
+  );
+  TLBuffer_7 apb2tlBuffer (
+    .clock(apb2tlBuffer_clock),
+    .reset(apb2tlBuffer_reset),
+    .auto_in_a_ready(apb2tlBuffer_auto_in_a_ready),
+    .auto_in_a_valid(apb2tlBuffer_auto_in_a_valid),
+    .auto_in_a_bits_opcode(apb2tlBuffer_auto_in_a_bits_opcode),
+    .auto_in_a_bits_address(apb2tlBuffer_auto_in_a_bits_address),
+    .auto_in_a_bits_data(apb2tlBuffer_auto_in_a_bits_data),
+    .auto_in_d_valid(apb2tlBuffer_auto_in_d_valid),
+    .auto_in_d_bits_data(apb2tlBuffer_auto_in_d_bits_data),
+    .auto_out_a_ready(apb2tlBuffer_auto_out_a_ready),
+    .auto_out_a_valid(apb2tlBuffer_auto_out_a_valid),
+    .auto_out_a_bits_opcode(apb2tlBuffer_auto_out_a_bits_opcode),
+    .auto_out_a_bits_param(apb2tlBuffer_auto_out_a_bits_param),
+    .auto_out_a_bits_size(apb2tlBuffer_auto_out_a_bits_size),
+    .auto_out_a_bits_source(apb2tlBuffer_auto_out_a_bits_source),
+    .auto_out_a_bits_address(apb2tlBuffer_auto_out_a_bits_address),
+    .auto_out_a_bits_mask(apb2tlBuffer_auto_out_a_bits_mask),
+    .auto_out_a_bits_data(apb2tlBuffer_auto_out_a_bits_data),
+    .auto_out_a_bits_corrupt(apb2tlBuffer_auto_out_a_bits_corrupt),
+    .auto_out_d_valid(apb2tlBuffer_auto_out_d_valid),
+    .auto_out_d_bits_data(apb2tlBuffer_auto_out_d_bits_data)
+  );
+  TLError_1 tlError (
+    .auto_in_a_ready(tlError_auto_in_a_ready),
+    .auto_in_a_valid(tlError_auto_in_a_valid),
+    .auto_in_d_ready(tlError_auto_in_d_ready),
+    .auto_in_d_valid(tlError_auto_in_d_valid)
+  );
+  APBFanout apbXbar (
+    .auto_in_psel(apbXbar_auto_in_psel),
+    .auto_in_penable(apbXbar_auto_in_penable),
+    .auto_in_pwrite(apbXbar_auto_in_pwrite),
+    .auto_in_paddr(apbXbar_auto_in_paddr),
+    .auto_in_pwdata(apbXbar_auto_in_pwdata),
+    .auto_in_pready(apbXbar_auto_in_pready),
+    .auto_in_prdata(apbXbar_auto_in_prdata),
+    .auto_out_1_psel(apbXbar_auto_out_1_psel),
+    .auto_out_1_pwrite(apbXbar_auto_out_1_pwrite),
+    .auto_out_1_paddr(apbXbar_auto_out_1_paddr),
+    .auto_out_1_pwdata(apbXbar_auto_out_1_pwdata),
+    .auto_out_1_pready(apbXbar_auto_out_1_pready),
+    .auto_out_1_prdata(apbXbar_auto_out_1_prdata),
+    .auto_out_0_psel(apbXbar_auto_out_0_psel),
+    .auto_out_0_penable(apbXbar_auto_out_0_penable),
+    .auto_out_0_pready(apbXbar_auto_out_0_pready)
+  );
+  APBDebugRegisters apbRegs (
+    .clock(apbRegs_clock),
+    .reset(apbRegs_reset),
+    .auto_in_psel(apbRegs_auto_in_psel),
+    .auto_in_penable(apbRegs_auto_in_penable),
+    .auto_in_pready(apbRegs_auto_in_pready)
   );
   TLDebugModuleOuter dmOuter (
     .clock(dmOuter_clock),
@@ -26935,6 +27659,7 @@ module TLDebugModuleOuterAsync(
     .auto_dmi_in_a_valid(dmOuter_auto_dmi_in_a_valid),
     .auto_dmi_in_a_bits_opcode(dmOuter_auto_dmi_in_a_bits_opcode),
     .auto_dmi_in_a_bits_address(dmOuter_auto_dmi_in_a_bits_address),
+    .auto_dmi_in_a_bits_mask(dmOuter_auto_dmi_in_a_bits_mask),
     .auto_dmi_in_a_bits_data(dmOuter_auto_dmi_in_a_bits_data),
     .auto_dmi_in_d_ready(dmOuter_auto_dmi_in_d_ready),
     .auto_dmi_in_d_valid(dmOuter_auto_dmi_in_d_valid),
@@ -26961,24 +27686,30 @@ module TLDebugModuleOuterAsync(
     .auto_node_out_out_a_ready(dmiBypass_auto_node_out_out_a_ready),
     .auto_node_out_out_a_valid(dmiBypass_auto_node_out_out_a_valid),
     .auto_node_out_out_a_bits_opcode(dmiBypass_auto_node_out_out_a_bits_opcode),
+    .auto_node_out_out_a_bits_param(dmiBypass_auto_node_out_out_a_bits_param),
+    .auto_node_out_out_a_bits_size(dmiBypass_auto_node_out_out_a_bits_size),
+    .auto_node_out_out_a_bits_source(dmiBypass_auto_node_out_out_a_bits_source),
     .auto_node_out_out_a_bits_address(dmiBypass_auto_node_out_out_a_bits_address),
+    .auto_node_out_out_a_bits_mask(dmiBypass_auto_node_out_out_a_bits_mask),
     .auto_node_out_out_a_bits_data(dmiBypass_auto_node_out_out_a_bits_data),
+    .auto_node_out_out_a_bits_corrupt(dmiBypass_auto_node_out_out_a_bits_corrupt),
     .auto_node_out_out_d_ready(dmiBypass_auto_node_out_out_d_ready),
     .auto_node_out_out_d_valid(dmiBypass_auto_node_out_out_d_valid),
     .auto_node_out_out_d_bits_opcode(dmiBypass_auto_node_out_out_d_bits_opcode),
-    .auto_node_out_out_d_bits_denied(dmiBypass_auto_node_out_out_d_bits_denied),
     .auto_node_out_out_d_bits_data(dmiBypass_auto_node_out_out_d_bits_data),
-    .auto_node_out_out_d_bits_corrupt(dmiBypass_auto_node_out_out_d_bits_corrupt),
     .auto_node_in_in_a_ready(dmiBypass_auto_node_in_in_a_ready),
     .auto_node_in_in_a_valid(dmiBypass_auto_node_in_in_a_valid),
     .auto_node_in_in_a_bits_opcode(dmiBypass_auto_node_in_in_a_bits_opcode),
+    .auto_node_in_in_a_bits_param(dmiBypass_auto_node_in_in_a_bits_param),
+    .auto_node_in_in_a_bits_size(dmiBypass_auto_node_in_in_a_bits_size),
+    .auto_node_in_in_a_bits_source(dmiBypass_auto_node_in_in_a_bits_source),
     .auto_node_in_in_a_bits_address(dmiBypass_auto_node_in_in_a_bits_address),
+    .auto_node_in_in_a_bits_mask(dmiBypass_auto_node_in_in_a_bits_mask),
     .auto_node_in_in_a_bits_data(dmiBypass_auto_node_in_in_a_bits_data),
+    .auto_node_in_in_a_bits_corrupt(dmiBypass_auto_node_in_in_a_bits_corrupt),
     .auto_node_in_in_d_ready(dmiBypass_auto_node_in_in_d_ready),
     .auto_node_in_in_d_valid(dmiBypass_auto_node_in_in_d_valid),
-    .auto_node_in_in_d_bits_denied(dmiBypass_auto_node_in_in_d_bits_denied),
     .auto_node_in_in_d_bits_data(dmiBypass_auto_node_in_in_d_bits_data),
-    .auto_node_in_in_d_bits_corrupt(dmiBypass_auto_node_in_in_d_bits_corrupt),
     .io_bypass(dmiBypass_io_bypass)
   );
   TLAsyncCrossingSource asource (
@@ -26987,17 +27718,25 @@ module TLDebugModuleOuterAsync(
     .auto_in_a_ready(asource_auto_in_a_ready),
     .auto_in_a_valid(asource_auto_in_a_valid),
     .auto_in_a_bits_opcode(asource_auto_in_a_bits_opcode),
+    .auto_in_a_bits_param(asource_auto_in_a_bits_param),
+    .auto_in_a_bits_size(asource_auto_in_a_bits_size),
+    .auto_in_a_bits_source(asource_auto_in_a_bits_source),
     .auto_in_a_bits_address(asource_auto_in_a_bits_address),
+    .auto_in_a_bits_mask(asource_auto_in_a_bits_mask),
     .auto_in_a_bits_data(asource_auto_in_a_bits_data),
+    .auto_in_a_bits_corrupt(asource_auto_in_a_bits_corrupt),
     .auto_in_d_ready(asource_auto_in_d_ready),
     .auto_in_d_valid(asource_auto_in_d_valid),
     .auto_in_d_bits_opcode(asource_auto_in_d_bits_opcode),
-    .auto_in_d_bits_denied(asource_auto_in_d_bits_denied),
     .auto_in_d_bits_data(asource_auto_in_d_bits_data),
-    .auto_in_d_bits_corrupt(asource_auto_in_d_bits_corrupt),
     .auto_out_a_mem_0_opcode(asource_auto_out_a_mem_0_opcode),
+    .auto_out_a_mem_0_param(asource_auto_out_a_mem_0_param),
+    .auto_out_a_mem_0_size(asource_auto_out_a_mem_0_size),
+    .auto_out_a_mem_0_source(asource_auto_out_a_mem_0_source),
     .auto_out_a_mem_0_address(asource_auto_out_a_mem_0_address),
+    .auto_out_a_mem_0_mask(asource_auto_out_a_mem_0_mask),
     .auto_out_a_mem_0_data(asource_auto_out_a_mem_0_data),
+    .auto_out_a_mem_0_corrupt(asource_auto_out_a_mem_0_corrupt),
     .auto_out_a_ridx(asource_auto_out_a_ridx),
     .auto_out_a_widx(asource_auto_out_a_widx),
     .auto_out_a_safe_ridx_valid(asource_auto_out_a_safe_ridx_valid),
@@ -27040,8 +27779,13 @@ module TLDebugModuleOuterAsync(
     .io_async_safe_sink_reset_n(io_innerCtrl_source_io_async_safe_sink_reset_n)
   );
   assign auto_asource_out_a_mem_0_opcode = asource_auto_out_a_mem_0_opcode;
+  assign auto_asource_out_a_mem_0_param = asource_auto_out_a_mem_0_param;
+  assign auto_asource_out_a_mem_0_size = asource_auto_out_a_mem_0_size;
+  assign auto_asource_out_a_mem_0_source = asource_auto_out_a_mem_0_source;
   assign auto_asource_out_a_mem_0_address = asource_auto_out_a_mem_0_address;
+  assign auto_asource_out_a_mem_0_mask = asource_auto_out_a_mem_0_mask;
   assign auto_asource_out_a_mem_0_data = asource_auto_out_a_mem_0_data;
+  assign auto_asource_out_a_mem_0_corrupt = asource_auto_out_a_mem_0_corrupt;
   assign auto_asource_out_a_widx = asource_auto_out_a_widx;
   assign auto_asource_out_a_safe_widx_valid = asource_auto_out_a_safe_widx_valid;
   assign auto_asource_out_a_safe_source_reset_n = asource_auto_out_a_safe_source_reset_n;
@@ -27049,10 +27793,8 @@ module TLDebugModuleOuterAsync(
   assign auto_asource_out_d_safe_ridx_valid = asource_auto_out_d_safe_ridx_valid;
   assign auto_asource_out_d_safe_sink_reset_n = asource_auto_out_d_safe_sink_reset_n;
   assign auto_intsource_out_sync_0 = intsource_auto_out_sync_0;
-  assign io_dmi_req_ready = dmi2tl_io_dmi_req_ready;
-  assign io_dmi_resp_valid = dmi2tl_io_dmi_resp_valid;
-  assign io_dmi_resp_bits_data = dmi2tl_io_dmi_resp_bits_data;
-  assign io_dmi_resp_bits_resp = dmi2tl_io_dmi_resp_bits_resp;
+  assign auto_apbXbar_in_pready = apbXbar_auto_in_pready;
+  assign auto_apbXbar_in_prdata = apbXbar_auto_in_prdata;
   assign io_ctrl_ndreset = dmOuter_io_ctrl_ndreset;
   assign io_ctrl_dmactive = dmOuter_io_ctrl_dmactive;
   assign io_innerCtrl_mem_0_resumereq = io_innerCtrl_source_io_async_mem_0_resumereq;
@@ -27063,36 +27805,63 @@ module TLDebugModuleOuterAsync(
   assign io_innerCtrl_safe_source_reset_n = io_innerCtrl_source_io_async_safe_source_reset_n;
   assign dmiXbar_clock = io_dmi_clock;
   assign dmiXbar_reset = io_dmi_reset;
-  assign dmiXbar_auto_in_a_valid = dmi2tl_auto_out_a_valid;
-  assign dmiXbar_auto_in_a_bits_opcode = dmi2tl_auto_out_a_bits_opcode;
-  assign dmiXbar_auto_in_a_bits_address = dmi2tl_auto_out_a_bits_address;
-  assign dmiXbar_auto_in_a_bits_data = dmi2tl_auto_out_a_bits_data;
-  assign dmiXbar_auto_in_d_ready = dmi2tl_auto_out_d_ready;
-  assign dmiXbar_auto_out_1_a_ready = dmOuter_auto_dmi_in_a_ready;
-  assign dmiXbar_auto_out_1_d_valid = dmOuter_auto_dmi_in_d_valid;
-  assign dmiXbar_auto_out_1_d_bits_data = dmOuter_auto_dmi_in_d_bits_data;
-  assign dmiXbar_auto_out_0_a_ready = dmiBypass_auto_node_in_in_a_ready;
-  assign dmiXbar_auto_out_0_d_valid = dmiBypass_auto_node_in_in_d_valid;
-  assign dmiXbar_auto_out_0_d_bits_denied = dmiBypass_auto_node_in_in_d_bits_denied;
-  assign dmiXbar_auto_out_0_d_bits_data = dmiBypass_auto_node_in_in_d_bits_data;
-  assign dmiXbar_auto_out_0_d_bits_corrupt = dmiBypass_auto_node_in_in_d_bits_corrupt;
-  assign dmi2tl_auto_out_a_ready = dmiXbar_auto_in_a_ready;
-  assign dmi2tl_auto_out_d_valid = dmiXbar_auto_in_d_valid;
-  assign dmi2tl_auto_out_d_bits_denied = dmiXbar_auto_in_d_bits_denied;
-  assign dmi2tl_auto_out_d_bits_data = dmiXbar_auto_in_d_bits_data;
-  assign dmi2tl_auto_out_d_bits_corrupt = dmiXbar_auto_in_d_bits_corrupt;
-  assign dmi2tl_io_dmi_req_valid = io_dmi_req_valid;
-  assign dmi2tl_io_dmi_req_bits_addr = io_dmi_req_bits_addr;
-  assign dmi2tl_io_dmi_req_bits_data = io_dmi_req_bits_data;
-  assign dmi2tl_io_dmi_req_bits_op = io_dmi_req_bits_op;
-  assign dmi2tl_io_dmi_resp_ready = io_dmi_resp_ready;
+  assign dmiXbar_auto_in_a_valid = apb2tlBuffer_auto_out_a_valid;
+  assign dmiXbar_auto_in_a_bits_opcode = apb2tlBuffer_auto_out_a_bits_opcode;
+  assign dmiXbar_auto_in_a_bits_param = apb2tlBuffer_auto_out_a_bits_param;
+  assign dmiXbar_auto_in_a_bits_size = apb2tlBuffer_auto_out_a_bits_size;
+  assign dmiXbar_auto_in_a_bits_source = apb2tlBuffer_auto_out_a_bits_source;
+  assign dmiXbar_auto_in_a_bits_address = apb2tlBuffer_auto_out_a_bits_address;
+  assign dmiXbar_auto_in_a_bits_mask = apb2tlBuffer_auto_out_a_bits_mask;
+  assign dmiXbar_auto_in_a_bits_data = apb2tlBuffer_auto_out_a_bits_data;
+  assign dmiXbar_auto_in_a_bits_corrupt = apb2tlBuffer_auto_out_a_bits_corrupt;
+  assign dmiXbar_auto_out_2_a_ready = dmOuter_auto_dmi_in_a_ready;
+  assign dmiXbar_auto_out_2_d_valid = dmOuter_auto_dmi_in_d_valid;
+  assign dmiXbar_auto_out_2_d_bits_data = dmOuter_auto_dmi_in_d_bits_data;
+  assign dmiXbar_auto_out_1_a_ready = dmiBypass_auto_node_in_in_a_ready;
+  assign dmiXbar_auto_out_1_d_valid = dmiBypass_auto_node_in_in_d_valid;
+  assign dmiXbar_auto_out_1_d_bits_data = dmiBypass_auto_node_in_in_d_bits_data;
+  assign dmiXbar_auto_out_0_a_ready = tlError_auto_in_a_ready;
+  assign dmiXbar_auto_out_0_d_valid = tlError_auto_in_d_valid;
+  assign apb2tl_clock = io_dmi_clock;
+  assign apb2tl_reset = io_dmi_reset;
+  assign apb2tl_auto_in_psel = apbXbar_auto_out_1_psel;
+  assign apb2tl_auto_in_pwrite = apbXbar_auto_out_1_pwrite;
+  assign apb2tl_auto_in_paddr = apbXbar_auto_out_1_paddr;
+  assign apb2tl_auto_in_pwdata = apbXbar_auto_out_1_pwdata;
+  assign apb2tl_auto_out_a_ready = apb2tlBuffer_auto_in_a_ready;
+  assign apb2tl_auto_out_d_valid = apb2tlBuffer_auto_in_d_valid;
+  assign apb2tl_auto_out_d_bits_data = apb2tlBuffer_auto_in_d_bits_data;
+  assign apb2tlBuffer_clock = io_dmi_clock;
+  assign apb2tlBuffer_reset = io_dmi_reset;
+  assign apb2tlBuffer_auto_in_a_valid = apb2tl_auto_out_a_valid;
+  assign apb2tlBuffer_auto_in_a_bits_opcode = apb2tl_auto_out_a_bits_opcode;
+  assign apb2tlBuffer_auto_in_a_bits_address = apb2tl_auto_out_a_bits_address;
+  assign apb2tlBuffer_auto_in_a_bits_data = apb2tl_auto_out_a_bits_data;
+  assign apb2tlBuffer_auto_out_a_ready = dmiXbar_auto_in_a_ready;
+  assign apb2tlBuffer_auto_out_d_valid = dmiXbar_auto_in_d_valid;
+  assign apb2tlBuffer_auto_out_d_bits_data = dmiXbar_auto_in_d_bits_data;
+  assign tlError_auto_in_a_valid = dmiXbar_auto_out_0_a_valid;
+  assign tlError_auto_in_d_ready = dmiXbar_auto_out_0_d_ready;
+  assign apbXbar_auto_in_psel = auto_apbXbar_in_psel;
+  assign apbXbar_auto_in_penable = auto_apbXbar_in_penable;
+  assign apbXbar_auto_in_pwrite = auto_apbXbar_in_pwrite;
+  assign apbXbar_auto_in_paddr = auto_apbXbar_in_paddr;
+  assign apbXbar_auto_in_pwdata = auto_apbXbar_in_pwdata;
+  assign apbXbar_auto_out_1_pready = apb2tl_auto_in_pready;
+  assign apbXbar_auto_out_1_prdata = apb2tl_auto_in_prdata;
+  assign apbXbar_auto_out_0_pready = apbRegs_auto_in_pready;
+  assign apbRegs_clock = io_dmi_clock;
+  assign apbRegs_reset = io_dmi_reset;
+  assign apbRegs_auto_in_psel = apbXbar_auto_out_0_psel;
+  assign apbRegs_auto_in_penable = apbXbar_auto_out_0_penable;
   assign dmOuter_clock = io_dmi_clock;
   assign dmOuter_reset = io_dmi_reset;
-  assign dmOuter_auto_dmi_in_a_valid = dmiXbar_auto_out_1_a_valid;
-  assign dmOuter_auto_dmi_in_a_bits_opcode = dmiXbar_auto_out_1_a_bits_opcode;
-  assign dmOuter_auto_dmi_in_a_bits_address = dmiXbar_auto_out_1_a_bits_address;
-  assign dmOuter_auto_dmi_in_a_bits_data = dmiXbar_auto_out_1_a_bits_data;
-  assign dmOuter_auto_dmi_in_d_ready = dmiXbar_auto_out_1_d_ready;
+  assign dmOuter_auto_dmi_in_a_valid = dmiXbar_auto_out_2_a_valid;
+  assign dmOuter_auto_dmi_in_a_bits_opcode = dmiXbar_auto_out_2_a_bits_opcode;
+  assign dmOuter_auto_dmi_in_a_bits_address = dmiXbar_auto_out_2_a_bits_address;
+  assign dmOuter_auto_dmi_in_a_bits_mask = dmiXbar_auto_out_2_a_bits_mask;
+  assign dmOuter_auto_dmi_in_a_bits_data = dmiXbar_auto_out_2_a_bits_data;
+  assign dmOuter_auto_dmi_in_d_ready = dmiXbar_auto_out_2_d_ready;
   assign dmOuter_io_ctrl_dmactiveAck = dmactiveAck_dmactiveAckSync_io_q;
   assign dmOuter_io_innerCtrl_ready = io_innerCtrl_source_io_enq_ready;
   assign dmOuter_io_hgDebugInt_0 = io_hgDebugInt_0;
@@ -27102,21 +27871,29 @@ module TLDebugModuleOuterAsync(
   assign dmiBypass_auto_node_out_out_a_ready = asource_auto_in_a_ready;
   assign dmiBypass_auto_node_out_out_d_valid = asource_auto_in_d_valid;
   assign dmiBypass_auto_node_out_out_d_bits_opcode = asource_auto_in_d_bits_opcode;
-  assign dmiBypass_auto_node_out_out_d_bits_denied = asource_auto_in_d_bits_denied;
   assign dmiBypass_auto_node_out_out_d_bits_data = asource_auto_in_d_bits_data;
-  assign dmiBypass_auto_node_out_out_d_bits_corrupt = asource_auto_in_d_bits_corrupt;
-  assign dmiBypass_auto_node_in_in_a_valid = dmiXbar_auto_out_0_a_valid;
-  assign dmiBypass_auto_node_in_in_a_bits_opcode = dmiXbar_auto_out_0_a_bits_opcode;
-  assign dmiBypass_auto_node_in_in_a_bits_address = dmiXbar_auto_out_0_a_bits_address;
-  assign dmiBypass_auto_node_in_in_a_bits_data = dmiXbar_auto_out_0_a_bits_data;
-  assign dmiBypass_auto_node_in_in_d_ready = dmiXbar_auto_out_0_d_ready;
+  assign dmiBypass_auto_node_in_in_a_valid = dmiXbar_auto_out_1_a_valid;
+  assign dmiBypass_auto_node_in_in_a_bits_opcode = dmiXbar_auto_out_1_a_bits_opcode;
+  assign dmiBypass_auto_node_in_in_a_bits_param = dmiXbar_auto_out_1_a_bits_param;
+  assign dmiBypass_auto_node_in_in_a_bits_size = dmiXbar_auto_out_1_a_bits_size;
+  assign dmiBypass_auto_node_in_in_a_bits_source = dmiXbar_auto_out_1_a_bits_source;
+  assign dmiBypass_auto_node_in_in_a_bits_address = dmiXbar_auto_out_1_a_bits_address;
+  assign dmiBypass_auto_node_in_in_a_bits_mask = dmiXbar_auto_out_1_a_bits_mask;
+  assign dmiBypass_auto_node_in_in_a_bits_data = dmiXbar_auto_out_1_a_bits_data;
+  assign dmiBypass_auto_node_in_in_a_bits_corrupt = dmiXbar_auto_out_1_a_bits_corrupt;
+  assign dmiBypass_auto_node_in_in_d_ready = dmiXbar_auto_out_1_d_ready;
   assign dmiBypass_io_bypass = ~io_ctrl_dmactive | ~dmactiveAck;
   assign asource_clock = io_dmi_clock;
   assign asource_reset = io_dmi_reset;
   assign asource_auto_in_a_valid = dmiBypass_auto_node_out_out_a_valid;
   assign asource_auto_in_a_bits_opcode = dmiBypass_auto_node_out_out_a_bits_opcode;
+  assign asource_auto_in_a_bits_param = dmiBypass_auto_node_out_out_a_bits_param;
+  assign asource_auto_in_a_bits_size = dmiBypass_auto_node_out_out_a_bits_size;
+  assign asource_auto_in_a_bits_source = dmiBypass_auto_node_out_out_a_bits_source;
   assign asource_auto_in_a_bits_address = dmiBypass_auto_node_out_out_a_bits_address;
+  assign asource_auto_in_a_bits_mask = dmiBypass_auto_node_out_out_a_bits_mask;
   assign asource_auto_in_a_bits_data = dmiBypass_auto_node_out_out_a_bits_data;
+  assign asource_auto_in_a_bits_corrupt = dmiBypass_auto_node_out_out_a_bits_corrupt;
   assign asource_auto_in_d_ready = dmiBypass_auto_node_out_out_d_ready;
   assign asource_auto_out_a_ridx = auto_asource_out_a_ridx;
   assign asource_auto_out_a_safe_ridx_valid = auto_asource_out_a_safe_ridx_valid;
@@ -29209,8 +29986,13 @@ module AsyncQueueSink_1(
   output [3:0]  io_deq_bits_mask,
   output [31:0] io_deq_bits_data,
   input  [2:0]  io_async_mem_0_opcode,
+  input  [2:0]  io_async_mem_0_param,
+  input  [1:0]  io_async_mem_0_size,
+  input         io_async_mem_0_source,
   input  [8:0]  io_async_mem_0_address,
+  input  [3:0]  io_async_mem_0_mask,
   input  [31:0] io_async_mem_0_data,
+  input         io_async_mem_0_corrupt,
   output        io_async_ridx,
   input         io_async_widx,
   output        io_async_safe_ridx_valid,
@@ -29247,8 +30029,10 @@ module AsyncQueueSink_1(
   reg  ridx_ridx_bin;
   wire  ridx_incremented = ~source_ready ? 1'h0 : ridx_ridx_bin + _ridx_T_1;
   wire  widx = widx_widx_gray_io_q;
-  wire [45:0] io_deq_bits_deq_bits_reg_io_d_lo = {io_async_mem_0_address,4'hf,io_async_mem_0_data,1'h0};
-  wire [8:0] io_deq_bits_deq_bits_reg_io_d_hi = {io_async_mem_0_opcode,3'h0,3'h4};
+  wire [45:0] io_deq_bits_deq_bits_reg_io_d_lo = {io_async_mem_0_address,io_async_mem_0_mask,io_async_mem_0_data,
+    io_async_mem_0_corrupt};
+  wire [8:0] io_deq_bits_deq_bits_reg_io_d_hi = {io_async_mem_0_opcode,io_async_mem_0_param,io_async_mem_0_size,
+    io_async_mem_0_source};
   wire [54:0] _io_deq_bits_WIRE_1 = io_deq_bits_deq_bits_reg_io_q;
   reg  valid_reg;
   reg  ridx_gray;
@@ -29490,8 +30274,13 @@ module TLAsyncCrossingSink(
   input         clock,
   input         reset,
   input  [2:0]  auto_in_a_mem_0_opcode,
+  input  [2:0]  auto_in_a_mem_0_param,
+  input  [1:0]  auto_in_a_mem_0_size,
+  input         auto_in_a_mem_0_source,
   input  [8:0]  auto_in_a_mem_0_address,
+  input  [3:0]  auto_in_a_mem_0_mask,
   input  [31:0] auto_in_a_mem_0_data,
+  input         auto_in_a_mem_0_corrupt,
   output        auto_in_a_ridx,
   input         auto_in_a_widx,
   output        auto_in_a_safe_ridx_valid,
@@ -29534,8 +30323,13 @@ module TLAsyncCrossingSink(
   wire [3:0] bundleOut_0_a_sink_io_deq_bits_mask;
   wire [31:0] bundleOut_0_a_sink_io_deq_bits_data;
   wire [2:0] bundleOut_0_a_sink_io_async_mem_0_opcode;
+  wire [2:0] bundleOut_0_a_sink_io_async_mem_0_param;
+  wire [1:0] bundleOut_0_a_sink_io_async_mem_0_size;
+  wire  bundleOut_0_a_sink_io_async_mem_0_source;
   wire [8:0] bundleOut_0_a_sink_io_async_mem_0_address;
+  wire [3:0] bundleOut_0_a_sink_io_async_mem_0_mask;
   wire [31:0] bundleOut_0_a_sink_io_async_mem_0_data;
+  wire  bundleOut_0_a_sink_io_async_mem_0_corrupt;
   wire  bundleOut_0_a_sink_io_async_ridx;
   wire  bundleOut_0_a_sink_io_async_widx;
   wire  bundleOut_0_a_sink_io_async_safe_ridx_valid;
@@ -29572,8 +30366,13 @@ module TLAsyncCrossingSink(
     .io_deq_bits_mask(bundleOut_0_a_sink_io_deq_bits_mask),
     .io_deq_bits_data(bundleOut_0_a_sink_io_deq_bits_data),
     .io_async_mem_0_opcode(bundleOut_0_a_sink_io_async_mem_0_opcode),
+    .io_async_mem_0_param(bundleOut_0_a_sink_io_async_mem_0_param),
+    .io_async_mem_0_size(bundleOut_0_a_sink_io_async_mem_0_size),
+    .io_async_mem_0_source(bundleOut_0_a_sink_io_async_mem_0_source),
     .io_async_mem_0_address(bundleOut_0_a_sink_io_async_mem_0_address),
+    .io_async_mem_0_mask(bundleOut_0_a_sink_io_async_mem_0_mask),
     .io_async_mem_0_data(bundleOut_0_a_sink_io_async_mem_0_data),
+    .io_async_mem_0_corrupt(bundleOut_0_a_sink_io_async_mem_0_corrupt),
     .io_async_ridx(bundleOut_0_a_sink_io_async_ridx),
     .io_async_widx(bundleOut_0_a_sink_io_async_widx),
     .io_async_safe_ridx_valid(bundleOut_0_a_sink_io_async_safe_ridx_valid),
@@ -29623,8 +30422,13 @@ module TLAsyncCrossingSink(
   assign bundleOut_0_a_sink_reset = reset;
   assign bundleOut_0_a_sink_io_deq_ready = auto_out_a_ready;
   assign bundleOut_0_a_sink_io_async_mem_0_opcode = auto_in_a_mem_0_opcode;
+  assign bundleOut_0_a_sink_io_async_mem_0_param = auto_in_a_mem_0_param;
+  assign bundleOut_0_a_sink_io_async_mem_0_size = auto_in_a_mem_0_size;
+  assign bundleOut_0_a_sink_io_async_mem_0_source = auto_in_a_mem_0_source;
   assign bundleOut_0_a_sink_io_async_mem_0_address = auto_in_a_mem_0_address;
+  assign bundleOut_0_a_sink_io_async_mem_0_mask = auto_in_a_mem_0_mask;
   assign bundleOut_0_a_sink_io_async_mem_0_data = auto_in_a_mem_0_data;
+  assign bundleOut_0_a_sink_io_async_mem_0_corrupt = auto_in_a_mem_0_corrupt;
   assign bundleOut_0_a_sink_io_async_widx = auto_in_a_widx;
   assign bundleOut_0_a_sink_io_async_safe_widx_valid = auto_in_a_safe_widx_valid;
   assign bundleOut_0_a_sink_io_async_safe_source_reset_n = auto_in_a_safe_source_reset_n;
@@ -29794,8 +30598,13 @@ module AsyncQueueSink_2(
 endmodule
 module TLDebugModuleInnerAsync(
   input  [2:0]  auto_dmiXing_in_a_mem_0_opcode,
+  input  [2:0]  auto_dmiXing_in_a_mem_0_param,
+  input  [1:0]  auto_dmiXing_in_a_mem_0_size,
+  input         auto_dmiXing_in_a_mem_0_source,
   input  [8:0]  auto_dmiXing_in_a_mem_0_address,
+  input  [3:0]  auto_dmiXing_in_a_mem_0_mask,
   input  [31:0] auto_dmiXing_in_a_mem_0_data,
+  input         auto_dmiXing_in_a_mem_0_corrupt,
   output        auto_dmiXing_in_a_ridx,
   input         auto_dmiXing_in_a_widx,
   output        auto_dmiXing_in_a_safe_ridx_valid,
@@ -29883,8 +30692,13 @@ module TLDebugModuleInnerAsync(
   wire  dmiXing_clock;
   wire  dmiXing_reset;
   wire [2:0] dmiXing_auto_in_a_mem_0_opcode;
+  wire [2:0] dmiXing_auto_in_a_mem_0_param;
+  wire [1:0] dmiXing_auto_in_a_mem_0_size;
+  wire  dmiXing_auto_in_a_mem_0_source;
   wire [8:0] dmiXing_auto_in_a_mem_0_address;
+  wire [3:0] dmiXing_auto_in_a_mem_0_mask;
   wire [31:0] dmiXing_auto_in_a_mem_0_data;
+  wire  dmiXing_auto_in_a_mem_0_corrupt;
   wire  dmiXing_auto_in_a_ridx;
   wire  dmiXing_auto_in_a_widx;
   wire  dmiXing_auto_in_a_safe_ridx_valid;
@@ -29980,8 +30794,13 @@ module TLDebugModuleInnerAsync(
     .clock(dmiXing_clock),
     .reset(dmiXing_reset),
     .auto_in_a_mem_0_opcode(dmiXing_auto_in_a_mem_0_opcode),
+    .auto_in_a_mem_0_param(dmiXing_auto_in_a_mem_0_param),
+    .auto_in_a_mem_0_size(dmiXing_auto_in_a_mem_0_size),
+    .auto_in_a_mem_0_source(dmiXing_auto_in_a_mem_0_source),
     .auto_in_a_mem_0_address(dmiXing_auto_in_a_mem_0_address),
+    .auto_in_a_mem_0_mask(dmiXing_auto_in_a_mem_0_mask),
     .auto_in_a_mem_0_data(dmiXing_auto_in_a_mem_0_data),
+    .auto_in_a_mem_0_corrupt(dmiXing_auto_in_a_mem_0_corrupt),
     .auto_in_a_ridx(dmiXing_auto_in_a_ridx),
     .auto_in_a_widx(dmiXing_auto_in_a_widx),
     .auto_in_a_safe_ridx_valid(dmiXing_auto_in_a_safe_ridx_valid),
@@ -30085,8 +30904,13 @@ module TLDebugModuleInnerAsync(
   assign dmiXing_clock = io_debug_clock;
   assign dmiXing_reset = io_debug_reset;
   assign dmiXing_auto_in_a_mem_0_opcode = auto_dmiXing_in_a_mem_0_opcode;
+  assign dmiXing_auto_in_a_mem_0_param = auto_dmiXing_in_a_mem_0_param;
+  assign dmiXing_auto_in_a_mem_0_size = auto_dmiXing_in_a_mem_0_size;
+  assign dmiXing_auto_in_a_mem_0_source = auto_dmiXing_in_a_mem_0_source;
   assign dmiXing_auto_in_a_mem_0_address = auto_dmiXing_in_a_mem_0_address;
+  assign dmiXing_auto_in_a_mem_0_mask = auto_dmiXing_in_a_mem_0_mask;
   assign dmiXing_auto_in_a_mem_0_data = auto_dmiXing_in_a_mem_0_data;
+  assign dmiXing_auto_in_a_mem_0_corrupt = auto_dmiXing_in_a_mem_0_corrupt;
   assign dmiXing_auto_in_a_widx = auto_dmiXing_in_a_widx;
   assign dmiXing_auto_in_a_safe_widx_valid = auto_dmiXing_in_a_safe_widx_valid;
   assign dmiXing_auto_in_a_safe_source_reset_n = auto_dmiXing_in_a_safe_source_reset_n;
@@ -30127,27 +30951,30 @@ module TLDebugModule(
   output [4:0]  auto_dmInner_dmInner_tl_in_d_bits_source,
   output [63:0] auto_dmInner_dmInner_tl_in_d_bits_data,
   output        auto_dmOuter_intsource_out_sync_0,
+  input         auto_dmOuter_apbXbar_in_psel,
+  input         auto_dmOuter_apbXbar_in_penable,
+  input         auto_dmOuter_apbXbar_in_pwrite,
+  input  [11:0] auto_dmOuter_apbXbar_in_paddr,
+  input  [31:0] auto_dmOuter_apbXbar_in_pwdata,
+  output        auto_dmOuter_apbXbar_in_pready,
+  output [31:0] auto_dmOuter_apbXbar_in_prdata,
   input         io_debug_clock,
   input         io_debug_reset,
   output        io_ctrl_ndreset,
   output        io_ctrl_dmactive,
   input         io_ctrl_dmactiveAck,
-  output        io_dmi_dmi_req_ready,
-  input         io_dmi_dmi_req_valid,
-  input  [6:0]  io_dmi_dmi_req_bits_addr,
-  input  [31:0] io_dmi_dmi_req_bits_data,
-  input  [1:0]  io_dmi_dmi_req_bits_op,
-  input         io_dmi_dmi_resp_ready,
-  output        io_dmi_dmi_resp_valid,
-  output [31:0] io_dmi_dmi_resp_bits_data,
-  output [1:0]  io_dmi_dmi_resp_bits_resp,
-  input         io_dmi_dmiClock,
-  input         io_dmi_dmiReset,
+  input         io_apb_clock,
+  input         io_apb_reset,
   input         io_hartIsInReset_0
 );
   wire [2:0] dmOuter_auto_asource_out_a_mem_0_opcode;
+  wire [2:0] dmOuter_auto_asource_out_a_mem_0_param;
+  wire [1:0] dmOuter_auto_asource_out_a_mem_0_size;
+  wire  dmOuter_auto_asource_out_a_mem_0_source;
   wire [8:0] dmOuter_auto_asource_out_a_mem_0_address;
+  wire [3:0] dmOuter_auto_asource_out_a_mem_0_mask;
   wire [31:0] dmOuter_auto_asource_out_a_mem_0_data;
+  wire  dmOuter_auto_asource_out_a_mem_0_corrupt;
   wire  dmOuter_auto_asource_out_a_ridx;
   wire  dmOuter_auto_asource_out_a_widx;
   wire  dmOuter_auto_asource_out_a_safe_ridx_valid;
@@ -30165,17 +30992,15 @@ module TLDebugModule(
   wire  dmOuter_auto_asource_out_d_safe_source_reset_n;
   wire  dmOuter_auto_asource_out_d_safe_sink_reset_n;
   wire  dmOuter_auto_intsource_out_sync_0;
+  wire  dmOuter_auto_apbXbar_in_psel;
+  wire  dmOuter_auto_apbXbar_in_penable;
+  wire  dmOuter_auto_apbXbar_in_pwrite;
+  wire [11:0] dmOuter_auto_apbXbar_in_paddr;
+  wire [31:0] dmOuter_auto_apbXbar_in_pwdata;
+  wire  dmOuter_auto_apbXbar_in_pready;
+  wire [31:0] dmOuter_auto_apbXbar_in_prdata;
   wire  dmOuter_io_dmi_clock;
   wire  dmOuter_io_dmi_reset;
-  wire  dmOuter_io_dmi_req_ready;
-  wire  dmOuter_io_dmi_req_valid;
-  wire [6:0] dmOuter_io_dmi_req_bits_addr;
-  wire [31:0] dmOuter_io_dmi_req_bits_data;
-  wire [1:0] dmOuter_io_dmi_req_bits_op;
-  wire  dmOuter_io_dmi_resp_ready;
-  wire  dmOuter_io_dmi_resp_valid;
-  wire [31:0] dmOuter_io_dmi_resp_bits_data;
-  wire [1:0] dmOuter_io_dmi_resp_bits_resp;
   wire  dmOuter_io_ctrl_ndreset;
   wire  dmOuter_io_ctrl_dmactive;
   wire  dmOuter_io_ctrl_dmactiveAck;
@@ -30190,8 +31015,13 @@ module TLDebugModule(
   wire  dmOuter_io_innerCtrl_safe_sink_reset_n;
   wire  dmOuter_io_hgDebugInt_0;
   wire [2:0] dmInner_auto_dmiXing_in_a_mem_0_opcode;
+  wire [2:0] dmInner_auto_dmiXing_in_a_mem_0_param;
+  wire [1:0] dmInner_auto_dmiXing_in_a_mem_0_size;
+  wire  dmInner_auto_dmiXing_in_a_mem_0_source;
   wire [8:0] dmInner_auto_dmiXing_in_a_mem_0_address;
+  wire [3:0] dmInner_auto_dmiXing_in_a_mem_0_mask;
   wire [31:0] dmInner_auto_dmiXing_in_a_mem_0_data;
+  wire  dmInner_auto_dmiXing_in_a_mem_0_corrupt;
   wire  dmInner_auto_dmiXing_in_a_ridx;
   wire  dmInner_auto_dmiXing_in_a_widx;
   wire  dmInner_auto_dmiXing_in_a_safe_ridx_valid;
@@ -30238,8 +31068,13 @@ module TLDebugModule(
   wire  dmInner_io_hartIsInReset_0;
   TLDebugModuleOuterAsync dmOuter (
     .auto_asource_out_a_mem_0_opcode(dmOuter_auto_asource_out_a_mem_0_opcode),
+    .auto_asource_out_a_mem_0_param(dmOuter_auto_asource_out_a_mem_0_param),
+    .auto_asource_out_a_mem_0_size(dmOuter_auto_asource_out_a_mem_0_size),
+    .auto_asource_out_a_mem_0_source(dmOuter_auto_asource_out_a_mem_0_source),
     .auto_asource_out_a_mem_0_address(dmOuter_auto_asource_out_a_mem_0_address),
+    .auto_asource_out_a_mem_0_mask(dmOuter_auto_asource_out_a_mem_0_mask),
     .auto_asource_out_a_mem_0_data(dmOuter_auto_asource_out_a_mem_0_data),
+    .auto_asource_out_a_mem_0_corrupt(dmOuter_auto_asource_out_a_mem_0_corrupt),
     .auto_asource_out_a_ridx(dmOuter_auto_asource_out_a_ridx),
     .auto_asource_out_a_widx(dmOuter_auto_asource_out_a_widx),
     .auto_asource_out_a_safe_ridx_valid(dmOuter_auto_asource_out_a_safe_ridx_valid),
@@ -30257,17 +31092,15 @@ module TLDebugModule(
     .auto_asource_out_d_safe_source_reset_n(dmOuter_auto_asource_out_d_safe_source_reset_n),
     .auto_asource_out_d_safe_sink_reset_n(dmOuter_auto_asource_out_d_safe_sink_reset_n),
     .auto_intsource_out_sync_0(dmOuter_auto_intsource_out_sync_0),
+    .auto_apbXbar_in_psel(dmOuter_auto_apbXbar_in_psel),
+    .auto_apbXbar_in_penable(dmOuter_auto_apbXbar_in_penable),
+    .auto_apbXbar_in_pwrite(dmOuter_auto_apbXbar_in_pwrite),
+    .auto_apbXbar_in_paddr(dmOuter_auto_apbXbar_in_paddr),
+    .auto_apbXbar_in_pwdata(dmOuter_auto_apbXbar_in_pwdata),
+    .auto_apbXbar_in_pready(dmOuter_auto_apbXbar_in_pready),
+    .auto_apbXbar_in_prdata(dmOuter_auto_apbXbar_in_prdata),
     .io_dmi_clock(dmOuter_io_dmi_clock),
     .io_dmi_reset(dmOuter_io_dmi_reset),
-    .io_dmi_req_ready(dmOuter_io_dmi_req_ready),
-    .io_dmi_req_valid(dmOuter_io_dmi_req_valid),
-    .io_dmi_req_bits_addr(dmOuter_io_dmi_req_bits_addr),
-    .io_dmi_req_bits_data(dmOuter_io_dmi_req_bits_data),
-    .io_dmi_req_bits_op(dmOuter_io_dmi_req_bits_op),
-    .io_dmi_resp_ready(dmOuter_io_dmi_resp_ready),
-    .io_dmi_resp_valid(dmOuter_io_dmi_resp_valid),
-    .io_dmi_resp_bits_data(dmOuter_io_dmi_resp_bits_data),
-    .io_dmi_resp_bits_resp(dmOuter_io_dmi_resp_bits_resp),
     .io_ctrl_ndreset(dmOuter_io_ctrl_ndreset),
     .io_ctrl_dmactive(dmOuter_io_ctrl_dmactive),
     .io_ctrl_dmactiveAck(dmOuter_io_ctrl_dmactiveAck),
@@ -30284,8 +31117,13 @@ module TLDebugModule(
   );
   TLDebugModuleInnerAsync dmInner (
     .auto_dmiXing_in_a_mem_0_opcode(dmInner_auto_dmiXing_in_a_mem_0_opcode),
+    .auto_dmiXing_in_a_mem_0_param(dmInner_auto_dmiXing_in_a_mem_0_param),
+    .auto_dmiXing_in_a_mem_0_size(dmInner_auto_dmiXing_in_a_mem_0_size),
+    .auto_dmiXing_in_a_mem_0_source(dmInner_auto_dmiXing_in_a_mem_0_source),
     .auto_dmiXing_in_a_mem_0_address(dmInner_auto_dmiXing_in_a_mem_0_address),
+    .auto_dmiXing_in_a_mem_0_mask(dmInner_auto_dmiXing_in_a_mem_0_mask),
     .auto_dmiXing_in_a_mem_0_data(dmInner_auto_dmiXing_in_a_mem_0_data),
+    .auto_dmiXing_in_a_mem_0_corrupt(dmInner_auto_dmiXing_in_a_mem_0_corrupt),
     .auto_dmiXing_in_a_ridx(dmInner_auto_dmiXing_in_a_ridx),
     .auto_dmiXing_in_a_widx(dmInner_auto_dmiXing_in_a_widx),
     .auto_dmiXing_in_a_safe_ridx_valid(dmInner_auto_dmiXing_in_a_safe_ridx_valid),
@@ -30338,12 +31176,10 @@ module TLDebugModule(
   assign auto_dmInner_dmInner_tl_in_d_bits_source = dmInner_auto_dmInner_tl_in_d_bits_source;
   assign auto_dmInner_dmInner_tl_in_d_bits_data = dmInner_auto_dmInner_tl_in_d_bits_data;
   assign auto_dmOuter_intsource_out_sync_0 = dmOuter_auto_intsource_out_sync_0;
+  assign auto_dmOuter_apbXbar_in_pready = dmOuter_auto_apbXbar_in_pready;
+  assign auto_dmOuter_apbXbar_in_prdata = dmOuter_auto_apbXbar_in_prdata;
   assign io_ctrl_ndreset = dmOuter_io_ctrl_ndreset;
   assign io_ctrl_dmactive = dmOuter_io_ctrl_dmactive;
-  assign io_dmi_dmi_req_ready = dmOuter_io_dmi_req_ready;
-  assign io_dmi_dmi_resp_valid = dmOuter_io_dmi_resp_valid;
-  assign io_dmi_dmi_resp_bits_data = dmOuter_io_dmi_resp_bits_data;
-  assign io_dmi_dmi_resp_bits_resp = dmOuter_io_dmi_resp_bits_resp;
   assign dmOuter_auto_asource_out_a_ridx = dmInner_auto_dmiXing_in_a_ridx;
   assign dmOuter_auto_asource_out_a_safe_ridx_valid = dmInner_auto_dmiXing_in_a_safe_ridx_valid;
   assign dmOuter_auto_asource_out_a_safe_sink_reset_n = dmInner_auto_dmiXing_in_a_safe_sink_reset_n;
@@ -30354,21 +31190,26 @@ module TLDebugModule(
   assign dmOuter_auto_asource_out_d_widx = dmInner_auto_dmiXing_in_d_widx;
   assign dmOuter_auto_asource_out_d_safe_widx_valid = dmInner_auto_dmiXing_in_d_safe_widx_valid;
   assign dmOuter_auto_asource_out_d_safe_source_reset_n = dmInner_auto_dmiXing_in_d_safe_source_reset_n;
-  assign dmOuter_io_dmi_clock = io_dmi_dmiClock;
-  assign dmOuter_io_dmi_reset = io_dmi_dmiReset;
-  assign dmOuter_io_dmi_req_valid = io_dmi_dmi_req_valid;
-  assign dmOuter_io_dmi_req_bits_addr = io_dmi_dmi_req_bits_addr;
-  assign dmOuter_io_dmi_req_bits_data = io_dmi_dmi_req_bits_data;
-  assign dmOuter_io_dmi_req_bits_op = io_dmi_dmi_req_bits_op;
-  assign dmOuter_io_dmi_resp_ready = io_dmi_dmi_resp_ready;
+  assign dmOuter_auto_apbXbar_in_psel = auto_dmOuter_apbXbar_in_psel;
+  assign dmOuter_auto_apbXbar_in_penable = auto_dmOuter_apbXbar_in_penable;
+  assign dmOuter_auto_apbXbar_in_pwrite = auto_dmOuter_apbXbar_in_pwrite;
+  assign dmOuter_auto_apbXbar_in_paddr = auto_dmOuter_apbXbar_in_paddr;
+  assign dmOuter_auto_apbXbar_in_pwdata = auto_dmOuter_apbXbar_in_pwdata;
+  assign dmOuter_io_dmi_clock = io_apb_clock;
+  assign dmOuter_io_dmi_reset = io_apb_reset;
   assign dmOuter_io_ctrl_dmactiveAck = io_ctrl_dmactiveAck;
   assign dmOuter_io_innerCtrl_ridx = dmInner_io_innerCtrl_ridx;
   assign dmOuter_io_innerCtrl_safe_ridx_valid = dmInner_io_innerCtrl_safe_ridx_valid;
   assign dmOuter_io_innerCtrl_safe_sink_reset_n = dmInner_io_innerCtrl_safe_sink_reset_n;
   assign dmOuter_io_hgDebugInt_0 = dmInner_io_hgDebugInt_0;
   assign dmInner_auto_dmiXing_in_a_mem_0_opcode = dmOuter_auto_asource_out_a_mem_0_opcode;
+  assign dmInner_auto_dmiXing_in_a_mem_0_param = dmOuter_auto_asource_out_a_mem_0_param;
+  assign dmInner_auto_dmiXing_in_a_mem_0_size = dmOuter_auto_asource_out_a_mem_0_size;
+  assign dmInner_auto_dmiXing_in_a_mem_0_source = dmOuter_auto_asource_out_a_mem_0_source;
   assign dmInner_auto_dmiXing_in_a_mem_0_address = dmOuter_auto_asource_out_a_mem_0_address;
+  assign dmInner_auto_dmiXing_in_a_mem_0_mask = dmOuter_auto_asource_out_a_mem_0_mask;
   assign dmInner_auto_dmiXing_in_a_mem_0_data = dmOuter_auto_asource_out_a_mem_0_data;
+  assign dmInner_auto_dmiXing_in_a_mem_0_corrupt = dmOuter_auto_asource_out_a_mem_0_corrupt;
   assign dmInner_auto_dmiXing_in_a_widx = dmOuter_auto_asource_out_a_widx;
   assign dmInner_auto_dmiXing_in_a_safe_widx_valid = dmOuter_auto_asource_out_a_safe_widx_valid;
   assign dmInner_auto_dmiXing_in_a_safe_source_reset_n = dmOuter_auto_asource_out_a_safe_source_reset_n;
@@ -30561,7 +31402,7 @@ module TLROM(
   wire [63:0] _GEN_139 = 8'h8b == index ? 64'h67756265642c7663 : _GEN_138;
   wire [63:0] _GEN_140 = 8'h8c == index ? 64'h3331302d : _GEN_139;
   wire [63:0] _GEN_141 = 8'h8d == index ? 64'h400000003000000 : _GEN_140;
-  wire [63:0] _GEN_142 = 8'h8e == index ? 64'h696d6423010000 : _GEN_141;
+  wire [63:0] _GEN_142 = 8'h8e == index ? 64'h62706123010000 : _GEN_141;
   wire [63:0] _GEN_143 = 8'h8f == index ? 64'h800000003000000 : _GEN_142;
   wire [63:0] _GEN_144 = 8'h90 == index ? 64'h200000030010000 : _GEN_143;
   wire [63:0] _GEN_145 = 8'h91 == index ? 64'h3000000ffff0000 : _GEN_144;
@@ -30726,7 +31567,7 @@ module ClockSinkDomain(
   assign bootrom_auto_in_a_bits_address = auto_bootrom_in_a_bits_address;
   assign bootrom_auto_in_d_ready = auto_bootrom_in_d_ready;
 endmodule
-module HNSRocketSystem(
+module MiniRocketSystem(
   input         clock,
   input         reset,
   input         mem_axi4_0_aw_ready,
@@ -30806,17 +31647,15 @@ module HNSRocketSystem(
   input         resetctrl_hartIsInReset_0,
   input         debug_clock,
   input         debug_reset,
-  output        debug_clockeddmi_dmi_req_ready,
-  input         debug_clockeddmi_dmi_req_valid,
-  input  [6:0]  debug_clockeddmi_dmi_req_bits_addr,
-  input  [31:0] debug_clockeddmi_dmi_req_bits_data,
-  input  [1:0]  debug_clockeddmi_dmi_req_bits_op,
-  input         debug_clockeddmi_dmi_resp_ready,
-  output        debug_clockeddmi_dmi_resp_valid,
-  output [31:0] debug_clockeddmi_dmi_resp_bits_data,
-  output [1:0]  debug_clockeddmi_dmi_resp_bits_resp,
-  input         debug_clockeddmi_dmiClock,
-  input         debug_clockeddmi_dmiReset,
+  input         debug_apb_psel,
+  input         debug_apb_penable,
+  input         debug_apb_pwrite,
+  input  [11:0] debug_apb_paddr,
+  input  [31:0] debug_apb_pwdata,
+  output        debug_apb_pready,
+  output [31:0] debug_apb_prdata,
+  input         debug_apb_clock,
+  input         debug_apb_reset,
   output        debug_ndreset,
   output        debug_dmactive,
   input         debug_dmactiveAck,
@@ -31077,22 +31916,20 @@ module HNSRocketSystem(
   wire [4:0] tlDM_auto_dmInner_dmInner_tl_in_d_bits_source;
   wire [63:0] tlDM_auto_dmInner_dmInner_tl_in_d_bits_data;
   wire  tlDM_auto_dmOuter_intsource_out_sync_0;
+  wire  tlDM_auto_dmOuter_apbXbar_in_psel;
+  wire  tlDM_auto_dmOuter_apbXbar_in_penable;
+  wire  tlDM_auto_dmOuter_apbXbar_in_pwrite;
+  wire [11:0] tlDM_auto_dmOuter_apbXbar_in_paddr;
+  wire [31:0] tlDM_auto_dmOuter_apbXbar_in_pwdata;
+  wire  tlDM_auto_dmOuter_apbXbar_in_pready;
+  wire [31:0] tlDM_auto_dmOuter_apbXbar_in_prdata;
   wire  tlDM_io_debug_clock;
   wire  tlDM_io_debug_reset;
   wire  tlDM_io_ctrl_ndreset;
   wire  tlDM_io_ctrl_dmactive;
   wire  tlDM_io_ctrl_dmactiveAck;
-  wire  tlDM_io_dmi_dmi_req_ready;
-  wire  tlDM_io_dmi_dmi_req_valid;
-  wire [6:0] tlDM_io_dmi_dmi_req_bits_addr;
-  wire [31:0] tlDM_io_dmi_dmi_req_bits_data;
-  wire [1:0] tlDM_io_dmi_dmi_req_bits_op;
-  wire  tlDM_io_dmi_dmi_resp_ready;
-  wire  tlDM_io_dmi_dmi_resp_valid;
-  wire [31:0] tlDM_io_dmi_dmi_resp_bits_data;
-  wire [1:0] tlDM_io_dmi_dmi_resp_bits_resp;
-  wire  tlDM_io_dmi_dmiClock;
-  wire  tlDM_io_dmi_dmiReset;
+  wire  tlDM_io_apb_clock;
+  wire  tlDM_io_apb_reset;
   wire  tlDM_io_hartIsInReset_0;
   wire  tileHartIdNexusNode_auto_out;
   wire [31:0] broadcast_auto_in;
@@ -31539,22 +32376,20 @@ module HNSRocketSystem(
     .auto_dmInner_dmInner_tl_in_d_bits_source(tlDM_auto_dmInner_dmInner_tl_in_d_bits_source),
     .auto_dmInner_dmInner_tl_in_d_bits_data(tlDM_auto_dmInner_dmInner_tl_in_d_bits_data),
     .auto_dmOuter_intsource_out_sync_0(tlDM_auto_dmOuter_intsource_out_sync_0),
+    .auto_dmOuter_apbXbar_in_psel(tlDM_auto_dmOuter_apbXbar_in_psel),
+    .auto_dmOuter_apbXbar_in_penable(tlDM_auto_dmOuter_apbXbar_in_penable),
+    .auto_dmOuter_apbXbar_in_pwrite(tlDM_auto_dmOuter_apbXbar_in_pwrite),
+    .auto_dmOuter_apbXbar_in_paddr(tlDM_auto_dmOuter_apbXbar_in_paddr),
+    .auto_dmOuter_apbXbar_in_pwdata(tlDM_auto_dmOuter_apbXbar_in_pwdata),
+    .auto_dmOuter_apbXbar_in_pready(tlDM_auto_dmOuter_apbXbar_in_pready),
+    .auto_dmOuter_apbXbar_in_prdata(tlDM_auto_dmOuter_apbXbar_in_prdata),
     .io_debug_clock(tlDM_io_debug_clock),
     .io_debug_reset(tlDM_io_debug_reset),
     .io_ctrl_ndreset(tlDM_io_ctrl_ndreset),
     .io_ctrl_dmactive(tlDM_io_ctrl_dmactive),
     .io_ctrl_dmactiveAck(tlDM_io_ctrl_dmactiveAck),
-    .io_dmi_dmi_req_ready(tlDM_io_dmi_dmi_req_ready),
-    .io_dmi_dmi_req_valid(tlDM_io_dmi_dmi_req_valid),
-    .io_dmi_dmi_req_bits_addr(tlDM_io_dmi_dmi_req_bits_addr),
-    .io_dmi_dmi_req_bits_data(tlDM_io_dmi_dmi_req_bits_data),
-    .io_dmi_dmi_req_bits_op(tlDM_io_dmi_dmi_req_bits_op),
-    .io_dmi_dmi_resp_ready(tlDM_io_dmi_dmi_resp_ready),
-    .io_dmi_dmi_resp_valid(tlDM_io_dmi_dmi_resp_valid),
-    .io_dmi_dmi_resp_bits_data(tlDM_io_dmi_dmi_resp_bits_data),
-    .io_dmi_dmi_resp_bits_resp(tlDM_io_dmi_dmi_resp_bits_resp),
-    .io_dmi_dmiClock(tlDM_io_dmi_dmiClock),
-    .io_dmi_dmiReset(tlDM_io_dmi_dmiReset),
+    .io_apb_clock(tlDM_io_apb_clock),
+    .io_apb_reset(tlDM_io_apb_reset),
     .io_hartIsInReset_0(tlDM_io_hartIsInReset_0)
   );
   BundleBridgeNexus_11 tileHartIdNexusNode (
@@ -31667,10 +32502,8 @@ module HNSRocketSystem(
   assign mmio_axi4_0_ar_bits_prot = subsystem_sbus_auto_coupler_to_port_named_mmio_port_axi4_axi4buf_out_ar_bits_prot;
   assign mmio_axi4_0_ar_bits_qos = subsystem_sbus_auto_coupler_to_port_named_mmio_port_axi4_axi4buf_out_ar_bits_qos;
   assign mmio_axi4_0_r_ready = subsystem_sbus_auto_coupler_to_port_named_mmio_port_axi4_axi4buf_out_r_ready;
-  assign debug_clockeddmi_dmi_req_ready = tlDM_io_dmi_dmi_req_ready;
-  assign debug_clockeddmi_dmi_resp_valid = tlDM_io_dmi_dmi_resp_valid;
-  assign debug_clockeddmi_dmi_resp_bits_data = tlDM_io_dmi_dmi_resp_bits_data;
-  assign debug_clockeddmi_dmi_resp_bits_resp = tlDM_io_dmi_dmi_resp_bits_resp;
+  assign debug_apb_pready = tlDM_auto_dmOuter_apbXbar_in_pready;
+  assign debug_apb_prdata = tlDM_auto_dmOuter_apbXbar_in_prdata;
   assign debug_ndreset = tlDM_io_ctrl_ndreset;
   assign debug_dmactive = tlDM_io_ctrl_dmactive;
   assign dummyClockGroupSourceNode_clock = clock;
@@ -31862,16 +32695,16 @@ module HNSRocketSystem(
   assign tlDM_auto_dmInner_dmInner_tl_in_a_bits_mask = subsystem_cbus_auto_coupler_to_debug_fragmenter_out_a_bits_mask;
   assign tlDM_auto_dmInner_dmInner_tl_in_a_bits_data = subsystem_cbus_auto_coupler_to_debug_fragmenter_out_a_bits_data;
   assign tlDM_auto_dmInner_dmInner_tl_in_d_ready = subsystem_cbus_auto_coupler_to_debug_fragmenter_out_d_ready;
+  assign tlDM_auto_dmOuter_apbXbar_in_psel = debug_apb_psel;
+  assign tlDM_auto_dmOuter_apbXbar_in_penable = debug_apb_penable;
+  assign tlDM_auto_dmOuter_apbXbar_in_pwrite = debug_apb_pwrite;
+  assign tlDM_auto_dmOuter_apbXbar_in_paddr = debug_apb_paddr;
+  assign tlDM_auto_dmOuter_apbXbar_in_pwdata = debug_apb_pwdata;
   assign tlDM_io_debug_clock = debug_clock;
   assign tlDM_io_debug_reset = debug_reset;
   assign tlDM_io_ctrl_dmactiveAck = debug_dmactiveAck;
-  assign tlDM_io_dmi_dmi_req_valid = debug_clockeddmi_dmi_req_valid;
-  assign tlDM_io_dmi_dmi_req_bits_addr = debug_clockeddmi_dmi_req_bits_addr;
-  assign tlDM_io_dmi_dmi_req_bits_data = debug_clockeddmi_dmi_req_bits_data;
-  assign tlDM_io_dmi_dmi_req_bits_op = debug_clockeddmi_dmi_req_bits_op;
-  assign tlDM_io_dmi_dmi_resp_ready = debug_clockeddmi_dmi_resp_ready;
-  assign tlDM_io_dmi_dmiClock = debug_clockeddmi_dmiClock;
-  assign tlDM_io_dmi_dmiReset = debug_clockeddmi_dmiReset;
+  assign tlDM_io_apb_clock = debug_apb_clock;
+  assign tlDM_io_apb_reset = debug_apb_reset;
   assign tlDM_io_hartIsInReset_0 = resetctrl_hartIsInReset_0;
   assign broadcast_auto_in = {{15'd0}, _bundleOut_0_T};
   assign intsource_1_clock = clock;
@@ -31889,7 +32722,7 @@ module HNSRocketSystem(
     subsystem_cbus_auto_coupler_to_bootrom_fragmenter_out_a_bits_address;
   assign bootROMDomainWrapper_auto_bootrom_in_d_ready = subsystem_cbus_auto_coupler_to_bootrom_fragmenter_out_d_ready;
 endmodule
-module HNSCore(
+module MiniRocket(
   input         clock,
   input         reset,
   input         mem_axi4_0_aw_ready,
@@ -31969,20 +32802,18 @@ module HNSCore(
   input         resetctrl_hartIsInReset_0,
   input         debug_clock,
   input         debug_reset,
-  output        debug_clockeddmi_dmi_req_ready,
-  input         debug_clockeddmi_dmi_req_valid,
-  input  [6:0]  debug_clockeddmi_dmi_req_bits_addr,
-  input  [31:0] debug_clockeddmi_dmi_req_bits_data,
-  input  [1:0]  debug_clockeddmi_dmi_req_bits_op,
-  input         debug_clockeddmi_dmi_resp_ready,
-  output        debug_clockeddmi_dmi_resp_valid,
-  output [31:0] debug_clockeddmi_dmi_resp_bits_data,
-  output [1:0]  debug_clockeddmi_dmi_resp_bits_resp,
-  input         debug_clockeddmi_dmiClock,
-  input         debug_clockeddmi_dmiReset,
   output        debug_ndreset,
   output        debug_dmactive,
   input         debug_dmactiveAck,
+  input         debug_apb_clock,
+  input         debug_apb_reset,
+  input         debug_apb_psel,
+  input         debug_apb_penable,
+  input         debug_apb_pwrite,
+  input  [11:0] debug_apb_paddr,
+  input  [31:0] debug_apb_pwdata,
+  output [31:0] debug_apb_prdata,
+  output        debug_apb_pready,
   input         meip_0,
   input         boot_mode
 );
@@ -32065,23 +32896,21 @@ module HNSCore(
   wire  ldut_resetctrl_hartIsInReset_0;
   wire  ldut_debug_clock;
   wire  ldut_debug_reset;
-  wire  ldut_debug_clockeddmi_dmi_req_ready;
-  wire  ldut_debug_clockeddmi_dmi_req_valid;
-  wire [6:0] ldut_debug_clockeddmi_dmi_req_bits_addr;
-  wire [31:0] ldut_debug_clockeddmi_dmi_req_bits_data;
-  wire [1:0] ldut_debug_clockeddmi_dmi_req_bits_op;
-  wire  ldut_debug_clockeddmi_dmi_resp_ready;
-  wire  ldut_debug_clockeddmi_dmi_resp_valid;
-  wire [31:0] ldut_debug_clockeddmi_dmi_resp_bits_data;
-  wire [1:0] ldut_debug_clockeddmi_dmi_resp_bits_resp;
-  wire  ldut_debug_clockeddmi_dmiClock;
-  wire  ldut_debug_clockeddmi_dmiReset;
+  wire  ldut_debug_apb_psel;
+  wire  ldut_debug_apb_penable;
+  wire  ldut_debug_apb_pwrite;
+  wire [11:0] ldut_debug_apb_paddr;
+  wire [31:0] ldut_debug_apb_pwdata;
+  wire  ldut_debug_apb_pready;
+  wire [31:0] ldut_debug_apb_prdata;
+  wire  ldut_debug_apb_clock;
+  wire  ldut_debug_apb_reset;
   wire  ldut_debug_ndreset;
   wire  ldut_debug_dmactive;
   wire  ldut_debug_dmactiveAck;
   wire  ldut_meip_0;
   wire  ldut_boot_mode;
-  HNSRocketSystem ldut (
+  MiniRocketSystem ldut (
     .clock(ldut_clock),
     .reset(ldut_reset),
     .mem_axi4_0_aw_ready(ldut_mem_axi4_0_aw_ready),
@@ -32161,17 +32990,15 @@ module HNSCore(
     .resetctrl_hartIsInReset_0(ldut_resetctrl_hartIsInReset_0),
     .debug_clock(ldut_debug_clock),
     .debug_reset(ldut_debug_reset),
-    .debug_clockeddmi_dmi_req_ready(ldut_debug_clockeddmi_dmi_req_ready),
-    .debug_clockeddmi_dmi_req_valid(ldut_debug_clockeddmi_dmi_req_valid),
-    .debug_clockeddmi_dmi_req_bits_addr(ldut_debug_clockeddmi_dmi_req_bits_addr),
-    .debug_clockeddmi_dmi_req_bits_data(ldut_debug_clockeddmi_dmi_req_bits_data),
-    .debug_clockeddmi_dmi_req_bits_op(ldut_debug_clockeddmi_dmi_req_bits_op),
-    .debug_clockeddmi_dmi_resp_ready(ldut_debug_clockeddmi_dmi_resp_ready),
-    .debug_clockeddmi_dmi_resp_valid(ldut_debug_clockeddmi_dmi_resp_valid),
-    .debug_clockeddmi_dmi_resp_bits_data(ldut_debug_clockeddmi_dmi_resp_bits_data),
-    .debug_clockeddmi_dmi_resp_bits_resp(ldut_debug_clockeddmi_dmi_resp_bits_resp),
-    .debug_clockeddmi_dmiClock(ldut_debug_clockeddmi_dmiClock),
-    .debug_clockeddmi_dmiReset(ldut_debug_clockeddmi_dmiReset),
+    .debug_apb_psel(ldut_debug_apb_psel),
+    .debug_apb_penable(ldut_debug_apb_penable),
+    .debug_apb_pwrite(ldut_debug_apb_pwrite),
+    .debug_apb_paddr(ldut_debug_apb_paddr),
+    .debug_apb_pwdata(ldut_debug_apb_pwdata),
+    .debug_apb_pready(ldut_debug_apb_pready),
+    .debug_apb_prdata(ldut_debug_apb_prdata),
+    .debug_apb_clock(ldut_debug_apb_clock),
+    .debug_apb_reset(ldut_debug_apb_reset),
     .debug_ndreset(ldut_debug_ndreset),
     .debug_dmactive(ldut_debug_dmactive),
     .debug_dmactiveAck(ldut_debug_dmactiveAck),
@@ -32230,12 +33057,10 @@ module HNSCore(
   assign mmio_axi4_0_ar_bits_prot = ldut_mmio_axi4_0_ar_bits_prot;
   assign mmio_axi4_0_ar_bits_qos = ldut_mmio_axi4_0_ar_bits_qos;
   assign mmio_axi4_0_r_ready = ldut_mmio_axi4_0_r_ready;
-  assign debug_clockeddmi_dmi_req_ready = ldut_debug_clockeddmi_dmi_req_ready;
-  assign debug_clockeddmi_dmi_resp_valid = ldut_debug_clockeddmi_dmi_resp_valid;
-  assign debug_clockeddmi_dmi_resp_bits_data = ldut_debug_clockeddmi_dmi_resp_bits_data;
-  assign debug_clockeddmi_dmi_resp_bits_resp = ldut_debug_clockeddmi_dmi_resp_bits_resp;
   assign debug_ndreset = ldut_debug_ndreset;
   assign debug_dmactive = ldut_debug_dmactive;
+  assign debug_apb_prdata = ldut_debug_apb_prdata;
+  assign debug_apb_pready = ldut_debug_apb_pready;
   assign ldut_clock = clock;
   assign ldut_reset = reset;
   assign ldut_mem_axi4_0_aw_ready = mem_axi4_0_aw_ready;
@@ -32263,13 +33088,13 @@ module HNSCore(
   assign ldut_resetctrl_hartIsInReset_0 = resetctrl_hartIsInReset_0;
   assign ldut_debug_clock = debug_clock;
   assign ldut_debug_reset = debug_reset;
-  assign ldut_debug_clockeddmi_dmi_req_valid = debug_clockeddmi_dmi_req_valid;
-  assign ldut_debug_clockeddmi_dmi_req_bits_addr = debug_clockeddmi_dmi_req_bits_addr;
-  assign ldut_debug_clockeddmi_dmi_req_bits_data = debug_clockeddmi_dmi_req_bits_data;
-  assign ldut_debug_clockeddmi_dmi_req_bits_op = debug_clockeddmi_dmi_req_bits_op;
-  assign ldut_debug_clockeddmi_dmi_resp_ready = debug_clockeddmi_dmi_resp_ready;
-  assign ldut_debug_clockeddmi_dmiClock = debug_clockeddmi_dmiClock;
-  assign ldut_debug_clockeddmi_dmiReset = debug_clockeddmi_dmiReset;
+  assign ldut_debug_apb_psel = debug_apb_psel;
+  assign ldut_debug_apb_penable = debug_apb_penable;
+  assign ldut_debug_apb_pwrite = debug_apb_pwrite;
+  assign ldut_debug_apb_paddr = debug_apb_paddr;
+  assign ldut_debug_apb_pwdata = debug_apb_pwdata;
+  assign ldut_debug_apb_clock = debug_apb_clock;
+  assign ldut_debug_apb_reset = debug_apb_reset;
   assign ldut_debug_dmactiveAck = debug_dmactiveAck;
   assign ldut_meip_0 = meip_0;
   assign ldut_boot_mode = boot_mode;

@@ -103,6 +103,10 @@ module test_axi_dw {
         }
         $assert(nar.bvalid);
         $assert(nar.bid == 3);
+        // B stays until it is taken. A master may hold `bready` low for a
+        // while (Rocket does, during a read burst).
+        clk.next(3);
+        $assert(nar.bvalid);
         nar.bready = 1;
         clk.next(1);
         nar.bready = 0;

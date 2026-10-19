@@ -272,7 +272,9 @@ fails with `code`), or from the first byte on an up channel named `hio-exit`.
 hio cpu boot --timeout 60 rv64ui-p-add   # 0 passes
 ```
 
-Their `benchmarks` print through HTIF system calls, which `hio` does not serve.
+Their `benchmarks` print through HTIF system calls (`tohost` and `fromhost`);
+`hio` answers `write`, so their output, `mcycle` and `minstret` included,
+reaches the terminal. Other calls stop `hio` with an error.
 
 `hio cpu boot --halt` stops at the first instruction instead, at the debug
 prompt ([The prompt](#the-prompt)), so breakpoints can go in before anything runs; `resume` lets
@@ -311,6 +313,7 @@ hio cpu resume
 hio cpu reset --halt      # reset through the Debug Module, stop at the first instruction
 hio cpu break main --elf app.elf   # a hardware breakpoint; `break` lists, `--clear` removes
 hio cpu mem COUNTER --elf app.elf  # memory at a DUT address or symbol; `--write` stores
+hio cpu disasm --elf app.elf       # the code around the halted PC; `disasm main`, `disasm 0x80000000 8`
 hio cpu catch             # stop on a fault (illegal instruction, access fault, ...)
 hio cpu dmi dmstatus      # one DMI register, raw; give a value to write it
 ```
@@ -322,6 +325,22 @@ console` do not, because they take over the terminal.
 `mem` goes through the window to the memories `dut_base` places at that
 address, so it needs no Debug Module and no halt. A CPU with a data cache may
 hold newer data than it shows. A symbol is read whole unless a count is given.
+
+`disasm` reads the same way, so with a place and `--elf` it needs no Debug
+Module either. Where two memories hold the address, it reads the one the CPU
+fetches from (the one the DUT does not write). It covers RV32 and RV64 with
+I, M, A, C, F, D, Zicsr, Zifencei, Zba, Zbb, Zbs, Zicond and Zicbom, and
+prints them as GNU objdump does. A call through `auipc` + `jalr` shows where
+it goes. A stop (`halt`, `step`, a breakpoint) shows the instruction at the
+PC too:
+
+```
+hart 0 halted at pc 0x800001f4 <main> (breakpoint)
+=> 0x800001f4:  1141      addi    sp,sp,-16
+```
+
+A line ends with `(the ELF has ... here)` where the memory differs from the
+ELF: the program changed it, or another program is loaded.
 
 `catch` uses the hart's exception trigger, an optional part of the trigger
 module many cores leave out (`hio` then says so); breakpoints use its
@@ -397,4 +416,6 @@ or the one `--ap` names.
 The PS's DDR, PLLs and the level shifters to the PL are set by software after
 every power-up. `hio dap ps7-init ps7_init.tcl` does it from the file Vivado
 writes with the PS7 IP. When the harness's `dram` is the PS's, `hio program`
-runs it after the bitstream, from the `ps7_init.tcl` beside it.
+runs it after the bitstream, from the `ps7_init.tcl` beside it. A design
+without a `dram` bundle does not use the PS, and `hio program` leaves it
+alone.

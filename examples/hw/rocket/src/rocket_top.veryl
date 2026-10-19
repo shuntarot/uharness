@@ -1,57 +1,51 @@
 // Core RTL, generated from rocket-chip v1.6 (see the comment below)
-include (inline, "HNSCore.v");
+include (inline, "MiniRocket.v");
 
-/// HNS CPU core (rocket-chip `HNSRocketSystem`) wrapped for the FPGA harness.
+/// A rocket-chip RV64 core (`MiniRocket`) wrapped for the FPGA harness.
 ///
-/// The core itself is a black box (`$sv::HNSCore`, `HNSCore.v` next to this
-/// file). It is rocket-chip v1.6 built with a small Chisel generator: one
+/// The core itself is a black box (`$sv::MiniRocket`, `MiniRocket.v` next to
+/// this file). It is rocket-chip v1.6 built with a small Chisel generator: one
 /// RV64IMAC Rocket core (no VM, FPU or BTB), a 4KB ICache, a 4KB DTIM instead
-/// of a DCache, no interrupts, and a debug module on DMI. `include(inline, ..)`
+/// of a DCache, no interrupts, and a debug module on APB. `include(inline, ..)`
 /// puts it in this module's output, so it reaches synthesis through the
 /// filelist. This wrapper only adapts its ports:
 ///
-///   - `mem`  : AXI4 master to DRAM, 64-bit data. The core maps it at
-///              0x8000_0000; the port carries the low 28 bits (256MB) only.
-///   - `mmio` : AXI4 master to MMIO, 64-bit data. The core maps it at
-///              0x0002_0000 - 0x0002_FFFF; the port carries the offset.
-///   - `dmi`  : Debug Module Interface (RISC-V debug spec DMI), valid/ready
-///   - `i_boot_mode`: 0 = jump to DRAM, 1 = wait for debugger in the BootROM
+///   - `mem` : AXI4 master to DRAM, 64-bit data, the core's own addresses
+///             (0x8000_0000 up).
+///   - `mmio`: AXI4 master to MMIO, 64-bit data, the core's own addresses
+///             (0x0002_0000 - 0x0002_FFFF).
+///   - `i_dmi_*`: the debug module's DMI as an APB slave. DMI register n is at
+///             byte address n * 4.
 ///
-/// The debug module and the DMI run on `i_clk`. `ndreset` from the debug module
-/// resets the core, but not the debug module itself.
-module hns_core (
-    i_clk: input clock,
-    i_rst: input reset,
+/// The core boots from DRAM. The debug module runs on its own reset
+/// (`i_dm_rst`), which the DUT reset does not touch, so a halted hart and a
+/// halt-on-reset request survive `hio reset`. `ndreset` from the debug module
+/// resets the core.
+module rocket_top (
+    i_clk   : input clock,
+    i_rst   : input reset,
+    i_dm_rst: input reset,
 
-    i_boot_mode: input logic,
+    i_dmi_psel   : input  logic    ,
+    i_dmi_penable: input  logic    ,
+    i_dmi_pwrite : input  logic    ,
+    i_dmi_paddr  : input  logic<12>,
+    i_dmi_pwdata : input  logic<32>,
+    o_dmi_prdata : output logic<32>,
+    o_dmi_pready : output logic    ,
 
-    // --- DMI request (debugger -> debug module) ---
-    i_dmi_req_valid: input  logic    ,
-    o_dmi_req_ready: output logic    ,
-    i_dmi_req_addr : input  logic<7> ,
-    i_dmi_req_data : input  logic<32>,
-    i_dmi_req_op   : input  logic<2> , // 0: nop, 1: read, 2: write
-
-    // --- DMI response (debug module -> debugger) ---
-    o_dmi_resp_valid: output logic    ,
-    i_dmi_resp_ready: input  logic    ,
-    o_dmi_resp_data : output logic<32>,
-    o_dmi_resp_resp : output logic<2> , // 0: success, 1: failure, 2: hw failure
-
-    // --- memory (DRAM) ---
-    mem: modport $std::axi4_if::<$std::axi4_pkg::<28, 8, 6, 1, 1, 1, 1, 1>>::master,
-
-    // --- MMIO ---
-    mmio: modport $std::axi4_if::<$std::axi4_pkg::<16, 8, 4, 1, 1, 1, 1, 1>>::master,
+    mem : modport $std::axi4_if::<$std::axi4_pkg::<32, 8, 6, 1, 1, 1, 1, 1>>::master,
+    mmio: modport $std::axi4_if::<$std::axi4_pkg::<18, 8, 4, 1, 1, 1, 1, 1>>::master,
 ) {
-    // Active-high synchronous resets for the core
+    // Active-high synchronous resets for the core and the debug module
     var sys_rst  : logic;
+    var dm_rst   : logic;
     var ndreset  : logic;
     var ndreset_q: logic;
     var core_rst : logic;
     var dmactive : logic;
 
-    always_ff {
+    always_ff (i_clk, i_rst) {
         if_reset {
             sys_rst   = 1;
             ndreset_q = 0;
@@ -61,18 +55,15 @@ module hns_core (
         }
     }
 
+    always_ff (i_clk, i_dm_rst) {
+        if_reset {
+            dm_rst = 1;
+        } else {
+            dm_rst = 0;
+        }
+    }
+
     assign core_rst = sys_rst | ndreset_q;
-
-    // Addresses from the core, before dropping the base
-    var mem_awaddr : logic<32>;
-    var mem_araddr : logic<32>;
-    var mmio_awaddr: logic<18>;
-    var mmio_araddr: logic<18>;
-
-    assign mem.awaddr  = mem_awaddr[27:0];
-    assign mem.araddr  = mem_araddr[27:0];
-    assign mmio.awaddr = mmio_awaddr[15:0];
-    assign mmio.araddr = mmio_araddr[15:0];
 
     // Signals of the AXI4 ports that the core does not have
     always_comb {
@@ -88,14 +79,14 @@ module hns_core (
         mmio.aruser   = 0;
     }
 
-    inst u_core: $sv::HNSCore (
+    inst u_core: $sv::MiniRocket (
         r#clock: i_clk   ,
         r#reset: core_rst,
 
         mem_axi4_0_aw_ready     : mem.awready,
         mem_axi4_0_aw_valid     : mem.awvalid,
         mem_axi4_0_aw_bits_id   : mem.awid   ,
-        mem_axi4_0_aw_bits_addr : mem_awaddr ,
+        mem_axi4_0_aw_bits_addr : mem.awaddr ,
         mem_axi4_0_aw_bits_len  : mem.awlen  ,
         mem_axi4_0_aw_bits_size : mem.awsize ,
         mem_axi4_0_aw_bits_burst: mem.awburst,
@@ -115,7 +106,7 @@ module hns_core (
         mem_axi4_0_ar_ready     : mem.arready,
         mem_axi4_0_ar_valid     : mem.arvalid,
         mem_axi4_0_ar_bits_id   : mem.arid   ,
-        mem_axi4_0_ar_bits_addr : mem_araddr ,
+        mem_axi4_0_ar_bits_addr : mem.araddr ,
         mem_axi4_0_ar_bits_len  : mem.arlen  ,
         mem_axi4_0_ar_bits_size : mem.arsize ,
         mem_axi4_0_ar_bits_burst: mem.arburst,
@@ -133,7 +124,7 @@ module hns_core (
         mmio_axi4_0_aw_ready     : mmio.awready,
         mmio_axi4_0_aw_valid     : mmio.awvalid,
         mmio_axi4_0_aw_bits_id   : mmio.awid   ,
-        mmio_axi4_0_aw_bits_addr : mmio_awaddr ,
+        mmio_axi4_0_aw_bits_addr : mmio.awaddr ,
         mmio_axi4_0_aw_bits_len  : mmio.awlen  ,
         mmio_axi4_0_aw_bits_size : mmio.awsize ,
         mmio_axi4_0_aw_bits_burst: mmio.awburst,
@@ -153,7 +144,7 @@ module hns_core (
         mmio_axi4_0_ar_ready     : mmio.arready,
         mmio_axi4_0_ar_valid     : mmio.arvalid,
         mmio_axi4_0_ar_bits_id   : mmio.arid   ,
-        mmio_axi4_0_ar_bits_addr : mmio_araddr ,
+        mmio_axi4_0_ar_bits_addr : mmio.araddr ,
         mmio_axi4_0_ar_bits_len  : mmio.arlen  ,
         mmio_axi4_0_ar_bits_size : mmio.arsize ,
         mmio_axi4_0_ar_bits_burst: mmio.arburst,
@@ -170,24 +161,22 @@ module hns_core (
 
         resetctrl_hartIsInReset_0: core_rst,
 
-        debug_clock                        : i_clk           ,
-        debug_reset                        : sys_rst         ,
-        debug_clockeddmi_dmi_req_ready     : o_dmi_req_ready ,
-        debug_clockeddmi_dmi_req_valid     : i_dmi_req_valid ,
-        debug_clockeddmi_dmi_req_bits_addr : i_dmi_req_addr  ,
-        debug_clockeddmi_dmi_req_bits_data : i_dmi_req_data  ,
-        debug_clockeddmi_dmi_req_bits_op   : i_dmi_req_op    ,
-        debug_clockeddmi_dmi_resp_ready    : i_dmi_resp_ready,
-        debug_clockeddmi_dmi_resp_valid    : o_dmi_resp_valid,
-        debug_clockeddmi_dmi_resp_bits_data: o_dmi_resp_data ,
-        debug_clockeddmi_dmi_resp_bits_resp: o_dmi_resp_resp ,
-        debug_clockeddmi_dmiClock          : i_clk           ,
-        debug_clockeddmi_dmiReset          : sys_rst         ,
-        debug_ndreset                      : ndreset         ,
-        debug_dmactive                     : dmactive        ,
-        debug_dmactiveAck                  : dmactive        ,
+        debug_clock      : i_clk        ,
+        debug_reset      : dm_rst       ,
+        debug_apb_clock  : i_clk        ,
+        debug_apb_reset  : dm_rst       ,
+        debug_apb_psel   : i_dmi_psel   ,
+        debug_apb_penable: i_dmi_penable,
+        debug_apb_pwrite : i_dmi_pwrite ,
+        debug_apb_paddr  : i_dmi_paddr  ,
+        debug_apb_pwdata : i_dmi_pwdata ,
+        debug_apb_prdata : o_dmi_prdata ,
+        debug_apb_pready : o_dmi_pready ,
+        debug_ndreset    : ndreset      ,
+        debug_dmactive   : dmactive     ,
+        debug_dmactiveAck: dmactive     ,
 
-        meip_0   : 1'b0       ,
-        boot_mode: i_boot_mode,
+        meip_0   : 1'b0,
+        boot_mode: 1'b0,
     );
 }

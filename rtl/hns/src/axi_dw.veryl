@@ -123,7 +123,10 @@ pub module axi_dw::<MPKG: $std::axi4_prototype, SPKG: $std::axi4_prototype> (
         m_axi.wstrb  = sw_s;
         m_axi.wlast  = sw_last;
         m_axi.wuser  = 0;
-        m_axi.bready = 1;
+        // The master may not take B at once: Rocket holds `bready` low while
+        // it takes a read burst. Taking B anyway lost it, and the master
+        // waited forever.
+        m_axi.bready = s_axi.bready;
 
         m_axi.arvalid  = r_busy & ~ar_done;
         m_axi.araddr   = ar_addr;

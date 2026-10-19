@@ -1,4 +1,4 @@
-// Smoke test for the HNS core on the FPGA harness.
+// Smoke test for MiniRocket on the FPGA harness.
 // Runs from DRAM (0x8000_0000) and writes to MMIO (0x0002_0000):
 //   +0x00: 0x21534e48 ("HNS!")
 //   +0x08: misa

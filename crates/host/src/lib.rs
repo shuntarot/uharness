@@ -15,6 +15,7 @@ pub mod adi;
 pub mod bitstream;
 pub mod bridge;
 pub mod config;
+pub mod disasm;
 pub mod dm;
 pub mod dma;
 pub mod elf;
