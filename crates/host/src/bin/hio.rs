@@ -668,6 +668,22 @@ enum CpuCmd {
         hart: HartArgs,
     },
 
+    /// Show the instructions at a place, or around the halted pc.
+    ///
+    /// The place is an address or a symbol (with the ELF). Without one, the
+    /// code around the pc is shown, and the pc's line is marked `=>`. The
+    /// instructions are read through the window from the memory the DUT
+    /// fetches from, so the hart need not halt. A line notes where the ELF
+    /// holds other bytes.
+    Disasm {
+        /// Address or symbol.
+        place: Option<String>,
+        /// How many instructions. Default: a whole symbol (up to 64), else 12.
+        count: Option<u32>,
+        #[command(flatten)]
+        hart: HartArgs,
+    },
+
     /// Set a hardware breakpoint, list them, or clear them.
     ///
     /// The place is an address or a symbol (with the ELF). Without one, the
@@ -1593,6 +1609,24 @@ fn uses_ps7(target: Option<&hns_targets::Target>) -> bool {
         .is_some_and(|d| d.is_ps7())
 }
 
+/// Whether this design reaches the PS's memory, so the PS must be set up
+/// after programming. A design that keeps to the PL (no `dram` bundle) does
+/// not: `make` writes no `ps7_init.tcl` for it, and its map has no
+/// calibration register.
+fn ps7_needed(cli: &Cli, bitstream: &std::path::Path) -> bool {
+    let beside = bitstream
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("ps7_init.tcl")
+        .is_file();
+    beside
+        || find_regs_opt(cli).ok().flatten().is_some_and(|(_, map)| {
+            map.registers
+                .iter()
+                .any(|r| r.role.as_deref() == Some("calib"))
+        })
+}
+
 /// Sets the PS up after programming, from the `ps7_init.tcl` beside the
 /// bitstream (`make` puts it there, and `make zip` takes it along).
 ///
@@ -1816,7 +1850,7 @@ fn program(
 
     // A Zynq's PS memory needs the PS set up, through the DAP. The probe is
     // released for that and opened again after.
-    let ps7 = uses_ps7(target.as_ref());
+    let ps7 = uses_ps7(target.as_ref()) && ps7_needed(cli, file);
     let mut m = if ps7 {
         drop(m);
         ps7_after_program(cli, file)?;
@@ -1991,7 +2025,7 @@ fn play_svf(cli: &Cli, file: &PathBuf) -> Result<(), String> {
     eprintln!("\r  done in {:.1} s", start.elapsed().as_secs_f64());
 
     // As after a `.bit`: a Zynq's PS memory needs the PS set up.
-    let ps7 = uses_ps7(resolve_target(cli).ok().flatten().as_ref());
+    let ps7 = uses_ps7(resolve_target(cli).ok().flatten().as_ref()) && ps7_needed(cli, file);
     let mut m = if ps7 {
         drop(m);
         ps7_after_program(cli, file)?;
@@ -5924,6 +5958,34 @@ impl WindowMem<'_> {
             off % entry_bytes,
         ))
     }
+
+    /// Up to `len` bytes from `addr`, from the memory the DUT fetches from:
+    /// where two memories hold the address, the one the DUT does not write
+    /// (a preloaded instruction memory). Fewer at the end of the memory.
+    fn read_fetch(&mut self, addr: u64, len: usize) -> Result<Vec<u8>, String> {
+        let (bundle, base, bytes) = self
+            .spans
+            .iter()
+            .filter(|s| s.covers(addr, 1))
+            .min_by_key(|s| s.dut_writes)
+            .map(|s| (s.bundle.clone(), s.base, s.bytes))
+            .ok_or_else(|| {
+                format!(
+                    "no memory holds {addr:#x}. The memories are at:\n{}",
+                    span_list(&self.spans)
+                )
+            })?;
+        let len = len.min((base + bytes - addr) as usize);
+        let span = Span {
+            bundle: bundle.clone(),
+            base,
+            bytes,
+            dut_writes: false,
+        };
+        let (from, to, skip) = self.entries_of(&span, addr, len)?;
+        let got = self.read_entries(&bundle, from, to)?;
+        Ok(got[skip..skip + len].to_vec())
+    }
 }
 
 impl hns_host::rtt::Memory for WindowMem<'_> {
@@ -5994,8 +6056,8 @@ fn exit_with(code: i32) -> Result<(), String> {
 }
 
 /// What `tohost` says, riscv-tests style: 1 is a pass, `(code << 1) | 1` a
-/// failure with `code`. An even value is an HTIF system call, which needs a
-/// host model this tool does not have.
+/// failure with `code`. An even value is an HTIF system call, which only
+/// `wait_tohost` answers (and only when the ELF has `fromhost`).
 fn tohost_status(value: u64) -> Result<Option<i32>, String> {
     match value {
         0 => Ok(None),
@@ -6175,7 +6237,10 @@ fn boot(
 
     let Some((rtt_addr, rtt_size)) = rtt_at else {
         return match tohost {
-            Some(addr) => wait_tohost(&mut mem, addr, ptr, attach.timeout),
+            Some(addr) => {
+                let fromhost = elf.symbol("fromhost").map(|s| s.value);
+                wait_tohost(&mut mem, addr, fromhost, ptr, attach.timeout)
+            }
             None => {
                 println!("no `_SEGGER_RTT` and no `tohost` in the ELF: nothing to wait for");
                 Ok(0)
@@ -6242,16 +6307,28 @@ impl Link {
     }
 }
 
-/// Polls `tohost` until the program reports.
+/// Polls `tohost` until the program reports. An HTIF `write` on the way
+/// (riscv-tests' benchmarks print with it) is answered through `fromhost`.
 fn wait_tohost(
     mem: &mut WindowMem,
     addr: u64,
+    fromhost: Option<u64>,
     ptr: u64,
     timeout: Option<std::time::Duration>,
 ) -> Result<i32, String> {
     let started = std::time::Instant::now();
     loop {
-        if let Some(code) = read_tohost(mem, addr, ptr)? {
+        let mut raw = [0u8; 8];
+        hns_host::rtt::Memory::read(mem, addr, &mut raw[..ptr as usize])?;
+        let value = u64::from_le_bytes(raw);
+        if value != 0
+            && value & 1 == 0
+            && let Some(fromhost) = fromhost
+        {
+            htif_call(mem, value, addr, fromhost)?;
+            continue;
+        }
+        if let Some(code) = tohost_status(value)? {
             return Ok(code);
         }
         if let Some(limit) = timeout
@@ -6262,6 +6339,42 @@ fn wait_tohost(
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+/// Answers one HTIF system call, the way riscv-tests' `syscall()` makes it:
+/// `tohost` holds the address of `magic_mem`, whose 64-bit words are the
+/// call number and its arguments. Only `write` (64) to stdout or stderr is
+/// answered. Its result goes to `magic_mem[0]`; then `tohost` is cleared and
+/// `fromhost` set, which lets the program go on.
+fn htif_call(mem: &mut WindowMem, magic: u64, tohost: u64, fromhost: u64) -> Result<(), String> {
+    use hns_host::rtt::Memory;
+    use std::io::Write;
+    /// The HTIF system call number of `write`.
+    const SYS_WRITE: u64 = 64;
+    let mut raw = [0u8; 32];
+    mem.read(magic, &mut raw)?;
+    let word = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
+    let (which, fd, buf, len) = (word(0), word(1), word(2), word(3));
+    if which != SYS_WRITE || !(1..=2).contains(&fd) {
+        return Err(format!(
+            "the program made HTIF system call {which} (arguments {fd:#x}, {buf:#x}, {len:#x}). \
+             hio answers only `write` (64) to stdout or stderr."
+        ));
+    }
+    let mut text = vec![0; len as usize];
+    mem.read(buf, &mut text)?;
+    if fd == 1 {
+        std::io::stdout()
+            .write_all(&text)
+            .and_then(|()| std::io::stdout().flush())
+    } else {
+        std::io::stderr().write_all(&text)
+    }
+    .map_err(|e| format!("cannot print the program's output: {e}"))?;
+    mem.write(magic, &len.to_le_bytes())?;
+    mem.write(tohost, &[0; 8])?;
+    mem.write(fromhost, &1u64.to_le_bytes())?;
+    Ok(())
 }
 
 fn timed_out(limit: std::time::Duration) -> String {
@@ -7003,6 +7116,174 @@ fn mem(
     Ok(())
 }
 
+/// Instructions, as `hio cpu disasm` prints them.
+///
+/// `count` instructions from `from`, read from the memory the DUT fetches
+/// from. A line starting a symbol of the ELF gets a `<name>:` heading. The
+/// line at `pc` is marked `=>`. Where the ELF holds other bytes at the same
+/// address, the line says so: the memory changed after loading, or holds
+/// another program.
+fn disasm_lines(
+    mem: &mut WindowMem,
+    elf: Option<&hns_host::elf::Elf>,
+    from: u64,
+    count: usize,
+    end: Option<u64>,
+    xlen: u32,
+    pc: Option<u64>,
+) -> Result<Vec<String>, String> {
+    use hns_host::disasm;
+    let bytes = mem.read_fetch(from, count * 4)?;
+    let mut lines = Vec::new();
+    let mut at = 0;
+    // The last instruction, for an `auipc` pair.
+    let mut last: Option<(u64, disasm::Insn)> = None;
+    for n in 0..count {
+        if at + 2 > bytes.len() {
+            break;
+        }
+        let addr = from + at as u64;
+        if end.is_some_and(|end| addr >= end) {
+            break;
+        }
+        let low = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        let len = disasm::length(low);
+        if at + len > bytes.len() {
+            break;
+        }
+        let here = &bytes[at..at + len];
+        let label = symbolize(elf, addr);
+        if n == 0 || (!label.is_empty() && !label.contains('+')) {
+            lines.push(format!("{}:", label.trim_start()));
+        }
+        let insn = disasm::decode(here, addr, xlen);
+        let pair = match (&last, &insn) {
+            (Some((first_addr, first)), Some(i)) => disasm::auipc_pair(first, *first_addr, i, xlen)
+                .map(|t| format!("  # {}{}", word(t, xlen), symbolize(elf, t))),
+            _ => None,
+        };
+        last = insn.clone().map(|i| (addr, i));
+        let (raw, text) = match insn {
+            Some(i) => {
+                let raw = if i.len == 2 {
+                    format!("{:04x}    ", i.raw)
+                } else {
+                    format!("{:08x}", i.raw)
+                };
+                let target = i
+                    .target
+                    .map(|t| format!("{}{}", word(t, xlen), symbolize(elf, t)))
+                    .unwrap_or_default();
+                let pair = pair.unwrap_or_default();
+                (
+                    raw,
+                    format!("{:<8}{}{target}{pair}", i.mnemonic, i.operands),
+                )
+            }
+            None if len == 2 => (format!("{low:04x}    "), format!(".short  {low:#06x}")),
+            None => {
+                let w = u32::from_le_bytes(here.try_into().expect("4 bytes"));
+                (format!("{w:08x}"), format!(".word   {w:#010x}"))
+            }
+        };
+        let mark = if pc == Some(addr) { "=>" } else { "  " };
+        let note = match elf.and_then(|e| elf_bytes(e, addr, len)) {
+            Some(file) if file != here => format!(
+                "    (the ELF has {} here)",
+                file.iter()
+                    .rev()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ),
+            _ => String::new(),
+        };
+        lines.push(format!(
+            "{mark} {}:  {raw}  {}{note}",
+            word(addr, xlen),
+            text.trim_end()
+        ));
+        at += len;
+    }
+    Ok(lines)
+}
+
+/// Where a listing of `place` starts, how many instructions it shows, and
+/// where it ends: a whole symbol (up to 64) unless a count is given.
+fn disasm_range(
+    place: &str,
+    count: Option<u32>,
+    elf: Option<&hns_host::elf::Elf>,
+) -> Result<(u64, usize, Option<u64>), String> {
+    let addr = place_address(place, elf)?;
+    let sized = elf.and_then(|e| e.symbols.iter().find(|s| s.value == addr && s.size > 0));
+    Ok(match (count, sized) {
+        (Some(n), _) => (addr, n as usize, None),
+        (None, Some(s)) => (addr, 64, Some(s.value + s.size)),
+        (None, None) => (addr, 12, None),
+    })
+}
+
+/// The line of the instruction at `pc`, for a stop report. Nothing when no
+/// memory holds it.
+fn pc_insn(
+    bus: &mut Bus,
+    map: &RegisterMap,
+    elf: Option<&hns_host::elf::Elf>,
+    pc: u64,
+    xlen: u32,
+) -> Option<String> {
+    let mut mem = WindowMem {
+        bus,
+        map,
+        spans: spans(map).ok()?,
+    };
+    let lines = disasm_lines(&mut mem, elf, pc, 1, None, xlen, Some(pc)).ok()?;
+    lines.into_iter().last()
+}
+
+/// The bytes a loadable segment of the ELF puts at `addr`, if one does.
+fn elf_bytes(elf: &hns_host::elf::Elf, addr: u64, len: usize) -> Option<&[u8]> {
+    elf.segments.iter().find_map(|s| {
+        let off = addr.checked_sub(s.paddr)? as usize;
+        s.bytes.get(off..off + len)
+    })
+}
+
+/// Where `disasm` starts when it shows the code around `pc`: a few
+/// instructions before it, counted from the start of its symbol, since
+/// compressed instructions cannot be walked backwards.
+fn disasm_start(mem: &mut WindowMem, elf: Option<&hns_host::elf::Elf>, pc: u64) -> u64 {
+    /// Instructions shown before the pc.
+    const BEFORE: usize = 4;
+    /// Bytes walked from the start of the symbol, at most.
+    const WALK: u64 = 1024;
+    let Some(start) = elf.and_then(|e| {
+        e.symbols
+            .iter()
+            .filter(|s| s.size > 0 && s.value <= pc && pc < s.value + s.size)
+            .min_by_key(|s| s.size)
+            .map(|s| s.value)
+    }) else {
+        return pc;
+    };
+    let start = start.max(pc.saturating_sub(WALK));
+    let Ok(bytes) = mem.read_fetch(start, (pc - start) as usize) else {
+        return pc;
+    };
+    let mut seen = Vec::new();
+    let mut at = 0;
+    while at + 2 <= bytes.len() {
+        seen.push(start + at as u64);
+        at += hns_host::disasm::length(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+    }
+    // Walking from the middle of a function may be out of step; then show
+    // from the pc.
+    if start + at as u64 != pc {
+        return pc;
+    }
+    seen.len().checked_sub(BEFORE).map_or(start, |i| seen[i])
+}
+
 /// An address typed as a number or a symbol. A Rust symbol may be named as
 /// it reads (`hello::main`) or by its last part (`main`) when that is unique.
 fn place_address(place: &str, elf: Option<&hns_host::elf::Elf>) -> Result<u64, String> {
@@ -7231,7 +7512,12 @@ fn stop_line(
         Stop::Trigger => "trigger",
         Stop::Other(cause) => hns_host::dm::cause_text(cause),
     };
-    Ok(format!("hart 0 halted at pc {} ({why})", at(pc)))
+    let mut text = format!("hart 0 halted at pc {} ({why})", at(pc));
+    if let Some(line) = pc_insn(bus, map, elf, pc, xlen) {
+        text.push('\n');
+        text.push_str(&line);
+    }
+    Ok(text)
 }
 
 /// "catching: ..." for the faults the exception trigger takes.
@@ -7330,6 +7616,7 @@ fn cpu_debug(
         | CpuCmd::Regs { hart, .. }
         | CpuCmd::Break { hart, .. }
         | CpuCmd::Mem { hart, .. }
+        | CpuCmd::Disasm { hart, .. }
         | CpuCmd::Catch { hart, .. }
         | CpuCmd::Reset { hart, .. } => hart,
     };
@@ -7353,7 +7640,33 @@ fn cpu_debug(
     {
         return mem(bus, map, elf, place, *words, write);
     }
-    let base = dmi_base(map, args.dmi.as_deref())?;
+    // A listing of a named place needs only the memory and the ELF's width,
+    // so it works on a CPU without a Debug Module too.
+    let base = match (dmi_base(map, args.dmi.as_deref()), cmd, elf) {
+        (Ok(base), _, _) => base,
+        (
+            Err(_),
+            CpuCmd::Disasm {
+                place: Some(place),
+                count,
+                ..
+            },
+            Some(e),
+        ) => {
+            let mut mem = WindowMem {
+                bus,
+                map,
+                spans: spans(map)?,
+            };
+            let (from, n, end) = disasm_range(place, *count, Some(e))?;
+            let xlen = if e.wide { 64 } else { 32 };
+            for line in disasm_lines(&mut mem, Some(e), from, n, end, xlen, None)? {
+                println!("{line}");
+            }
+            return Ok(());
+        }
+        (Err(e), _, _) => return Err(e),
+    };
     let window = WindowDmi { bus, base };
 
     // Raw access needs no attach: it is for when the debugger cannot.
@@ -7386,14 +7699,17 @@ fn cpu_debug(
     let mut dm = Debug::attach(window, args.hart)?;
     let hart = dm.hart();
     // "pc 0x... (cause)" for a halted hart.
+    // With the instruction there on a second line, when a memory holds it.
     let stopped = |dm: &mut Debug<WindowDmi>| -> Result<String, String> {
         let pc = dm.read_reg(Reg::parse("pc").expect("pc is a name"))?;
         let cause = hns_host::dm::cause_text(dm.cause()?);
-        Ok(format!(
-            "pc {}{} ({cause})",
-            word(pc, dm.xlen()?),
-            symbolize(elf, pc)
-        ))
+        let xlen = dm.xlen()?;
+        let mut text = format!("pc {}{} ({cause})", word(pc, xlen), symbolize(elf, pc));
+        if let Some(line) = pc_insn(dm.dmi_mut().bus, map, elf, pc, xlen) {
+            text.push('\n');
+            text.push_str(&line);
+        }
+        Ok(text)
     };
     match cmd {
         CpuCmd::Info { .. } => {
@@ -7513,6 +7829,49 @@ fn cpu_debug(
                 println!("hart {hart} reset and halted at {}", stopped(&mut dm)?);
             } else {
                 println!("hart {hart} reset and running");
+            }
+        }
+        CpuCmd::Disasm { place, count, .. } => {
+            let pc = match dm.is_halted()? {
+                true => Some(dm.read_reg(Reg::parse("pc").expect("pc is a name"))?),
+                false => None,
+            };
+            let xlen = match (elf, pc) {
+                (Some(e), _) => {
+                    if e.wide {
+                        64
+                    } else {
+                        32
+                    }
+                }
+                (None, Some(_)) => dm.xlen()?,
+                (None, None) => {
+                    return Err(
+                        "the hart is running, and without the ELF hio does not know \
+                                whether it is RV32 or RV64. Halt it, or give the program \
+                                with --elf."
+                            .to_string(),
+                    );
+                }
+            };
+            let mut mem = WindowMem {
+                bus: dm.dmi_mut().bus,
+                map,
+                spans: spans(map)?,
+            };
+            let (from, n, end) = match place {
+                Some(place) => disasm_range(place, *count, elf)?,
+                None => {
+                    let pc = pc.ok_or(
+                        "the hart is running. Halt it to see the code around the pc, \
+                         or give a place.",
+                    )?;
+                    let n = count.map_or(12, |n| n as usize);
+                    (disasm_start(&mut mem, elf, pc), n, None)
+                }
+            };
+            for line in disasm_lines(&mut mem, elf, from, n, end, xlen, pc)? {
+                println!("{line}");
             }
         }
         CpuCmd::Boot { .. } | CpuCmd::Console { .. } | CpuCmd::Dmi { .. } | CpuCmd::Mem { .. } => {

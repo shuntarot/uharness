@@ -1430,6 +1430,19 @@ mod jtag_tests {
         assert!(preset.contains("CONFIG.PCW_UIPARAM_DDR_PARTNO {MT41J256M16 RE-125}"));
     }
 
+    /// The Zybo is the same kind of board, with its own part and PS settings.
+    #[test]
+    fn the_zybo_carries_its_ps7_preset() {
+        let t = resolve("digilent/zybo", &[]).unwrap();
+        assert_eq!(t.head.device.part, "xc7z010clg400-1");
+        assert_eq!(jtag(&t).chain_tdi_side, [4]);
+        let d = dram(&t).unwrap();
+        assert!(d.is_ps7());
+        assert_eq!(d.base, Some(0x1000_0000));
+        let preset = read_beside(&t, "ps7_preset.tcl").expect("shipped beside the target");
+        assert!(preset.contains("CONFIG.PCW_UIPARAM_DDR_PARTNO {MT41K128M16 JT-125}"));
+    }
+
     /// VU9P has three SLRs, and the master (SLR1) comes first in a `.bit`.
     #[test]
     fn the_vcu118_names_a_cfg_in_per_slr() {

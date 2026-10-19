@@ -487,6 +487,7 @@ to fix it.
 | `digilent/arty-a7-35` | `jtag` | DDR3L, 256 MB | ✓ |
 | `digilent/arty-a7-100` | `jtag` | DDR3L, 256 MB | not yet |
 | `digilent/pynq-z1` | `jtag` | DDR3 through the PS, 256 MB | ✓ |
+| `digilent/zybo` | `jtag` | DDR3 through the PS, 256 MB | ✓ |
 | `xilinx/vcu118` | `jtag`, `pcie` | DDR4 | ✓ |
 | `xilinx/kcu105` | `jtag`, `pcie` | DDR4, 2 GB, with `:dr` or `:062` | ✓ |
 | `xilinx/kc705` | `jtag` | DDR3, 1 GB | not yet |
@@ -501,13 +502,14 @@ JTAG-HS2 wired to the card's 6-pin header; another FTDI adapter works through
 `hio --vid/--pid/--product/--layout-init`. It has no USB-UART either, so
 `[heartbeat]` has no pin there.
 
-On the PYNQ-Z1 the DDR3 belongs to the Zynq's PS. A `dram` bundle reaches it
-through the PS's S_AXI_HP0 port: the upper 256 MB, on the harness clock. No
-program runs on the CPUs; the PS is set up over JTAG instead, and `hio program`
-does that after the bitstream (`ps7_init.tcl`, beside the bitstream, from the
-PS settings that ship with the target). The USB-UART is the PS's too, so
-`[heartbeat]` has no pin. Set the boot jumper to JTAG, so a bitstream from the
-SD card does not replace yours.
+On the PYNQ-Z1 and the Zybo the DDR3 belongs to the Zynq's PS. A `dram` bundle
+reaches it through the PS's S_AXI_HP0 port: the upper 256 MB, on the harness
+clock. No program runs on the CPUs; the PS is set up over JTAG instead, and
+`hio program` does that after the bitstream (`ps7_init.tcl`, beside the
+bitstream, from the PS settings that ship with the target). The USB-UART is the
+PS's too, so `[heartbeat]` has no pin. Set the boot jumper to JTAG, so a
+bitstream from the SD card does not replace yours (JP4 on the PYNQ-Z1, JP5 on
+the Zybo).
 
 The KCU105 carries one of two DDR4 parts, and the memory controller must know
 which. Add the config that matches the chips: `:dr` for EDY4016AABG-DR-F

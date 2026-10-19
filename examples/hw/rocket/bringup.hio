@@ -11,7 +11,7 @@ read mem_calib
 echo == load the program while the core is held ==
 reset --hold
 write mmio 0x00 0 0 0 0 0 0 0 0
-load mem sw/smoke.elf --base 0x80000000 --verify
+load mem sw/smoke.elf --verify
 reset --release
 sleep 100
 

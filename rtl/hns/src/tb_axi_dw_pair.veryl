@@ -173,7 +173,7 @@ module test_axi_dw_pair {
         seed0: input logic<32>,
         seed1: input logic<32>,
     ) {
-        // Burst 0. Do not wait for B here. Waiting would skip the window where
+        // Burst 0. Do not take B yet. Taking it would skip the window where
         // the bug happens (between wlast and B).
         nar.awaddr  = addr0;
         nar.awlen   = len;
@@ -214,6 +214,19 @@ module test_axi_dw_pair {
             $assert(!nar.wready);
             clk.next(1);
         }
+
+        // Take B of burst 0. The bridge holds it until it is taken, and does
+        // not open the next burst before.
+        for _i in 0..64 {
+            if nar.bvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        $assert(nar.bvalid);
+        nar.bready = 1;
+        clk.next(1);
+        nar.bready = 0;
 
         nar.awaddr  = addr1;
         nar.awlen   = len;

@@ -54,11 +54,11 @@ hio (HostIO) works over JTAG (an FTDI cable) or PCIe, and needs no Vivado.
 
 ## Boards
 
-Arty A7-35 and A7-100, PYNQ-Z1, VCU118, KCU105, KC705, AS02MC04. The list,
-with what each board carries and which ones have run on hardware, is in
-[Boards](doc/guide-harness.md#boards). Adding one is a TOML file.
-No board at hand: `--target sim` runs the harness in the Veryl simulator,
-and `hio` talks to it over a socket.
+Arty A7-35 and A7-100, PYNQ-Z1, Zybo, VCU118, KCU105, KC705, AS02MC04. The
+list, with what each board carries and which ones have run on hardware, is in
+[Boards](doc/guide-harness.md#boards). Adding one is a TOML file. No board at
+hand: `--target sim` runs the harness in the Veryl simulator, and `hio` talks
+to it over a socket.
 
 ## Examples
 

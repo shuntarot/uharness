@@ -246,6 +246,11 @@ impl Reg {
         if let Some((_, csr)) = CSR_NAMES.iter().find(|(name, _)| *name == text) {
             return Some(Reg::Csr(*csr));
         }
+        // Every other standard name the disassembler knows (`mcountinhibit`,
+        // `mcycle`, `pmpaddr0`, ...).
+        if let Some(csr) = (0..0x1000).find(|&n| crate::disasm::csr_name(n) == text) {
+            return Some(Reg::Csr(csr));
+        }
         let number = text.strip_prefix("csr").unwrap_or(&text);
         let csr = u32::from_str_radix(number.strip_prefix("0x")?, 16).ok()?;
         (csr < 0x1000).then_some(Reg::Csr(csr))
@@ -265,9 +270,9 @@ impl fmt::Display for Reg {
         match self {
             Reg::Gpr(n) => write!(f, "{}", GPR_NAMES[*n as usize]),
             Reg::Csr(DPC) => write!(f, "pc"),
-            Reg::Csr(n) => match CSR_NAMES.iter().find(|(_, csr)| csr == n) {
-                Some((name, _)) => write!(f, "{name}"),
-                None => write!(f, "csr{n:#05x}"),
+            Reg::Csr(n) => match crate::disasm::csr_name(*n) {
+                name if name.starts_with("0x") => write!(f, "csr{n:#05x}"),
+                name => write!(f, "{name}"),
             },
         }
     }
@@ -510,6 +515,11 @@ impl<D: Dmi> Debug<D> {
         dm.progbuf_size = (abstractcs >> 24) & 0x1f;
         dm.impebreak = status & IMPEBREAK != 0;
         Ok(dm)
+    }
+
+    /// The DMI underneath, for other traffic on the same link.
+    pub fn dmi_mut(&mut self) -> &mut D {
+        &mut self.dmi
     }
 
     pub fn hart(&self) -> u32 {
@@ -1646,6 +1656,11 @@ mod tests {
         assert_eq!(Reg::parse("pc"), Some(Reg::Csr(DPC)));
         assert_eq!(Reg::parse("mcause"), Some(Reg::Csr(0x342)));
         assert_eq!(Reg::parse("0x7a0"), Some(Reg::Csr(0x7a0)));
+        // Names beyond the ones `regs` shows.
+        assert_eq!(Reg::parse("mcountinhibit"), Some(Reg::Csr(0x320)));
+        assert_eq!(Reg::parse("mcycle"), Some(Reg::Csr(0xb00)));
+        assert_eq!(Reg::parse("pmpaddr3"), Some(Reg::Csr(0x3b3)));
+        assert_eq!(Reg::Csr(0x320).to_string(), "mcountinhibit");
         assert_eq!(Reg::parse("x32"), None);
         assert_eq!(Reg::parse("nope"), None);
         assert_eq!(reg::parse("dmstatus"), Some(0x11));

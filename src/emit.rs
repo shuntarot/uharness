@@ -280,10 +280,15 @@ pub const AXI_PC_MODULE: &str = "hns_axi_pc";
 
 /// Whether `dram` is a Zynq-7000 PS's memory (`controller = "ps7"`).
 pub fn is_ps7(plan: &Plan) -> bool {
+    has_dram(plan) && target_dram(plan).is_some_and(|d| d.is_ps7())
+}
+
+/// Whether the manifest puts a bundle on the board's memory. What the target
+/// offers matters only then.
+fn has_dram(plan: &Plan) -> bool {
     plan.axi_mems
         .iter()
         .any(|m| m.backing == crate::manifest::Backing::Dram)
-        && target_dram(plan).is_some_and(|d| d.is_ps7())
 }
 
 /// `hns/syn/ps7.tcl`: the Zynq PS with S_AXI_HP0, and the converter in
@@ -412,7 +417,7 @@ fn board_part_tcl(out: &mut String, plan: &Plan) {
 
 /// Whether the controller takes its pin placement from the board files.
 fn uses_board_interface(plan: &Plan) -> bool {
-    target_dram(plan).is_some_and(|d| d.board_interface.is_some())
+    has_dram(plan) && target_dram(plan).is_some_and(|d| d.board_interface.is_some())
 }
 
 /// Whether the controller is UltraScale+ DDR4. Its port names are all different.
@@ -3644,11 +3649,7 @@ pub fn dram_pins(plan: &Plan) -> Vec<(String, &'static str, usize)> {
     let Some(target) = plan.target() else {
         return Vec::new();
     };
-    if !plan
-        .axi_mems
-        .iter()
-        .any(|m| m.backing == crate::manifest::Backing::Dram)
-    {
+    if !has_dram(plan) {
         return Vec::new();
     }
     let Some(dram) = hns_targets::dram(target) else {
