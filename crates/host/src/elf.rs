@@ -39,10 +39,15 @@ pub struct Symbol {
     pub value: u64,
     /// `st_size`, in bytes.
     pub size: u64,
+    /// A plain number rather than an address (`SHN_ABS`), as linker scripts
+    /// define sizes and counts (`_hart_stack_size`). It still names itself,
+    /// but names no address.
+    pub absolute: bool,
 }
 
 const PT_LOAD: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
+const SHN_ABS: u16 = 0xfff1;
 
 impl Elf {
     /// Whether the bytes start like an ELF.
@@ -158,10 +163,15 @@ fn symbols(r: &Reader, wide: bool) -> Result<Vec<Symbol>, String> {
             .ok_or_else(|| bad("the symbol names run past the end of the file"))?;
         for n in 0..size / entsize {
             let at = (offset + n * entsize) as usize;
-            let (name, value, size) = if wide {
-                (r.u32(at)?, r.u64(at + 8)?, r.u64(at + 16)?)
+            let (name, value, size, shndx) = if wide {
+                (r.u32(at)?, r.u64(at + 8)?, r.u64(at + 16)?, r.u16(at + 6)?)
             } else {
-                (r.u32(at)?, r.u32(at + 4)? as u64, r.u32(at + 8)? as u64)
+                (
+                    r.u32(at)?,
+                    r.u32(at + 4)? as u64,
+                    r.u32(at + 8)? as u64,
+                    r.u16(at + 14)?,
+                )
             };
             let name = strings
                 .get(name as usize..)
@@ -169,7 +179,12 @@ fn symbols(r: &Reader, wide: bool) -> Result<Vec<Symbol>, String> {
                 .map(|name| String::from_utf8_lossy(name).into_owned())
                 .unwrap_or_default();
             if !name.is_empty() {
-                out.push(Symbol { name, value, size });
+                out.push(Symbol {
+                    name,
+                    value,
+                    size,
+                    absolute: shndx == SHN_ABS,
+                });
             }
         }
     }

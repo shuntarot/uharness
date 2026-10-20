@@ -423,6 +423,13 @@ pub fn run(
             &emit::synth_tcl(&plan),
             "synthesis (Tcl)",
         )?);
+        if let Some(tcl) = emit::user_tcl(&plan) {
+            written.push(write(
+                &out.join("syn").join("user.tcl"),
+                &tcl,
+                "user synthesis settings (Tcl)",
+            )?);
+        }
         written.push(write(
             &out.join("syn").join("area.tcl"),
             &emit::area_tcl(&plan),

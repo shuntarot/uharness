@@ -5935,7 +5935,15 @@ pub fn synth_tcl(plan: &Plan) -> String {
     out.push_str("# exist before constraining them). Plain read_xdc drops control flow with\n");
     out.push_str("# CRITICAL WARNING Designutils 20-1307 and applies nothing.\n");
     out.push_str("read_xdc -unmanaged harness.xdc\n\n");
-    out.push_str("synth_design -top $top -part $part\n\n");
+    out.push_str("# The directive of each step. `[vivado] tcl` in Harness.toml can set them.\n");
+    for (var, _) in crate::manifest::DIRECTIVES {
+        out.push_str(&format!("set {var:<18} Default\n"));
+    }
+    if plan.loaded.vivado_tcl.is_some() {
+        out.push_str("source user.tcl\n");
+    }
+    out.push('\n');
+    out.push_str("synth_design -top $top -part $part -directive $SYNTH_DIRECTIVE\n\n");
     // Move the debug hub away from the window.
     //
     // When an IP brings a debug core (the UltraScale+ DDR4 calibration
@@ -5948,7 +5956,10 @@ pub fn synth_tcl(plan: &Plan) -> String {
     out.push_str("if {[llength [get_debug_cores -quiet dbg_hub]]} {\n");
     out.push_str("    set_property C_USER_SCAN_CHAIN 3 [get_debug_cores dbg_hub]\n");
     out.push_str("}\n\n");
-    out.push_str("opt_design\nplace_design\nphys_opt_design\nroute_design\n\n");
+    out.push_str("opt_design      -directive $OPT_DIRECTIVE\n");
+    out.push_str("place_design    -directive $PLACE_DIRECTIVE\n");
+    out.push_str("phys_opt_design -directive $PHYS_OPT_DIRECTIVE\n");
+    out.push_str("route_design    -directive $ROUTE_DIRECTIVE\n\n");
     out.push_str("report_timing_summary            -file $output/timing.rpt -max_paths 10\n");
     out.push_str("report_utilization -hierarchical -file $output/util.rpt\n");
     // Harness area. `util.rpt` goes deep into the IP, so it is hard to compare
@@ -5959,6 +5970,20 @@ pub fn synth_tcl(plan: &Plan) -> String {
     out.push_str("write_checkpoint -force $output/$top\n");
     out.push_str("write_bitstream  -force $output/$top\n");
     out
+}
+
+/// `hns/syn/user.tcl`: the file `[vivado] tcl` names, copied. The marker
+/// lets `gen` rewrite it, and remove it when the key goes away.
+pub fn user_tcl(plan: &Plan) -> Option<String> {
+    let text = plan.loaded.vivado_tcl.as_ref()?;
+    let from = plan.loaded.manifest.vivado.tcl.as_ref()?;
+    let mut out = header_tcl();
+    out.push_str(&format!(
+        "# Copied from {} (`[vivado] tcl` in Harness.toml)\n#\n",
+        from.display()
+    ));
+    out.push_str(text);
+    Some(out)
 }
 
 /// `hns/syn/area.tcl`: the harness area next to the DUT.
