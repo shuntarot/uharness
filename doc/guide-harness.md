@@ -395,7 +395,7 @@ window_base = 0
 Addresses count from 0 within the region. Anything past the end is refused
 before it is sent.
 
-### `[tie_off]`, `[leave_open]`, `[pin]`, `[heartbeat]`, `[pcie]`
+### `[tie_off]`, `[leave_open]`, `[pin]`, `[heartbeat]`, `[pcie]`, `[vivado]`
 
 ```toml
 [tie_off]                 # inputs only, value must fit the port
@@ -417,6 +417,9 @@ device_id  = 0x0001
 class_code = 0xff0000     # base / sub / interface, as `lspci -n` shows; default: no class
 bar_bytes  = 4096
 perst_resets_dut = true   # PERST# holds the DUT in reset (never the harness)
+
+[vivado]                  # your own Tcl for synthesis
+tcl = "vivado.tcl"        # relative to Harness.toml
 ```
 
 - `perst_resets_dut = false` keeps the DUT running through a host reboot.
@@ -451,6 +454,21 @@ perst_resets_dut = true   # PERST# holds the DUT in reset (never the harness)
 - The default PCIe IDs are borrowed from an example and are not ours: **choose
   your own before putting a card in a machine**. The BAR must be a power of two,
   at least 4096 bytes, and larger than the window.
+- `[vivado] tcl` is copied to `syn/user.tcl`. `synth.tcl` sources it just
+  before `synth_design`. Each step runs with `-directive` from a variable,
+  which is `Default` unless your file sets it:
+
+  ```tcl
+  # vivado.tcl: settings for a congested design on a large device
+  set SYNTH_DIRECTIVE    AlternateRoutability
+  set OPT_DIRECTIVE      Explore
+  set PLACE_DIRECTIVE    SSI_SpreadLogic_high
+  set PHYS_OPT_DIRECTIVE AggressiveExplore
+  set ROUTE_DIRECTIVE    AlternateCLBRouting
+  ```
+
+  The file can hold any other Tcl too (`set_param`, more XDC). It is the same
+  for every board; check `$part` in it if a board needs other settings.
 
 ## Commands
 

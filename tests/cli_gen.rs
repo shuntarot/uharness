@@ -1595,6 +1595,67 @@ fn the_build_flow_is_generated() {
         "{ip}"
     );
     assert!(ip.contains("file mkdir $ip_dir"), "{ip}");
+
+    // Without `[vivado] tcl`, every step runs with the default directive.
+    assert!(synth.contains("set ROUTE_DIRECTIVE"), "{synth}");
+    assert!(
+        synth.contains("route_design    -directive $ROUTE_DIRECTIVE"),
+        "{synth}"
+    );
+    assert!(!has_command(&synth, "source user.tcl"), "{synth}");
+    assert!(!dir.path().join("hns/syn/user.tcl").exists());
+}
+
+/// `[vivado] tcl` is copied beside `synth.tcl` and sourced before
+/// `synth_design`, after the defaults, so it can change them. Removing the key
+/// removes the copy.
+#[test]
+fn vivado_tcl_is_sourced_before_synthesis() {
+    let toml = format!("{HARNESS_TOML}\n[vivado]\ntcl = \"vivado.tcl\"\n");
+    let dir = fixture(&veryl_toml(), &toml);
+    fs::write(
+        dir.path().join("vivado.tcl"),
+        "set PLACE_DIRECTIVE SSI_SpreadLogic_high\n",
+    )
+    .unwrap();
+    let output = run_gen(&dir, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let user = fs::read_to_string(dir.path().join("hns/syn/user.tcl")).unwrap();
+    assert!(user.contains("veryl-harness:generated"), "{user}");
+    assert!(
+        user.contains("set PLACE_DIRECTIVE SSI_SpreadLogic_high"),
+        "{user}"
+    );
+
+    let synth = fs::read_to_string(dir.path().join("hns/syn/synth.tcl")).unwrap();
+    let default = synth.find("set PLACE_DIRECTIVE").unwrap();
+    let source = synth.find("source user.tcl").unwrap();
+    let synth_design = synth.find("synth_design -top").unwrap();
+    assert!(default < source && source < synth_design, "{synth}");
+
+    fs::write(dir.path().join("Harness.toml"), HARNESS_TOML).unwrap();
+    assert_eq!(run_gen(&dir, &[]).status.code(), Some(0));
+    assert!(!dir.path().join("hns/syn/user.tcl").exists());
+}
+
+/// A wrong path in `[vivado] tcl` is an error, not a silent default build.
+#[test]
+fn a_missing_vivado_tcl_is_refused() {
+    let toml = format!("{HARNESS_TOML}\n[vivado]\ntcl = \"nowhere.tcl\"\n");
+    let dir = fixture(&veryl_toml(), &toml);
+    let output = run_gen(&dir, &["--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        value["error"]["code"],
+        "harness::manifest::vivado_tcl_unreadable"
+    );
 }
 
 #[allow(dead_code)]

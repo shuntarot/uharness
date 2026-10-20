@@ -1042,7 +1042,36 @@ pub struct Manifest {
     /// are not ours, so set them before using a real board.
     #[serde(default)]
     pub pcie: Option<Pcie>,
+
+    /// `[vivado]`: what the user adds to the synthesis script.
+    #[serde(default)]
+    pub vivado: Vivado,
 }
+
+/// `[vivado]`: what the user adds to the synthesis script.
+///
+/// ```toml
+/// [vivado]
+/// tcl = "vivado.tcl"
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Vivado {
+    /// A Tcl file that `synth.tcl` sources just before `synth_design`. The
+    /// path is relative to `Harness.toml`. It can set the directives
+    /// (`SYNTH_DIRECTIVE`, ...) and anything else Tcl can do at that point.
+    pub tcl: Option<PathBuf>,
+}
+
+/// The variables `synth.tcl` passes to `-directive`, one for each step. Each
+/// is `Default` unless `[vivado] tcl` sets it.
+pub const DIRECTIVES: [(&str, &str); 5] = [
+    ("SYNTH_DIRECTIVE", "synth_design"),
+    ("OPT_DIRECTIVE", "opt_design"),
+    ("PLACE_DIRECTIVE", "place_design"),
+    ("PHYS_OPT_DIRECTIVE", "phys_opt_design"),
+    ("ROUTE_DIRECTIVE", "route_design"),
+];
 
 #[derive(Debug)]
 pub struct Loaded {
@@ -1051,6 +1080,10 @@ pub struct Loaded {
     /// The file that was used. `check` always prints it: with several
     /// candidates, the user must see which one took effect.
     pub path: PathBuf,
+
+    /// The text of `[vivado] tcl`. It is read with the manifest, so a wrong
+    /// path fails `check` too, not only `gen`.
+    pub vivado_tcl: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,6 +1137,19 @@ pub enum ManifestError {
         )
     )]
     ExplicitUnreadable {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("cannot read `{}` given by `[vivado] tcl`", path.display())]
+    #[diagnostic(
+        code(harness::manifest::vivado_tcl_unreadable),
+        help(
+            "The path is relative to Harness.toml. Fix it, or remove `tcl` from `[vivado]` to synthesise with the default directives."
+        )
+    )]
+    VivadoTclUnreadable {
         path: PathBuf,
         #[source]
         source: io::Error,
@@ -1313,9 +1359,21 @@ fn parse(text: &str, path: &Path) -> Result<Loaded, ManifestError> {
 
     manifest.validate()?;
 
+    let vivado_tcl = match &manifest.vivado.tcl {
+        Some(tcl) => {
+            let dir = path.parent().unwrap_or(Path::new(""));
+            let full = dir.join(tcl);
+            let text = fs::read_to_string(&full)
+                .map_err(|source| ManifestError::VivadoTclUnreadable { path: full, source })?;
+            Some(text)
+        }
+        None => None,
+    };
+
     Ok(Loaded {
         manifest,
         path: path.to_path_buf(),
+        vivado_tcl,
     })
 }
 

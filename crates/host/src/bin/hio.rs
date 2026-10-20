@@ -7153,7 +7153,7 @@ fn disasm_lines(
         }
         let here = &bytes[at..at + len];
         let label = symbolize(elf, addr);
-        if n == 0 || (!label.is_empty() && !label.contains('+')) {
+        if !label.is_empty() && (n == 0 || !label.contains('+')) {
             lines.push(format!("{}:", label.trim_start()));
         }
         let insn = disasm::decode(here, addr, xlen);
@@ -7329,8 +7329,8 @@ fn place_address(place: &str, elf: Option<&hns_host::elf::Elf>) -> Result<u64, S
 /// ` <name+0x1c>` for an address inside a symbol of the ELF, or nothing.
 ///
 /// A sized symbol that holds the address wins; a label without a size only
-/// names its own address. Assembler locals (`.L…`) and mapping symbols
-/// (`$x`) name nothing a reader looks for.
+/// names its own address. Assembler locals (`.L…`), mapping symbols (`$x`)
+/// and plain numbers (`SHN_ABS`) name nothing a reader looks for.
 fn symbolize(elf: Option<&hns_host::elf::Elf>, addr: u64) -> String {
     let Some(elf) = elf else {
         return String::new();
@@ -7338,7 +7338,7 @@ fn symbolize(elf: Option<&hns_host::elf::Elf>, addr: u64) -> String {
     let named = || {
         elf.symbols
             .iter()
-            .filter(|s| !s.name.is_empty() && !s.name.starts_with(['.', '$']))
+            .filter(|s| !s.name.is_empty() && !s.name.starts_with(['.', '$']) && !s.absolute)
     };
     let inside = named()
         .filter(|s| s.size > 0 && s.value <= addr && addr < s.value + s.size)
@@ -8404,22 +8404,26 @@ mod tests {
                     name: "main".to_string(),
                     value: 0x8000_0b56,
                     size: 0x40,
+                    absolute: false,
                 },
                 hns_host::elf::Symbol {
                     name: "_start".to_string(),
                     value: 0x8000_0000,
                     size: 0,
+                    absolute: false,
                 },
                 // A local label inside `main`, and a mangled Rust name.
                 hns_host::elf::Symbol {
                     name: ".L0 ".to_string(),
                     value: 0x8000_0b5a,
                     size: 0,
+                    absolute: false,
                 },
                 hns_host::elf::Symbol {
                     name: "_RNvMs3_Cslv7u3prg1jP_10rtt_targetNtB5_11DownChannel4read".to_string(),
                     value: 0x8000_0c00,
                     size: 0x40,
+                    absolute: false,
                 },
             ],
         };
@@ -8433,6 +8437,15 @@ mod tests {
         assert_eq!(symbolize(Some(&elf), 0x8000_0000), " <_start>");
         assert_eq!(symbolize(Some(&elf), 0x8000_0100), "");
         assert_eq!(symbolize(None, 0x8000_0b72), "");
+        // A number from the linker script is not an address.
+        let mut with_abs = elf.clone();
+        with_abs.symbols.push(hns_host::elf::Symbol {
+            name: "_hart_stack_size".to_string(),
+            value: 0x1_0000,
+            size: 0,
+            absolute: true,
+        });
+        assert_eq!(symbolize(Some(&with_abs), 0x1_0000), "");
     }
 
     /// A place is an address, or a symbol by its stored, readable or last
@@ -8443,6 +8456,7 @@ mod tests {
             name: name.to_string(),
             value,
             size: 4,
+            absolute: false,
         };
         let elf = hns_host::elf::Elf {
             wide: false,
