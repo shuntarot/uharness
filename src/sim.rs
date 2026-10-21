@@ -15,11 +15,26 @@ use crate::generate::Invocation;
 /// Where the component writes the address it listens on. `hio` reads it.
 pub const ADDR_FILE: &str = "sim.addr";
 
-pub fn run(out_dir: Option<&Path>, wave: bool, watch: bool) -> miette::Result<()> {
+pub fn run(
+    out_dir: Option<&Path>,
+    wave: bool,
+    watch: bool,
+    listen: Option<&str>,
+) -> miette::Result<()> {
+    // The socket component reads these when the simulation starts.
+    // SAFETY: no other thread runs yet; the first one is started below.
     if watch {
-        // The socket component reads this when the simulation starts.
-        // SAFETY: no other thread runs yet; the first one is started below.
         unsafe { std::env::set_var("HNS_SIM_WATCH", "1") };
+    }
+    if let Some(listen) = listen {
+        if listen.parse::<std::net::SocketAddr>().is_err() {
+            return Err(miette::miette!(
+                code = "harness::sim::bad_addr",
+                help = "Give an IP address and a port, e.g. `--addr 0.0.0.0:5555`. Port 0 picks a free one.",
+                "`{listen}` is not an address to listen on"
+            ));
+        }
+        unsafe { std::env::set_var("HNS_SIM_ADDR", listen) };
     }
     let out = match out_dir {
         Some(path) if path.is_relative() => std::env::current_dir()

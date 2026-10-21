@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use hns_host::sim::{Error, Link};
+use hns_host::hns2::{Error, Link};
 
 mod common;
 

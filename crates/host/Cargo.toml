@@ -20,6 +20,9 @@ clap_complete = "4.6"
 miette = {version = "7.6", features = ["fancy"]}
 # Rust symbol names at the debug prompt.
 rustc-demangle = "0.1"
+# The INFO message of HNS2.
+serde      = {version = "1.0", features = ["derive"]}
+serde_json = "1.0"
 
 [dev-dependencies]
 # The `pcie.rs` tests build a fake sysfs to run the BAR path without a board.

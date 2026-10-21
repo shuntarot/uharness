@@ -7,6 +7,7 @@ Generating the harness is in [guide-harness.md](guide-harness.md).
 - [Basics](#basics)
 - [The prompt](#the-prompt)
 - [Over PCIe](#over-pcie)
+- [From another machine](#from-another-machine)
 - [Resetting the DUT](#resetting-the-dut)
 - [Writing a procedure down](#writing-a-procedure-down)
 - [Loading a memory](#loading-a-memory)
@@ -147,6 +148,27 @@ Abort, and a longer write is dropped. The counts saturate and survive a link
 reset. A request the PCIe block refuses itself (no BAR hit, memory decoding
 off) never reaches them; `lspci -vvv` shows that one as `UnsupReq+` in the
 card's `DevSta`. Read them over JTAG: a read over PCIe counts itself.
+
+## From another machine
+
+`hio serve` on the machine the board is on keeps the window open and passes
+batches from `hio --connect` on other machines. It speaks
+[HNS2](hns2.md), so other programs can be clients too.
+
+```bash
+# on the machine with the board (add -p, under sudo, for PCIe)
+hio serve --listen 127.0.0.1:5555
+# elsewhere: forward the port, then connect with a copy of its regs.json
+ssh -N -L 5555:localhost:5555 board-host &
+hio --regs regs.json --connect localhost:5555 id
+```
+
+- `HIO_CONNECT=localhost:5555` does the same as `--connect`.
+- One client at a time; another is refused until the first is done.
+- There is no password. Keep the default `127.0.0.1` and use `ssh -L`.
+- `--connect` reaches only the window. `program`, `erase`, `probe`, `dap`
+  and the card's DMA (`--dma`, `dma-fire`) run on the server's machine.
+- A simulation is served the same way: `veryl harness sim --addr`.
 
 ## Resetting the DUT
 

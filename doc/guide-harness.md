@@ -625,8 +625,13 @@ hio run bringup.hio
   inside a board one (`-o hns/sim`): generating the board one again leaves
   it alone.
 - It listens on a free port of `127.0.0.1` and writes the address to
-  `hns/sim.addr`, where `hio` finds it. `HNS_SIM_ADDR=<ip:port>` listens
-  elsewhere.
+  `hns/sim.addr`, where `hio` finds it. `--addr <ip:port>` (or
+  `HNS_SIM_ADDR`) listens elsewhere.
+- From another machine, start it with `--addr 0.0.0.0:5555`, copy its
+  `regs.json`, and run `hio --regs regs.json --connect <host>:5555 ...`
+  (or set `HIO_CONNECT`). There is no password: anyone who reaches the
+  port can drive the harness. The protocol is [HNS2](hns2.md); one client
+  is served at a time.
 - `veryl harness sim --watch` prints the simulated clock rate every second
   (`HNS_SIM_WATCH=1` does the same).
 - A DUT with several clocks runs with each clock at its `freq_mhz`, so their
