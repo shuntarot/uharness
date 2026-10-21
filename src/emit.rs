@@ -4086,8 +4086,10 @@ fn mig_instance(
             out.push_str("    );\n\n");
             format!("daxi_{bundle}")
         };
+        // The arbiter's output. Not `raxi_`: that is the range check's output,
+        // and a bundle with `dut_base` has both.
         out.push_str(&format!(
-            "    inst raxi_{bundle}: {domain}$std::axi4_if::<{cpkg}>;\n"
+            "    inst paxi_{bundle}: {domain}$std::axi4_if::<{cpkg}>;\n"
         ));
         // Wires between the DMA engine and the hard block. They are declared
         // first; `veryl check` rejects a name used before its declaration.
@@ -4266,9 +4268,9 @@ fn mig_instance(
         out.push_str(&format!("        i_rst: rst_{host},\n"));
         out.push_str(&format!("        m0: {into_cdc},\n"));
         out.push_str(&format!("        m1: {dma_side},\n"));
-        out.push_str(&format!("        s: raxi_{bundle},\n"));
+        out.push_str(&format!("        s: paxi_{bundle},\n"));
         out.push_str("    );\n\n");
-        format!("raxi_{bundle}")
+        format!("paxi_{bundle}")
     } else {
         into_cdc
     };

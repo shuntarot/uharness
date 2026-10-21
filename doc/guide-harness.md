@@ -626,7 +626,9 @@ hio run bringup.hio
   it alone.
 - It listens on a free port of `127.0.0.1` and writes the address to
   `hns/sim.addr`, where `hio` finds it. `HNS_SIM_ADDR=<ip:port>` listens
-  elsewhere; `HNS_SIM_WATCH=1` prints the simulated clock rate every second.
+  elsewhere.
+- `veryl harness sim --watch` prints the simulated clock rate every second
+  (`HNS_SIM_WATCH=1` does the same).
 - A DUT with several clocks runs with each clock at its `freq_mhz`, so their
   ratio holds; the DUT reset reaches every domain.
 - `dram` is a 256 MB memory that holds only the pages written; unwritten
