@@ -2539,6 +2539,8 @@ dependencies = [
  "miette",
  "nusb",
  "rustc-demangle",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

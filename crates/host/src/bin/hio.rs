@@ -138,6 +138,20 @@ struct Cli {
     #[arg(short = 'p', conflicts_with = "transport")]
     pcie: bool,
 
+    /// Reach the window through a server, e.g. localhost:5555.
+    ///
+    /// The server is `hio serve` on the machine the board is on, or `veryl harness sim
+    /// --addr`. Use the same regs.json as the server. Commands that need the cable or the
+    /// card's memory (program, probe, DMA) run only on the server's machine.
+    #[arg(
+        long,
+        value_name = "HOST:PORT",
+        env = "HIO_CONNECT",
+        conflicts_with_all = ["transport", "pcie"],
+        hide_short_help = true
+    )]
+    connect: Option<String>,
+
     /// PCI address of the card, e.g. 0000:04:00.0.
     ///
     /// Without it the ID in regs.json picks the card; this is only needed when more than
@@ -453,6 +467,17 @@ enum Cmd {
         /// Stop after this many entries.
         #[arg(long, value_name = "N")]
         max: Option<usize>,
+    },
+
+    /// Serve the window to `hio --connect` on other machines.
+    ///
+    /// Opens the window as any command does (JTAG, or PCIe with `-p`) and keeps it
+    /// open. One client at a time. There is no password: keep the default address
+    /// and reach it with `ssh -L`. Ctrl-C stops it.
+    Serve {
+        /// Where to listen. Port 0 picks a free one.
+        #[arg(long, value_name = "IP:PORT", default_value = "127.0.0.1:0")]
+        listen: String,
     },
 
     /// Print a shell completion script on standard output.
@@ -1100,7 +1125,12 @@ fn parse_step(line: &str) -> Result<Step, String> {
             "`cpu boot` and `cpu console` take over the terminal; run them on their own."
                 .to_string(),
         ),
-        Cmd::Probe | Cmd::Dap(_) | Cmd::Targets | Cmd::Check | Cmd::Completions { .. } => {
+        Cmd::Probe
+        | Cmd::Dap(_)
+        | Cmd::Targets
+        | Cmd::Check
+        | Cmd::Serve { .. }
+        | Cmd::Completions { .. } => {
             Err("that only makes sense before the link is open; run it on its own.".to_string())
         }
         cmd => Ok(Step::Window(cmd)),
@@ -1128,6 +1158,7 @@ fn run_step(cli: &Cli, bus: &mut Bus, map: &RegisterMap, step: Step) -> Result<(
         | Cmd::Probe
         | Cmd::Dap(_)
         | Cmd::Targets
+        | Cmd::Serve { .. }
         | Cmd::Completions { .. } => {
             unreachable!("refused when the script was read")
         }
@@ -2356,6 +2387,9 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
     if matches!(cmd, Cmd::Targets) {
         return targets();
     }
+    if cli.connect.is_some() {
+        refuse_over_connect(&cmd)?;
+    }
     // The card moves data only over PCIe. Allowing `--dma` over JTAG would
     // test PCIe while the user thinks they test JTAG.
     let forced = match &cmd {
@@ -2465,6 +2499,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
         | Cmd::Completions { .. } => {
             unreachable!("handled above")
         }
+        Cmd::Serve { listen } => serve(&mut bus, &map, &listen),
         Cmd::Id => id(&mut bus, &map),
         Cmd::Read { who, at, words } => do_read(&mut bus, &map, &who, at, words),
         Cmd::Write { who, values } => do_write(&mut bus, &map, &who, &values),
@@ -2579,10 +2614,129 @@ impl Cli {
     fn transport_name(&self) -> &str {
         if self.pcie {
             "pcie"
+        } else if self.connect.is_some() {
+            "a server (--connect)"
         } else {
             self.transport.as_deref().unwrap_or("jtag")
         }
     }
+}
+
+/// Checks that the server serves what regs.json describes, before any batch.
+/// `from` says where its address came from.
+fn check_server(
+    cli: &Cli,
+    link: &hns_host::hns2::Link,
+    map: &RegisterMap,
+    from: &str,
+) -> Result<(), String> {
+    let info = link.info();
+    let sim = map.target.as_deref() == Some(hns_targets::SIM);
+    let serves = match info.kind.as_str() {
+        "sim" => "a simulation".to_string(),
+        _ => format!(
+            "a board ({})",
+            info.target.as_deref().unwrap_or("target not named")
+        ),
+    };
+    let fits = if sim {
+        info.kind == "sim"
+    } else {
+        info.kind != "sim"
+            && (info.target.is_none() || map.target.is_none() || info.target == map.target)
+    };
+    if !fits {
+        return Err(format!(
+            "the server at {from} serves {serves}, and regs.json is for {}.\n\
+             Pass the regs.json the server uses (copy it from the server's machine).",
+            map.target.as_deref().unwrap_or("a target file")
+        ));
+    }
+    if let Some(hash) = info.map_hash
+        && hash != map.map_hash
+        && !cli.no_verify
+    {
+        return Err(format!(
+            "the server at {from} uses a regs.json with map hash {hash:#010x}, and this one \
+             has {:#010x}.\n\
+             Pass the regs.json the server uses (copy it from the server's machine).",
+            map.map_hash
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses what a server cannot do for a client: it passes on batches for
+/// the window, and nothing else.
+fn refuse_over_connect(cmd: &Cmd) -> Result<(), String> {
+    let cable = match cmd {
+        Cmd::Probe => Some("probe"),
+        Cmd::Dap(_) => Some("dap"),
+        Cmd::Program { .. } => Some("program"),
+        Cmd::Erase => Some("erase"),
+        _ => None,
+    };
+    if let Some(name) = cable {
+        return Err(format!(
+            "`{name}` works on the JTAG cable, and `--connect` reaches only the window.\n\
+             Run it on the machine the board is on."
+        ));
+    }
+    let dma = match cmd {
+        Cmd::Memtest { dma: true, .. } => Some("memtest --dma"),
+        Cmd::Load { dma: true, .. } => Some("load --dma"),
+        Cmd::DmaFire { .. } => Some("dma-fire"),
+        _ => None,
+    };
+    if let Some(name) = dma {
+        return Err(format!(
+            "`{name}` has the card move data in the memory of the machine it is in, and \
+             `--connect` reaches only the window.\n\
+             Run it on the machine the board is on, or use `--pio`."
+        ));
+    }
+    if matches!(cmd, Cmd::Serve { .. }) {
+        return Err("`serve` opens the window on this machine; drop `--connect`.".to_string());
+    }
+    Ok(())
+}
+
+/// `hio serve`: passes batches from clients to the window, until Ctrl-C.
+fn serve(bus: &mut Bus, map: &RegisterMap, listen: &str) -> Result<(), String> {
+    use hns_host::hns2;
+
+    if map.target.as_deref() == Some(hns_targets::SIM) {
+        return Err(
+            "a simulation serves its window itself: start it with `veryl harness sim --addr`.\n\
+             `hio serve` is for a board."
+                .to_string(),
+        );
+    }
+    let info = hns2::Info {
+        server: format!("hio {}", env!("CARGO_PKG_VERSION")),
+        kind: "board".to_string(),
+        target: map.target.clone(),
+        master: bus.master().to_string(),
+        map_hash: Some(map.map_hash),
+        max_ops: hns2::MAX_OPS,
+    };
+    let listener = std::net::TcpListener::bind(listen)
+        .map_err(|e| format!("cannot listen on {listen}: {e}"))?;
+    let local = listener.local_addr().map_err(|e| e.to_string())?;
+    println!(
+        "hio: serving {} over {} on {local}; Ctrl-C stops",
+        map.dut, info.master
+    );
+    if !local.ip().is_loopback() {
+        eprintln!("warning: {local} is reachable from other machines, and HNS2 has no password");
+    }
+    hns2::serve(
+        listener,
+        &info,
+        |batch| bus.run(batch),
+        |line| println!("hio: {line}"),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Sets the TCK gap between scans (`hns_host::mpsse::update_gap`).
@@ -2610,14 +2764,19 @@ fn open_bus(cli: &Cli, map_path: &str, map: &RegisterMap) -> Result<Bus, String>
     } else {
         cli.transport_name()
     };
+    if let Some(addr) = &cli.connect {
+        let link = hns_host::hns2::Link::connect(addr).map_err(|e| e.to_string())?;
+        check_server(cli, &link, map, addr)?;
+        return Ok(Bus::Net(link));
+    }
     match transport {
         "sim" => {
             let dir = std::path::Path::new(map_path)
                 .parent()
                 .unwrap_or(std::path::Path::new("."));
-            Ok(Bus::Sim(
-                hns_host::sim::Link::open(dir).map_err(|e| e.to_string())?,
-            ))
+            let link = hns_host::hns2::Link::open(dir).map_err(|e| e.to_string())?;
+            check_server(cli, &link, map, hns_host::hns2::ADDR_FILE)?;
+            Ok(Bus::Net(link))
         }
         "jtag" => {
             let cfg = resolve_probe(cli)?;
@@ -3993,8 +4152,8 @@ fn wide_words(value: u64, words: usize) -> Vec<u32> {
 enum Bus {
     Jtag(Bridge<Mpsse<Ftdi>>),
     Pcie(hns_host::pcie::Bar),
-    /// `--target sim`: a socket to `veryl harness sim`.
-    Sim(hns_host::sim::Link),
+    /// An HNS2 server: `veryl harness sim`, or `hio serve` with a board.
+    Net(hns_host::hns2::Link),
 }
 
 impl Bus {
@@ -4002,7 +4161,7 @@ impl Bus {
         match self {
             Bus::Jtag(bridge) => bridge.run(batch).map_err(|e| e.to_string()),
             Bus::Pcie(bar) => bar.run(batch).map_err(|e| e.to_string()),
-            Bus::Sim(link) => link.run(batch).map_err(|e| e.to_string()),
+            Bus::Net(link) => link.run(batch).map_err(|e| e.to_string()),
         }
     }
 
@@ -4011,9 +4170,11 @@ impl Bus {
     /// read a different address.
     fn master(&self) -> &'static str {
         match self {
-            // The simulator drives the AXI4-Lite port JTAG drives on a board.
-            Bus::Jtag(_) | Bus::Sim(_) => "jtag",
+            Bus::Jtag(_) => "jtag",
             Bus::Pcie(_) => "pcie",
+            // The simulator drives the AXI4-Lite port JTAG drives on a board.
+            Bus::Net(link) if link.info().master == "pcie" => "pcie",
+            Bus::Net(_) => "jtag",
         }
     }
 
@@ -4021,7 +4182,7 @@ impl Bus {
         match self {
             Bus::Jtag(bridge) => bridge.read32(addr).map_err(|e| e.to_string()),
             Bus::Pcie(bar) => bar.read32(addr).map_err(|e| e.to_string()),
-            Bus::Sim(link) => link.read32(addr).map_err(|e| e.to_string()),
+            Bus::Net(link) => link.read32(addr).map_err(|e| e.to_string()),
         }
     }
 
@@ -4029,7 +4190,7 @@ impl Bus {
         match self {
             Bus::Jtag(bridge) => bridge.read_burst(addr, out).map_err(|e| e.to_string()),
             Bus::Pcie(bar) => bar.read_burst(addr, out).map_err(|e| e.to_string()),
-            Bus::Sim(link) => link.read_burst(addr, out).map_err(|e| e.to_string()),
+            Bus::Net(link) => link.read_burst(addr, out).map_err(|e| e.to_string()),
         }
     }
 
@@ -4041,7 +4202,7 @@ impl Bus {
             Bus::Pcie(bar) => bar
                 .read_parallel(addr, out, threads)
                 .map_err(|e| e.to_string()),
-            Bus::Sim(link) => link.read_burst(addr, out).map_err(|e| e.to_string()),
+            Bus::Net(link) => link.read_burst(addr, out).map_err(|e| e.to_string()),
         }
     }
 }
@@ -4115,7 +4276,7 @@ fn id(bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
     println!("dut      {}", map.dut);
     check_identity_values(magic, hash, map)?;
     report_timeouts(bus, map)?;
-    let what = if matches!(bus, Bus::Sim(_)) {
+    let what = if matches!(bus, Bus::Net(link) if link.info().kind == "sim") {
         "the simulation"
     } else {
         "the board"
@@ -9138,6 +9299,65 @@ mod tests {
         };
         assert!(err.contains("not a transport"), "{err}");
         assert!(err.contains("jtag"), "{err}");
+    }
+
+    /// `--connect` reaches a server, checks what it serves, and refuses what
+    /// only the server's machine can do.
+    #[test]
+    fn connect_reaches_a_server_that_serves_this_map() {
+        let map: RegisterMap = RegisterMap::from_json(&sample_map()).unwrap();
+        let start = |info: hns_host::hns2::Info| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            std::thread::spawn(move || {
+                hns_host::hns2::serve(listener, &info, |_| Err("no window".to_string()), |_| {})
+            });
+            addr
+        };
+        let info = hns_host::hns2::Info {
+            server: "test".to_string(),
+            kind: "board".to_string(),
+            target: map.target.clone(),
+            master: "pcie".to_string(),
+            map_hash: Some(map.map_hash),
+            max_ops: 16,
+        };
+        let addr = start(info.clone());
+        let cli = Cli::parse_from(["hio", "--connect", &addr, "id"]);
+        match open_bus(&cli, "no-such-dir/regs.json", &map) {
+            Ok(bus) => assert_eq!(bus.master(), "pcie"),
+            Err(e) => panic!("{e}"),
+        }
+        // Another map, or a simulation, is named before anything runs.
+        let other = start(hns_host::hns2::Info {
+            map_hash: Some(map.map_hash ^ 1),
+            ..info.clone()
+        });
+        let cli = Cli::parse_from(["hio", "--connect", &other, "id"]);
+        let err = open_bus(&cli, "regs.json", &map).err().unwrap();
+        assert!(err.contains("map hash"), "{err}");
+        let sim = start(hns_host::hns2::Info {
+            kind: "sim".to_string(),
+            ..info
+        });
+        let cli = Cli::parse_from(["hio", "--connect", &sim, "id"]);
+        let err = open_bus(&cli, "regs.json", &map).err().unwrap();
+        assert!(err.contains("a simulation"), "{err}");
+    }
+
+    #[test]
+    fn connect_refuses_the_cable_and_dma() {
+        for args in [
+            vec!["hio", "--connect", "h:1", "program", "x.bit"],
+            vec!["hio", "--connect", "h:1", "probe"],
+            vec!["hio", "--connect", "h:1", "load", "mem", "x.elf", "--dma"],
+            vec!["hio", "--connect", "h:1", "serve"],
+        ] {
+            let err = run_cli(Cli::parse_from(&args)).unwrap_err();
+            assert!(err.contains("--connect"), "{args:?}: {err}");
+        }
+        // A transport and a server at once: which one would win?
+        assert!(Cli::try_parse_from(["hio", "-p", "--connect", "h:1", "id"]).is_err());
     }
 
     /// clap's own consistency check. Conflicts in the argument definitions

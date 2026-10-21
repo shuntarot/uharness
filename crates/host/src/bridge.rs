@@ -324,6 +324,11 @@ impl Reads {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// The values in the order of the reads.
+    pub fn values(&self) -> &[u32] {
+        &self.0
+    }
 }
 
 /// Accesses queued and sent together.
@@ -380,6 +385,10 @@ impl Batch {
     pub fn replayable(&mut self) -> &mut Self {
         self.replay = true;
         self
+    }
+
+    pub fn is_replayable(&self) -> bool {
+        self.replay
     }
 
     pub fn write(&mut self, addr: u32, data: u32) -> &mut Self {

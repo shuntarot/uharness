@@ -21,12 +21,12 @@ pub mod dma;
 pub mod elf;
 pub mod frame;
 pub mod ftdi;
+pub mod hns2;
 pub mod mpsse;
 pub mod pcie;
 pub mod ps7;
 pub mod rtt;
 pub mod semihosting;
-pub mod sim;
 pub mod svf;
 
 #[cfg(test)]

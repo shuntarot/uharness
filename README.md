@@ -83,7 +83,9 @@ cargo build --release   # gives veryl-harness and hio
 
 Needs `veryl` on `PATH` (the version pinned in `Cargo.toml`), and Vivado for
 synthesis. Details: [doc/guide-harness.md](doc/guide-harness.md) for the
-manifest and generation, [doc/guide-hio.md](doc/guide-hio.md) for `hio`.
+manifest and generation, [doc/guide-hio.md](doc/guide-hio.md) for `hio`,
+[doc/hns2.md](doc/hns2.md) for the protocol of `hio serve` and the
+simulation.
 
 ## License
 
