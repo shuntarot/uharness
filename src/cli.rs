@@ -65,7 +65,7 @@ pub enum Command {
 /// `sim` runs what `gen --target sim` wrote, so it takes only the directory.
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Environment:\n  HNS_SIM_WATCH=1        print the simulated clock rate once a second\n  HNS_SIM_ADDR=<ip:port> listen there instead of a free port on 127.0.0.1\n\nThe address is written to sim.addr in the directory, where hio finds it.\nStop with Ctrl-C."
+    after_help = "Environment:\n  HNS_SIM_WATCH=1        the same as --watch\n  HNS_SIM_ADDR=<ip:port> listen there instead of a free port on 127.0.0.1\n\nThe address is written to sim.addr in the directory, where hio finds it.\nStop with Ctrl-C."
 )]
 pub struct SimArgs {
     /// Which harness to run. Defaults to the current directory when it is one, else hns/ beside Veryl.toml.
@@ -75,6 +75,10 @@ pub struct SimArgs {
     /// Dump a waveform, as `veryl test --wave` does.
     #[arg(long)]
     pub wave: bool,
+
+    /// Print the simulated clock rate once a second while it runs.
+    #[arg(long)]
+    pub watch: bool,
 }
 
 /// `update` only repeats a generation, so it takes only the directory. The
@@ -282,7 +286,7 @@ fn run(cli: Cli) -> miette::Result<()> {
             let target = resolve_target(&replay)?;
             crate::generate::run(&invocation(&replay), target, Some(&out), format)
         }
-        Command::Sim(args) => crate::sim::run(args.out_dir.as_deref(), args.wave),
+        Command::Sim(args) => crate::sim::run(args.out_dir.as_deref(), args.wave, args.watch),
         Command::Targets => list_targets(),
     }
 }

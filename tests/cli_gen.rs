@@ -2719,6 +2719,18 @@ module dut_top (
     run("jtag", "hnsj");
     let jtag = fs::read_to_string(dir.path().join("hnsj").join("src").join("top.veryl")).unwrap();
     assert!(!jtag.contains("dma_gate"), "{jtag}");
+
+    // With `dut_base` the bundle also has a range check. Its interface and
+    // the arbiter's once had the same name, which `veryl check` rejects.
+    fs::write(
+        dir.path().join("Harness.toml"),
+        "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 100\n\n[bundle.mem]\nbacking = \"dram\"\ndepth = \"16M\"\naperture = 256\ndut_base = 0x400_0000\n\n[pcie]\nbar_bytes = 8192\n",
+    )
+    .unwrap();
+    run("pcie", "based");
+    if let Err(why) = common::veryl_check(&dir.path().join("based")) {
+        panic!("the PCIe harness with a requester and dut_base does not check:\n{why}");
+    }
 }
 
 /// The window watchdog limit is computed from the clock.

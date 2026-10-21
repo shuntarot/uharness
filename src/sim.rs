@@ -15,7 +15,12 @@ use crate::generate::Invocation;
 /// Where the component writes the address it listens on. `hio` reads it.
 pub const ADDR_FILE: &str = "sim.addr";
 
-pub fn run(out_dir: Option<&Path>, wave: bool) -> miette::Result<()> {
+pub fn run(out_dir: Option<&Path>, wave: bool, watch: bool) -> miette::Result<()> {
+    if watch {
+        // The socket component reads this when the simulation starts.
+        // SAFETY: no other thread runs yet; the first one is started below.
+        unsafe { std::env::set_var("HNS_SIM_WATCH", "1") };
+    }
     let out = match out_dir {
         Some(path) if path.is_relative() => std::env::current_dir()
             .map_err(|source| miette::miette!("cannot read the current directory: {source}"))?
