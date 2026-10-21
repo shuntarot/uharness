@@ -4,14 +4,14 @@ How to put a DUT on a board with this tool: the manifest, generation, and
 what comes out. Talking to the board afterwards is in
 [guide-hio.md](guide-hio.md).
 
-- [The flow](#the-flow)
+- [`gen`, then `make`: the flow](#gen-then-make-the-flow)
 - [Harness.toml](#harnesstoml)
-- [Commands](#commands)
-- [What is generated](#what-is-generated)
-- [Simulation](#simulation)
+- [`veryl harness` commands](#veryl-harness-commands)
+- [`gen` output: what is generated](#gen-output-what-is-generated)
+- [`sim`: the harness in a testbench](#sim-the-harness-in-a-testbench)
 - [Limits](#limits)
 
-## The flow
+## `gen`, then `make`: the flow
 
 ```
 your Veryl project              generated
@@ -180,7 +180,7 @@ ports = { valid = "i_push", ready = "!o_full", data = "i_data" }
 Every port must belong to exactly one bundle. `check` prints how each one was
 decided.
 
-### Common shapes
+### Common `[bundle]` shapes
 
 **Registers.** One register per port, in the window.
 
@@ -345,7 +345,7 @@ reset   = "i_dm_rst"  # the Debug Module's own reset port
   reset and `hio reset` clears it. Inside the DUT, reset the core with the DUT
   reset *or* the Debug Module's `ndmreset` / hart reset.
 
-### How the host sees a memory
+### `access`: `region` or `indirect`
 
 Independent of what the DUT's port looks like:
 
@@ -470,7 +470,7 @@ tcl = "vivado.tcl"        # relative to Harness.toml
   The file can hold any other Tcl too (`set_param`, more XDC). It is the same
   for every board; check `$part` in it if a board needs other settings.
 
-## Commands
+## `veryl harness` commands
 
 ```
 veryl harness check [options]     # match only
@@ -498,7 +498,7 @@ Exit codes: 0 success, 1 a diagnostic, 2 a command-line mistake.
 **what it did not check** — every time. A failure prints the error and how
 to fix it.
 
-### Boards
+### `--target`: boards
 
 | `--target` | transports | `dram` | tested |
 |---|---|---|---|
@@ -510,7 +510,7 @@ to fix it.
 | `xilinx/kcu105` | `jtag`, `pcie` | DDR4, 2 GB, with `:dr` or `:062` | ✓ |
 | `xilinx/kc705` | `jtag` | DDR3, 1 GB | not yet |
 | `alibaba/as02mc04` | `jtag` | — (no DRAM) | not yet |
-| `sim` | `sim` | — (no board; see [Without a board](#without-a-board)) | — |
+| `sim` | `sim` | — (no board; see [`--target sim` and `veryl harness sim`](#--target-sim-and-veryl-harness-sim)) | — |
 
 **tested** means the board has run a harness. A board marked "not yet" builds,
 but `check` and `gen` print a note that it has not run on hardware.
@@ -534,7 +534,7 @@ which. Add the config that matches the chips: `:dr` for EDY4016AABG-DR-F
 (older boards) or `:062` for MT40A256M16LY-062E (newer boards). Without one,
 the board works over JTAG and PCIe, and a `dram` bundle is refused.
 
-## What is generated
+## `gen` output: what is generated
 
 The output directory is **a Veryl project of its own**, depending on yours by
 path. Its directory name becomes the project name, and Veryl puts that in front
@@ -594,18 +594,20 @@ names.
 **No Tcl is generated for reaching the window.** The harness uses its own
 BSCANE2 bridge, which Vivado cannot see; use `hio`.
 
-## Simulation
+## `sim`: the harness in a testbench
 
 `sim` is the harness top without transport or clock generation, with AXI4-Lite
 on its ports, so a testbench can drive it directly. `top` cannot be simulated
 (it holds the MMCM and the JTAG primitive). Everything below the CSR is the same
-generated code in both. `cargo test` runs this. See `dev/design-sim.md` for what
-it does not cover.
+generated code in both. `cargo test` runs this. It does not cover the MMCM
+and the JTAG primitive (the clocks, the reset release and the clock
+crossings), timing, or the board's pins; synthesis and the board do.
 
-### Without a board
+### `--target sim` and `veryl harness sim`
 
 `--target sim` runs the harness in the Veryl simulator, and `hio` talks to it
-over a local socket. The same `regs.json`, commands and procedure files work.
+over a TCP socket, on this machine unless `--addr` says otherwise. The same
+`regs.json`, commands and procedure files work.
 
 ```bash
 veryl harness gen --target sim     # writes hns/, as for a board

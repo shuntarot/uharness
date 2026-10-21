@@ -4,18 +4,19 @@
 reads and writes the window, loads memories, runs firmware and debugs a CPU.
 Generating the harness is in [guide-harness.md](guide-harness.md).
 
-- [Basics](#basics)
-- [The prompt](#the-prompt)
-- [Over PCIe](#over-pcie)
-- [From another machine](#from-another-machine)
-- [Resetting the DUT](#resetting-the-dut)
-- [Writing a procedure down](#writing-a-procedure-down)
-- [Loading a memory](#loading-a-memory)
-- [Running firmware](#running-firmware)
-- [Debugging the CPU](#debugging-the-cpu)
-- [Programming](#programming)
+- [`id`, `read`, `write`, `dump`: the basics](#id-read-write-dump-the-basics)
+- [`hio` with no command: the prompt](#hio-with-no-command-the-prompt)
+- [`-p`: over PCIe](#-p-over-pcie)
+- [`hio serve` and `--connect`: from another machine](#hio-serve-and---connect-from-another-machine)
+- [`hio reset`](#hio-reset)
+- [`hio run`: procedure files](#hio-run-procedure-files)
+- [`hio load` and `memtest`](#hio-load-and-memtest)
+- [`hio cpu boot` and `cpu console`: run firmware](#hio-cpu-boot-and-cpu-console-run-firmware)
+- [`hio cpu halt`, `step`, `regs`: debug the CPU](#hio-cpu-halt-step-regs-debug-the-cpu)
+- [`hio program` and `erase`](#hio-program-and-erase)
+- [`hio dap`: the Zynq-7000 PS](#hio-dap-the-zynq-7000-ps)
 
-## Basics
+## `id`, `read`, `write`, `dump`: the basics
 
 `hio` reaches the window over JTAG or PCIe. **Vivado and OpenOCD are not
 needed** — it drives the same cable directly.
@@ -57,13 +58,13 @@ magic and the map hash before anything else happens** (`--no-verify` skips it).
 | `check` | whether the board and this machine are ready, and what to fix |
 | `dma-fire` | the card moves one descriptor itself, either way (PCIe + `dram`); `--pcie-addr` aims it at another card's BAR |
 | `run <file>` | a file of commands, holding the link open |
-| `cpu …` | firmware and the CPU: `boot`, `console`, and the Debug Module (`halt`, `step`, `regs`, `break`, `mem`, `catch`, …); see [Running firmware](#running-firmware) and [Debugging the CPU](#debugging-the-cpu) |
+| `cpu …` | firmware and the CPU: `boot`, `console`, and the Debug Module (`halt`, `step`, `regs`, `break`, `mem`, `catch`, …); see [`hio cpu boot` and `cpu console`: run firmware](#hio-cpu-boot-and-cpu-console-run-firmware) and [`hio cpu halt`, `step`, `regs`: debug the CPU](#hio-cpu-halt-step-regs-debug-the-cpu) |
 
 `hio --help` shows the common commands and options. `hio --list` lists every
 command, and `hio help options` explains every option, the probe settings
 included.
 
-## The prompt
+## `hio` with no command: the prompt
 
 `hio` alone opens a prompt that keeps the link open, so each command
 answers without reconnecting. A line is a line of a procedure file; `cpu`
@@ -108,7 +109,7 @@ hart 0 halted at pc 0x80000508 <hazard3_bsp::getc> (breakpoint)
 
 The target's output waits while the prompt is up and shows when you go back.
 
-## Over PCIe
+## `-p`: over PCIe
 
 | | |
 |---|---|
@@ -149,7 +150,7 @@ reset. A request the PCIe block refuses itself (no BAR hit, memory decoding
 off) never reaches them; `lspci -vvv` shows that one as `UnsupReq+` in the
 card's `DevSta`. Read them over JTAG: a read over PCIe counts itself.
 
-## From another machine
+## `hio serve` and `--connect`: from another machine
 
 `hio serve` on the machine the board is on keeps the window open and passes
 batches from `hio --connect` on other machines. It speaks
@@ -170,7 +171,7 @@ hio --regs regs.json --connect localhost:5555 id
   and the card's DMA (`--dma`, `dma-fire`) run on the server's machine.
 - A simulation is served the same way: `veryl harness sim --addr`.
 
-## Resetting the DUT
+## `hio reset`
 
 ```bash
 hio reset                   # reset the DUT and let it run again
@@ -196,7 +197,7 @@ the whole time. `hio` writes `dut_reset` and then reads `dut_reset_state` until 
 changes, so the timing does not depend on the transport. `check` says when the
 DUT is still held.
 
-## Writing a procedure down
+## `hio run`: procedure files
 
 ```
 # bringup.hio
@@ -217,7 +218,7 @@ One command per line, written exactly as on the command line; `#` comments;
 board is touched**, and the first error stops it with the line and its number.
 `program` and `erase` cannot appear — reconfiguration stays outside a procedure.
 
-## Loading a memory
+## `hio load` and `memtest`
 
 ```bash
 hio load dmem prog.elf --verify
@@ -261,7 +262,7 @@ card's addresses through); without it the window is used instead, and the output
 says which it was. Only the memory the card is wired to (the `dram` bundle) goes
 this way. `--pio` and `--dma` force one or the other, for telling them apart.
 
-## Running firmware
+## `hio cpu boot` and `cpu console`: run firmware
 
 `hio cpu boot` loads an ELF, runs it, and connects to its RTT console. It is
 meant as a cargo runner:
@@ -299,7 +300,7 @@ Their `benchmarks` print through HTIF system calls (`tohost` and `fromhost`);
 reaches the terminal. Other calls stop `hio` with an error.
 
 `hio cpu boot --halt` stops at the first instruction instead, at the debug
-prompt ([The prompt](#the-prompt)), so breakpoints can go in before anything runs; `resume` lets
+prompt ([`hio` with no command: the prompt](#hio-with-no-command-the-prompt)), so breakpoints can go in before anything runs; `resume` lets
 it go, and Ctrl-A c shows the console once the program has set up RTT. It
 needs the Debug Module on its own reset (`reset` in the `dmi` bundle).
 
@@ -322,7 +323,7 @@ keyboard input are not offered. Each call halts the core until the answer
 comes, so RTT stays the fast way to print; semihosting is for a program that
 also runs on QEMU, or that prints before RTT is up.
 
-## Debugging the CPU
+## `hio cpu halt`, `step`, `regs`: debug the CPU
 
 With a `dmi` bundle, `hio cpu` also drives the Debug Module:
 
@@ -385,7 +386,7 @@ A halt also makes `ebreak` in the program halt into the debugger. CSRs the
 Debug Module cannot reach directly go through its program buffer, with `s0`
 saved and put back.
 
-## Programming
+## `hio program` and `erase`
 
 ```bash
 hio program                    # the one beside the register map
@@ -420,7 +421,7 @@ A chain with other devices on it (the ARM DAP of a Zynq-7000) is handled from
 the target description: `hio` holds them in BYPASS. `hio probe` lists the chain
 and marks the device it talks to.
 
-## A Zynq-7000's PS
+## `hio dap`: the Zynq-7000 PS
 
 A Zynq-7000 has an ARM DAP on the JTAG chain beside the PL. `hio dap` reaches
 the PS's memory and registers through it, with no program on the CPUs; `dap`
