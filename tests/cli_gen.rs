@@ -2179,6 +2179,113 @@ fn the_class_code_reaches_both_pcie_ips() {
     }
 }
 
+/// A board with `[flash]` gets the boot settings in its XDC, the flash part in
+/// board.tcl, and `make mcs` / `make flash`. A board without one gets none of
+/// it, so its bitstream is the same as before.
+#[test]
+fn a_board_with_a_flash_gets_the_flash_targets() {
+    let dir = fixture(&veryl_toml(), HARNESS_TOML);
+    for (target, flash) in [("alibaba/as02mc04", true), ("digilent/arty-a7-35", false)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+            .args(["gen", "--target", target, "--transport", "jtag"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{target}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let syn = dir.path().join("hns/syn");
+        let xdc = fs::read_to_string(syn.join("board.xdc")).unwrap();
+        let tcl = fs::read_to_string(syn.join("board.tcl")).unwrap();
+        let make = fs::read_to_string(syn.join("Makefile")).unwrap();
+        assert_eq!(xdc.contains("CONFIG_MODE SPIx4"), flash, "{target}\n{xdc}");
+        assert_eq!(
+            xdc.contains("BITSTREAM.GENERAL.COMPRESS true"),
+            flash,
+            "{target}"
+        );
+        assert_eq!(
+            tcl.contains("set ::hns::flash_part      {mt25qu256-spi-x1_x2_x4}"),
+            flash,
+            "{target}\n{tcl}"
+        );
+        assert_eq!(make.contains("\nflash:\n"), flash, "{target}\n{make}");
+        assert_eq!(syn.join("mcs.tcl").exists(), flash, "{target}");
+        assert_eq!(syn.join("flash.tcl").exists(), flash, "{target}");
+    }
+}
+
+/// `gt_quad` in the target places lane 0, on every board: the IP's own
+/// default matches some card edges and not others. A KU3P (`kintexuplus`)
+/// gets the same IP as a VU9P.
+#[test]
+fn the_gt_quad_reaches_the_pcie_ip() {
+    let dir = fixture(&veryl_toml(), HARNESS_TOML);
+    for (target, ip, quad) in [
+        ("alibaba/as02mc04", "pcie4_uscale_plus", "GTY_Quad_225"),
+        ("xilinx/vcu118", "pcie4_uscale_plus", "GTY_Quad_227"),
+        ("xilinx/kcu105", "pcie3_ultrascale", "GTH_Quad_225"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+            .args(["gen", "--target", target, "--transport", "pcie"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{target}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let tcl = fs::read_to_string(dir.path().join("hns/syn/pcie.tcl")).unwrap();
+        assert!(tcl.contains(&format!("create_ip -name {ip}")), "{tcl}");
+        assert!(tcl.contains("CONFIG.mode_selection {Advanced}"), "{tcl}");
+        assert!(tcl.contains("CONFIG.en_gt_selection {true}"), "{tcl}");
+        assert!(
+            tcl.contains(&format!("CONFIG.select_quad {{{quad}}}")),
+            "{tcl}"
+        );
+    }
+}
+
+/// A [pcie] without `gt_quad` is refused, and the error names the key.
+#[test]
+fn a_pcie_target_without_the_gt_quad_is_refused() {
+    let dir = fixture(&veryl_toml(), HARNESS_TOML);
+    let target = dir.path().join("board.toml");
+    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/targets/targets/xilinx/vcu118/default.toml");
+    let text = fs::read_to_string(shipped).unwrap();
+    let without: String = text
+        .lines()
+        .filter(|line| !line.starts_with("gt_quad"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&target, without).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+        .args(["check", "--json", "--transport", "pcie", "--target-file"])
+        .arg(&target)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{value:#}");
+    assert_eq!(
+        value["error"]["code"], "harness::plan::target_has_no_pcie_pins",
+        "{value:#}"
+    );
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`gt_quad`"),
+        "{value:#}"
+    );
+}
+
 /// `--transport` without a target is refused.
 ///
 /// A transport has meaning only against the target's `provides.transport`.

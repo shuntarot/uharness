@@ -7,18 +7,17 @@
 # and from the BSDL Vivado ships. Where they disagree, the choice and the
 # reason are written next to the value.
 #
-# **JTAG only for now.** The card has PCIe gen3 x8 (see the notes at the end),
-# but the PCIe IP must be told which GT quad lane 0 starts in, and the
-# generator has no key for that yet. It has no DRAM.
+# JTAG, and PCIe gen3 x8 (`[pcie]` at the end). It has no DRAM.
 #
-# **Not confirmed on hardware.**
+# **Run on hardware over JTAG** (2026-10-22): `hio program` from the .bit and
+# from Vivado's SVF, the window (examples/hw/fifo without its heartbeat: the
+# card has no UART), and `hio sysmon`.
 
 [board]
 provider    = "alibaba"
 name        = "as02mc04"
 description = "Alibaba Cloud AS02MC04 (Kintex UltraScale+ KU3P)"
 url         = "https://github.com/dkozel/Alibaba-Cloud-FPGA"
-untested    = true
 
 [device]
 vendor = "xilinx"
@@ -32,7 +31,8 @@ part   = "xcku3p-ffvb676-1-e"
 hw_pattern = "xcku3p"
 
 [provides]
-transport = ["jtag"]
+# With two listed, `check` and `gen` stop unless `--transport` says which.
+transport = ["jtag", "pcie"]
 
 # 36Kb x 360 = 12,960 Kbit on the XCKU3P. From the datasheet. The 48 UltraRAM
 # blocks are not counted.
@@ -61,11 +61,13 @@ active   = "low"
 # measurement**, the same as the other boards.
 max_tck_mhz = 30
 
-# The adapter `hio` opens: a Digilent JTAG-HS2, an FT232H. VID/PID, product
-# and the level-shifter enable (data, direction) are from OpenOCD's
+# The adapter `hio` opens: a Digilent JTAG-HS2, an FT232H. VID/PID and the
+# level-shifter enable (data, direction) are from OpenOCD's
 # tcl/interface/ftdi/digilent-hs2.cfg; the enable is the one measured on the
-# VCU118 and the KCU105. **Not measured on this card.** Vivado's hw_server
-# drives the HS2 too, so `make program` works as well as `hio program`.
+# VCU118 and the KCU105. **Measured on this card** (2026-10-22): the enable
+# works, but the HS2 reports "Digilent USB Device", not OpenOCD's "Digilent
+# Adept USB Device". Vivado's hw_server drives the HS2 too, so
+# `make program` works as well as `hio program`.
 #
 # The card's JTAG header is a 6-pin layout of its own (VREF, GND, TCK, TMS,
 # TDI, TDO), so the HS2's flying leads have to be wired to it pin by pin. The
@@ -78,8 +80,22 @@ max_tck_mhz = 30
 vid         = 0x0403
 pid         = 0x6014
 interface   = 0
-product     = "Digilent Adept USB Device"
+product     = "Digilent USB Device"
 layout_init = [0x00e8, 0x60eb]
+
+# **The fastest TCK the FT232H can make below 30 MHz** that reads clean, over
+# the HS2's flying leads. It only divides 30 MHz by an integer. Measured
+# (2026-10-22, `hio bench --repeat 100`, every read compared against the
+# magic):
+#
+#    7.5 MHz  100,000 reads clean  9.3 us per read
+#   10 MHz    100,000 reads clean  7.9 us per read
+#   15 MHz    100,000 reads clean  7.0 us per read (0.58 MB/s)
+#   30 MHz    the magic did not come back
+#
+# Programming the 15 MB `.bit` takes 9.0 s at 15 MHz, and 42 s at the 3 MHz
+# `hio` uses when nothing is stated.
+host_tck_mhz = 15
 
 # The device IDCODE, as essenceia read it over JTAG (version 0). One device in
 # the chain.
@@ -98,21 +114,62 @@ cfg_in_ir   = 0x05
 jstart_ir   = 0x0c
 bypass_ir   = 0x3f
 
+# The system monitor, `SYSMON_DRP` in the same BSDL. `hio sysmon` reads it,
+# with or without a bitstream.
+sysmon_ir   = 0x37
+
+# **Read back rather than just waited for**, as in the SVF Vivado writes for
+# this part (`make svf`, read on 2026-10-22; the same values as the KCU105).
+# Without `ready`, `hio program` left JPROGRAM in the IR while it waited, and
+# the data that followed was ignored: DONE stayed low, with no error. The card
+# boots from its flash (M[2:0] = 001), so a JPROGRAM also starts that load.
+[jtag.ready]
+ir     = 0x14   # ISC_NOOP
+expect = 0x11
+mask   = 0x31
+
+[jtag.done]
+ir     = 0x09   # IDCODE
+expect = 0x31
+mask   = 0x11
+
+# The flash the card boots from (M[2:0] = 001, Master SPI). Part and settings
+# from taxi (Makefile and fpga.xdc). **Run on hardware** (2026-10-22): an image
+# made with these booted at power-up, after the whole flash was erased and
+# written from Vivado Lab. The card arrived with two images in it, at 0 and at
+# 16 MB, and nothing that jumped between them.
+[flash]
+part            = "mt25qu256-spi-x1_x2_x4"
+size_mb         = 32
+interface       = "SPIx4"
+config_rate_mhz = 72.9
+spi_fall_edge   = true
+cfgbvs          = "GND"
+config_voltage  = 1.8
+
 [topology]
 nodes = 1
 links = []
 
-# --- PCIe (not used yet) ---
+# --- PCIe ---
 #
-# For when the generator can place the IP. Facts about the board only, from
-# taxi's pcie.xdc and pcie4_uscale_plus_0.tcl, which train gen3 x8:
+# Facts about the board only, from taxi's pcie.xdc and pcie4_uscale_plus_0.tcl,
+# which train gen3 x8. **Run on hardware** (2026-10-22, in a desktop's CPU x16
+# slot): booted from the flash at power-up, the link trained gen3 x8, and a
+# window read took 0.54 us. Loaded over JTAG and then warm-rebooted, it came up
+# at gen2 with the host's target speed at gen2; retraining at gen3 worked.
 #
-#   lanes 8, gen 3, refclk 100 MHz at T7 (MGTREFCLK1P_225), PERST# at A9
-#   (LVCMOS33, pull-up). Lane 0 is at the top of quad 225 and the lanes run
-#   down into quad 224:
-#     rx_p = P2 T2 V2 Y2 AB2 AD2 AE4 AF2
-#     tx_p = R5 U5 W5 AA5 AC5 AD7 AE9 AF7
-#   The IP needs `mode_selection Advanced`, `en_gt_selection true` and
-#   `select_quad GTY_Quad_225`. Without them it places lane 0 at the bottom
-#   of quad 224, and the link trains reversed at x4 at best (Chester Gillon's
-#   notes in the repository above).
+# Lane 0 is at the top of quad 225 and the lanes run down into quad 224. The
+# IP must be told so (`gt_quad`): by default it puts lane 0 at the bottom of
+# quad 224, and the link trains reversed at x4 at best (Chester Gillon's notes
+# in the repository above).
+[pcie]
+lanes          = 8
+max_gen        = 3
+refclk_mhz     = 100
+refclk_p       = "T7"    # MGTREFCLK1P_225
+reset_n        = "A9"    # PERST#, pulled up on the card
+reset_standard = "LVCMOS33"
+rx_p    = ["P2", "T2", "V2", "Y2", "AB2", "AD2", "AE4", "AF2"]
+tx_p    = ["R5", "U5", "W5", "AA5", "AC5", "AD7", "AE9", "AF7"]
+gt_quad = "GTY_Quad_225"

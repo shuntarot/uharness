@@ -121,6 +121,10 @@ cfg_in_ir   = 0x05
 jstart_ir   = 0x0c
 bypass_ir   = 0x3f
 
+# The system monitor, `SYSMON_DRP` in the same BSDL. `hio sysmon` reads it,
+# with or without a bitstream.
+sysmon_ir   = 0x37
+
 # Read back rather than waited for, as Vivado's SVF does. **Checked against the
 # SVF Vivado wrote for this part** (`make svf`, 2026-09-30): the same IRs,
 # expected values and masks, and the same JPROGRAM / CFG_IN. That SVF also
@@ -174,3 +178,7 @@ reset_standard = "LVCMOS18"
 # Lane 0 first. Only the p side; Vivado derives the n side.
 rx_p = ["AB2", "AD2", "AF2", "AH2", "AJ4", "AK2", "AM2", "AP2"]
 tx_p = ["AC4", "AE4", "AG4", "AH6", "AK6", "AL4", "AM6", "AN4"]
+# The GT quad of lane 0, as the IP names it. The IP's default on the XCKU040,
+# and the one in the KCU105 board file; the link trained with it before the
+# key existed (2026-10-22).
+gt_quad = "GTH_Quad_225"

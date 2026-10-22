@@ -28,6 +28,7 @@ pub mod ps7;
 pub mod rtt;
 pub mod semihosting;
 pub mod svf;
+pub mod sysmon;
 
 #[cfg(test)]
 mod model;

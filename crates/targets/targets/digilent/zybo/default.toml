@@ -115,6 +115,10 @@ cfg_in_ir   = 0x05
 jstart_ir   = 0x0c
 bypass_ir   = 0x3f
 
+# The system monitor, `XADC_DRP` in the same BSDL. `hio sysmon` reads it,
+# with or without a bitstream.
+sysmon_ir   = 0x37
+
 # --- Status checks ---
 #
 # The same as the PYNQ-Z1's.

@@ -108,6 +108,10 @@ cfg_in_ir   = 0x05
 jstart_ir   = 0x0c
 bypass_ir   = 0x3f
 
+# The system monitor, `XADC_DRP` in the same BSDL. `hio sysmon` reads it,
+# with or without a bitstream.
+sysmon_ir   = 0x37
+
 # Read back rather than waited for, as Vivado's SVF does. **Checked against the
 # SVF Vivado wrote for this part** (`make svf`, 2026-09-30): the same IRs,
 # expected values and masks, and the same JPROGRAM / CFG_IN / JSTART. That SVF

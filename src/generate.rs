@@ -452,6 +452,18 @@ pub fn run(
             &emit::svf_tcl(),
             "programming sequence as SVF (Tcl)",
         )?);
+        if plan.target().and_then(hns_targets::flash).is_some() {
+            written.push(write(
+                &out.join("syn").join("mcs.tcl"),
+                &emit::mcs_tcl(),
+                "flash image (Tcl)",
+            )?);
+            written.push(write(
+                &out.join("syn").join("flash.tcl"),
+                &emit::flash_tcl(),
+                "flash programming (Tcl)",
+            )?);
+        }
         written.push(write(
             &out.join("syn").join("Makefile"),
             &emit::makefile(&plan),

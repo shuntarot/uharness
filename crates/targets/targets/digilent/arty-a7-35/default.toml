@@ -164,6 +164,10 @@ cfg_in_ir   = 0x05
 jstart_ir   = 0x0c
 bypass_ir   = 0x3f
 
+# The system monitor, `XADC_DRP` in the same BSDL. `hio sysmon` reads it,
+# with or without a bitstream.
+sysmon_ir   = 0x37
+
 # **Read back rather than just waited for**, which is what Vivado's SVF does
 # (read on 2026-09-03). The bits carry no meaning here; `TDO`/`MASK` are copied
 # from the SVF as they are, because guessing at their meaning breaks quietly
