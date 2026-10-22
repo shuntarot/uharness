@@ -195,14 +195,14 @@ pub enum PlanError {
 
     /// With half the pins, synthesis passes and the link never comes up,
     /// which is very hard to debug.
-    #[error("target `{target}` says it carries pcie but does not say where its pins are")]
+    #[error("target `{target}` says it carries pcie but its [pcie] lacks {missing}")]
     #[diagnostic(
         code(harness::plan::target_has_no_pcie_pins),
         help(
-            "Add a [pcie] section with `lanes`, `max_gen`, `refclk_mhz`, `refclk_p`, `reset_n`, `reset_standard`, and one `rx_p`/`tx_p` entry per lane."
+            "[pcie] needs `lanes`, `max_gen`, `refclk_mhz`, `refclk_p`, `reset_n`, `reset_standard`, one `rx_p`/`tx_p` entry per lane, and `gt_quad`.\n\n`gt_quad` is the GT quad of lane 0 as the PCIe IP names it (`GTY_Quad_227`). The card edge fixes it; find it in the board's schematic or in a design that trains the link."
         )
     )]
-    TargetHasNoPciePins { target: String },
+    TargetHasNoPciePins { target: String, missing: String },
 
     #[error(
         "target `{target}` says its PCIe link is gen{generation} x{lanes}, which is not generated yet"
@@ -521,6 +521,12 @@ fn generatable(plan: &Plan) -> Result<(), PlanError> {
         if !pcie.is_complete() {
             return Err(PlanError::TargetHasNoPciePins {
                 target: board.target.name.clone(),
+                missing: pcie
+                    .missing()
+                    .iter()
+                    .map(|key| format!("`{key}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
             });
         }
         // Only links whose stream width and user clock are known. A silent

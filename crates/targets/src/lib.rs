@@ -394,10 +394,22 @@ pub enum TargetError {
         missing: &'static str,
         example: &'static str,
     },
+
+    /// A flash image built from a guess boots wrongly or not at all, and the
+    /// board then comes up with nothing on it.
+    #[error("[flash] of target `{target}` lacks or gets wrong {missing}")]
+    #[diagnostic(
+        code(harness::target::flash_incomplete),
+        help(
+            "[flash] describes the flash the FPGA boots from. It needs all of:\n\n{FLASH_EXAMPLE}\n\n`part` is the name Vivado's `get_cfgmem_parts` lists, `interface` one of SPIx1, SPIx2, SPIx4, SPIx8, and `cfgbvs` VCCO or GND. Take the values from the board's schematic or a design that boots from it."
+        )
+    )]
+    FlashIncomplete { target: String, missing: String },
 }
 
 /// Examples shown in the help text.
 const CLOCK_EXAMPLE: &str = "    [clocks.sys]            # single-ended\n    freq_mhz = 100\n    diff     = false\n    pin      = \"E3\"\n    standard = \"LVCMOS33\"\n\n    [clocks.sys]            # differential\n    freq_mhz = 125\n    diff     = true\n    pin_p    = \"AY24\"\n    pin_n    = \"AY23\"\n    standard = \"LVDS\"";
+const FLASH_EXAMPLE: &str = "    [flash]\n    part            = \"mt25qu256-spi-x1_x2_x4\"\n    size_mb         = 32\n    interface       = \"SPIx4\"\n    config_rate_mhz = 72.9\n    spi_fall_edge   = true\n    cfgbvs          = \"GND\"\n    config_voltage  = 1.8";
 const RESET_EXAMPLE: &str =
     "    [resets.sys]\n    pin      = \"C2\"\n    standard = \"LVCMOS33\"\n    active   = \"low\"";
 
@@ -538,7 +550,108 @@ fn check_board_signals(target: &Target) -> Result<(), TargetError> {
             }
         }
     }
+
+    if let Some(table) = target.table.get("flash") {
+        let missing = match table.as_table() {
+            Some(table) => flash_missing(table),
+            None => vec!["everything (it is not a table)"],
+        };
+        if !missing.is_empty() {
+            return Err(TargetError::FlashIncomplete {
+                target: target.name.clone(),
+                missing: missing.join(", "),
+            });
+        }
+    }
     Ok(())
+}
+
+/// `[flash]`: the configuration flash the FPGA boots from at power-up.
+///
+/// Facts about the board, read from the schematic or from a design that
+/// boots from it. A description either has all of it or none: loading
+/// refuses a partial one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Flash {
+    /// The part as Vivado's `get_cfgmem_parts` names it.
+    pub part: String,
+    pub size_mb: u32,
+    /// `SPIx1`, `SPIx2`, `SPIx4` or `SPIx8`.
+    pub interface: String,
+    /// The clock the FPGA reads the flash with (`BITSTREAM.CONFIG.CONFIGRATE`).
+    pub config_rate_mhz: f64,
+    /// Whether the FPGA samples the flash on the falling edge.
+    pub spi_fall_edge: bool,
+    /// `CFGBVS`: `VCCO` or `GND`, by the voltage of the configuration bank.
+    pub cfgbvs: String,
+    pub config_voltage: f64,
+}
+
+impl Flash {
+    /// The data lines, from `interface` (`SPIx4` -> 4).
+    pub fn bus_width(&self) -> u32 {
+        self.interface
+            .trim_start_matches("SPIx")
+            .parse()
+            .expect("checked when the target was loaded")
+    }
+}
+
+const FLASH_INTERFACES: &[&str] = &["SPIx1", "SPIx2", "SPIx4", "SPIx8"];
+
+fn flash_missing(t: &toml::Table) -> Vec<&'static str> {
+    let text = |key: &str| t.get(key).and_then(|v| v.as_str());
+    let num = |key: &str| {
+        t.get(key)
+            .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+    };
+    let mut out = Vec::new();
+    if text("part").is_none() {
+        out.push("`part`");
+    }
+    if !t
+        .get("size_mb")
+        .and_then(|v| v.as_integer())
+        .is_some_and(|n| n > 0)
+    {
+        out.push("`size_mb`");
+    }
+    if !text("interface").is_some_and(|i| FLASH_INTERFACES.contains(&i)) {
+        out.push("`interface`");
+    }
+    if !num("config_rate_mhz").is_some_and(|mhz| mhz > 0.0) {
+        out.push("`config_rate_mhz`");
+    }
+    if t.get("spi_fall_edge").and_then(|v| v.as_bool()).is_none() {
+        out.push("`spi_fall_edge`");
+    }
+    if !text("cfgbvs").is_some_and(|c| c == "VCCO" || c == "GND") {
+        out.push("`cfgbvs`");
+    }
+    if !num("config_voltage").is_some_and(|v| v > 0.0) {
+        out.push("`config_voltage`");
+    }
+    out
+}
+
+/// Reads `[flash]`. `None` when the board does not describe one. Loading has
+/// already refused a partial one.
+pub fn flash(target: &Target) -> Option<Flash> {
+    let t = target.table.get("flash")?.as_table()?;
+    let text = |key: &str| t.get(key)?.as_str().map(str::to_string);
+    let num = |key: &str| {
+        let v = t.get(key)?;
+        v.as_float().or_else(|| v.as_integer().map(|i| i as f64))
+    };
+    Some(Flash {
+        part: text("part")?,
+        size_mb: t.get("size_mb")?.as_integer()? as u32,
+        interface: text("interface")?,
+        config_rate_mhz: num("config_rate_mhz")?,
+        spi_fall_edge: t.get("spi_fall_edge")?.as_bool()?,
+        cfgbvs: text("cfgbvs")?,
+        config_voltage: num("config_voltage")?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -652,6 +765,9 @@ pub struct Jtag {
     pub cfg_in_ir: Option<u32>,
     pub jstart_ir: Option<u32>,
     pub bypass_ir: Option<u32>,
+    /// Selects the system monitor's DRP (`XADC_DRP` or `SYSMON_DRP` in the
+    /// BSDL). It works without a bitstream.
+    pub sysmon_ir: Option<u32>,
     /// Reads whether the erase finished. It carries the SVF `TDO`/`MASK` as
     /// is, with no meaning given to the bits. Without it, the host only
     /// waits.
@@ -712,20 +828,51 @@ pub struct Pcie {
     /// derives it.
     pub rx_p: Vec<String>,
     pub tx_p: Vec<String>,
+    /// The GT quad that lane 0 starts in, as the IP names it
+    /// (`GTY_Quad_225`). The card edge fixes it. The IP's own default matches
+    /// some boards and not others, so it is never left to the IP.
+    pub gt_quad: Option<String>,
 }
 
 impl Pcie {
     /// Whether the description has everything PCIe needs. A partial one was
     /// left unfinished, so it is not used.
     pub fn is_complete(&self) -> bool {
-        self.lanes.is_some_and(|n| n > 0)
-            && self.max_gen.is_some()
-            && self.refclk_mhz.is_some()
-            && self.refclk_p.is_some()
-            && self.reset_n.is_some()
-            && self.reset_standard.is_some()
-            && self.rx_p.len() as u32 == self.lanes.unwrap_or(0)
-            && self.tx_p.len() as u32 == self.lanes.unwrap_or(0)
+        self.missing().is_empty()
+    }
+
+    /// The keys PCIe needs that the description lacks or gets wrong.
+    pub fn missing(&self) -> Vec<&'static str> {
+        let lanes = self.lanes.unwrap_or(0);
+        let mut out = Vec::new();
+        if lanes == 0 {
+            out.push("lanes");
+        }
+        if self.max_gen.is_none() {
+            out.push("max_gen");
+        }
+        if self.refclk_mhz.is_none() {
+            out.push("refclk_mhz");
+        }
+        if self.refclk_p.is_none() {
+            out.push("refclk_p");
+        }
+        if self.reset_n.is_none() {
+            out.push("reset_n");
+        }
+        if self.reset_standard.is_none() {
+            out.push("reset_standard");
+        }
+        if self.rx_p.len() as u32 != lanes {
+            out.push("rx_p");
+        }
+        if self.tx_p.len() as u32 != lanes {
+            out.push("tx_p");
+        }
+        if self.gt_quad.is_none() {
+            out.push("gt_quad");
+        }
+        out
     }
 }
 
@@ -763,6 +910,7 @@ pub fn pcie(target: &Target) -> Pcie {
         reset_standard: text("reset_standard"),
         rx_p: list("rx_p"),
         tx_p: list("tx_p"),
+        gt_quad: text("gt_quad"),
     }
 }
 
@@ -940,6 +1088,7 @@ pub fn jtag(target: &Target) -> Jtag {
         cfg_in_ir: int("cfg_in_ir").map(|v| v as u32),
         jstart_ir: int("jstart_ir").map(|v| v as u32),
         bypass_ir: int("bypass_ir").map(|v| v as u32),
+        sysmon_ir: int("sysmon_ir").map(|v| v as u32),
     }
 }
 
@@ -1396,6 +1545,7 @@ mod jtag_tests {
             assert!(j.jprogram_ir.is_some(), "{name}: jprogram_ir");
             assert!(j.jstart_ir.is_some(), "{name}: jstart_ir");
             assert!(j.bypass_ir.is_some(), "{name}: bypass_ir");
+            assert!(j.sysmon_ir.is_some(), "{name}: sysmon_ir");
             assert!(
                 j.cfg_in_ir.is_some() || !j.slr_cfg_in_ir.is_empty(),
                 "{name}: nothing says where the bitstream goes"
@@ -1504,6 +1654,38 @@ mod tests {
             let err = load(&body).unwrap_err();
             assert!(
                 matches!(err, TargetError::BoardSignalIncomplete { .. }),
+                "{body}\n{err:?}"
+            );
+            assert!(err.to_string().contains(says), "{body}\n{err}");
+        }
+    }
+
+    /// A partial [flash] would build an image that does not boot.
+    #[test]
+    fn a_flash_with_a_missing_or_wrong_field_is_refused() {
+        const HEAD: &str = "[board]\nprovider = \"acme\"\nname = \"proto\"\n\n[device]\nvendor = \"xilinx\"\nfamily = \"kintexuplus\"\npart = \"xcku3p\"\n\n";
+        const FULL: &str = "part = \"mt25qu256-spi-x1_x2_x4\"\nsize_mb = 32\ninterface = \"SPIx4\"\nconfig_rate_mhz = 72.9\nspi_fall_edge = true\ncfgbvs = \"GND\"\nconfig_voltage = 1.8\n";
+        let dir = tempfile::tempdir().unwrap();
+        let load = |body: &str| {
+            let path = dir.path().join("t.toml");
+            std::fs::write(&path, format!("{HEAD}[flash]\n{body}")).unwrap();
+            load_file(&path, &[])
+        };
+        let target = load(FULL).unwrap();
+        let flash = flash(&target).unwrap();
+        assert_eq!(flash.bus_width(), 4);
+        assert_eq!(flash.part, "mt25qu256-spi-x1_x2_x4");
+
+        for (from, to, says) in [
+            ("size_mb = 32\n", "", "`size_mb`"),
+            ("\"SPIx4\"", "\"QSPI\"", "`interface`"),
+            ("\"GND\"", "\"1.8\"", "`cfgbvs`"),
+            ("spi_fall_edge = true\n", "", "`spi_fall_edge`"),
+        ] {
+            let body = FULL.replace(from, to);
+            let err = load(&body).unwrap_err();
+            assert!(
+                matches!(err, TargetError::FlashIncomplete { .. }),
                 "{body}\n{err:?}"
             );
             assert!(err.to_string().contains(says), "{body}\n{err}");
@@ -1798,6 +1980,16 @@ mod pcie_tests {
         let mut p = pcie(&resolve("xilinx/vcu118", &[]).unwrap());
         p.rx_p.pop();
         assert!(!p.is_complete(), "a missing lane must not read as complete");
+        assert_eq!(p.missing(), ["rx_p"]);
+    }
+
+    /// The quad of lane 0 is a fact of the card edge, like the pins.
+    #[test]
+    fn a_description_without_the_gt_quad_is_not_complete() {
+        let mut p = pcie(&resolve("xilinx/vcu118", &[]).unwrap());
+        assert_eq!(p.gt_quad.as_deref(), Some("GTY_Quad_227"));
+        p.gt_quad = None;
+        assert_eq!(p.missing(), ["gt_quad"]);
     }
 
     /// No `[pcie]` is not an error; it reads as empty.

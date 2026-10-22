@@ -1,0 +1,45 @@
+/// A DUT that is only a port onto a **large block RAM**.
+///
+/// The host fills and checks the memory through the window. The DUT's own
+/// port is driven from registers, so a word the host wrote can be read by the
+/// DUT, and a word the DUT wrote can be read by the host.
+///
+/// **Board-independent.** Which board it is built for is decided by
+/// `gen --target`. There is no heartbeat, so it also builds for a board with
+/// no UART.
+module dut_top (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    // --- driven by the host (reg) ---
+    i_addr : input logic<15>, // word index
+    i_en   : input logic    , // read enable
+    i_wen  : input logic    , // write
+    i_wdata: input logic<32>, // the word to write
+    i_wstrb: input logic<4> , // byte strobes
+
+    // --- observed by the host (reg) ---
+    o_read: output logic<32>, // the word the DUT read
+
+    // --- memory (bram) ---
+    o_mem_addr : output logic<15>,
+    o_mem_en   : output logic    ,
+    i_mem_rdata: input  logic<32>,
+    o_mem_wdata: output logic<32>,
+    o_mem_wstrb: output logic<4> ,
+    o_mem_wen  : output logic    ,
+) {
+    always_ff {
+        if_reset {
+            o_read = 0;
+        } else {
+            o_read = i_mem_rdata;
+        }
+    }
+
+    assign o_mem_addr  = i_addr;
+    assign o_mem_en    = i_en;
+    assign o_mem_wdata = i_wdata;
+    assign o_mem_wstrb = i_wstrb;
+    assign o_mem_wen   = i_wen;
+}

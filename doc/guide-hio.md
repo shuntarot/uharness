@@ -14,6 +14,7 @@ Generating the harness is in [guide-harness.md](guide-harness.md).
 - [`hio cpu boot` and `cpu console`: run firmware](#hio-cpu-boot-and-cpu-console-run-firmware)
 - [`hio cpu halt`, `step`, `regs`: debug the CPU](#hio-cpu-halt-step-regs-debug-the-cpu)
 - [`hio program` and `erase`](#hio-program-and-erase)
+- [`hio sysmon`: temperature and voltages](#hio-sysmon-temperature-and-voltages)
 - [`hio dap`: the Zynq-7000 PS](#hio-dap-the-zynq-7000-ps)
 
 ## `id`, `read`, `write`, `dump`: the basics
@@ -404,6 +405,10 @@ nothing else — nothing is written to flash. Devices with several SLRs are
 handled from the target description. `hio program <file>.svf` replays an SVF,
 which works on devices this build does not know.
 
+After DONE, `program` reads the magic through the window, when it finds the
+register map. A bitstream that is not a harness has no map: `--no-verify`
+stops at DONE without a note.
+
 Stop Vivado's `hw_server` first (`pkill hw_server`); it takes the same channel.
 
 When the board is on a machine without Vivado, `make -C hns/syn zip` packs
@@ -420,6 +425,34 @@ hio id
 A chain with other devices on it (the ARM DAP of a Zynq-7000) is handled from
 the target description: `hio` holds them in BYPASS. `hio probe` lists the chain
 and marks the device it talks to.
+
+## `hio sysmon`: temperature and voltages
+
+```bash
+hio --target xilinx/vcu118 sysmon
+```
+
+```text
+monitor   SYSMONE4 (internal reference)
+                now      min      max     codes (now min max)
+temp           37.5     35.1     44.0  C  0x9fb6 0x9e7f 0xa2f4
+vccint        0.721    0.716    0.724  V  0x3d86 0x3d1b 0x3dc4
+vccaux        1.792    1.786    1.798  V  0x98e4 0x9868 0x9973
+vccbram       0.850    0.846    0.854  V  0x4884 0x4839 0x48d7
+```
+
+It reads the FPGA's system monitor (XADC on 7-series, SYSMON on UltraScale)
+through the monitor's own JTAG instruction, `sysmon_ir` in the target's
+`[jtag]`. No bitstream is needed, so a new board can be checked before
+anything is loaded onto it, and a running design is not disturbed. `min` and
+`max` are what the monitor kept since it started: at power-up, and again at
+each `erase` or `program`. A device with several SLRs shows the master SLR. A
+Zynq-7000 also lists the PS supplies.
+
+The temperature uses the formulas of Xilinx's drivers. On UltraScale+ with the
+internal reference, Vivado's hardware manager can show a few degrees less for
+the same codes. On UltraScale (SYSMONE1) only the codes are shown. Stop
+`hw_server` first, as for `program`.
 
 ## `hio dap`: the Zynq-7000 PS
 

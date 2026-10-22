@@ -1,0 +1,31 @@
+# bram -- hio run bringup.hio
+# 128 KB of block RAM, reached from both sides. The expected values are in
+# the comments.
+
+echo == identity ==
+id
+
+echo == the whole memory through the window ==
+memtest mem
+
+echo == the DUT reads what the host wrote ==
+write mem 0x1fffc 0xc0ffee42
+write i_addr 0x7fff
+write i_en 1
+write i_en 0
+# 0xc0ffee42: the last word, through the DUT's port
+read o_read
+
+echo == the host reads what the DUT wrote ==
+write i_addr 0x10
+write i_wdata 0x12345678
+write i_wstrb 0x3
+write mem 0x40 0xffffffff
+write i_wen 1
+write i_wen 0
+# 0xffff5678: only the two low bytes were written
+read mem 0x40 1
+
+echo == the size the harness was built with ==
+# 0x00008000 (32768 entries)
+read mem_depth

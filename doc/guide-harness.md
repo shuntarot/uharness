@@ -580,8 +580,16 @@ borrowed Verilog under `vendor/` are left alone.
 | `syn/*.tcl`, `syn/*.xdc`, `syn/Makefile` | IP, constraints, build flow |
 | `vendor/` | borrowed Verilog (PCIe), with `COPYING` and `AUTHORS` |
 
-`make` targets: `bit` (default), `rtl`, `ip`, `program`, `verify`, `clean`.
-`VIVADO_BIN` and `VERYL_BIN` override the executables.
+`make` targets: `bit` (default), `rtl`, `ip`, `program`, `svf`, `area`, `zip`,
+`clean`. `VIVADO_BIN` and `VERYL_BIN` override the executables.
+
+A board whose target description has `[flash]` (the flash the FPGA boots from)
+also gets `make mcs`, which makes the flash image from the bitstream, and
+`make flash`, which writes it. The bitstream is built to boot from that flash,
+compressed so that it starts sooner. `make flash` needs the board on the
+machine's JTAG cable, where Vivado Lab is enough
+(`make flash VIVADO_BIN=vivado_lab`). **It erases the whole flash first**, so
+read it back first if what is on it matters.
 
 For a 7-series DDR3 board (the Arty), the memory controller is generated from
 `syn/mig.prj`, a copy of the board file that ships with the target. With

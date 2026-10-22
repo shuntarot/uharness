@@ -1,0 +1,23 @@
+[dut]
+module = "dut_top"
+
+[clock.i_clk]
+freq_mhz = 100
+
+# The DUT's port, driven from registers, so that each side of the memory can
+# be tried by hand.
+[bundle.ctl]
+backing = "reg"
+ports   = ["i_addr", "i_en", "i_wen", "i_wdata", "i_wstrb", "o_read"]
+
+# 128 KB of FPGA memory: 32K words of 32 bits. This fits every shipped board.
+# Raise `depth` for more; `check` stops when the target's block RAM is
+# smaller. Vivado picks the RAM primitive: 512 KB became 128 RAMB36 on the
+# VCU118 and the AS02MC04, with no UltraRAM.
+[bundle.mem]
+latency    = 1
+backing    = "bram"
+addressing = "word"
+depth      = 32768
+ports      = { addr = "o_mem_addr", re = "o_mem_en", rdata = "i_mem_rdata",
+               wdata = "o_mem_wdata", wstrb = "o_mem_wstrb", we = "o_mem_wen" }

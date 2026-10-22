@@ -116,6 +116,10 @@ cfg_in_ir   = 0x05
 jstart_ir   = 0x0c
 bypass_ir   = 0x3f
 
+# The system monitor, `XADC_DRP` in the same BSDL. `hio sysmon` reads it,
+# with or without a bitstream.
+sysmon_ir   = 0x37
+
 # --- Status checks (from the SVF `make svf` writes) ---
 #
 # The same as the Arty's. That SVF also carries `TIR 4` and `TDR 1`: Vivado

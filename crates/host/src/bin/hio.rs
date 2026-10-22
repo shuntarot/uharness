@@ -159,9 +159,10 @@ struct Cli {
     #[arg(long, value_name = "BDF", hide_short_help = true)]
     bdf: Option<String>,
 
-    /// Do not check the magic and map hash before acting.
+    /// Do not check the magic and map hash before acting, or after `program`.
     ///
-    /// Only useful when the window is known not to answer yet.
+    /// Only useful when the window is known not to answer yet, or to program
+    /// a bitstream that is not a harness: `program` then stops after DONE.
     #[arg(long, hide_short_help = true)]
     no_verify: bool,
 
@@ -196,6 +197,14 @@ enum Cmd {
 
     /// List the FTDI probes that are plugged in.
     Probe,
+
+    /// Read the FPGA's temperature and supply voltages over JTAG.
+    ///
+    /// It uses the system monitor's own JTAG instruction (`sysmon_ir` in the
+    /// target's [jtag]), so it works with no bitstream loaded, and while any
+    /// design runs. Max and min are kept by the monitor since power-up or the last
+    /// erase or configuration, which restart it.
+    Sysmon,
 
     /// Read and write memory through the ARM DAP on the JTAG chain.
     ///
@@ -1126,6 +1135,7 @@ fn parse_step(line: &str) -> Result<Step, String> {
                 .to_string(),
         ),
         Cmd::Probe
+        | Cmd::Sysmon
         | Cmd::Dap(_)
         | Cmd::Targets
         | Cmd::Check
@@ -1156,6 +1166,7 @@ fn run_step(cli: &Cli, bus: &mut Bus, map: &RegisterMap, step: Step) -> Result<(
         | Cmd::Run { .. }
         | Cmd::Cpu(CpuCmd::Boot { .. } | CpuCmd::Console { .. })
         | Cmd::Probe
+        | Cmd::Sysmon
         | Cmd::Dap(_)
         | Cmd::Targets
         | Cmd::Serve { .. }
@@ -1443,6 +1454,109 @@ fn probe(cli: &Cli) -> Result<(), String> {
         "user ir {:#04x} (not checked here -- `id` is what confirms it)",
         cfg.user1_ir
     );
+    Ok(())
+}
+
+/// Reads the system monitor through its JTAG instruction.
+fn sysmon(cli: &Cli) -> Result<(), String> {
+    let Some(target) = resolve_target(cli)? else {
+        return Err(
+            "`sysmon` needs to know the board: its IR value and the monitor type.\n\
+             Pass --target naming the board."
+                .to_string(),
+        );
+    };
+    let jtag = hns_targets::jtag(&target);
+    let Some(ir) = jtag.sysmon_ir else {
+        return Err(format!(
+            "`{}` does not say which IR value selects the system monitor.\n\
+             Add `sysmon_ir` to its [jtag]. The device's BSDL lists it as `XADC_DRP` \
+             (7-series) or `SYSMON_DRP` (UltraScale).",
+            target.name
+        ));
+    };
+    let family = &target.head.device.family;
+    let Some(kind) = hns_host::sysmon::Kind::of_family(family) else {
+        return Err(format!(
+            "hio does not know the system monitor of the `{family}` family, so it cannot \
+             convert what it reads.\n\
+             Read the monitor in Vivado's hardware manager instead."
+        ));
+    };
+    let cfg = resolve_probe(cli)?;
+    let mut m = Mpsse::attach(Ftdi::open(&cfg).map_err(|e| e.to_string())?, &cfg)
+        .map_err(|e| e.to_string())?;
+    let capture = m.scan_ir(ir, cfg.ir_length).map_err(|e| e.to_string())?;
+    if !Mpsse::<Ftdi>::ir_length_looks_right(capture) {
+        return Err(format!(
+            "the IR captured {capture:#x}, and its low two bits are not `01`.\n\
+             The IR length ({}) is wrong, or the chain is. `hio probe` measures it.",
+            cfg.ir_length
+        ));
+    }
+    // Erasing or configuring the device restarts the monitor, and it reads 0
+    // until its first conversion (measured: a few seconds after `erase`).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let r = loop {
+        let r = hns_host::sysmon::read_all(&mut m, kind, family == "zynq")
+            .map_err(|e| e.to_string())?;
+        if r.has_reading() {
+            break r;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("the system monitor has no reading yet.\n\
+                 It restarts when the device is erased or configured. Run `hio sysmon` \
+                 again in a few seconds."
+                .to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+
+    let reference = if r.internal_ref {
+        "internal"
+    } else {
+        "external"
+    };
+    println!("monitor   {} ({reference} reference)", kind.name());
+    println!(
+        "{:<10}{:>9}{:>9}{:>9}     codes (now min max)",
+        "", "now", "min", "max"
+    );
+    for s in &r.sensors {
+        let (now, max, min) = r.values(s);
+        let (now_code, max_code, min_code) = hns_host::sysmon::Readings::codes(s);
+        let (unit, digits) = if s.temperature { ("C", 1) } else { ("V", 3) };
+        let show = |v: Option<f64>| match v {
+            Some(v) => format!("{v:>9.digits$}"),
+            None => format!("{:>9}", "?"),
+        };
+        println!(
+            "{:<10}{}{}{}  {unit}  {now_code:#06x} {min_code:#06x} {max_code:#06x}",
+            s.name,
+            show(now),
+            show(min),
+            show(max)
+        );
+    }
+    match kind {
+        hns_host::sysmon::Kind::SysmonE1 => println!(
+            "note      hio does not know the temperature conversion of SYSMONE1, so only \
+             the codes are shown."
+        ),
+        // Measured on a VCU118 with no bitstream: the same codes, 4 C less in
+        // Vivado. With the external reference (an AS02MC04) Vivado agreed.
+        hns_host::sysmon::Kind::SysmonE4 if r.internal_ref => println!(
+            "note      temp uses the formula of Xilinx's drivers. Vivado's hardware manager \
+             can show a few degrees less for the same codes."
+        ),
+        hns_host::sysmon::Kind::SysmonE4 | hns_host::sysmon::Kind::Xadc => {}
+    }
+    if r.over_temperature {
+        println!(
+            "ALARM     the over-temperature alarm is set. Power the board off and check its \
+             cooling."
+        );
+    }
     Ok(())
 }
 
@@ -1942,8 +2056,12 @@ const PS7_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 ///
 /// Configuration itself succeeded, so a missing map is not an error. If the
 /// map could not be read, say why. "Not found" would tell someone who already
-/// passed `--regs` to pass `--regs`.
+/// passed `--regs` to pass `--regs`. With `--no-verify` nothing is checked or
+/// said: the bitstream need not be a harness.
 fn after_config_map(cli: &Cli, what: &str) -> Option<RegisterMap> {
+    if cli.no_verify {
+        return None;
+    }
     match find_regs_opt(cli) {
         Ok(Some((_, map))) => Some(map),
         Ok(None) => {
@@ -2427,6 +2545,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
     if cli.transport_name() == "pcie" {
         let only_jtag = match &cmd {
             Cmd::Probe => Some("probe"),
+            Cmd::Sysmon => Some("sysmon"),
             Cmd::Dap(_) => Some("dap"),
             Cmd::Program { .. } => Some("program"),
             Cmd::Erase => Some("erase"),
@@ -2445,6 +2564,9 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
 
     if matches!(cmd, Cmd::Probe) {
         return probe(&cli);
+    }
+    if matches!(cmd, Cmd::Sysmon) {
+        return sysmon(&cli);
     }
     if let Cmd::Dap(dap) = &cmd {
         return dap_cmd(&cli, dap);
@@ -2491,6 +2613,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
     match cmd {
         Cmd::Targets
         | Cmd::Probe
+        | Cmd::Sysmon
         | Cmd::Dap(_)
         | Cmd::Program { .. }
         | Cmd::Erase
@@ -2671,6 +2794,7 @@ fn check_server(
 fn refuse_over_connect(cmd: &Cmd) -> Result<(), String> {
     let cable = match cmd {
         Cmd::Probe => Some("probe"),
+        Cmd::Sysmon => Some("sysmon"),
         Cmd::Dap(_) => Some("dap"),
         Cmd::Program { .. } => Some("program"),
         Cmd::Erase => Some("erase"),

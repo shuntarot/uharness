@@ -230,6 +230,10 @@ jprogram_ir = 0x0b2cb
 jstart_ir   = 0x0c30c
 bypass_ir   = 0x3ffff
 
+# The system monitor of SLR1 (the master), `SYSMON_DRP` in the same BSDL:
+# `110111 100100 100100`. `hio sysmon` reads it, with or without a bitstream.
+sysmon_ir   = 0x37924
+
 # **Where each part of the `.bit` goes.** With three SLRs, a `.bit` is three
 # sub-bitstreams, nested: each one after the first is wrapped in a BOUT write
 # (`3003c000` and a Type 2 length) that covers it and every later one, and the
@@ -299,3 +303,7 @@ reset_standard = "LVCMOS18"
 # wiring and Vivado derives it.
 rx_p = ["AA4", "AB2", "AC4", "AD2", "AE4", "AF2", "AG4", "AH2"]
 tx_p = ["Y7", "AB7", "AD7", "AF7", "AH7", "AK7", "AM7", "AN5"]
+# The GT quad of lane 0, as the IP names it. This is the IP's default on the
+# VU9P, read back from the generated IP (`.xci`) of designs that trained gen3
+# x8 on this board before the key existed (2026-10-22).
+gt_quad = "GTY_Quad_227"
