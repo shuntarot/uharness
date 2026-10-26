@@ -31,7 +31,7 @@ part   = "xcku3p-ffvb676-1-e"
 hw_pattern = "xcku3p"
 
 [provides]
-# With two listed, `check` and `gen` stop unless `--transport` says which.
+# Without `--transport`, `check` and `gen` take jtag.
 transport = ["jtag", "pcie"]
 
 # 36Kb x 360 = 12,960 Kbit on the XCKU3P. From the datasheet. The 48 UltraRAM
@@ -136,8 +136,7 @@ mask   = 0x11
 # The flash the card boots from (M[2:0] = 001, Master SPI). Part and settings
 # from taxi (Makefile and fpga.xdc). **Run on hardware** (2026-10-22): an image
 # made with these booted at power-up, after the whole flash was erased and
-# written from Vivado Lab. The card arrived with two images in it, at 0 and at
-# 16 MB, and nothing that jumped between them.
+# written from Vivado Lab.
 [flash]
 part            = "mt25qu256-spi-x1_x2_x4"
 size_mb         = 32
@@ -173,3 +172,6 @@ reset_standard = "LVCMOS33"
 rx_p    = ["P2", "T2", "V2", "Y2", "AB2", "AD2", "AE4", "AF2"]
 tx_p    = ["R5", "U5", "W5", "AA5", "AC5", "AD7", "AE9", "AF7"]
 gt_quad = "GTY_Quad_225"
+# The PCIe hard block, read back from the `.xci` of the design that trained
+# gen3 x8 on this card.
+block   = "X0Y0"

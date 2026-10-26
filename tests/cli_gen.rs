@@ -2218,16 +2218,21 @@ fn a_board_with_a_flash_gets_the_flash_targets() {
     }
 }
 
-/// `gt_quad` in the target places lane 0, on every board: the IP's own
-/// default matches some card edges and not others. A KU3P (`kintexuplus`)
-/// gets the same IP as a VU9P.
+/// `block` and `gt_quad` in the target place the hard block and lane 0, on
+/// every board: the IP's own defaults match some card edges and not others.
+/// A KU3P (`kintexuplus`) gets the same IP as a VU9P.
 #[test]
 fn the_gt_quad_reaches_the_pcie_ip() {
     let dir = fixture(&veryl_toml(), HARNESS_TOML);
-    for (target, ip, quad) in [
-        ("alibaba/as02mc04", "pcie4_uscale_plus", "GTY_Quad_225"),
-        ("xilinx/vcu118", "pcie4_uscale_plus", "GTY_Quad_227"),
-        ("xilinx/kcu105", "pcie3_ultrascale", "GTH_Quad_225"),
+    for (target, ip, quad, site) in [
+        (
+            "alibaba/as02mc04",
+            "pcie4_uscale_plus",
+            "GTY_Quad_225",
+            "X0Y0",
+        ),
+        ("xilinx/vcu118", "pcie4_uscale_plus", "GTY_Quad_227", "X1Y2"),
+        ("xilinx/kcu105", "pcie3_ultrascale", "GTH_Quad_225", "X0Y0"),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
             .args(["gen", "--target", target, "--transport", "pcie"])
@@ -2248,7 +2253,73 @@ fn the_gt_quad_reaches_the_pcie_ip() {
             tcl.contains(&format!("CONFIG.select_quad {{{quad}}}")),
             "{tcl}"
         );
+        assert!(
+            tcl.contains(&format!("CONFIG.pcie_blk_locn {{{site}}}")),
+            "{tcl}"
+        );
     }
+}
+
+/// On a board whose board reset is PERST# (one pin), the top has one port for
+/// both: the harness takes its reset from PERST#, and only the PCIe XDC holds
+/// the pin. A description that gives the pin two polarities is refused.
+#[test]
+fn a_board_reset_that_is_perst_shares_one_port() {
+    let dir = fixture(&veryl_toml(), HARNESS_TOML);
+    let shared = dir.path().join("shared.toml");
+    fs::write(
+        &shared,
+        "[resets.sys]\npin = \"AM17\"\nstandard = \"LVCMOS18\"\nactive = \"low\"\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+        .args(["gen", "--target", "xilinx/vcu118", "--transport", "pcie"])
+        .arg("--target-patch")
+        .arg(&shared)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let top = fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap();
+    assert!(!top.contains("i_sys_rst: input"), "{top}");
+    assert!(top.contains("assign sys_rst = i_pcie_reset_n;"), "{top}");
+    let board = fs::read_to_string(dir.path().join("hns/syn/board.xdc")).unwrap();
+    assert!(!board.contains("i_sys_rst"), "{board}");
+    let pcie = fs::read_to_string(dir.path().join("hns/syn/pcie.xdc")).unwrap();
+    assert!(pcie.contains("PACKAGE_PIN AM17"), "{pcie}");
+
+    // The same pin, but active high: refused.
+    let high = dir.path().join("high.toml");
+    fs::write(
+        &high,
+        "[resets.sys]\npin = \"AM17\"\nstandard = \"LVCMOS18\"\nactive = \"high\"\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+        .args([
+            "check",
+            "--json",
+            "--target",
+            "xilinx/vcu118",
+            "--transport",
+            "pcie",
+        ])
+        .arg("--target-patch")
+        .arg(&high)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{value:#}");
+    assert_eq!(
+        value["error"]["code"], "harness::plan::shared_reset_mismatch",
+        "{value:#}"
+    );
 }
 
 /// A [pcie] without `gt_quad` is refused, and the error names the key.
@@ -3816,6 +3887,85 @@ fn a_pcie_flr_of_the_wrong_shape_is_refused() {
     assert_ne!(out.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("pcie_flr"), "{stderr}");
+}
+
+/// A DDR4 board without board files: the IP settings come from the
+/// description, the port widths follow `ranks`, and the pin XDC beside the
+/// description is copied and read by synthesis.
+#[test]
+fn a_ddr4_without_board_files_takes_its_pins_from_beside_the_description() {
+    let dir = dram_fixture();
+    fs::write(dir.path().join("Veryl.toml"), veryl_toml()).unwrap();
+    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/targets/targets/xilinx/vcu118/default.toml");
+    let text = fs::read_to_string(shipped).unwrap();
+    let dram = "dram = {kind = \"ddr4\", channels = 1, gb = 16, width = 64, controller = \"ddr4\", part = \"MTA16ATF2G64HZ-2G3\", memory_type = \"SODIMMs\", data_mask = \"DM_NO_DBI\", ranks = 2, mem_clk_ps = 1600, sys_clk_ps = 9600, cas_latency = 10, cas_write_latency = 9, pins_xdc = \"ddr4.xdc\", sys_clk = \"ddr\", axi_data_bits = 512, axi_addr_bits = 34, axi_id_bits = 8, ui_clk_mhz = 156.25, row_bits = 17, bank_bits = 2, bank_group_bits = 2, sys_rst_active = \"high\"}";
+    let board: String = text
+        .lines()
+        .map(|line| {
+            if line.starts_with("dram = ") {
+                dram
+            } else {
+                line
+            }
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(dir.path().join("board.toml"), board).unwrap();
+    let mut xdc = String::new();
+    for (port, width) in [
+        ("adr", 17),
+        ("ba", 2),
+        ("bg", 2),
+        ("cke", 2),
+        ("cs_n", 2),
+        ("odt", 2),
+        ("ck_t", 2),
+        ("ck_c", 2),
+        ("dq", 64),
+        ("dqs_t", 8),
+        ("dqs_c", 8),
+        ("dm_dbi_n", 8),
+    ] {
+        for i in 0..width {
+            xdc.push_str(&format!(
+                "set_property PACKAGE_PIN A1 [get_ports {{c0_ddr4_{port}[{i}]}}]\n"
+            ));
+        }
+    }
+    for port in ["act_n", "reset_n"] {
+        xdc.push_str(&format!(
+            "set_property PACKAGE_PIN A1 [get_ports c0_ddr4_{port}]\n"
+        ));
+    }
+    fs::write(dir.path().join("ddr4.xdc"), &xdc).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+        .args(["gen", "--transport", "jtag", "--target-file", "board.toml"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let syn = dir.path().join("hns/syn");
+    let copied = fs::read_to_string(syn.join("dram.xdc")).unwrap();
+    assert!(copied.contains("c0_ddr4_cs_n[1]"), "{copied}");
+    let synth = fs::read_to_string(syn.join("synth.tcl")).unwrap();
+    assert!(has_command(&synth, "read_xdc dram.xdc"), "{synth}");
+    let mig = fs::read_to_string(syn.join("mig.tcl")).unwrap();
+    assert!(mig.contains("CONFIG.C0.DDR4_MemoryType {SODIMMs}"), "{mig}");
+    assert!(mig.contains("CONFIG.C0.DDR4_DataMask {DM_NO_DBI}"), "{mig}");
+    let top = tight(&fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap());
+    for port in ["cke", "cs_n", "odt", "ck_t", "ck_c"] {
+        assert!(
+            top.contains(&format!("c0_ddr4_{port} : output 'mig logic <2> ,")),
+            "{port}: {top}"
+        );
+    }
 }
 
 /// An AXI4 memory of one word has no index bits. Veryl rejects the zero-width

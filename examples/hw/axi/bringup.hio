@@ -1,17 +1,14 @@
 # axi -- hio run bringup.hio
 #
 # The DUT reaches memory over AXI4, and the host reaches the same memory
-# through an arbiter -- there is no backdoor, because a real memory controller
-# does not have one. So the thing to prove here is that **both sides see one
-# memory**. `backing = "dram"` will put a controller where the BRAM is now,
-# without changing anything above.
+# through an arbiter (a real controller has no backdoor), so the thing to
+# prove here is that **both sides see one memory**. `backing = "dram"` puts a
+# controller where the BRAM is now (examples/hw/dram), with nothing above
+# changed.
 #
-# Runs at the board's default TCK. Going through the AXI4 bus and the arbiter
-# answers more slowly than a register does -- too slowly for the Arty's 20 MHz
-# if the commands are packed back to back. `hio` notices and re-sends the
-# region traffic with the commands spaced further apart, which is safe because
-# harness memory reads and writes are idempotent.
-# Nothing has to be passed on the command line.
+# Memory answers more slowly than a register. When a packed batch outruns it,
+# `hio` sends the memory traffic again, spaced out; memory reads and writes
+# are safe to repeat. Nothing has to be passed on the command line.
 
 echo == identity ==
 id

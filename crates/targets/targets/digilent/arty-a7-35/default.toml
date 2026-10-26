@@ -1,8 +1,8 @@
 # Digilent Arty A7-35T
 #
-# This describes what the board **can do**, not where every signal goes. Pin
-# assignments are added when the XDC is generated; the only pins here are the
-# ones whose identity changes the meaning (the board clock and reset).
+# This describes what the board **can do**, not where every signal goes. The
+# manifest decides which port goes to which pin; the pins here are the board
+# clock, the reset, and the signals the board brings out (`[pins]`).
 #
 # **The schema is provisional.** It is being settled by writing targets rather
 # than declared up front.
@@ -41,8 +41,7 @@ transport = ["jtag"]
 # against a utilization report.
 bram_kb = 225
 
-# What the MIG needs and what it presents. **Read out of `mig.prj`**
-# (2026-09-08). Both `sys_clk` and `ref_clk` are "No Buffer", so the harness
+# What the MIG needs and what it presents. **Read out of `mig.prj`**. Both `sys_clk` and `ref_clk` are "No Buffer", so the harness
 # MMCM makes them.
 dram = {kind = "ddr3l", device = "MT41K128M16XX-15E", channels = 1, mb = 256, width = 16, controller = "mig", sys_clk_mhz = 166.666, ref_clk_mhz = 200.0, ui_clk_mhz = 83.333, axi_data_bits = 128, axi_addr_bits = 28, axi_id_bits = 4, row_bits = 14, bank_bits = 3, sys_rst_active = "low"}
 
@@ -105,18 +104,10 @@ product   = "Digilent USB Device"
 # `hio` at run time when several of the same type are attached.
 
 # The MPSSE GPIO values that enable the level shifters (data, direction).
-#
-# **Measured** (2026-08-25, OpenOCD 0.11). Without them:
-#
-#   Error: JTAG scan chain interrogation failed: all ones
-#
-# — **TDO never comes back**. With `0x0088 0x008b`:
-#
-#   Info : JTAG tap: tap/device found: 0x0362d093 (mfg: 0x049 (Xilinx), part: 0x362d)
+# **Measured** (2026-08-25): without them **TDO never comes back** (all ones).
 #
 # The values come from OpenOCD's `interface/ftdi/digilent-hs1.cfg` (same
-# `0403:6010`), but they are recorded here **because they were confirmed on this
-# board**. Note that hs1.cfg matches `"Digilent Adept USB Device"` while the
+# `0403:6010`). That file matches `"Digilent Adept USB Device"` while the
 # on-board module reports `"Digilent USB Device"`, so it does not apply as-is:
 # Digilent uses a different descriptor per product.
 layout_init = [0x0088, 0x008b]
@@ -127,38 +118,24 @@ layout_init = [0x0088, 0x008b]
 # set by the round-trip delay through the cable and the level shifters, and can
 # only be measured.
 #
-# At 30 MHz `hio bench` came back corrupted (2026-09-02). Neither `Dropped` nor
-# `sticky_err` appeared, so the bridge was not discarding commands — **TDO was
-# not being sampled in time**: the round trip does not fit in the 16.7 ns half
-# period. At 20 MHz, 10000 reads came back clean at 0.94 MB/s.
+# **Measured** (2026-09-02, `hio bench`): at 30 MHz reads came back corrupted,
+# because TDO is not sampled in time (the round trip does not fit in the 16.7 ns
+# half period). At 20 MHz they came back clean at 0.94 MB/s.
 host_tck_mhz = 20
 
-# IR length of the TAP. **Measured** — with `-irlen 6` the IR capture pattern
-# comes back as expected (`0x01`); a wrong value gives `IR capture error`.
+# IR length of the TAP. **Measured**: the IR capture comes back as `0x01`.
 ir_length = 6
 
-# The device IDCODE. **Measured** (XC7A35T). Confirms that the device that was
-# opened really is this board.
+# The device IDCODE. **Measured** (XC7A35T).
 idcode = 0x0362d093
 
-# The IR value that selects BSCANE2 `JTAG_CHAIN 1` (USER1). **Measured**
-# (2026-08-25).
-#
-# With a bitstream carrying the bridge, `irscan 0x02` followed by two 41-bit DR
-# scans returned `0x159214938` on the second — magic (`0x5648524e`) << 2, the low
-# two bits being busy and err, both 0. **This was confirmed by the bridge
-# answering, not copied out of UG470.**
+# The IR value that selects BSCANE2 `JTAG_CHAIN 1` (USER1). **Confirmed by the
+# bridge answering** (2026-08-25), not only copied out of UG470.
 user1_ir = 0x02
 
-# The IRs for configuring over JTAG (UG470 Table 6-3, 7-series). **Measured**
-# (2026-09-03).
-#
-# `hio program` loaded a bitstream and **the design it loaded answered on the
-# window**. All four have to be right for that, so passing confirms the set.
-#
-# `jprogram_ir` was also confirmed on its own with `hio erase`: a running
-# harness stopped answering. **That is what made the table trustworthy**, after
-# which only the data path had to be watched.
+# The IRs for configuring over JTAG (UG470 Table 6-3, 7-series). **Confirmed**
+# (2026-09-03): the design `hio program` loaded answered on the window, which
+# needs all four to be right.
 jprogram_ir = 0x0b
 cfg_in_ir   = 0x05
 jstart_ir   = 0x0c
@@ -168,8 +145,8 @@ bypass_ir   = 0x3f
 # with or without a bitstream.
 sysmon_ir   = 0x37
 
-# **Read back rather than just waited for**, which is what Vivado's SVF does
-# (read on 2026-09-03). The bits carry no meaning here; `TDO`/`MASK` are copied
+# **Read back rather than just waited for**, which is what Vivado's SVF does.
+# The bits carry no meaning here; `TDO`/`MASK` are copied
 # from the SVF as they are, because guessing at their meaning breaks quietly
 # when the sequence changes.
 #

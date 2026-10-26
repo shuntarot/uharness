@@ -2,9 +2,9 @@
 // crates/std/veryl/src/async_fifo/async_fifo.veryl), MIT OR Apache-2.0,
 // Copyright (c) 2022 Naoye Hatta. One line differs; see below.
 
-/// Async FIFO. A copy of `std::async_fifo` that differs in one line.
+/// Async FIFO. A copy of `std::async_fifo` (v0.20.3) with one line fixed.
 ///
-/// std feeds the read pointer's gray code into the synchronizer straight from
+/// std v0.20.3 feeds the read pointer's gray code into the synchronizer straight from
 /// combinational logic (`i_d` of `u_synchronizer_rp` is `rp_dclk_gray`). That
 /// value is an XOR of a binary counter, so the write side can capture a glitch
 /// while several counter bits change. Then the write side sees too much free
@@ -16,8 +16,9 @@
 /// The write side already feeds `wp_sclk_gray_ff` (a flip-flop output), so the
 /// two sides now match.
 ///
-/// When std is fixed, switch back to `$std::async_fifo`. The ports and the
-/// logic are the same, so only the name changes.
+/// std has the same fix since v0.22.0, so this copy can be replaced with
+/// `$std::async_fifo`. The ports and the logic are the same, so only the name
+/// changes.
 import $std::async_fifo_pkg::calc_default_depth;
 
 pub module async_fifo::<S: $std::synchronizer> #(
@@ -220,7 +221,7 @@ pub module async_fifo::<S: $std::synchronizer> #(
         o_d  : wp_dclk_gray   ,
     );
 
-    // The only difference from std: std feeds `rp_dclk_gray` (combinational).
+    // The fix: std v0.20.3 feeds `rp_dclk_gray` (combinational).
     inst u_synchronizer_rp: S #(
         WIDTH : POINTER_WIDTH,
         STAGES: STAGES       ,

@@ -7,10 +7,8 @@
 //! analyzer resolves is taken from the source, and whatever it cannot (width
 //! shown as UNRESOLVED) is what the manifest has to state instead.
 //!
-//! **The work is in `harness::dut::describe_ports`.** Kept in the library
-//! rather than here, because code that lives only in an example cannot be
-//! called from tests -- and would be found broken exactly when it is needed
-//! (`tests/dut_resolve.rs` guards it).
+//! The work is in `harness::dut::describe_ports`, in the library, so that
+//! `tests/dut_resolve.rs` can test it.
 
 use std::env;
 use std::path::PathBuf;

@@ -3,14 +3,19 @@
 //! Integration tests run the generated Veryl through the analyzer, and
 //! `tests/sim.rs` runs it in the simulator.
 //!
-//! ## `unsafe (cdc)` appears in two places
+//! ## `unsafe (cdc)` marks only crossings the harness inserts itself
 //!
 //! - the MMCM instance: it makes a new clock, so it is a domain boundary.
 //! - the reset synchronizers: `locked` and the board reset are in the input
 //!   domain, and the flops run on the output clock.
+//! - on a board whose board reset is PERST# (one pin), the board reset taken
+//!   from the PCIe port. It is asynchronous and both ends synchronize it.
+//! - the edges of Vivado black boxes (the memory controller, the Zynq PS, the
+//!   PCIe wrapper), and the synchronizers that bring their status and counts
+//!   to the window clock.
 //!
-//! Both are crossings that the harness inserts itself. Only these may get a
-//! false path. The compiler rejects any other crossing that is not wrapped.
+//! Only these may get a false path. The compiler rejects any other crossing
+//! that is not wrapped.
 
 use miette::Diagnostic;
 use thiserror::Error;
@@ -70,7 +75,7 @@ pub fn format(text: &str, metadata: &Metadata) -> Result<String, EmitError> {
 /// The IP module name as Veryl sees it. It must match `-module_name` in the Tcl.
 pub const MMCM_MODULE: &str = "hns_mmcm";
 
-/// `hns/src/hns_clk.veryl`.
+/// `hns/src/clk.veryl`.
 ///
 /// The board reset polarity and the DUT reset polarity are different things.
 /// The first comes from the target (`[resets.sys] active`), the second from
@@ -347,6 +352,59 @@ pub fn mig_prj(plan: &Plan) -> Option<String> {
     Some(mark_xml(&prj, &target.source.beside(name)))
 }
 
+/// `hns/syn/dram.xdc`: the memory pins, copied from beside the target
+/// description (`[provides.dram] pins_xdc`). Only a DDR4 controller without a
+/// board interface has one; `feasibility::check` has made sure it is there and
+/// places every memory port.
+pub fn dram_xdc(plan: &Plan) -> Option<String> {
+    if dram_pins(plan).is_empty() || !is_ddr4(plan) {
+        return None;
+    }
+    let target = plan.target()?;
+    let name = target_dram(plan)?.pins_xdc?;
+    let xdc = crate::target::read_beside(target, &name)?;
+    let mut out = header_tcl();
+    out.push_str(&format!(
+        "#\n# The memory pins. Copied from {}\n\n",
+        target.source.beside(&name)
+    ));
+    out.push_str(&xdc);
+    Some(out)
+}
+
+/// The memory ports an XDC gives a `PACKAGE_PIN`, one entry per bit
+/// (`c0_ddr4_dq[3]`, or `c0_ddr4_act_n` for a 1-bit port).
+pub fn placed_ports(xdc: &str) -> Vec<String> {
+    let mut ports = Vec::new();
+    for line in xdc.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || !line.contains("PACKAGE_PIN") {
+            continue;
+        }
+        let Some((_, rest)) = line.split_once("get_ports") else {
+            continue;
+        };
+        // `{c0_ddr4_dq[3]}` ends at the brace; a bare `c0_ddr4_act_n` at the
+        // bracket that closes `[get_ports ...]`.
+        let rest = rest.trim_start();
+        let name: String = match rest.strip_prefix('{') {
+            Some(braced) => braced
+                .trim_start()
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '}')
+                .collect(),
+            None => rest
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != ']')
+                .collect(),
+        };
+        if !name.is_empty() {
+            ports.push(name);
+        }
+    }
+    ports
+}
+
 /// Adds the marker as a comment after the XML declaration, so that `gen` may
 /// write the file again. The declaration must stay on the first line.
 fn mark_xml(xml: &str, from: &str) -> String {
@@ -483,8 +541,9 @@ fn ddr4_tcl(dram: &hns_targets::Dram) -> String {
         out.push('\n');
     };
     // A board interface makes the board file fill in everything: part, speed,
-    // CAS, and the pin constraints. Without it there are no pins, and
-    // `opt_design` fails with "ports are not placed" (measured).
+    // CAS, and the pin constraints. Without it, the pins come from the XDC
+    // beside the target description (`dram_xdc`); with neither, `opt_design`
+    // fails with "ports are not placed" (measured).
     if let Some(name) = &dram.board_interface {
         put("_BOARD_INTERFACE", name.clone());
     }
@@ -503,8 +562,10 @@ fn ddr4_tcl(dram: &hns_targets::Dram) -> String {
         if let Some(v) = dram.sys_clk_ps {
             put("InputClockPeriod", v.to_string());
         }
+        if let Some(v) = &dram.memory_type {
+            put("MemoryType", v.clone());
+        }
         if let Some(v) = &dram.part {
-            put("MemoryType", "Components".to_string());
             put("MemoryPart", v.clone());
         }
         if let Some(v) = dram.width {
@@ -516,7 +577,9 @@ fn ddr4_tcl(dram: &hns_targets::Dram) -> String {
         if let Some(v) = dram.cas_write_latency {
             put("CasWriteLatency", v.to_string());
         }
-        put("DataMask", "NO_DM_NO_DBI".to_string());
+        if let Some(v) = &dram.data_mask {
+            put("DataMask", v.clone());
+        }
         put("Mem_Add_Map", "ROW_COLUMN_BANK_INTLV".to_string());
     }
     // Drop the last line continuation.
@@ -746,9 +809,21 @@ pub fn pcie_tcl(plan: &Plan, board: &hns_targets::Pcie) -> String {
         .gt_quad
         .as_ref()
         .expect("plan::generatable checks gt_quad");
+    let site = board
+        .block
+        .as_ref()
+        .expect("plan::generatable checks block");
     out.push_str("    CONFIG.mode_selection {Advanced} \\\n");
+    out.push_str(&format!("    CONFIG.pcie_blk_locn {{{site}}} \\\n"));
     out.push_str("    CONFIG.en_gt_selection {true} \\\n");
     out.push_str(&format!("    CONFIG.select_quad {{{quad}}} \\\n"));
+    // PERST# reaches the PCIE3 block through the fabric. With
+    // `dedicate_perst` on, the IP grows three MCAP reset ports, and its default
+    // differs by device (on for the KU040, off for the VU440). Off everywhere,
+    // one wrapper fits every device.
+    if block == PcieBlock::Pcie3 {
+        out.push_str("    CONFIG.dedicate_perst {false} \\\n");
+    }
     out.push_str(&format!("] [get_ips {ip}_0]\n"));
     out
 }
@@ -965,7 +1040,7 @@ fn widen(expr: &str, width: usize) -> String {
     }
 }
 
-/// `hns/src/hns_csr.veryl`: the `reg` terminator.
+/// `hns/src/csr.veryl`: the `reg` terminator.
 ///
 /// It uses the layout from `regmap` as is. The RTL and the host API must come
 /// from the same IR, so no offset is computed again here.
@@ -1384,7 +1459,7 @@ fn sim_drams(plan: &Plan) -> Vec<&crate::terminator::AxiMemPlan> {
         .collect()
 }
 
-/// `hns/src/hns_sim.veryl`: the top level for simulation.
+/// `hns/src/sim.veryl`: the top level for simulation.
 ///
 /// It is `hns_top` without the transport and the clock generation. The MMCM
 /// and JTAG are Vivado IP (black boxes) and cannot be simulated. The AXI4-Lite
@@ -1755,6 +1830,15 @@ fn copied_source(source: &str) -> String {
 /// this means "the window gets a second master".
 pub fn has_pcie(plan: &Plan) -> bool {
     plan.feasibility().is_some_and(|f| f.transport == "pcie")
+}
+
+/// Whether the board reset and PERST# are the same pin. The top then has one
+/// port for both, and the harness takes its reset from PERST#.
+pub fn perst_is_board_reset(plan: &Plan) -> bool {
+    let board_pin = &plan.board().clocks.reset.pin;
+    has_pcie(plan)
+        && board_pin.is_some()
+        && plan.target().and_then(|t| hns_targets::pcie(t).reset_n) == *board_pin
 }
 
 /// Whether PERST# also resets the DUT (`[pcie] perst_resets_dut`).
@@ -3470,7 +3554,7 @@ fn core_body(
     out.push_str("    );\n");
 }
 
-/// `hns/src/hns_uart.veryl`: the heartbeat UART (8N1).
+/// `hns/src/uart.veryl`: the heartbeat UART (8N1).
 ///
 /// It tells whether the harness is alive and which bitstream runs, even when
 /// the transport does not work. It is a UART, not an LED, because the board
@@ -3696,9 +3780,15 @@ pub fn dram_pins(plan: &Plan) -> Vec<(String, &'static str, usize)> {
         }
         return pins;
     }
-    // No defaults. `feasibility` already rejects a target that lacks a key, so
-    // every key is present here. A default would let a wrong width pass until
-    // synthesis.
+    memory_pins(&dram)
+}
+
+/// The memory pins of a MIG or DDR4 controller: (port, direction, width).
+///
+/// No defaults. `feasibility` already rejects a target that lacks a key, so
+/// every key is present here. A default would let a wrong width pass until
+/// synthesis.
+pub fn memory_pins(dram: &hns_targets::Dram) -> Vec<(String, &'static str, usize)> {
     let int = |value: Option<u32>| {
         value.expect("feasibility refuses a dram target that does not state this") as usize
     };
@@ -3706,12 +3796,21 @@ pub fn dram_pins(plan: &Plan) -> Vec<(String, &'static str, usize)> {
     let lanes = (dq / 8).max(1);
     let kind = dram
         .kind
+        .as_deref()
         .expect("feasibility refuses a dram target that does not state this");
     // DDR4 is not a variant of DDR3 (measured). `ras_n` / `cas_n` / `we_n`
     // become `act_n`, and bank groups (`bg`) are added. `addr` -> `adr`,
     // `ck_p/n` -> `ck_t/c`, `dqs_p/n` -> `dqs_t/c`, `dm` -> `dm_dbi_n` (an
     // inout). No name matches after a prefix change, so the lists are separate.
     if kind.starts_with("ddr4") {
+        // One cs_n, cke, odt and ck per rank. The boards with a board
+        // interface are single rank (measured on the generated IP); the others
+        // state `ranks`.
+        let ranks = if dram.board_interface.is_some() {
+            1
+        } else {
+            int(dram.ranks)
+        };
         return vec![
             ("c0_ddr4_adr".to_string(), "output", int(dram.row_bits)),
             ("c0_ddr4_ba".to_string(), "output", int(dram.bank_bits)),
@@ -3721,12 +3820,12 @@ pub fn dram_pins(plan: &Plan) -> Vec<(String, &'static str, usize)> {
                 int(dram.bank_group_bits),
             ),
             ("c0_ddr4_act_n".to_string(), "output", 1),
-            ("c0_ddr4_cke".to_string(), "output", 1),
-            ("c0_ddr4_cs_n".to_string(), "output", 1),
-            ("c0_ddr4_odt".to_string(), "output", 1),
+            ("c0_ddr4_cke".to_string(), "output", ranks),
+            ("c0_ddr4_cs_n".to_string(), "output", ranks),
+            ("c0_ddr4_odt".to_string(), "output", ranks),
             ("c0_ddr4_reset_n".to_string(), "output", 1),
-            ("c0_ddr4_ck_t".to_string(), "output", 1),
-            ("c0_ddr4_ck_c".to_string(), "output", 1),
+            ("c0_ddr4_ck_t".to_string(), "output", ranks),
+            ("c0_ddr4_ck_c".to_string(), "output", ranks),
             ("c0_ddr4_dq".to_string(), "inout", dq),
             ("c0_ddr4_dqs_t".to_string(), "inout", lanes),
             ("c0_ddr4_dqs_c".to_string(), "inout", lanes),
@@ -4563,9 +4662,10 @@ pub const MIG_MODULE: &str = "hns_mig";
 
 /// `hns/src/top.veryl`: the harness top level.
 ///
-/// It takes the board pins, makes the clocks, reaches the CSR from
-/// JTAG-to-AXI, and connects the DUT. JTAG goes through BSCANE2 and needs no
-/// pins. The body is `core_body`, shared with `hns_sim`.
+/// It takes the board pins, makes the clocks, reaches the CSR from the JTAG
+/// bridge (and from the PCIe BAR on PCIe), and connects the DUT. JTAG goes
+/// through BSCANE2 and needs no pins. The body is `core_body`, shared with
+/// `hns_sim`.
 pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) -> String {
     let clocks = &plan.board().clocks;
     let reset = plan.metadata.build.reset_type;
@@ -4594,7 +4694,10 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
     } else {
         out.push_str("    i_sys_clk: input 'sys clock,\n");
     }
-    out.push_str(&format!("    i_sys_rst: input 'sys {board_reset},\n"));
+    let shared_reset = perst_is_board_reset(plan);
+    if !shared_reset {
+        out.push_str(&format!("    i_sys_rst: input 'sys {board_reset},\n"));
+    }
     // PCIe: only the reference clock, the reset and the lanes. The rest is
     // inside the wrapper.
     if has_pcie(plan) {
@@ -4684,6 +4787,14 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
     // The request from `hns::reset_ctl` (inside `core_body`). `u_clk` uses it
     // first, so it is declared here.
     out.push_str(&format!("    var dut_rst_req: '{csr_ident} logic;\n"));
+    if shared_reset {
+        // One pin is both PERST# and the board reset, so it reaches the
+        // clocking as the board reset too. Both sides synchronize it.
+        out.push_str(&format!("    var sys_rst: 'sys {board_reset};\n"));
+        out.push_str("    unsafe (cdc) {\n");
+        out.push_str("        assign sys_rst = i_pcie_reset_n;\n");
+        out.push_str("    }\n");
+    }
     out.push('\n');
 
     out.push_str("    inst u_clk: clk (\n");
@@ -4692,7 +4803,11 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
     } else {
         out.push_str("        i_sys_clk,\n");
     }
-    out.push_str("        i_sys_rst,\n");
+    out.push_str(if shared_reset {
+        "        i_sys_rst: sys_rst,\n"
+    } else {
+        "        i_sys_rst,\n"
+    });
     for output in &clocks.outputs {
         let ident = &output.ident;
         out.push_str(&format!("        o_clk_{ident}: clk_{ident},\n"));
@@ -5553,7 +5668,10 @@ pub fn board_xdc(plan: &Plan) -> String {
         out.push('\n');
     }
 
-    if let (Some(pin), Some(standard)) = (&clocks.reset.pin, &clocks.reset.standard) {
+    // On a board whose board reset is PERST#, the PCIe constraints hold the pin.
+    if let (Some(pin), Some(standard)) = (&clocks.reset.pin, &clocks.reset.standard)
+        && !perst_is_board_reset(plan)
+    {
         out.push_str(&format!(
             "set_property -dict {{ PACKAGE_PIN {pin} IOSTANDARD {standard} }} [get_ports {{ i_sys_rst }}]\n"
         ));
@@ -5981,6 +6099,9 @@ pub fn synth_tcl(plan: &Plan) -> String {
     out.push_str("read_xdc board.xdc\n");
     if has_pcie(plan) {
         out.push_str("read_xdc pcie.xdc\n");
+    }
+    if dram_xdc(plan).is_some() {
+        out.push_str("read_xdc dram.xdc\n");
     }
     out.push_str("# -unmanaged: harness.xdc is Tcl (it checks that the synchroniser cells\n");
     out.push_str("# exist before constraining them). Plain read_xdc drops control flow with\n");
@@ -6473,16 +6594,6 @@ fn markdown_table(header: &[&str], rows: &[Vec<String>]) -> String {
     out
 }
 
-/// `hns/regs.md`: the register table for people.
-///
-/// It comes from the same IR as `regs.json`. It is the same data formatted for
-/// people, not per-DUT accessor code.
-///
-/// It is not part of the map hash. Otherwise every wording change would change
-/// the hash and break the match against a programmed bitstream.
-///
-/// The notes are fixed text chosen by `role`. Hand-written notes per bundle
-/// would make a second source of truth next to the map.
 /// A byte count for people: `8 KB`, `2 GB`, or `48 bytes`.
 fn bytes_text(n: u64) -> String {
     for (unit, shift) in [("GB", 30), ("MB", 20), ("KB", 10)] {
@@ -6493,6 +6604,16 @@ fn bytes_text(n: u64) -> String {
     format!("{n} bytes")
 }
 
+/// `hns/regs.md`: the register table for people.
+///
+/// It comes from the same IR as `regs.json`. It is the same data formatted for
+/// people, not per-DUT accessor code.
+///
+/// It is not part of the map hash. Otherwise every wording change would change
+/// the hash and break the match against a programmed bitstream.
+///
+/// The notes are fixed text chosen by `role`. Hand-written notes per bundle
+/// would make a second source of truth next to the map.
 pub fn regs_md(plan: &Plan) -> String {
     let map = &plan.registers;
     let mut out = format!("<!-- {MARKER} -->\n");
@@ -6626,8 +6747,6 @@ pub fn regs_md(plan: &Plan) -> String {
     out
 }
 
-/// The notes column. It is derived from `role`, so it cannot disagree with
-/// the map.
 /// What one TLP count counts, for regs.md.
 fn tlp_counter_note(role: &str) -> &'static str {
     match role {
@@ -6649,6 +6768,8 @@ fn tlp_counter_note(role: &str) -> &'static str {
 /// What all the TLP counts share, for regs.md.
 const TLP_COUNTER_NOTE: &str = "All `pcie_*` counts saturate, and a link reset does not clear them. A request the PCIe block refuses itself (no BAR hit, Memory Space off) never reaches them: see the function's Device Status. A read over PCIe counts itself; read over JTAG to leave them alone";
 
+/// The notes column. It is derived from `role`, so it cannot disagree with
+/// the map.
 fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
     let mut notes: Vec<String> = Vec::new();
 

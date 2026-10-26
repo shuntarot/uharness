@@ -1,7 +1,7 @@
 //! Host side: reaches the harness window.
 //!
-//! There are two layers. Only the lower one depends on USB, so the upper one runs
-//! in tests without a board.
+//! Over JTAG there are two layers. Only the lower one depends on USB, so the upper
+//! one runs in tests without a board.
 //!
 //! | Layer | Contents | Tested |
 //! |---|---|---|
@@ -25,6 +25,7 @@ pub mod hns2;
 pub mod mpsse;
 pub mod pcie;
 pub mod ps7;
+pub mod reprogram;
 pub mod rtt;
 pub mod semihosting;
 pub mod svf;

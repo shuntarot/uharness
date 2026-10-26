@@ -141,8 +141,9 @@ struct Cli {
     /// Reach the window through a server, e.g. localhost:5555.
     ///
     /// The server is `hio serve` on the machine the board is on, or `veryl harness sim
-    /// --addr`. Use the same regs.json as the server. Commands that need the cable or the
-    /// card's memory (program, probe, DMA) run only on the server's machine.
+    /// --addr`. Use the same regs.json as the server. `program` sends the bitstream to a
+    /// PCIe server; the other commands that need the cable or the card's memory (probe,
+    /// DMA) run only on the server's machine.
     #[arg(
         long,
         value_name = "HOST:PORT",
@@ -152,10 +153,10 @@ struct Cli {
     )]
     connect: Option<String>,
 
-    /// PCI address of the card, e.g. 0000:04:00.0.
+    /// PCI address of the card: the first column of `lspci`.
     ///
-    /// Without it the ID in regs.json picks the card; this is only needed when more than
-    /// one answers to it.
+    /// The domain (`0000:`) may be left out. Without this option the ID in regs.json
+    /// picks the card; it is only needed when more than one answers to it.
     #[arg(long, value_name = "BDF", hide_short_help = true)]
     bdf: Option<String>,
 
@@ -220,9 +221,8 @@ enum Cmd {
         /// A raw .bin has no header and is refused, because it carries no device name to
         /// check against the board.
         ///
-        /// Devices with more than one SLR (VU9P and friends) need the .svf: their
-        /// .bit is one sub-bitstream per SLR, and splitting it means guessing at a
-        /// format Xilinx does not document. `make svf` writes one next to the .bit.
+        /// A .svf is replayed as it is, so it also works on a device this build
+        /// does not know. `make svf` writes one next to the .bit.
         ///
         /// Left out, the one beside the register map is used: `syn/output/*.bit`
         /// under the directory regs.json was found in. That is where `gen` puts it,
@@ -658,6 +658,20 @@ enum CpuCmd {
 
     /// Let a halted hart run.
     Resume {
+        #[command(flatten)]
+        hart: HartArgs,
+    },
+
+    /// Measure the IPC of the program that runs on the hart.
+    ///
+    /// It halts the hart, reads `mcycle` and `minstret`, lets it run for the
+    /// given time, halts it and reads them again, then leaves the hart as it
+    /// was. The counters are never written; if `mcountinhibit` stops them, it
+    /// is lifted for the run and put back.
+    Ipc {
+        /// How long to let it run, in seconds.
+        #[arg(long, value_name = "SECONDS", default_value_t = 1.0)]
+        time: f64,
         #[command(flatten)]
         hart: HartArgs,
     },
@@ -1916,82 +1930,14 @@ fn program(
     let bit = hns_host::bitstream::parse(&bytes).map_err(|e| e.to_string())?;
     println!("{}  {}  {} {}", bit.top(), bit.part, bit.date, bit.time);
 
-    // Check the device before writing. Without a target there is nothing to
-    // compare with, so do not go on silently.
     let target = resolve_target(cli)?;
-    match (&target, allow_any_device) {
-        (Some(t), _) => {
-            let part = &t.head.device.part;
-            if !hns_host::bitstream::part_matches(&bit.part, part) {
-                let e = hns_host::bitstream::Error::WrongDevice {
-                    bitstream: bit.part.clone(),
-                    target: part.clone(),
-                };
-                if !allow_any_device {
-                    return Err(e.to_string());
-                }
-                eprintln!("warning: {e}");
-            }
-        }
-        (None, true) => eprintln!("warning: no target given, so the device is not checked"),
-        (None, false) => {
-            return Err(
-                "no target was given, so hio cannot check the bitstream's device.\n\
-                 Pass --target (or --target-file) naming the board this .bit was built for. \
-                 --allow-any-device skips the check."
-                    .to_string(),
-            );
-        }
-    }
-
-    let jtag = target.as_ref().map(hns_targets::jtag).unwrap_or_default();
-    let ir = match (jtag.jprogram_ir, jtag.jstart_ir, jtag.bypass_ir) {
-        (Some(jprogram), Some(jstart), Some(bypass)) => hns_host::config::ConfigIr {
-            jprogram,
-            jstart,
-            bypass,
-            ready: jtag.ready.map(|c| hns_host::config::Check {
-                ir: c.ir,
-                expect: c.expect,
-                mask: c.mask,
-            }),
-            done: jtag.done.map(|c| hns_host::config::Check {
-                ir: c.ir,
-                expect: c.expect,
-                mask: c.mask,
-            }),
-        },
-        _ => {
-            return Err(
-                "the target does not say which IR values select JTAG configuration.\n\
-                 `jprogram_ir`, `jstart_ir` and `bypass_ir` are needed. They differ by \
-                 device family. Find them in the device's BSDL file, under \
-                 data/parts/xilinx/<family>/public/bsdl/ in Vivado."
-                    .to_string(),
-            );
-        }
-    };
-    let chunks = split(&bit, &jtag)?;
-
-    let cfg = resolve_probe(cli)?;
-    let mut m = Mpsse::attach(Ftdi::open(&cfg).map_err(|e| e.to_string())?, &cfg)
-        .map_err(|e| e.to_string())?;
-
-    let start = std::time::Instant::now();
-    hns_host::config::program(
-        &mut m,
-        &ir,
-        cfg.ir_length,
-        &bit.data,
-        &chunks,
+    let (m, cfg) = configure(
+        cli,
+        target.as_ref(),
+        &bit,
+        allow_any_device,
         std::time::Duration::from_millis(erase_wait_ms),
-    )
-    .map_err(|e| e.to_string())?;
-    println!(
-        "sent {} bytes in {:.2} s",
-        bit.data.len(),
-        start.elapsed().as_secs_f64()
-    );
+    )?;
 
     // A Zynq's PS memory needs the PS set up, through the DAP. The probe is
     // released for that and opened again after.
@@ -2028,6 +1974,86 @@ fn program(
         }
         None => Ok(()),
     }
+}
+
+/// Checks the bitstream's device against the target and sends it over JTAG.
+/// Answers the probe, still open.
+fn configure(
+    cli: &Cli,
+    target: Option<&hns_targets::Target>,
+    bit: &hns_host::bitstream::Bitstream,
+    allow_any_device: bool,
+    erase_wait: std::time::Duration,
+) -> Result<(Mpsse<Ftdi>, ProbeConfig), String> {
+    // Check the device before writing. Without a target there is nothing to
+    // compare with, so do not go on silently.
+    match (target, allow_any_device) {
+        (Some(t), _) => {
+            let part = &t.head.device.part;
+            if !hns_host::bitstream::part_matches(&bit.part, part) {
+                let e = hns_host::bitstream::Error::WrongDevice {
+                    bitstream: bit.part.clone(),
+                    target: part.clone(),
+                };
+                if !allow_any_device {
+                    return Err(e.to_string());
+                }
+                eprintln!("warning: {e}");
+            }
+        }
+        (None, true) => eprintln!("warning: no target given, so the device is not checked"),
+        (None, false) => {
+            return Err(
+                "no target was given, so hio cannot check the bitstream's device.\n\
+                 Pass --target (or --target-file) naming the board this .bit was built for. \
+                 --allow-any-device skips the check."
+                    .to_string(),
+            );
+        }
+    }
+
+    let jtag = target.map(hns_targets::jtag).unwrap_or_default();
+    let ir = match (jtag.jprogram_ir, jtag.jstart_ir, jtag.bypass_ir) {
+        (Some(jprogram), Some(jstart), Some(bypass)) => hns_host::config::ConfigIr {
+            jprogram,
+            jstart,
+            bypass,
+            ready: jtag.ready.map(|c| hns_host::config::Check {
+                ir: c.ir,
+                expect: c.expect,
+                mask: c.mask,
+            }),
+            done: jtag.done.map(|c| hns_host::config::Check {
+                ir: c.ir,
+                expect: c.expect,
+                mask: c.mask,
+            }),
+        },
+        _ => {
+            return Err(
+                "the target does not say which IR values select JTAG configuration.\n\
+                 `jprogram_ir`, `jstart_ir` and `bypass_ir` are needed. They differ by \
+                 device family. Find them in the device's BSDL file, under \
+                 data/parts/xilinx/<family>/public/bsdl/ in Vivado."
+                    .to_string(),
+            );
+        }
+    };
+    let chunks = split(bit, &jtag)?;
+
+    let cfg = resolve_probe(cli)?;
+    let mut m = Mpsse::attach(Ftdi::open(&cfg).map_err(|e| e.to_string())?, &cfg)
+        .map_err(|e| e.to_string())?;
+
+    let start = std::time::Instant::now();
+    hns_host::config::program(&mut m, &ir, cfg.ir_length, &bit.data, &chunks, erase_wait)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "sent {} bytes in {:.2} s",
+        bit.data.len(),
+        start.elapsed().as_secs_f64()
+    );
+    Ok((m, cfg))
 }
 
 /// `id`, given a moment to come back after the PS was set up.
@@ -2135,10 +2161,9 @@ fn split(
 
 /// Replays an SVF as it is.
 ///
-/// Devices with several SLRs can only be programmed this way. Their `.bit`
-/// joins one sub-bitstream per SLR, and Xilinx does not document where they
-/// split. Vivado writes an SVF without a board, so the FPGA host needs no
-/// Vivado.
+/// The configuration steps come from the file, not from the target
+/// description, so it works on a device this build does not know. Vivado
+/// writes an SVF without a board, so the FPGA host needs no Vivado.
 fn play_svf(cli: &Cli, file: &PathBuf) -> Result<(), String> {
     let text = std::fs::read_to_string(file)
         .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
@@ -2581,6 +2606,9 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
             Some(f) => f.clone(),
             None => beside_the_map(&cli)?,
         };
+        if cli.connect.is_some() {
+            return program_remote(&cli, &file, *erase_wait_ms);
+        }
         return program(&cli, &file, *allow_any_device, *erase_wait_ms);
     }
     if matches!(cmd, Cmd::Erase) {
@@ -2622,7 +2650,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
         | Cmd::Completions { .. } => {
             unreachable!("handled above")
         }
-        Cmd::Serve { listen } => serve(&mut bus, &map, &listen),
+        Cmd::Serve { listen } => serve(&cli, &mut bus, &map, &listen),
         Cmd::Id => id(&mut bus, &map),
         Cmd::Read { who, at, words } => do_read(&mut bus, &map, &who, at, words),
         Cmd::Write { who, values } => do_write(&mut bus, &map, &who, &values),
@@ -2782,7 +2810,8 @@ fn check_server(
         return Err(format!(
             "the server at {from} uses a regs.json with map hash {hash:#010x}, and this one \
              has {:#010x}.\n\
-             Pass the regs.json the server uses (copy it from the server's machine).",
+             Pass the regs.json the server uses (copy it from the server's machine), or \
+             put this design on the board: `hio --connect {from} program`.",
             map.map_hash
         ));
     }
@@ -2790,16 +2819,35 @@ fn check_server(
 }
 
 /// Refuses what a server cannot do for a client: it passes on batches for
-/// the window, and nothing else.
+/// the window, and programs a bitstream, and nothing else.
 fn refuse_over_connect(cmd: &Cmd) -> Result<(), String> {
     let cable = match cmd {
         Cmd::Probe => Some("probe"),
         Cmd::Sysmon => Some("sysmon"),
         Cmd::Dap(_) => Some("dap"),
-        Cmd::Program { .. } => Some("program"),
+        Cmd::Program {
+            file: Some(file), ..
+        } if file
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("svf")) =>
+        {
+            Some("program <svf>")
+        }
         Cmd::Erase => Some("erase"),
         _ => None,
     };
+    if let Cmd::Program {
+        allow_any_device: true,
+        ..
+    } = cmd
+    {
+        return Err(
+            "`--allow-any-device` does not go through `--connect`: the server checks the \
+             bitstream against the board it serves.\n\
+             Run `hio program` on the machine the board is on."
+                .to_string(),
+        );
+    }
     if let Some(name) = cable {
         return Err(format!(
             "`{name}` works on the JTAG cable, and `--connect` reaches only the window.\n\
@@ -2826,7 +2874,7 @@ fn refuse_over_connect(cmd: &Cmd) -> Result<(), String> {
 }
 
 /// `hio serve`: passes batches from clients to the window, until Ctrl-C.
-fn serve(bus: &mut Bus, map: &RegisterMap, listen: &str) -> Result<(), String> {
+fn serve(cli: &Cli, bus: &mut Bus, map: &RegisterMap, listen: &str) -> Result<(), String> {
     use hns_host::hns2;
 
     if map.target.as_deref() == Some(hns_targets::SIM) {
@@ -2844,6 +2892,16 @@ fn serve(bus: &mut Bus, map: &RegisterMap, listen: &str) -> Result<(), String> {
         map_hash: Some(map.map_hash),
         max_ops: hns2::MAX_OPS,
     };
+    // Saved while the card answers, to be written back after programming.
+    let saved = match &*bus {
+        Bus::Pcie(bar) => hns_host::reprogram::read_config(
+            std::path::Path::new(hns_host::pcie::SYSFS),
+            &bar.info().bdf,
+        )
+        .ok()
+        .filter(|c| hns_host::reprogram::answering(c, bar.info().bar0_start)),
+        _ => None,
+    };
     let listener = std::net::TcpListener::bind(listen)
         .map_err(|e| format!("cannot listen on {listen}: {e}"))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
@@ -2854,13 +2912,208 @@ fn serve(bus: &mut Bus, map: &RegisterMap, listen: &str) -> Result<(), String> {
     if !local.ip().is_loopback() {
         eprintln!("warning: {local} is reachable from other machines, and HNS2 has no password");
     }
-    hns2::serve(
-        listener,
-        &info,
-        |batch| bus.run(batch),
-        |line| println!("hio: {line}"),
-    )
-    .map_err(|e| e.to_string())
+    let mut window = BoardWindow {
+        cli,
+        bus,
+        map: map.clone(),
+        info,
+        saved,
+    };
+    hns2::serve(listener, &mut window, |line| println!("hio: {line}")).map_err(|e| e.to_string())
+}
+
+/// What `hio serve` serves: the window, and programming the board under it.
+struct BoardWindow<'a> {
+    cli: &'a Cli,
+    bus: &'a mut Bus,
+    /// The map of the design on the board. Programming replaces it.
+    map: RegisterMap,
+    info: hns_host::hns2::Info,
+    /// The card's config space from when it last answered at its address.
+    saved: Option<Vec<u8>>,
+}
+
+impl hns_host::hns2::Window for BoardWindow<'_> {
+    fn info(&self) -> hns_host::hns2::Info {
+        self.info.clone()
+    }
+
+    fn run(&mut self, batch: &Batch) -> Result<Reads, String> {
+        self.bus.run(batch)
+    }
+
+    fn program(
+        &mut self,
+        request: &hns_host::hns2::Program,
+    ) -> Result<hns_host::hns2::Info, String> {
+        self.reprogram(request)
+    }
+}
+
+impl BoardWindow<'_> {
+    /// Programs over JTAG while the machine keeps the card, then writes the
+    /// card's config space back, so the window answers at the same address.
+    ///
+    /// A design that looks different from the bus is refused before anything
+    /// is programmed: the machine would have to enumerate the card again.
+    fn reprogram(
+        &mut self,
+        request: &hns_host::hns2::Program,
+    ) -> Result<hns_host::hns2::Info, String> {
+        use hns_host::reprogram::{self, Shape};
+
+        let Bus::Pcie(bar) = &*self.bus else {
+            return Err(
+                "this server reaches the window over JTAG, and programming through \
+                 `hio serve` works over PCIe only so far.\n\
+                 Run `hio program` on the machine the board is on."
+                    .to_string(),
+            );
+        };
+        let bdf = bar.info().bdf.clone();
+        let next = std::str::from_utf8(request.map)
+            .map_err(|_| "the regs.json sent is not UTF-8".to_string())
+            .and_then(|text| {
+                RegisterMap::from_json(text)
+                    .map_err(|e| format!("the regs.json sent cannot be read: {e}"))
+            })?;
+        if next.target != self.map.target {
+            return Err(format!(
+                "the regs.json sent is for {}, and this server serves {}.\n\
+                 Pass the regs.json of a design built for this board.",
+                next.target.as_deref().unwrap_or("no named target"),
+                self.map.target.as_deref().unwrap_or("no named target"),
+            ));
+        }
+        let Some(pcie) = &next.pcie else {
+            return Err(
+                "the regs.json sent has no `pcie` section: that design has no PCIe \
+                 endpoint, and the machine would lose the card.\n\
+                 Generate it with `--transport pcie`."
+                    .to_string(),
+            );
+        };
+        let bit = hns_host::bitstream::parse(request.bitstream).map_err(|e| e.to_string())?;
+
+        let root = std::path::Path::new(hns_host::pcie::SYSFS);
+        let card = hns_host::pcie::info_at(root, &bdf).map_err(|e| e.to_string())?;
+        let changed = reprogram::changes(
+            &Shape::of_card(&card),
+            &Shape {
+                vendor: pcie.vendor_id as u16,
+                device: pcie.device_id as u16,
+                class: pcie.class_code,
+                bar_bytes: u64::from(pcie.bar_bytes),
+                intx: next
+                    .registers
+                    .iter()
+                    .any(|r| r.role.as_deref() == Some("irq_level")),
+            },
+        );
+        if !changed.is_empty() {
+            return Err(format!(
+                "the new design looks different from the bus ({}). Nothing was \
+                 programmed.\n\
+                 The machine has to enumerate the card again, which a running server \
+                 cannot do. On the board's machine: stop `hio serve`, run `hio program`, \
+                 then as root remove the card and rescan the bus (reboot instead if the \
+                 BAR grew past the bridge window), and start `hio serve` again.",
+                changed.join(", ")
+            ));
+        }
+        let config = reprogram::read_config(root, &bdf)
+            .map_err(|e| format!("cannot read the config space of {bdf}: {e}"))?;
+        if reprogram::answering(&config, card.bar0_start) {
+            self.saved = Some(config);
+        }
+        let Some(saved) = self.saved.clone() else {
+            return Err(format!(
+                "{bdf} does not answer at its address now, and this server saved no \
+                 config space from when it did. Nothing was programmed.\n\
+                 Make the card answer by hand (as root, remove it and rescan the bus), \
+                 then start `hio serve` again."
+            ));
+        };
+
+        // From here the board no longer runs the map the server had.
+        self.info.map_hash = None;
+        let target = resolve_target(self.cli)?;
+        let (m, _) = configure(
+            self.cli,
+            target.as_ref(),
+            &bit,
+            false,
+            std::time::Duration::from_millis(u64::from(request.erase_wait_ms)),
+        )?;
+        drop(m);
+        reprogram::wait_for_card(
+            root,
+            &bdf,
+            card.vendor,
+            card.device,
+            std::time::Duration::from_secs(10),
+        )?;
+        reprogram::write_config(root, &bdf, &reprogram::restore_plan(&saved))
+            .map_err(|e| format!("cannot write the config space of {bdf} back: {e}"))?;
+        check_identity_settled(self.bus, &next)?;
+        self.map = next;
+        self.info.map_hash = Some(self.map.map_hash);
+        Ok(self.info.clone())
+    }
+}
+
+/// `check_identity`, given a moment for the harness to come out of reset
+/// after programming.
+fn check_identity_settled(bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        match check_identity(bus, map) {
+            Ok(()) => return Ok(()),
+            Err(_) if started.elapsed() < std::time::Duration::from_secs(2) => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `program` through `hio serve`. The server programs the board, writes the
+/// card's config space back, and takes this regs.json as its map.
+fn program_remote(cli: &Cli, file: &std::path::Path, erase_wait_ms: u64) -> Result<(), String> {
+    let addr = cli.connect.as_deref().expect("called with --connect");
+    let (map_path, map) = find_regs(cli)?;
+    let map_text = std::fs::read(&map_path).map_err(|e| format!("cannot read {map_path}: {e}"))?;
+    let bytes = std::fs::read(file).map_err(|e| read_error(file, e))?;
+    let bit = hns_host::bitstream::parse(&bytes).map_err(|e| e.to_string())?;
+    println!("{}  {}  {} {}", bit.top(), bit.part, bit.date, bit.time);
+    let erase_wait_ms = u32::try_from(erase_wait_ms)
+        .map_err(|_| format!("--erase-wait-ms {erase_wait_ms} is too long"))?;
+
+    let mut link = hns_host::hns2::Link::connect(addr).map_err(|e| e.to_string())?;
+    let info = link.info();
+    if info.kind == "sim" {
+        return Err(format!(
+            "the server at {addr} is a simulation, and it has no FPGA to program.\n\
+             Generate the simulation again instead: `veryl harness gen --target sim`."
+        ));
+    }
+    if info.target.is_some() && map.target.is_some() && info.target != map.target {
+        return Err(format!(
+            "the server at {addr} serves {}, and regs.json is for {}.\n\
+             Pass the regs.json of a design built for that board.",
+            info.target.as_deref().unwrap_or("a board"),
+            map.target.as_deref().unwrap_or("another board"),
+        ));
+    }
+    let start = std::time::Instant::now();
+    link.program(erase_wait_ms, &map_text, &bytes)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "sent {} bytes; programmed in {:.2} s",
+        bytes.len(),
+        start.elapsed().as_secs_f64()
+    );
+    id(&mut Bus::Net(link), &map)
 }
 
 /// Sets the TCK gap between scans (`hns_host::mpsse::update_gap`).
@@ -2941,7 +3194,13 @@ fn open_bar(cli: &Cli, map: &RegisterMap) -> Result<hns_host::pcie::Bar, String>
 /// (decode, bus mastering, IOMMU) before it opens the window.
 fn find_bdf(cli: &Cli, pcie: &hns_regs::Pcie) -> Result<String, String> {
     match &cli.bdf {
-        Some(bdf) => Ok(bdf.clone()),
+        Some(bdf) => hns_host::pcie::named_at(
+            std::path::Path::new(hns_host::pcie::SYSFS),
+            bdf,
+            pcie.vendor_id as u16,
+            pcie.device_id as u16,
+        )
+        .map_err(|e| e.to_string()),
         None => Ok(hns_host::pcie::find_at(
             std::path::Path::new(hns_host::pcie::SYSFS),
             pcie.vendor_id as u16,
@@ -6362,8 +6621,6 @@ fn rtt_place(elf: &hns_host::elf::Elf, attach: &AttachArgs) -> Option<(u64, Opti
     }
 }
 
-/// Loads (when `load`) and runs an ELF, then stays on its console. Returns
-/// the program's exit status.
 /// How `boot` starts the console.
 #[derive(Clone, Copy)]
 enum Start {
@@ -6374,6 +6631,8 @@ enum Start {
     Attach,
 }
 
+/// Loads (with `Start::Load`) and runs an ELF, then stays on its console.
+/// Returns the program's exit status.
 fn boot(
     cli: &Cli,
     bus: &mut Bus,
@@ -6724,8 +6983,6 @@ fn wait_rtt(
     }
 }
 
-/// Up channel 0 to the terminal, keys to down channel 0, until Ctrl-A x or
-/// until the program reports an exit status.
 /// The console: up channel 0 to the terminal, keys to down channel 0, until
 /// Ctrl-A x or until the program reports an exit status. Ctrl-A c switches to
 /// the prompt and back.
@@ -7880,6 +8137,34 @@ fn dmi_base(map: &RegisterMap, bundle: Option<&str>) -> Result<u32, String> {
     Ok(region.window_base as u32)
 }
 
+/// What `cpu ipc` prints about one run, without the PC.
+fn ipc_report(m: &hns_host::dm::Measured, secs: f64) -> String {
+    let mut out = format!("cycles    {}\ninstret   {}\n", m.cycles, m.instret);
+    if m.cycles > 0 && m.instret > 0 {
+        out.push_str(&format!(
+            "IPC       {:.3}  (CPI {:.1})\n",
+            m.instret as f64 / m.cycles as f64,
+            m.cycles as f64 / m.instret as f64
+        ));
+    } else {
+        out.push_str(
+            "IPC       -  (a counter did not move: is the hart in wfi, or does it lack the counters?)\n",
+        );
+    }
+    out.push_str(&format!(
+        "over      {secs:.2} s, about {:.1} MHz, {:.2} MIPS",
+        m.cycles as f64 / secs / 1e6,
+        m.instret as f64 / secs / 1e6
+    ));
+    if m.inhibit & 0b101 != 0 {
+        out.push_str(&format!(
+            "\nnote      mcountinhibit was {:#x}; lifted for the run, then put back",
+            m.inhibit
+        ));
+    }
+    out
+}
+
 /// The `cpu` commands that talk to the Debug Module.
 fn cpu_debug(
     bus: &mut Bus,
@@ -7897,6 +8182,7 @@ fn cpu_debug(
         | CpuCmd::Dmi { hart, .. }
         | CpuCmd::Halt { hart }
         | CpuCmd::Resume { hart }
+        | CpuCmd::Ipc { hart, .. }
         | CpuCmd::Step { hart, .. }
         | CpuCmd::Regs { hart, .. }
         | CpuCmd::Break { hart, .. }
@@ -8027,6 +8313,22 @@ fn cpu_debug(
         CpuCmd::Resume { .. } => {
             dm.resume()?;
             println!("hart {hart} running");
+        }
+        CpuCmd::Ipc { time, .. } => {
+            if !(time.is_finite() && *time > 0.0) {
+                return Err(format!(
+                    "--time {time} is not a time: give seconds above 0."
+                ));
+            }
+            let run = std::time::Duration::from_secs_f64(*time);
+            let (m, took) = dm.measure(|_| {
+                let start = std::time::Instant::now();
+                std::thread::sleep(run);
+                start.elapsed()
+            })?;
+            let xlen = dm.xlen()?;
+            println!("{}", ipc_report(&m, took.as_secs_f64()));
+            println!("last pc   {}{}", word(m.pc, xlen), symbolize(elf, m.pc));
         }
         CpuCmd::Step { count, .. } => {
             for _ in 0..*count {
@@ -9434,7 +9736,11 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap().to_string();
             std::thread::spawn(move || {
-                hns_host::hns2::serve(listener, &info, |_| Err("no window".to_string()), |_| {})
+                let mut window = hns_host::hns2::Batches {
+                    info,
+                    run: |_: &Batch| Err("no window".to_string()),
+                };
+                hns_host::hns2::serve(listener, &mut window, |_| {})
             });
             addr
         };
@@ -9472,7 +9778,15 @@ mod tests {
     #[test]
     fn connect_refuses_the_cable_and_dma() {
         for args in [
-            vec!["hio", "--connect", "h:1", "program", "x.bit"],
+            vec!["hio", "--connect", "h:1", "program", "x.svf"],
+            vec![
+                "hio",
+                "--connect",
+                "h:1",
+                "program",
+                "--allow-any-device",
+                "x.bit",
+            ],
             vec!["hio", "--connect", "h:1", "probe"],
             vec!["hio", "--connect", "h:1", "load", "mem", "x.elf", "--dma"],
             vec!["hio", "--connect", "h:1", "serve"],

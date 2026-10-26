@@ -396,13 +396,9 @@ module hns_pcie_wrap #(
         .sys_clk(pcie_sys_clk),
         .sys_clk_gt(pcie_sys_clk_gt),
         .sys_reset(i_pcie_reset_n),
-        // The MCAP reset of the second block, which is not used. Tied to 0,
-        // the IP's own default and what its example design leaves it at.
-        // **Not to PERST#**: the placer then tries to put the PERST# pin in the
-        // second block's shape as well, and fails (Shape Builder 18-119).
-        .pcie_perstn1_in(1'b0),
-        .pcie_perstn0_out(),
-        .pcie_perstn1_out(),
+        // No `pcie_perstn*` ports: the generator turns `dedicate_perst` off,
+        // which removes them. Their default differs by device (the KU040 has
+        // them, the VU440 does not).
         .int_qpll1lock_out(),
         .int_qpll1outrefclk_out(),
         .int_qpll1outclk_out(),

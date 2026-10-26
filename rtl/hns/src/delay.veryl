@@ -8,7 +8,7 @@
 /// those assumptions away on purpose.
 ///
 /// Off by default. `i_delay = 0` passes everything through combinationally,
-/// so a harness that does not ask for stress behaves exactly as before.
+/// so a harness that does not ask for stress behaves exactly as without it.
 ///
 /// Driven from a register, not from the manifest. Re-synthesising to change
 /// a number would cost minutes on a small board and an hour on a large one; the

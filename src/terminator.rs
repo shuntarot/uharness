@@ -3,9 +3,10 @@
 //! `reg` is one register per port, so `regmap` alone handles it. The other
 //! backings add a circuit to the harness: the FIFO of `host_poll_fifo`
 //! (`resolve`), fixed-latency memories (`resolve_memories`), the transfer-level
-//! interface (`resolve_host_mem`), slaves inside the DUT (`resolve_slaves`), and
-//! AXI4 memories (`resolve_axi_mems`). `check_claimed` checks that each bundle
-//! is taken by exactly one of them.
+//! interface (`resolve_host_mem`), slaves inside the DUT (`resolve_slaves`,
+//! `resolve_apbs`, `resolve_axi_slaves`), AXI4 memories (`resolve_axi_mems`),
+//! and the PCIe lines (`resolve_irqs`, `resolve_flrs`). `check_claimed` checks
+//! that each bundle is taken by exactly one of them.
 //!
 //! ## What `host_poll_fifo` terminates
 //!
@@ -1245,9 +1246,9 @@ fn resolve_xfer_ports(
 
 /// Plans the transfer-level bundles, only where a stand-in exists.
 ///
-/// The contract check (`contract::check_host_mem`) has already checked that the
-/// eight read roles are complete. Here we check that a stand-in exists and that
-/// it can hold the shape (beat width, depth).
+/// The contract check (`contract::check_host_mem`) has already checked that
+/// each present side has all its roles. Here we check that a stand-in exists
+/// and that it can hold the shape (beat width, depth).
 pub fn resolve_host_mem(
     dut: &Dut,
     manifest: &Manifest,
@@ -1351,9 +1352,6 @@ impl SlavePlan {
     }
 }
 
-/// Resolves the `backing = "slave"` bundles. The contract resolution has already
-/// checked the direction of `addr`. The other directions, the widths, and the
-/// size in the window are checked here.
 /// A `host_irq` terminator: the DUT's interrupt line, sent to the host as
 /// INTA over PCIe.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1486,6 +1484,9 @@ pub fn resolve_flrs(
     Ok(plans)
 }
 
+/// Resolves the `backing = "slave"` bundles. The contract resolution has already
+/// checked the direction of `addr`. The other directions, the widths, and the
+/// size in the window are checked here.
 pub fn resolve_slaves(
     dut: &Dut,
     manifest: &Manifest,
@@ -3009,7 +3010,7 @@ pub fn check_claimed(
             }
             (None, _) => match declared.backing {
                 Backing::Reg => ("a `reg` bundle", &[][..]),
-                // No terminator yet. `gen` rejects it (`generate::terminable`).
+                // No terminator yet. `gen` rejects it (`plan::generatable`).
                 Backing::HostMem | Backing::Observe => continue,
                 backing => {
                     return Err(TerminatorError::NotTerminated {

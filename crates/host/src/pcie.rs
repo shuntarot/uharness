@@ -65,6 +65,14 @@ pub enum Error {
     /// No card with that ID. Endpoints are enumerated once at boot, so a card
     /// programmed after boot is not visible until a reboot.
     NotFound { vendor: u16, device: u16 },
+    /// No device at the BDF given with `--bdf`. `found` lists the cards with
+    /// the ID in `regs.json`, so the right one can be picked.
+    NoSuchCard {
+        bdf: String,
+        vendor: u16,
+        device: u16,
+        found: Vec<String>,
+    },
     /// Several cards have that ID. The default ID comes from a verilog-pcie
     /// example, so two harness boards look the same from outside.
     Ambiguous {
@@ -86,7 +94,7 @@ impl std::fmt::Display for Error {
             Error::NoDevice { bdf, path } => write!(
                 f,
                 "no PCI device {bdf} ({} does not exist).\n\
-                 `lspci -D` lists the cards. The BDF is the first column (0000:04:00.0). \
+                 `lspci -D` lists the cards. The BDF is the first column. \
                  If the card is not listed, its bitstream has no PCIe endpoint, or the \
                  machine was not rebooted after programming.",
                 path.display()
@@ -142,6 +150,35 @@ impl std::fmt::Display for Error {
                  `lspci -Dnn` lists the cards. If the card is in the slot, it runs \
                  another bitstream, or the machine was not rebooted after programming. \
                  Linux finds the card only at boot."
+            ),
+            Error::NoSuchCard {
+                bdf,
+                vendor,
+                device,
+                found,
+            } if found.is_empty() => write!(
+                f,
+                "no PCI device {bdf}, and no card has ID {vendor:04x}:{device:04x} \
+                 (the ID in regs.json).\n\
+                 `lspci -Dnn` lists the cards. If the card is in the slot, it runs \
+                 another bitstream, or the machine was not rebooted after programming. \
+                 Linux finds the card only at boot."
+            ),
+            Error::NoSuchCard {
+                bdf,
+                vendor,
+                device,
+                found,
+            } => write!(
+                f,
+                "no PCI device {bdf}. These cards have ID {vendor:04x}:{device:04x} \
+                 (the ID in regs.json):\n{}\n\
+                 Pick one with --bdf.",
+                found
+                    .iter()
+                    .map(|bdf| format!("    {bdf}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ),
             Error::Ambiguous {
                 vendor,
@@ -306,6 +343,17 @@ pub fn info_at(root: &Path, bdf: &str) -> Result<Info, Error> {
     })
 }
 
+/// The BDF as sysfs names it. `lspci` prints `01:00.0` without the domain
+/// (`0000:`) unless given `-D`, so both forms are taken.
+pub fn full_bdf(bdf: &str) -> String {
+    let bdf = bdf.trim().to_ascii_lowercase();
+    if bdf.matches(':').count() == 1 {
+        format!("0000:{bdf}")
+    } else {
+        bdf
+    }
+}
+
 fn read_trimmed(path: &Path) -> Result<String, Error> {
     fs::read_to_string(path)
         .map(|text| text.trim().to_string())
@@ -352,6 +400,24 @@ pub fn find_at(root: &Path, vendor: u16, device: u16) -> Result<Info, Error> {
             found: matched.into_iter().map(|info| info.bdf).collect(),
         }),
     }
+}
+
+/// The card given with `--bdf`, by the name sysfs uses.
+pub fn named_at(root: &Path, bdf: &str, vendor: u16, device: u16) -> Result<String, Error> {
+    let bdf = full_bdf(bdf);
+    if root.join(&bdf).is_dir() {
+        return Ok(bdf);
+    }
+    Err(Error::NoSuchCard {
+        bdf,
+        vendor,
+        device,
+        found: devices_at(root)
+            .into_iter()
+            .filter(|info| info.vendor == vendor && info.device == device)
+            .map(|info| info.bdf)
+            .collect(),
+    })
 }
 
 /// A mapped BAR.
@@ -632,6 +698,13 @@ fn unmap(_base: *mut u32, _bytes: usize) {}
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_bdf_without_the_domain_gets_the_first_one() {
+        assert_eq!(full_bdf("01:00.0"), "0000:01:00.0");
+        assert_eq!(full_bdf("0000:03:00.0"), "0000:03:00.0");
+        assert_eq!(full_bdf("0001:0A:00.1"), "0001:0a:00.1");
+    }
+
     /// Build a fake sysfs. `resource0` is a plain file, which mmap accepts, so
     /// the code path is the same as on real hardware.
     fn fake_sysfs(bytes: u64, flags: u64, enabled: bool) -> tempfile::TempDir {
@@ -862,6 +935,34 @@ mod tests {
         assert!(err.contains("lspci"), "{err}");
         // It mentions a reboot: reprogramming alone does not re-enumerate.
         assert!(err.contains("rebooted"), "{err}");
+    }
+
+    #[test]
+    fn a_bdf_that_is_not_there_lists_the_cards_with_the_id() {
+        let root = fake_sysfs(4096, 0x40200, true);
+        add_device(
+            root.path(),
+            "0000:01:00.0",
+            0x10ee,
+            0x7024,
+            65536,
+            0x40200,
+            true,
+        );
+        assert_eq!(
+            named_at(root.path(), "04:00.0", 0x1234, 0x0001).unwrap(),
+            "0000:04:00.0"
+        );
+        let err = named_at(root.path(), "02:00.0", 0x1234, 0x0001)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0000:02:00.0"), "{err}");
+        assert!(err.contains("0000:04:00.0"), "{err}");
+        assert!(!err.contains("0000:01:00.0"), "{err}");
+        let err = named_at(root.path(), "02:00.0", 0x1234, 0x0002)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no card has ID 1234:0002"), "{err}");
     }
 
     /// The default ID is borrowed, so two cards look the same.

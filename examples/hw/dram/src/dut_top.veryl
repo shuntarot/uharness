@@ -2,12 +2,11 @@
 ///
 /// The same 32-bit master as `examples/hw/axi`, which puts its memory in the
 /// FPGA. Only the manifest differs: `backing = "dram"`. The controller's bus
-/// is 128 bits wide and does not take narrow bursts, so the harness widens
-/// this one (`hns::axi_dw`) -- the DUT does not have to know.
+/// is wider (128 bits on the Arty) and does not take narrow bursts, so the
+/// harness widens this one (`hns::axi_dw`) -- the DUT does not have to know.
 ///
-/// The address is 28 bits because that is what the controller has. A wider
-/// one is refused rather than truncated: an address past the end would
-/// quietly come back as a different one.
+/// The address is 28 bits, as on the Arty's controller. An address wider than
+/// the controller's is refused rather than truncated.
 ///
 /// The point of this example is not the DUT -- it is that **the host and the
 /// DUT reach the same memory**, and that they do so through the same AXI4 bus

@@ -2,14 +2,11 @@
 //!
 //! ## Why replay
 //!
-//! On a device with several SLRs (such as VU9P), the `.bit` is the SLR
-//! bitstreams joined together, and each one must go to its own `CFG_IN`. Xilinx
-//! does not publish where they split, and a guessed split must not be trusted.
-//!
 //! Vivado writes an SVF without a board. The build machine already has Vivado,
 //! so it can write the `.svf` next to the `.bit`, and the machine with the FPGA
-//! still needs no Vivado. Replay works for any device family, and it includes
-//! the status checks that Vivado does.
+//! still needs no Vivado. The configuration steps come from the file, not from
+//! the target description, so replay works for any device family, and it
+//! includes the status checks that Vivado does.
 //!
 //! ## Scope
 //!

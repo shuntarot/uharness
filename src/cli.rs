@@ -50,7 +50,7 @@ pub enum Command {
     Check(CheckArgs),
 
     /// Generate the harness into hns/: RTL, IP scripts, constraints, a Makefile and the register map.
-    Gen(CheckArgs),
+    Gen(GenArgs),
 
     /// Re-generate a harness with the options it was generated with.
     Update(UpdateArgs),
@@ -100,8 +100,11 @@ pub struct UpdateArgs {
     pub json: bool,
 }
 
+/// What `check` and `gen` both take: the manifest, the target and the
+/// transport. Each command adds only the options it uses, so none is
+/// accepted and then ignored.
 #[derive(Debug, Args)]
-pub struct CheckArgs {
+pub struct Common {
     /// Path to Harness.toml. Skips the search entirely.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
@@ -122,12 +125,32 @@ pub struct CheckArgs {
     /// Transport: `pcie` or `jtag` (`sim` for `--target sim`). Without it, jtag, or the board's only transport.
     #[arg(long, value_name = "NAME")]
     pub transport: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct CheckArgs {
+    #[command(flatten)]
+    pub common: Common,
 
     /// Write the register map to this path as JSON, without generating anything else.
     #[arg(long, value_name = "PATH")]
     pub emit_regs: Option<PathBuf>,
 
-    /// Where `gen` writes. Defaults to hns/ beside Veryl.toml.
+    /// Emit one JSON document on stdout instead of the human report.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Also list every port and register, and what was and was not checked.
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct GenArgs {
+    #[command(flatten)]
+    pub common: Common,
+
+    /// Where to write. Defaults to hns/ beside Veryl.toml.
     ///
     /// The directory name becomes the Veryl project name, and Veryl puts that in front
     /// of every module it emits -- so a second directory is how two boards live side by side.
@@ -137,9 +160,6 @@ pub struct CheckArgs {
     /// Emit one JSON document on stdout instead of the human report.
     #[arg(long)]
     pub json: bool,
-    /// With `check`: also list every port and register, and what was and was not checked.
-    #[arg(short, long)]
-    pub verbose: bool,
 }
 
 /// Bad option combinations, and a broken shipped target description. An
@@ -189,7 +209,8 @@ impl Cli {
     /// `--json` on any subcommand makes all output JSON, errors included.
     fn format(&self) -> Format {
         let json = match &self.command {
-            Some(Command::Check(args)) | Some(Command::Gen(args)) => args.json,
+            Some(Command::Check(args)) => args.json,
+            Some(Command::Gen(args)) => args.json,
             Some(Command::Update(args)) => args.json,
             _ => false,
         };
@@ -221,11 +242,11 @@ fn run(cli: Cli) -> miette::Result<()> {
             } else {
                 Format::Human
             };
-            let target = resolve_target(&args)?;
+            let target = resolve_target(&args.common)?;
             crate::check::run(
-                args.config.as_deref(),
+                args.common.config.as_deref(),
                 target,
-                args.transport.as_deref(),
+                args.common.transport.as_deref(),
                 args.emit_regs.as_deref(),
                 format,
                 args.verbose,
@@ -237,8 +258,13 @@ fn run(cli: Cli) -> miette::Result<()> {
             } else {
                 Format::Human
             };
-            let target = resolve_target(&args)?;
-            crate::generate::run(&invocation(&args), target, args.out_dir.as_deref(), format)
+            let target = resolve_target(&args.common)?;
+            crate::generate::run(
+                &invocation(&args.common),
+                target,
+                args.out_dir.as_deref(),
+                format,
+            )
         }
         // The options come from the record, not the command line. Otherwise
         // a harness could be overwritten for another board.
@@ -278,16 +304,12 @@ fn run(cli: Cli) -> miette::Result<()> {
                     miette::miette!("cannot enter `{}`: {source}", dir.display())
                 })?;
             }
-            let replay = CheckArgs {
+            let replay = Common {
                 config: recorded.config.clone(),
                 target: recorded.target.clone(),
                 target_file: recorded.target_file.clone(),
                 target_patch: recorded.target_patch.clone(),
                 transport: recorded.transport.clone(),
-                emit_regs: None,
-                out_dir: Some(out.clone()),
-                json: args.json,
-                verbose: false,
             };
             let target = resolve_target(&replay)?;
             crate::generate::run(&invocation(&replay), target, Some(&out), format)
@@ -302,7 +324,7 @@ fn run(cli: Cli) -> miette::Result<()> {
     }
 }
 
-fn invocation(args: &CheckArgs) -> crate::generate::Invocation {
+fn invocation(args: &Common) -> crate::generate::Invocation {
     crate::generate::Invocation {
         marker: String::new(),
         // `generate::run` fills this in; the project is not resolved yet.
@@ -317,7 +339,7 @@ fn invocation(args: &CheckArgs) -> crate::generate::Invocation {
 
 /// Resolves `--target` / `--target-file` / `--target-patch` to one target.
 /// Returns `None` without a target; the manifest checks still run then.
-fn resolve_target(args: &CheckArgs) -> miette::Result<Option<Target>> {
+fn resolve_target(args: &Common) -> miette::Result<Option<Target>> {
     match (&args.target, &args.target_file) {
         (Some(name), None) => Ok(Some(target::resolve(name, &args.target_patch)?)),
         (None, Some(path)) => Ok(Some(target::load_file(path, &args.target_patch)?)),
@@ -351,8 +373,8 @@ fn list_targets() -> miette::Result<()> {
 
     println!();
     println!(
-        "Not every target here has been tested end to end. The all-targets \
-         CI is not running yet."
+        "The test suite generates a harness for every target here. Synthesis and \
+         runs on a board are done by hand, so not every target has run on a board."
     );
     Ok(())
 }
@@ -413,7 +435,7 @@ mod tests {
             panic!("expected check");
         };
 
-        let err = resolve_target(&args).unwrap_err();
+        let err = resolve_target(&args.common).unwrap_err();
         assert!(
             format!("{err:?}").contains("patch_without_target"),
             "{err:?}"
@@ -439,7 +461,7 @@ mod tests {
         };
 
         assert_eq!(
-            args.target_patch,
+            args.common.target_patch,
             [PathBuf::from("a.toml"), PathBuf::from("b.toml")]
         );
     }
@@ -462,6 +484,27 @@ mod tests {
         let Some(Command::Check(args)) = cli.command else {
             panic!("expected check");
         };
-        assert_eq!(args.config, Some(PathBuf::from("x/Harness.toml")));
+        assert_eq!(args.common.config, Some(PathBuf::from("x/Harness.toml")));
+    }
+
+    /// An option one command does not use is refused, not ignored.
+    #[test]
+    fn each_command_takes_only_its_own_options() {
+        for argv in [
+            ["veryl-harness", "gen", "--emit-regs", "r.json"],
+            ["veryl-harness", "gen", "--verbose", "--json"],
+            ["veryl-harness", "check", "-o", "out"],
+        ] {
+            let err = Cli::try_parse_from(argv).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{argv:?}"
+            );
+        }
+        assert!(Cli::try_parse_from(["veryl-harness", "gen", "-o", "out"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["veryl-harness", "check", "-v", "--emit-regs", "r.json"]).is_ok()
+        );
     }
 }

@@ -1,8 +1,8 @@
 /// A DUT that reaches memory over **AXI4**.
 ///
 /// `backing` says where the data lives; the port shape is a fact about the
-/// DUT. This one is terminated by FPGA memory today (`backing = "bram"`) and
-/// will take a real controller (`backing = "dram"`) without changing a line.
+/// DUT. Here FPGA memory terminates it (`backing = "bram"`); `examples/hw/dram`
+/// puts the same DUT on a real controller (`backing = "dram"`).
 ///
 /// The point of this example is not the DUT -- it is that **the host and the
 /// DUT reach the same memory**, and that they do so through the same AXI4 bus
@@ -37,7 +37,7 @@ module dut_top (
     o_writes: output logic<32>, // completed writes
     o_resp  : output logic<2> , // the last RRESP / BRESP
 
-    // --- memory (dram) ---
+    // --- memory (bram) ---
     axi: modport $std::axi4_if::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>>::master,
 ) {
     /// How much of the memory the sweep walks, in 32-bit words.

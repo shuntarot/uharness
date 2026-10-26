@@ -2,8 +2,8 @@
 //!
 //! The module is `generate` because `gen` is reserved in Rust 2024.
 //!
-//! - All output goes under `hns/` (`hns/src` = Veryl, `hns/syn` =
-//!   Tcl/XDC/Makefile).
+//! - All output goes under the output directory, `hns/` by default (`src/` =
+//!   Veryl, `syn/` = Tcl/XDC/Makefile).
 //! - Nothing that `check` rejects is generated: both share `plan`, and `gen`
 //!   only writes out the result.
 //! - Hand-written files are never overwritten. Generated files carry a
@@ -304,6 +304,13 @@ pub fn run(
                 &out.join("syn").join("mig.prj"),
                 &prj,
                 "memory controller settings (board file)",
+            )?);
+        }
+        if let Some(xdc) = emit::dram_xdc(&plan) {
+            written.push(write(
+                &out.join("syn").join("dram.xdc"),
+                &xdc,
+                "memory pins (XDC, from the target)",
             )?);
         }
         if let Some(tcl) = emit::ps7_tcl(&plan) {

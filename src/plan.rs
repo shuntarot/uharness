@@ -199,10 +199,25 @@ pub enum PlanError {
     #[diagnostic(
         code(harness::plan::target_has_no_pcie_pins),
         help(
-            "[pcie] needs `lanes`, `max_gen`, `refclk_mhz`, `refclk_p`, `reset_n`, `reset_standard`, one `rx_p`/`tx_p` entry per lane, and `gt_quad`.\n\n`gt_quad` is the GT quad of lane 0 as the PCIe IP names it (`GTY_Quad_227`). The card edge fixes it; find it in the board's schematic or in a design that trains the link."
+            "[pcie] needs `lanes`, `max_gen`, `refclk_mhz`, `refclk_p`, `reset_n`, `reset_standard`, one `rx_p`/`tx_p` entry per lane, `block` and `gt_quad`.\n\n`block` is the PCIe hard block's site and `gt_quad` the GT quad of lane 0, both as the PCIe IP names them (`X1Y2`, `GTY_Quad_227`). The card edge fixes them; read them from the `.xci` of a design that trains the link, or from the board's schematic."
         )
     )]
     TargetHasNoPciePins { target: String, missing: String },
+
+    /// The board reset and PERST# are one pin, but the description gives it
+    /// two meanings. A pin has one polarity and one IOSTANDARD.
+    #[error("target `{target}` uses pin {pin} as both the board reset and PERST#, but {wrong}")]
+    #[diagnostic(
+        code(harness::plan::shared_reset_mismatch),
+        help(
+            "When `[resets.sys] pin` and `[pcie] reset_n` are the same pin, the harness takes its reset from PERST#. PERST# is active low, so `[resets.sys]` needs `active = \"low\"` and the same `standard` as `[pcie] reset_standard`. Check the board's schematic for which of the two is right."
+        )
+    )]
+    SharedResetMismatch {
+        target: String,
+        pin: String,
+        wrong: String,
+    },
 
     #[error(
         "target `{target}` says its PCIe link is gen{generation} x{lanes}, which is not generated yet"
@@ -491,14 +506,14 @@ fn harness_name(dut_project: &str, out_dir_name: &str) -> Result<String, PlanErr
     Ok(harness_project(dut_project, out_dir_name))
 }
 
-/// Whether the current generator can build this plan. Call it only with a
-/// target.
-///
-/// Exit 0 from `check --target` means that `gen` succeeds.
 /// The longest `latency` of a `slave` RAM port. Far beyond any register file,
 /// and 6.4 us at 10 MHz, inside the 10 us the window waits.
 pub const MAX_SLAVE_LATENCY: u32 = 64;
 
+/// Whether the current generator can build this plan. Call it only with a
+/// target.
+///
+/// Exit 0 from `check --target` means that `gen` succeeds.
 fn generatable(plan: &Plan) -> Result<(), PlanError> {
     use crate::manifest::Backing;
 
@@ -542,6 +557,29 @@ fn generatable(plan: &Plan) -> Result<(), PlanError> {
                     .collect::<Vec<_>>()
                     .join(", "),
             });
+        }
+        // One pin as both the board reset and PERST#: the harness takes its
+        // reset from PERST#, which is active low and has one IOSTANDARD.
+        let board_reset = &plan.board().clocks.reset;
+        if board_reset.pin.is_some() && board_reset.pin == pcie.reset_n {
+            let mut wrong = Vec::new();
+            if !board_reset.active_low {
+                wrong.push("`[resets.sys] active` is high, and PERST# is active low".to_string());
+            }
+            if board_reset.standard != pcie.reset_standard {
+                wrong.push(format!(
+                    "`[resets.sys] standard` is {:?}, and `[pcie] reset_standard` is {:?}",
+                    board_reset.standard.as_deref().unwrap_or("-"),
+                    pcie.reset_standard.as_deref().unwrap_or("-")
+                ));
+            }
+            if !wrong.is_empty() {
+                return Err(PlanError::SharedResetMismatch {
+                    target: board.target.name.clone(),
+                    pin: pcie.reset_n.clone().unwrap_or_default(),
+                    wrong: wrong.join("; "),
+                });
+            }
         }
         let (generation, lanes) = (pcie.max_gen.unwrap_or(0), pcie.lanes.unwrap_or(0));
         // The wrapper has 8 lanes and 256-bit streams.

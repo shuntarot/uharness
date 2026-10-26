@@ -46,6 +46,7 @@ HNS2 closes it without an answer.
 |---|---|---|
 | `0x01` | `BATCH` | `flags: u8`, `count: u32`, then `count` ops |
 | `0x02` | `FINISH` | empty |
+| `0x03` | `PROGRAM` | `erase_wait_ms: u32`, `map_len: u32`, `map_len` bytes of regs.json, then the bitstream |
 
 An op is 9 bytes: `op: u8`, `addr: u32`, `data: u32`.
 
@@ -65,6 +66,21 @@ next batch before the answer arrives.
 
 `FINISH` ends a simulation, as Ctrl-C would. The server answers `READS` with
 no values, then stops. A board server answers `ERROR`.
+
+`PROGRAM` has the server program the board with the bitstream (a `.bit`
+file, up to 512 MB) and take the regs.json as its map. The server answers a
+new `INFO` once the window answers with that map's magic and map hash, or
+`ERROR`. `hio serve` over PCIe does it without the machine enumerating the
+card again:
+
+- It refuses a design that looks different from the bus (ID, class, BAR size,
+  interrupt pin) before programming. The machine would have to enumerate the
+  card again.
+- It saves the card's config space, programs over JTAG, waits for the link,
+  and writes the config space back.
+
+Other servers answer `ERROR`. While programming, `map_hash` in `INFO` is
+`null`; it stays `null` when the window does not answer with the map.
 
 ### Server to client
 
@@ -94,9 +110,9 @@ whether to go on.
 |---|---|
 | `server` | the program and its version, e.g. `"hio 0.4.0"` |
 | `kind` | `"sim"` or `"board"` |
-| `target` | the target name, e.g. `"arty"`; `"sim"` for a simulation |
+| `target` | the target name, e.g. `"digilent/arty-a7-35"`; `"sim"` for a simulation |
 | `master` | `"jtag"` or `"pcie"`: which master the window sees |
-| `map_hash` | the map hash of the `regs.json` the server uses, or `null` |
+| `map_hash` | the map hash of the `regs.json` the server uses, or `null` (changes with `PROGRAM`) |
 | `max_ops` | the most ops one `BATCH` may carry |
 
 A client ignores keys it does not know. `master` matters for windows with a

@@ -105,6 +105,15 @@ const TDATA1: u32 = 0x7a1;
 const TDATA2: u32 = 0x7a2;
 const TINFO: u32 = 0x7a4;
 
+// The counters `measure` reads. On RV32 the high halves are CSRs of their own.
+const MCOUNTINHIBIT: u32 = 0x320;
+const MCYCLE: u32 = 0xb00;
+const MINSTRET: u32 = 0xb02;
+const MCYCLEH: u32 = 0xb80;
+const MINSTRETH: u32 = 0xb82;
+// `mcountinhibit` bits: CY and IR.
+const INHIBIT_CY_IR: u64 = 0b101;
+
 // `tdata1` bits that `mcontrol` (type 2) and `mcontrol6` (type 6) share.
 const T_LOAD: u64 = 1 << 0;
 const T_STORE: u64 = 1 << 1;
@@ -420,6 +429,20 @@ impl fmt::Display for Info {
             ),
         }
     }
+}
+
+/// What [`Debug::measure`] saw over one run of the hart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Measured {
+    /// `mcycle` advanced by this much.
+    pub cycles: u64,
+    /// `minstret` advanced by this much.
+    pub instret: u64,
+    /// `mcountinhibit` as it was. Its CY and IR bits were cleared for the run
+    /// and put back afterwards.
+    pub inhibit: u64,
+    /// Where the hart was when it was halted at the end.
+    pub pc: u64,
 }
 
 /// A breakpoint: an address trigger that halts into the debugger.
@@ -933,6 +956,70 @@ impl<D: Dmi> Debug<D> {
             .map_err(|CmdErr(e)| format!("cannot write csr {csr:#05x}: {}", cmderr_text(e)));
         self.write_reg(Reg::Gpr(S0), s0)?;
         ran
+    }
+
+    /// Lets the hart run while `wait` runs, and counts its cycles and retired
+    /// instructions over that time.
+    ///
+    /// The hart is halted to read the counters before and after, and is left
+    /// as it was found: running, or halted (at a later PC). The counters are
+    /// never written. If `mcountinhibit` stops them, its CY and IR bits are
+    /// cleared for the run and put back. Whether the counters also count
+    /// while the hart is halted is up to the core (`dcsr.stopcount`).
+    pub fn measure<T>(
+        &mut self,
+        wait: impl FnOnce(&mut Self) -> T,
+    ) -> Result<(Measured, T), String> {
+        let was_running = !self.is_halted()?;
+        self.halt()?;
+        // A hart without the CSR counts all the time.
+        let inhibit = self.read_reg(Reg::Csr(MCOUNTINHIBIT)).unwrap_or(0);
+        if inhibit & INHIBIT_CY_IR != 0 {
+            self.write_reg(Reg::Csr(MCOUNTINHIBIT), inhibit & !INHIBIT_CY_IR)?;
+        }
+        let before = self.counters()?;
+        self.resume()?;
+        let out = wait(self);
+        self.halt()?;
+        let after = self.counters()?;
+        let pc = self.read_reg(Reg::Csr(DPC))?;
+        if inhibit & INHIBIT_CY_IR != 0 {
+            self.write_reg(Reg::Csr(MCOUNTINHIBIT), inhibit)?;
+        }
+        if was_running {
+            self.run()?;
+        }
+        let measured = Measured {
+            cycles: after.0.wrapping_sub(before.0),
+            instret: after.1.wrapping_sub(before.1),
+            inhibit,
+            pc,
+        };
+        Ok((measured, out))
+    }
+
+    /// `mcycle` and `minstret`, whole. The hart must be halted.
+    fn counters(&mut self) -> Result<(u64, u64), String> {
+        Ok((
+            self.counter(MCYCLE, MCYCLEH)?,
+            self.counter(MINSTRET, MINSTRETH)?,
+        ))
+    }
+
+    /// A 64-bit counter. On RV32 the high half is read on both sides of the
+    /// low one, in case the counter runs while the hart is halted and carries
+    /// in between.
+    fn counter(&mut self, lo: u32, hi: u32) -> Result<u64, String> {
+        if self.xlen()? == 64 {
+            return self.read_reg(Reg::Csr(lo));
+        }
+        loop {
+            let high = self.read_reg(Reg::Csr(hi))?;
+            let low = self.read_reg(Reg::Csr(lo))?;
+            if self.read_reg(Reg::Csr(hi))? == high {
+                return Ok((high << 32) | low);
+            }
+        }
     }
 
     /// Runs `f` with the hart halted, and lets it run again afterwards if it
@@ -1486,6 +1573,51 @@ mod tests {
         dm.halt().unwrap();
         dm.resume().unwrap();
         assert!(!dm.is_halted().unwrap());
+    }
+
+    /// The counters are read whole across a carry into the high half, the
+    /// inhibit bits are lifted only for the run, and the hart is left as it
+    /// was found.
+    #[test]
+    fn measure_counts_one_run_and_puts_everything_back() {
+        let mut m = Model::new(32);
+        m.csr.insert(MCOUNTINHIBIT, 0b101);
+        m.csr.insert(MCYCLEH, 1);
+        m.csr.insert(MCYCLE, 0xffff_fff0);
+        m.csr.insert(MINSTRET, 100);
+        let mut dm = Debug::attach(&mut m, 0).unwrap();
+        let (measured, inhibit_in_run) = dm
+            .measure(|dm| {
+                let m = dm.dmi_mut();
+                m.csr.insert(MCYCLEH, 2);
+                m.csr.insert(MCYCLE, 0x10);
+                m.csr.insert(MINSTRET, 130);
+                m.pc = 0x8000_1234;
+                m.csr[&MCOUNTINHIBIT]
+            })
+            .unwrap();
+        assert_eq!(inhibit_in_run, 0, "the counters run during the measurement");
+        assert_eq!(
+            measured,
+            Measured {
+                cycles: 0x20,
+                instret: 30,
+                inhibit: 0b101,
+                pc: 0x8000_1234,
+            }
+        );
+        assert!(!dm.is_halted().unwrap(), "it was running, so it runs again");
+        assert_eq!(
+            m.csr[&MCOUNTINHIBIT], 0b101,
+            "the inhibit bits are put back"
+        );
+
+        // A halted hart stays halted.
+        let mut m = Model::new(64);
+        let mut dm = Debug::attach(&mut m, 0).unwrap();
+        dm.halt().unwrap();
+        dm.measure(|_| ()).unwrap();
+        assert!(dm.is_halted().unwrap());
     }
 
     #[test]

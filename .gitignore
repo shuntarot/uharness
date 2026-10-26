@@ -27,6 +27,11 @@
 /.mcp.json
 
 
+# Target descriptions that are not published. Only the README is tracked;
+# the rest may be a git repository of its own (see its README).
+/crates/targets/targets-private/*
+!/crates/targets/targets-private/README.md
+
 # Veryl build artifacts
 *.sv
 *.sv.map

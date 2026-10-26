@@ -50,7 +50,8 @@ const POLL_CYCLES: u64 = 256;
 /// After a reply, poll every cycle for this long: a client that is in the
 /// middle of a command sends its next batch soon.
 const HOT_CYCLES: u64 = 4096;
-/// How long a connection waits for the client before it to leave.
+/// How long a new connection waits for the current client to leave before
+/// it is refused.
 const WAIT_TO_REFUSE: std::time::Duration = std::time::Duration::from_secs(1);
 /// Cycles between clock reads for the watch.
 const WATCH_CYCLES: u64 = 4096;

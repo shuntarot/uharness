@@ -1,5 +1,5 @@
-/// The smallest DMA engine that copies within host memory. **It exists to carry
-/// the port that M6 has to terminate.**
+/// The smallest DMA engine that copies within host memory. It exists to carry
+/// a transfer-level port for the harness to terminate.
 ///
 /// The port is **transfer-level**: one command asks for "N bytes from address
 /// A", and the data comes back as a stream of 64-bit beats. **No latency is
@@ -7,9 +7,8 @@
 /// valid / ready carry the flow.
 ///
 /// The shape follows a working transfer-level host port, but **with no tags,
-/// no 2D fields and no split**. All that is needed here is to state what
-/// `host_mem` must provide; multiple outstanding commands and page tables are
-/// not part of M6.
+/// no 2D fields and no split**. Multiple outstanding commands and page tables
+/// are left out.
 ///
 /// **Whether it worked is visible from the host, in two ways.** The sum of the
 /// beats and their count are registers, so a known pattern in memory gives a
