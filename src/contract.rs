@@ -1092,7 +1092,7 @@ mod tests {
         assert!(head.contains("not generated yet"), "{head}");
     }
 
-    /// Transfer-level roles have meaning only on `host_mem` and `bram`.
+    /// Transfer-level roles have meaning only on `bram`, `dram` and `host_mem`.
     #[test]
     fn a_transfer_role_on_another_backing_is_refused() {
         let bar = manifest(

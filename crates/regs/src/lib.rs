@@ -2,7 +2,7 @@
 //!
 //! The generator writes it and the host client reads it. This crate is the
 //! reader, kept separate as the contract between the two. The generator has a
-//! test that reads its own output back with these types (`tests/regs_json.rs`),
+//! test that reads its own output back with these types (`tests/cli_gen.rs`),
 //! so `cargo test` fails when writer and reader drift apart.
 //!
 //! The first two window words are `magic` and `map_hash`. The host uses them

@@ -26,6 +26,7 @@ pub const GREETING: &[u8; 4] = b"HNS2";
 
 pub const BATCH: u8 = 0x01;
 pub const FINISH: u8 = 0x02;
+pub const PROGRAM: u8 = 0x03;
 pub const INFO: u8 = 0x80;
 pub const READS: u8 = 0x81;
 pub const ERROR: u8 = 0x82;
@@ -44,6 +45,9 @@ pub const NO_OP: u32 = u32::MAX;
 
 /// The most ops `hio serve` takes in one `BATCH`. 9 MB of ops.
 pub const MAX_OPS: u32 = 1 << 20;
+
+/// The largest `PROGRAM` a server takes. A VU9P bitstream is 80 MB.
+pub const MAX_PROGRAM: usize = 512 << 20;
 
 /// What a server says about itself after the greeting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,9 +150,18 @@ pub fn send_message(w: &mut impl Write, kind: u8, body: &[u8]) -> std::io::Resul
 /// Reads one message. A body longer than `max` is refused before it is read:
 /// a stream that is not HNS2 would otherwise ask for gigabytes.
 pub fn read_message(r: &mut impl Read, max: usize) -> std::io::Result<(u8, Vec<u8>)> {
+    read_message_by_kind(r, |_| max)
+}
+
+/// Reads one message whose largest body depends on its kind.
+fn read_message_by_kind(
+    r: &mut impl Read,
+    max_of: impl Fn(u8) -> usize,
+) -> std::io::Result<(u8, Vec<u8>)> {
     let mut head = [0u8; 5];
     r.read_exact(&mut head)?;
     let len = u32::from_le_bytes(head[1..5].try_into().unwrap()) as usize;
+    let max = max_of(head[0]);
     if len > max {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
@@ -199,6 +212,43 @@ pub fn decode_batch(body: &[u8]) -> Result<(u8, Vec<WireOp>), String> {
         })
         .collect();
     Ok((flags, ops))
+}
+
+/// The body of `PROGRAM`: how long to wait for the configuration memory to
+/// clear, the regs.json that goes with the bitstream, and the bitstream.
+pub fn encode_program(erase_wait_ms: u32, map: &[u8], bitstream: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + map.len() + bitstream.len());
+    out.extend_from_slice(&erase_wait_ms.to_le_bytes());
+    out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+    out.extend_from_slice(map);
+    out.extend_from_slice(bitstream);
+    out
+}
+
+/// What a client asks of `PROGRAM`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Program<'a> {
+    pub erase_wait_ms: u32,
+    /// The regs.json of the design, as its file holds it.
+    pub map: &'a [u8],
+    pub bitstream: &'a [u8],
+}
+
+pub fn decode_program(body: &[u8]) -> Result<Program<'_>, String> {
+    let (Some(wait), Some(len)) = (body.get(..4), body.get(4..8)) else {
+        return Err("a PROGRAM shorter than its header".to_string());
+    };
+    let len = u32::from_le_bytes(len.try_into().unwrap()) as usize;
+    let Some(map) = body.get(8..8 + len) else {
+        return Err(format!(
+            "a PROGRAM whose regs.json of {len} bytes runs past its end"
+        ));
+    };
+    Ok(Program {
+        erase_wait_ms: u32::from_le_bytes(wait.try_into().unwrap()),
+        map,
+        bitstream: &body[8 + len..],
+    })
 }
 
 /// The body of `READS`.
@@ -349,6 +399,36 @@ impl Link {
         Ok(())
     }
 
+    /// Has the server program the board, and take `map` as its map. The
+    /// server answers with its new `INFO` once the window answers with the
+    /// map's magic and hash.
+    pub fn program(
+        &mut self,
+        erase_wait_ms: u32,
+        map: &[u8],
+        bitstream: &[u8],
+    ) -> Result<&Info, Error> {
+        send_message(
+            &mut self.stream,
+            PROGRAM,
+            &encode_program(erase_wait_ms, map, bitstream),
+        )?;
+        match read_message(&mut self.stream, max_reply(self.info.max_ops))? {
+            (INFO, body) => {
+                self.info = serde_json::from_slice(&body)
+                    .map_err(|e| Error::Protocol(format!("an INFO that is not valid: {e}")))?;
+                Ok(&self.info)
+            }
+            (ERROR, body) => {
+                let (_, _, message) = decode_error(&body).map_err(Error::Protocol)?;
+                Err(Error::Failed(message))
+            }
+            (kind, _) => Err(Error::Protocol(format!(
+                "message {kind:#04x} as an answer to PROGRAM, not INFO or ERROR"
+            ))),
+        }
+    }
+
     /// Ends the simulation, as Ctrl-C on `veryl harness sim` would.
     pub fn finish(mut self) -> Result<(), Error> {
         send_message(&mut self.stream, FINISH, &[])?;
@@ -390,16 +470,46 @@ impl Link {
     }
 }
 
+/// What a server serves.
+pub trait Window {
+    /// What the server says about itself. Asked for each client, since
+    /// programming changes it.
+    fn info(&self) -> Info;
+
+    /// Runs a batch. An error becomes an `ERROR` with no op.
+    fn run(&mut self, batch: &Batch) -> Result<Reads, String>;
+
+    /// Programs the board and takes the map that goes with it. Answers the
+    /// new `INFO`.
+    fn program(&mut self, _request: &Program) -> Result<Info, String> {
+        Err("this server does not program the board".to_string())
+    }
+}
+
+/// A window that only runs batches, through a closure.
+pub struct Batches<F> {
+    pub info: Info,
+    pub run: F,
+}
+
+impl<F: FnMut(&Batch) -> Result<Reads, String>> Window for Batches<F> {
+    fn info(&self) -> Info {
+        self.info.clone()
+    }
+
+    fn run(&mut self, batch: &Batch) -> Result<Reads, String> {
+        (self.run)(batch)
+    }
+}
+
 /// Serves the window to one client at a time, for good.
 ///
-/// `run` runs a batch on the window; its error becomes an `ERROR` with no op.
 /// A second client is refused while one is served: a command made of several
 /// batches would break if another ran batches in between. `log` gets one line
 /// per client.
 pub fn serve(
     listener: TcpListener,
-    info: &Info,
-    mut run: impl FnMut(&Batch) -> Result<Reads, String>,
+    window: &mut impl Window,
     log: impl Fn(&str),
 ) -> std::io::Result<()> {
     let busy = Arc::new(AtomicBool::new(false));
@@ -411,14 +521,13 @@ pub fn serve(
             std::thread::spawn(move || take_turn(stream, &held, &tx));
         }
     });
-    let info_body = serde_json::to_vec(info).expect("Info is plain data");
     for mut stream in rx {
         let peer = stream
             .peer_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "a client".to_string());
         log(&format!("{peer} connected"));
-        let end = serve_one(&mut stream, &info_body, info.max_ops, &mut run);
+        let end = serve_one(&mut stream, window, &log);
         log(&match end {
             Ok(()) => format!("{peer} left"),
             Err(e) => format!("{peer} dropped: {e}"),
@@ -430,10 +539,11 @@ pub fn serve(
 
 fn serve_one(
     stream: &mut TcpStream,
-    info: &[u8],
-    max_ops: u32,
-    run: &mut impl FnMut(&Batch) -> Result<Reads, String>,
+    window: &mut impl Window,
+    log: &impl Fn(&str),
 ) -> std::io::Result<()> {
+    let info = window.info();
+    let max_ops = info.max_ops;
     stream.set_nodelay(true)?;
     keep_alive(stream)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -447,9 +557,13 @@ fn serve_one(
     }
     stream.set_read_timeout(None)?;
     stream.write_all(GREETING)?;
-    send_message(stream, INFO, info)?;
+    send_message(stream, INFO, &info_body(&info))?;
     loop {
-        let (kind, body) = match read_message(stream, 5 + 9 * max_ops as usize) {
+        let max_of = |kind| match kind {
+            PROGRAM => MAX_PROGRAM,
+            _ => 5 + 9 * max_ops as usize,
+        };
+        let (kind, body) = match read_message_by_kind(stream, max_of) {
             Ok(message) => message,
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => {
@@ -457,8 +571,32 @@ fn serve_one(
                 return Err(e);
             }
         };
+        if kind == PROGRAM {
+            let done = decode_program(&body).and_then(|request| {
+                log(&format!(
+                    "programming {} bytes; batches wait",
+                    request.bitstream.len()
+                ));
+                window.program(&request)
+            });
+            match done {
+                Ok(info) => {
+                    log(&format!(
+                        "programmed; map hash {}",
+                        info.map_hash
+                            .map_or("unknown".to_string(), |h| format!("{h:#010x}"))
+                    ));
+                    send_message(stream, INFO, &info_body(&info))?
+                }
+                Err(message) => {
+                    log("programming failed");
+                    send_message(stream, ERROR, &encode_error(NO_OP, 0, &message))?
+                }
+            }
+            continue;
+        }
         let answer = match kind {
-            BATCH => run_batch(&body, run),
+            BATCH => run_batch(&body, &mut |batch| window.run(batch)),
             FINISH => Err((
                 NO_OP,
                 "this is a board, and FINISH ends only a simulation".to_string(),
@@ -474,6 +612,10 @@ fn serve_one(
             Err((op, message)) => send_message(stream, ERROR, &encode_error(op, 0, &message))?,
         }
     }
+}
+
+fn info_body(info: &Info) -> Vec<u8> {
+    serde_json::to_vec(info).expect("Info is plain data")
 }
 
 fn run_batch(
@@ -551,7 +693,7 @@ fn keep_alive(stream: &TcpStream) -> std::io::Result<()> {
     Ok(())
 }
 
-/// How long a connection waits for the client before it to leave.
+/// How long a new connection waits for the current client to leave.
 const WAIT_TO_REFUSE: Duration = Duration::from_secs(1);
 
 /// Hands the connection to the server once no client is served, or refuses
@@ -616,10 +758,9 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
             let mut mem = [0u32; 16];
-            serve(
-                listener,
-                &info(),
-                |batch| {
+            let mut window = Batches {
+                info: info(),
+                run: |batch: &Batch| {
                     let mut values = Vec::new();
                     for (frame, addr) in batch.ops() {
                         if *addr == 0x100 {
@@ -633,9 +774,8 @@ mod tests {
                     }
                     Ok(Reads::new(values))
                 },
-                |_| {},
-            )
-            .unwrap();
+            };
+            serve(listener, &mut window, |_| {}).unwrap();
         });
         addr
     }
@@ -745,6 +885,75 @@ mod tests {
             let mut link = Link::connect(&addr).unwrap_or_else(|e| panic!("{e}"));
             link.read32(0).unwrap();
         }
+    }
+
+    #[test]
+    fn a_program_request_carries_the_map_and_the_bitstream() {
+        let body = encode_program(200, b"{}", &[1, 2, 3]);
+        assert_eq!(
+            decode_program(&body).unwrap(),
+            Program {
+                erase_wait_ms: 200,
+                map: b"{}",
+                bitstream: &[1, 2, 3],
+            }
+        );
+        assert!(decode_program(&body[..9]).is_err());
+    }
+
+    /// A board that takes the map hash from the first byte of the bitstream.
+    struct Board {
+        info: Info,
+    }
+
+    impl Window for Board {
+        fn info(&self) -> Info {
+            self.info.clone()
+        }
+
+        fn run(&mut self, _batch: &Batch) -> Result<Reads, String> {
+            Ok(Reads::new(Vec::new()))
+        }
+
+        fn program(&mut self, request: &Program) -> Result<Info, String> {
+            match request.bitstream.first() {
+                Some(&hash) => {
+                    self.info.map_hash = Some(u32::from(hash));
+                    Ok(self.info.clone())
+                }
+                None => Err("an empty bitstream".to_string()),
+            }
+        }
+    }
+
+    #[test]
+    fn programming_changes_what_the_next_client_is_told() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let mut board = Board { info: info() };
+            serve(listener, &mut board, |_| {}).unwrap();
+        });
+        let mut link = Link::connect(&addr).unwrap();
+        let err = link.program(200, b"{}", &[]).unwrap_err();
+        assert!(err.to_string().contains("an empty bitstream"), "{err}");
+        assert_eq!(
+            link.program(200, b"{}", &[0x42]).unwrap().map_hash,
+            Some(0x42)
+        );
+        assert_eq!(link.info().map_hash, Some(0x42));
+        drop(link);
+        let link = Link::connect(&addr).unwrap();
+        assert_eq!(link.info().map_hash, Some(0x42));
+    }
+
+    #[test]
+    fn a_server_that_does_not_program_says_so() {
+        let mut link = Link::connect(&start()).unwrap();
+        let err = link.program(200, b"{}", &[1]).unwrap_err();
+        assert!(err.to_string().contains("does not program"), "{err}");
+        // The connection stays usable.
+        assert_eq!(link.read32(0x0).unwrap(), 0);
     }
 
     #[test]

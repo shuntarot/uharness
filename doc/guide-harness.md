@@ -36,8 +36,9 @@ Your DUT source is never modified.
 
 ## Harness.toml
 
-Searched as `--config <path>`, then `Harness.toml` upwards from the current
-directory. A lowercase `harness.toml` is an error asking you to rename it.
+`--config <path>` if given, else `Harness.toml` beside the project's
+`Veryl.toml` (found upwards from the current directory, as `veryl` does). A
+lowercase `harness.toml` is an error asking you to rename it.
 
 ### `[dut]` and `[clock.<port>]`
 
@@ -81,12 +82,13 @@ data lives (`backing`); the shape of the port is read from the DUT.**
 | `ports` | array, or a table of roles | matched by name |
 | `contract` | see below | **follows from the ports**; if written, it is checked |
 | `latency` | integer | required for a fixed-latency memory port, for `slave`, and wherever `contract = "fixed_latency"` is written; only for ports without a handshake |
-| `depth` | power of two | 256 for `host_poll_fifo`; for memory, from the address width |
+| `depth` | power of two | 256 for `host_poll_fifo`; for memory, from the address width; for `dram`, the whole memory |
 | `addressing` | `"byte"` / `"word"` | fixed-latency memory port only; required when a word is wider than 8 bits |
 | `access` | `"indirect"` / `"region"` | fixed-latency memory port only; default `region` |
 | `aperture` | size, power of two | a region or an AXI4 port; default is the whole memory. Required for `dram` |
 | `window_base` | byte offset in the window | a region only (`region` memory, `dram`, `slave`); default is the first free place |
 | `dut_base` | byte address | a memory; the DUT address of its first byte, default 0. A multiple of 4 KB on AXI4 |
+| `reset` | port name | `dmi` only: the Debug Module's own reset port |
 
 A key the bundle's shape does not use is an error, not ignored.
 
@@ -104,7 +106,7 @@ Sizes accept a suffix: `4k`, `256M` (1024-based). `depth`, `aperture`,
 | `bram` | FPGA memory | works |
 | `bram_preload` | FPGA memory the host fills and the DUT only reads | works |
 | `dram` | the board's DRAM | works |
-| `host_mem` | host memory | not yet (needs the PCIe requester) |
+| `host_mem` | host memory | not yet (needs a PCIe requester for the DUT) |
 | `host_irq` | the DUT's interrupt line, sent to the host as INTA (PCIe) | works; one 1-bit output, at most one bundle |
 | `pcie_flr` | the host's Function Level Reset, handed to the DUT (PCIe) | works; one 1-bit input, optionally one 1-bit done output |
 | `observe` | | not yet |
@@ -354,11 +356,10 @@ Independent of what the DUT's port looks like:
 - `indirect` — two registers, `<bundle>_maddr` and `_mdata`. Uses two words of
   the window whatever the memory's size, at two round trips per word.
 
-A region is faster at any realistic size. It makes the window as large as the
-memory, but that only costs JTAG chain length — a 1 MB window carries 54 bits
-per scan against a minimum of 41, where `indirect` costs a whole second round
-trip. Over PCIe a large window costs nothing per access; it only has to fit
-inside `bar_bytes`, and `check` says so when it does not.
+A region is faster at any realistic size: a larger window adds only a few bits
+to each JTAG scan, while `indirect` costs a second round trip per word. Over
+PCIe the region has to fit inside `bar_bytes`; `check` says so when it does
+not.
 
 ```toml
 [bundle.imem]
@@ -475,7 +476,7 @@ tcl = "vivado.tcl"        # relative to Harness.toml
 ```
 veryl harness check [options]     # match only
 veryl harness gen   [options]     # generate
-veryl harness update [-o <dir>]   # generate again, with the recorded options
+veryl harness update [-o <dir>] [--json]   # generate again, with the recorded options
 veryl harness sim [-o <dir>]      # run a `--target sim` harness for hio
 veryl harness targets             # what ships with this build
 ```
@@ -487,7 +488,7 @@ veryl harness targets             # what ships with this build
 | `--target-patch <path>` | ✓ | ✓ | a TOML patch over it, repeatable |
 | `--transport <name>` | ✓ | ✓ | `jtag` (default) or `pcie`; a board without `jtag` defaults to its only transport (`sim` for `--target sim`) |
 | `--config <path>` | ✓ | ✓ | where `Harness.toml` is |
-| `--emit-regs <path>` | ✓ | ✓ | also write the register map there |
+| `--emit-regs <path>` | ✓ | — | also write the register map there (`gen` always writes `regs.json`) |
 | `-o`, `--out-dir <path>` | — | ✓ | default `hns/` beside `Veryl.toml` |
 | `--json` | ✓ | ✓ | one JSON document on stdout |
 | `-v`, `--verbose` | ✓ | — | every port and register, and what was checked |
@@ -506,10 +507,10 @@ to fix it.
 | `digilent/arty-a7-100` | `jtag` | DDR3L, 256 MB | not yet |
 | `digilent/pynq-z1` | `jtag` | DDR3 through the PS, 256 MB | ✓ |
 | `digilent/zybo` | `jtag` | DDR3 through the PS, 256 MB | ✓ |
-| `xilinx/vcu118` | `jtag`, `pcie` | DDR4 | ✓ |
+| `xilinx/vcu118` | `jtag`, `pcie` | DDR4, 2 GB | ✓ |
 | `xilinx/kcu105` | `jtag`, `pcie` | DDR4, 2 GB, with `:dr` or `:062` | ✓ |
 | `xilinx/kc705` | `jtag` | DDR3, 1 GB | not yet |
-| `alibaba/as02mc04` | `jtag` | — (no DRAM) | not yet |
+| `alibaba/as02mc04` | `jtag`, `pcie` | — (no DRAM) | ✓ |
 | `sim` | `sim` | — (no board; see [`--target sim` and `veryl harness sim`](#--target-sim-and-veryl-harness-sim)) | — |
 
 **tested** means the board has run a harness. A board marked "not yet" builds,
@@ -643,7 +644,8 @@ hio run bringup.hio
   port can drive the harness. The protocol is [HNS2](hns2.md); one client
   is served at a time.
 - `veryl harness sim --watch` prints the simulated clock rate every second
-  (`HNS_SIM_WATCH=1` does the same).
+  (`HNS_SIM_WATCH=1` does the same). `--wave` dumps a waveform, as
+  `veryl test --wave` does.
 - A DUT with several clocks runs with each clock at its `freq_mhz`, so their
   ratio holds; the DUT reset reaches every domain.
 - `dram` is a 256 MB memory that holds only the pages written; unwritten
@@ -670,7 +672,5 @@ written for simulation can fail there on its own.
 - Where a memory has no `re`, `<bundle>_oor` counts cycles rather than accesses.
 - Veryl simulates two-valued, so X-related mismatches with hardware do not show.
 
-Errors state what to do. Two worth knowing in advance: a leftover broken `hns/`
-makes the analyser fail on it rather than on your DUT (delete it and generate
-again), and a hash mismatch in `verify` means the bitstream and the map are from
-different generations.
+Errors state what to do. One worth knowing in advance: a hash mismatch in
+`hio id` means the bitstream and the map are from different generations.

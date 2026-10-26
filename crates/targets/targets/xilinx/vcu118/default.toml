@@ -37,33 +37,27 @@ engineering_sample = true
 board_part = "xilinx.com:vcu118:part0:2.4"
 
 [provides]
-# **Both.** `gen` can emit the PCIe window (BAR) as of 2026-09-06. With two
-# listed, `check` and `gen` stop unless `--transport` says which — they do not
-# guess. JTAG stays available even in a PCIe build: when the window does not
-# answer, it is what tells "PCIe is broken" from "the window is broken".
+# **Both.** Without `--transport`, `check` and `gen` take jtag. JTAG stays
+# available even in a PCIe build: when the window does not answer, it is what
+# tells "PCIe is broken" from "the window is broken".
 transport = ["jtag", "pcie"]
 
 # 36Kb x 2160 = 75,600 Kbit on the VU9P. From the datasheet, not confirmed
 # against a utilization report.
 bram_kb = 9450
 
-# **Measured out of the generated IP** (2026-09-09), not read off a datasheet:
-# the configuration below was generated once and its ports and properties read
-# back. `sys_clk` names the board clock the controller receives **directly**,
-# without passing through the harness MMCM -- this board routes a dedicated
-# 250 MHz pair to the memory, where the Arty expects the fabric to supply one.
-# **Naming `board_interface` lets the board files fill the rest in** -- the part,
-# the speed grade, the CAS latencies, and **the pin constraints too**. Listing
-# the parameters by hand leaves the pins undeclared, and `opt_design` fails with
-# "ports are not placed" (seen 2026-09-09). What gets filled in is
-# `MT40A256M16GE-083E` / 833 ps / 64 bits wide, and **that is what is on the
-# board** -- corundum's settings (`-075E` / 750 / 72) are its own choice, not
-# this board's default. Only the values the harness itself needs for wiring are
-# kept below.
+# **Read out of the generated IP**, not off a datasheet. `sys_clk` names the
+# board clock the controller receives **directly**, without the harness MMCM:
+# this board routes a dedicated 250 MHz pair to the memory, where the Arty
+# expects the fabric to supply one. **Naming `board_interface` lets the board
+# files fill the rest in** -- the part, the speed grade, the CAS latencies, and
+# **the pin constraints too**. Listing the parameters by hand leaves the pins
+# undeclared, and `opt_design` fails with "ports are not placed". What gets
+# filled in is `MT40A256M16GE-083E` / 833 ps / 64 bits wide, which is what is
+# on the board (corundum's `-075E` / 750 / 72 is its own choice). Only the
+# values the harness needs for wiring are kept below.
 #
-# **Confirmed on hardware** (2026-09-10): a `backing = "dram"` design calibrated
-# and answered, with the DUT and the host reaching one memory. Only the first
-# channel is wired up.
+# **Confirmed on hardware** (2026-09-10). Only the first channel is wired up.
 #
 # The user clock is a quarter of the 833 ps memory clock: 300.12 MHz
 # (`mmcm_clkout0` in the timing report, 3.332 ns).
@@ -80,17 +74,16 @@ pin_p    = "AY24"
 pin_n    = "AY23"
 standard = "LVDS"
 
-# **Synthesis emits two critical warnings** (seen 2026-09-03):
+# **Synthesis emits two critical warnings**:
 #
 #   Clock 'sys_clk' completely overrides clock 'i_sys_clk_p'
 #
 # Our `create_clock -name sys_clk` overrides the constraint the IP puts on the
-# same port. **The period is right** (8.000 ns = 125 MHz, as above) and timing
-# closes (WNS +8.458 ns with the reference DUT), but constraints referring to
-# the overridden clock are dropped. If the board behaves inexplicably, suspect
-# this first.
+# same port. **The period is right** (8.000 ns = 125 MHz, as above), but
+# constraints referring to the overridden clock are dropped. If the board
+# behaves inexplicably, suspect this first.
 
-# The clock the DDR4 controller takes, straight from the board (2026-09-09).
+# The clock the DDR4 controller takes, straight from the board.
 #
 # **It does not go through the harness MMCM.** The IP receives the differential
 # pair itself; `[provides] dram.sys_clk = "ddr"` is what says so. Pins are from
@@ -145,12 +138,9 @@ vid       = 0x0403
 pid       = 0x6014
 interface = 0
 
-# **Measured** (2026-09-03, on hardware). Two `0403:6014` devices were attached,
-# but **their descriptors differ**: this one reports `"Digilent USB Device"` and
-# the other `"Single RS232-HS"` (an FTDI default EEPROM). **The pid and product
-# pair identifies it**, so it can be written down. This was first thought to be
-# impossible, from looking only at the order `lsusb` printed; asking the device
-# settled it.
+# **Measured** (2026-09-03). Another `0403:6014` device (an FTDI default EEPROM)
+# reports `"Single RS232-HS"`, so **the pid and product pair identifies this
+# one**.
 product = "Digilent USB Device"
 
 # **No serial number here.** That identifies one board, not the type; pass it to
@@ -171,13 +161,12 @@ product = "Digilent USB Device"
 # here. The product string is the same on both; the wiring is not.
 layout_init = [0x00e8, 0x60eb]
 
-# IR length of the TAP. **Measured** (2026-09-03) — asked the chain rather than
-# read from a table (`hio probe` fills IR with ones, shifts a zero in and counts
-# until it appears on TDO).
+# IR length of the TAP. **Measured** (2026-09-03) with `hio probe`, which asks
+# the chain rather than a table.
 #
-# **It is not 6 as on 7-series. UltraScale+ is 18.** Copying the 7-series table
-# would have been wrong. With `--ir-length 18` the IR capture returns `0x35d75`,
-# whose low two bits are `01` as IEEE 1149.1 requires.
+# **It is not 6 as on 7-series. UltraScale+ is 18.** With `--ir-length 18` the
+# IR capture returns `0x35d75`, whose low two bits are `01` as IEEE 1149.1
+# requires.
 ir_length = 18
 
 # The device IDCODE. **Measured** (2026-09-03, XCVU9P). One device in the chain.
@@ -194,15 +183,11 @@ idcode = 0x04b31093
 # read): USB and the host are the limit from there. 12 leaves some margin.
 host_tck_mhz = 12
 
-# --- JTAG instructions (from the BSDL, 2026-09-03) ---
-#
-# Taken from **the BSDL Vivado ships**:
+# --- JTAG instructions (from the BSDL) ---
 #
 #   <Vivado>/data/parts/xilinx/virtexuplus/public/bsdl/xcvu9p_flga2104.bsd
 #
 # `INSTRUCTION_LENGTH` is 18 and `INSTRUCTION_OPCODE` holds the bit patterns.
-# **The same file also confirmed the Arty's measured values**
-# (0x02/0x0b/0x05/0x0c/0x3f), which is why reading it this way is trusted.
 #
 # **18 bits because there are three SLRs.** Three six-bit instruction fields sit
 # side by side, each holding what 7-series would use:
@@ -215,13 +200,8 @@ host_tck_mhz = 12
 # **Use the `CFG_IN` that addresses SLR1.** The BSDL has one per SLR and states
 # that "SLR1 is the master SLR".
 #
-# **`user1_ir` is confirmed on hardware** (2026-09-03): a harness was loaded and
-# `hio id` returned magic. A value taken from the BSDL worked as-is, so **the
-# other instructions from the same file are trusted to the same degree**.
-#
-# **No padding was needed on the DR side.** Three SLRs suggested the DR might be
-# split too, but `hio probe` counts one device in the chain: only the IR is
-# divided.
+# **Only the IR is divided.** `hio probe` counts one device in the chain, so the
+# DR needs no padding.
 #
 # For reference, other IRs Vivado uses: IDCODE `0x09249`, and `0x014514` /
 # `0x004924` for the ready and status reads.
@@ -243,14 +223,14 @@ sysmon_ir   = 0x37924
 # device, so only they are written here, in file order (master first).
 #
 # The order was found by comparing Vivado's SVF (`create_hw_target`, no board
-# needed) with the `.bit` byte for byte (2026-09-03).
+# needed) with the `.bit` byte for byte.
 slr_cfg_in_ir = [
     0x05924,   # CFG_IN_SLR1 (master)
     0x24164,   # CFG_IN_SLR0
     0x24905,   # CFG_IN_SLR2
 ]
 
-# **Read back rather than just waited for** (from Vivado's SVF, 2026-09-03):
+# **Read back rather than just waited for** (from Vivado's SVF):
 #
 #   SIR 18 TDI (014514) TDO (011000) MASK (031000)   the erase finished
 #   SIR 18 TDI (009249) TDO (031000) MASK (011000)   DONE
@@ -263,33 +243,26 @@ mask   = 0x31000
 ir     = 0x09249   # IDCODE
 expect = 0x31000
 mask   = 0x11000
-# **Hardware returns `0x35d75`** (2026-09-03), which differs from the SVF's
-# `0x31000` but agrees once masked (both `0x11000`). **That is what the mask is
-# for**: split into six-bit fields it is `110101` three times, one per SLR — the
-# same shape as the Arty's `0x35`. An exact comparison would never pass.
-
-# **Erase wait.** The default 200 ms was measured on an XC7A35T, and the VU9P is
-# far larger, so it may not be enough: try `hio program --erase-wait-ms 2000`.
-# When it is too short, **programming fails without an error** — that symptom was
-# hit on the Arty on 2026-09-03.
+# **Hardware returns `0x35d75`**, which differs from the SVF's `0x31000` but
+# agrees once masked (both `0x11000`). **That is what the mask is for**: split
+# into six-bit fields it is `110101` three times, one per SLR — the same shape as
+# the Arty's `0x35`. An exact comparison would never pass.
 
 [topology]
 nodes = 1
 links = []
 
-# --- PCIe (2026-09-06) ---
+# --- PCIe ---
 #
 # **Facts about the board only.** How it is used (BAR size, IDs, link speed) is
 # a design choice and lives in the manifest.
 #
-# The pins were extracted mechanically from the verilog-pcie VCU118 example
-# (`example/VCU118/fpga_axi_x8/fpga.xdc`) — **not copied by hand**: eighteen
-# entries copied by eye are eighteen chances to be wrong. They originate in the
-# Vivado board files, so they can be checked there too.
+# The pins were extracted by script, not by hand, from the verilog-pcie VCU118
+# example (`example/VCU118/fpga_axi_x8/fpga.xdc`). They originate in the Vivado
+# board files, so they can be checked there too.
 #
-# **Another configuration is known to work on this board**: x4, reference clock
-# `AL9` (refclk_2, quad 225), lanes left unconstrained. **Try that if the link
-# does not come up**.
+# **Confirmed on hardware** (2026-10-25): the window over PCIe, in a slot that
+# is x4 electrically.
 [pcie]
 lanes      = 8
 # Gen3 is what the board can do; what the link actually trains at is another
@@ -307,3 +280,5 @@ tx_p = ["Y7", "AB7", "AD7", "AF7", "AH7", "AK7", "AM7", "AN5"]
 # VU9P, read back from the generated IP (`.xci`) of designs that trained gen3
 # x8 on this board before the key existed (2026-10-22).
 gt_quad = "GTY_Quad_227"
+# The PCIe hard block, read back the same way.
+block   = "X1Y2"

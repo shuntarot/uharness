@@ -131,9 +131,8 @@ sysmon_ir   = 0x37
 # checks IDCODE 0x03822093 under mask 0x0fffffff.
 #
 # **That SVF sends no JSTART**, unlike the 7-series ones: the startup command is
-# in the bitstream. `hio program` sends JSTART anyway, as it does on the VCU118.
-# **Confirmed on the board** (2026-10-01): `hio program` wrote the 16 MB `.bit`
-# and `id` matched the magic and the map hash right after.
+# in the bitstream. `hio program` sends JSTART anyway, as it does on the VCU118,
+# and that works on the board.
 [jtag.ready]
 ir     = 0x14   # ISC_NOOP
 expect = 0x11
@@ -153,10 +152,6 @@ links = []
 # Facts about the board only. From the board files (the pci_express_x8
 # interface and part0_pins.xml), cross-checked with taxi's KCU105 XDC. The block
 # is PCIE_3_1 X0Y0 on GTH quads 224/225, which is the IP's default.
-#
-# A gen3 x4 link with the same IP has come up on this board in another project
-# (link up and BAR reads), so the block, the reference clock and PERST# are
-# known to work.
 #
 # **Confirmed on hardware** (2026-10-01), in a slot that is x4 electrically:
 # the link came up at 8.0 GT/s x4 (the card allows x8), `hio -p check` passed
@@ -182,3 +177,5 @@ tx_p = ["AC4", "AE4", "AG4", "AH6", "AK6", "AL4", "AM6", "AN4"]
 # and the one in the KCU105 board file; the link trained with it before the
 # key existed (2026-10-22).
 gt_quad = "GTH_Quad_225"
+# The PCIe hard block, read back the same way.
+block   = "X0Y0"

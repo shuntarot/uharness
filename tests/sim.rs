@@ -2882,9 +2882,8 @@ module moving_window {{
 /// rest, the arbiter would keep the path while it waits for B, and host
 /// accesses to the region would stop.
 ///
-/// This test cannot show that the DUT really resets and runs again. The
-/// native simulator runs `if_reset` only on the test bench reset event, so a
-/// reset made inside the harness has no effect. That is checked on the board.
+/// It does not check that the DUT really resets and runs again; that was
+/// checked on the board.
 #[test]
 fn a_dut_reset_cuts_a_burst_without_blocking_the_host() {
     let dut = r#"

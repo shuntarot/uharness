@@ -53,8 +53,7 @@ bram_kb = 270
 # PYNQ-Z1. board.xml calls it a 50 MHz oscillator in its description, but
 # gives 125 MHz as the frequency, and the reference manual agrees with 125.
 # Setting the PS up rewrites the PHY's MIO pins, so the window may stop for a
-# moment after ps7_init; `hio program` waits for it. On this board `id` passed
-# at the first try.
+# moment after ps7_init; `hio program` waits for it.
 [clocks.sys]
 freq_mhz = 125
 diff     = false

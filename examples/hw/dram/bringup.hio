@@ -1,17 +1,12 @@
 # dram -- hio run bringup.hio
 #
-# The DUT reaches memory over AXI4, and the host reaches the same memory
-# through an arbiter -- there is no backdoor, because a real memory controller
-# does not have one. So the thing to prove here is that **both sides see one
-# memory**. `backing = "dram"` will put a controller where the BRAM is now,
-# without changing anything above.
+# The axi example on the board's memory controller. The host reaches the same
+# memory through an arbiter (a real controller has no backdoor), so the thing
+# to prove here is that **both sides see one memory**.
 #
-# Runs at the board's default TCK. Going through the AXI4 bus and the arbiter
-# answers more slowly than a register does -- too slowly for the Arty's 20 MHz
-# if the commands are packed back to back. `hio` notices and re-sends the
-# region traffic with the commands spaced further apart, which is safe because
-# harness memory reads and writes are idempotent.
-# Nothing has to be passed on the command line.
+# Memory answers more slowly than a register. When a packed batch outruns it,
+# `hio` sends the memory traffic again, spaced out; memory reads and writes
+# are safe to repeat. Nothing has to be passed on the command line.
 
 echo == identity ==
 id
@@ -49,10 +44,9 @@ echo == nothing was refused ==
 read o_resp
 
 echo == the window moves, and the host does not have to know ==
-# The memory is the whole chip, the window 256B. `hio` moves `mem_base_jtag`
-# for us -- the page number is 23 bits wide here, and the host never has to
-# know that.
-# 0xfc..0x100 straddles two pages, so one command becomes two.
+# The memory is the whole chip, seen through a 32MB window (`aperture`).
+# `hio` moves `mem_base_jtag` when an access is past the window. These two
+# words are on the first page; an offset past 32M would move it.
 write mem 252 0x11111111 0x22222222
 read mem 252 2
 read mem_base_jtag

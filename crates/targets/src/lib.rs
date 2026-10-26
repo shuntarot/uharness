@@ -1,10 +1,6 @@
 //! Target descriptions and how they resolve. Both the generator and the host
 //! read them.
 //!
-//! `TargetError` carries a miette `NamedSource`, so it is large. Boxing it
-//! only adds a level of indirection for the reader, so it is returned as is.
-#![allow(clippy::result_large_err)]
-
 //! ```text
 //! --target      <provider>/<board>[:<config>]   look up by name
 //! --target-file <path>                          your own file (unofficial, warns)
@@ -22,6 +18,10 @@
 //! The descriptions are embedded with `rust-embed`, as veryl-std does. A
 //! binary on PATH must work without knowing where the repository is.
 
+// `TargetError` carries a miette `NamedSource`, so it is large. Boxing it
+// only adds a level of indirection for the reader, so it is returned as is.
+#![allow(clippy::result_large_err)]
+
 use std::path::{Path, PathBuf};
 
 use miette::{Diagnostic, NamedSource, SourceSpan};
@@ -35,6 +35,7 @@ use thiserror::Error;
 #[include = "*.toml"]
 #[include = "*.prj"]
 #[include = "*.tcl"]
+#[include = "*.xdc"]
 struct Public;
 
 /// Private targets. They are not in the repository; they live on the machine
@@ -45,6 +46,7 @@ struct Public;
 #[include = "*.toml"]
 #[include = "*.prj"]
 #[include = "*.tcl"]
+#[include = "*.xdc"]
 struct Private;
 
 const DEFAULT_CONFIG: &str = "default";
@@ -413,10 +415,6 @@ const FLASH_EXAMPLE: &str = "    [flash]\n    part            = \"mt25qu256-spi-
 const RESET_EXAMPLE: &str =
     "    [resets.sys]\n    pin      = \"C2\"\n    standard = \"LVCMOS33\"\n    active   = \"low\"";
 
-/// Checks that every board clock and reset has all its fields. It runs on
-/// every load, after patches, because a patch can remove a field.
-///
-/// A missing `diff` is not read as single-ended: that would be a guess.
 /// DCI cascade: I/O banks that take their DCI reference from another bank,
 /// as `(master, slaves)`. From `[vivado] dci_cascade = { master = 33, slaves =
 /// [32, 34] }`.
@@ -456,6 +454,10 @@ pub fn dci_cascade(target: &Target) -> Result<Option<(u32, Vec<u32>)>, TargetErr
     Ok(Some((master, slaves)))
 }
 
+/// Checks that every board clock and reset has all its fields. It runs on
+/// every load, after patches, because a patch can remove a field.
+///
+/// A missing `diff` is not read as single-ended: that would be a guess.
 fn check_board_signals(target: &Target) -> Result<(), TargetError> {
     dci_cascade(target)?;
     let incomplete = |section, name: &str, missing, example| TargetError::BoardSignalIncomplete {
@@ -832,6 +834,10 @@ pub struct Pcie {
     /// (`GTY_Quad_225`). The card edge fixes it. The IP's own default matches
     /// some boards and not others, so it is never left to the IP.
     pub gt_quad: Option<String>,
+    /// The PCIe hard block, as the IP names its site (`X0Y0`). A device can
+    /// have several, each wired to its own GT quads; the card edge fixes
+    /// which one.
+    pub block: Option<String>,
 }
 
 impl Pcie {
@@ -872,6 +878,9 @@ impl Pcie {
         if self.gt_quad.is_none() {
             out.push("gt_quad");
         }
+        if self.block.is_none() {
+            out.push("block");
+        }
         out
     }
 }
@@ -911,6 +920,7 @@ pub fn pcie(target: &Target) -> Pcie {
         rx_p: list("rx_p"),
         tx_p: list("tx_p"),
         gt_quad: text("gt_quad"),
+        block: text("block"),
     }
 }
 
@@ -951,6 +961,16 @@ pub struct Dram {
     pub sys_clk_ps: Option<u32>,
     pub cas_latency: Option<u32>,
     pub cas_write_latency: Option<u32>,
+    /// Without a board interface: the IP's `MemoryType` (`Components`,
+    /// `SODIMMs`, ...) and `DataMask` (`DM_NO_DBI`, `NO_DM_NO_DBI`, ...).
+    pub memory_type: Option<String>,
+    pub data_mask: Option<String>,
+    /// Without a board interface: the ranks of the memory. cs_n, cke, odt and
+    /// ck are one per rank.
+    pub ranks: Option<u32>,
+    /// Without a board interface: an XDC beside the description that places
+    /// the memory pins, written with the harness port names (`c0_ddr4_*`).
+    pub pins_xdc: Option<String>,
     /// `ps7`: the PS address the harness's memory starts at. The harness
     /// reaches `2^axi_addr_bits` bytes from there.
     pub base: Option<u64>,
@@ -1009,6 +1029,10 @@ pub fn dram(target: &Target) -> Option<Dram> {
         sys_clk_ps: int("sys_clk_ps"),
         cas_latency: int("cas_latency"),
         cas_write_latency: int("cas_write_latency"),
+        memory_type: text("memory_type"),
+        data_mask: text("data_mask"),
+        ranks: int("ranks"),
+        pins_xdc: text("pins_xdc"),
         base: t
             .get("base")
             .and_then(|v| v.as_integer())
@@ -1990,6 +2014,10 @@ mod pcie_tests {
         assert_eq!(p.gt_quad.as_deref(), Some("GTY_Quad_227"));
         p.gt_quad = None;
         assert_eq!(p.missing(), ["gt_quad"]);
+        p.gt_quad = Some("GTY_Quad_227".into());
+        assert_eq!(p.block.as_deref(), Some("X1Y2"));
+        p.block = None;
+        assert_eq!(p.missing(), ["block"]);
     }
 
     /// No `[pcie]` is not an error; it reads as empty.

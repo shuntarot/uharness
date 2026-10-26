@@ -58,7 +58,11 @@ magic and the map hash before anything else happens** (`--no-verify` skips it).
 | `bench` | how fast the window is; `<region> --both` measures writes too |
 | `check` | whether the board and this machine are ready, and what to fix |
 | `dma-fire` | the card moves one descriptor itself, either way (PCIe + `dram`); `--pcie-addr` aims it at another card's BAR |
-| `run <file>` | a file of commands, holding the link open |
+| `run <file>` | a file of commands, holding the link open (`-` for standard input) |
+| `serve` | serve the window to `hio --connect` on other machines |
+| `sysmon` | the FPGA's temperature and supply voltages |
+| `dap …` | the Zynq-7000 PS's memory, through the ARM DAP: `info`, `read`, `write`, `ps7-init` |
+| `completions <shell>` | a shell completion script |
 | `cpu …` | firmware and the CPU: `boot`, `console`, and the Debug Module (`halt`, `step`, `regs`, `break`, `mem`, `catch`, …); see [`hio cpu boot` and `cpu console`: run firmware](#hio-cpu-boot-and-cpu-console-run-firmware) and [`hio cpu halt`, `step`, `regs`: debug the CPU](#hio-cpu-halt-step-regs-debug-the-cpu) |
 
 `hio --help` shows the common commands and options. `hio --list` lists every
@@ -116,7 +120,7 @@ The target's output waits while the prompt is up and shows when you go back.
 |---|---|
 | default | JTAG. A PCIe design has both, so this reaches it too |
 | `-p` (= `-t pcie` = `--transport pcie`) | over the BAR; needs root |
-| `--bdf 0000:04:00.0` | only when several cards answer to the same ID |
+| `--bdf <bdf>` | only when several cards answer to the same ID; the first column of `lspci` |
 
 ```bash
 sudo "$(command -v hio)" -p id
@@ -168,9 +172,23 @@ hio --regs regs.json --connect localhost:5555 id
 - `HIO_CONNECT=localhost:5555` does the same as `--connect`.
 - One client at a time; another is refused until the first is done.
 - There is no password. Keep the default `127.0.0.1` and use `ssh -L`.
-- `--connect` reaches only the window. `program`, `erase`, `probe`, `dap`
-  and the card's DMA (`--dma`, `dma-fire`) run on the server's machine.
+- `--connect` reaches only the window, with one exception below. `erase`,
+  `probe`, `sysmon`, `dap`, `program <file>.svf` and the card's DMA (`--dma`,
+  `dma-fire`) run on the server's machine.
 - A simulation is served the same way: `veryl harness sim --addr`.
+
+Over PCIe, the server also programs the board, so you can change the design
+without a reboot:
+
+```bash
+sudo "$(command -v hio)" -p --serial <probe> serve --listen 127.0.0.1:5555   # once, on the board's machine
+hio --connect localhost:5555 program                                     # elsewhere, from the project
+```
+
+`program` sends the `.bit` and its `regs.json`. The server programs over JTAG,
+writes the card's PCI config space back, and serves the new map. It refuses a
+design whose ID, class, BAR size or interrupt pin differs from the card's: the
+machine would have to find the card again (remove and rescan, or reboot).
 
 ## `hio reset`
 
@@ -250,9 +268,8 @@ hio memtest mem --size 256M    # the pins
 ```
 
 Over PCIe the read-back is spread over 4 threads, because a read stalls one core
-for the whole round trip while the link sits idle. It stops helping past 4 --
-about a third of the round trip is serial somewhere the host cannot overlap.
-`--threads N` sets it; over JTAG there is one cable to walk, so it stays at 1.
+for the whole round trip. More than 4 does not help. `--threads N` sets it;
+over JTAG it stays at 1.
 
 A large transfer is done by the card itself rather than one word at a time
 through the window: to fill the memory (`load`, and the pattern `memtest` writes)
@@ -339,6 +356,7 @@ hio cpu break main --elf app.elf   # a hardware breakpoint; `break` lists, `--cl
 hio cpu mem COUNTER --elf app.elf  # memory at a DUT address or symbol; `--write` stores
 hio cpu disasm --elf app.elf       # the code around the halted PC; `disasm main`, `disasm 0x80000000 8`
 hio cpu catch             # stop on a fault (illegal instruction, access fault, ...)
+hio cpu ipc --time 3      # cycles, instructions and IPC of the running program
 hio cpu dmi dmstatus      # one DMI register, raw; give a value to write it
 ```
 
@@ -378,6 +396,12 @@ hart 0 trapped: illegal instruction at 0x80000508 <hazard3_bsp::getc> (mtval 0x0
 Triggers live in the core, so a reset clears them; `cpu boot --catch` sets it
 at the first instruction. Without a terminal (a test run), a halt in the
 console ends `hio` with an error instead of waiting at a prompt.
+
+`ipc` halts the hart to read `mcycle` and `minstret`, lets it run for the
+time (1 s by default), and reads them again; the hart is then left running or
+halted, as it was. If `mcountinhibit` stops the counters, it is lifted for the
+run and put back. Whether they also count while halted depends on the core,
+so keep the time long against the two halts.
 
 A breakpoint takes one of the hart's address triggers. Resuming or stepping
 from one first runs its instruction with the trigger off, since the trigger

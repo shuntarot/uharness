@@ -10,10 +10,9 @@ backing  = "reg"
 ports    = ["i_start", "i_addr", "i_dst", "i_size", "o_busy", "o_done", "o_sum", "o_beats"]
 
 # A transfer-level port: "read N bytes from address A" and the data comes back
-# as a stream. The DUT is written as though it were reaching host memory, and
-# it is -- once there is a PCIe requester, `backing = "host_mem"` puts the data
-# there. **Until then it lives in the FPGA**, which is what `bram` says: the
-# same port, one word away, and this runs over JTAG alone.
+# as a stream. The DUT is written as though it were reaching host memory;
+# `bram` puts that memory in the FPGA, so this runs over JTAG alone.
+# `backing = "host_mem"` will put it in host memory, once it is generated.
 [bundle.hmem]
 backing = "bram"
 depth   = 512

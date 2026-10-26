@@ -278,8 +278,7 @@ pub enum Role {
     /// Optional. Pairs with `rd_cmd_tag`.
     RdTag,
 
-    // --- `host_mem` write. Only the names are fixed; the terminator comes
-    //     after the read side. Read and write have separate ports for full
+    // --- `host_mem` write. Read and write have separate ports for full
     //     duplex: a shared command interface could not issue both in one cycle.
     WrCmdValid,
     WrCmdReady,

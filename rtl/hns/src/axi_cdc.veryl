@@ -7,7 +7,7 @@
 /// Inside are five async FIFOs, one per channel. Each carries one struct with
 /// all signals of its channel, so no hand-written gray pointers or
 /// synchronizer stages are needed. The FIFO is `hns::async_fifo`, a copy of
-/// `std::async_fifo` with a one-line CDC fix. Switch back when std is fixed.
+/// `std::async_fifo` with a one-line CDC fix that std v0.22.0 also has.
 ///
 /// Order is kept: each channel has one FIFO, so nothing can overtake. AXI4
 /// does not require order between channels, so this is enough.

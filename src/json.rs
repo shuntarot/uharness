@@ -47,6 +47,7 @@ use crate::unconnected::Kind;
 /// - 15: renamed `registers.regions[].base` to `window_base`; added
 ///   `registers.dut_base`, `registers.dut_read_only`,
 ///   `bundles[].memory.dut_base` and `bundles[].axi_mem.dut_base`
+/// - 16: added `bundles[].dmi`
 pub const FORMAT_VERSION: u32 = 16;
 
 /// How deep `related` is followed. Veryl diagnostics can nest.

@@ -1,9 +1,10 @@
 # Fixed-shape RTL parts that the harness uses.
 #
 # It holds only parts whose shape does not depend on the manifest; only their
-# parameters change: terminators (fifo / mem), the window slave (axil), the
-# JTAG bridge (dr / bscan), and the APB master for a Debug Module (apb_host).
-# Wiring and register decode change shape per project, so the generator emits
+# parameters change. For example: terminators (fifo / mem), the window slave
+# (axil), the JTAG bridge (dr / bscan), the AXI4 parts (axi_*), the DMA engines
+# (dma_*), the PCIe glue (tlp_*), and the APB master for a Debug Module
+# (apb_host). Wiring and register decode change shape per project, so the generator emits
 # them.
 #
 # The parts are a separate package so that hand-verified CDC logic is not

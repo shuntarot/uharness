@@ -11,8 +11,8 @@
 ///
 /// The logic is one `hns::async_fifo`. Keep it that way: like `hns::axi_cdc`,
 /// this has no test bench yet, so correctness is kept inside the FIFO.
-/// `hns::async_fifo` is a copy of `std::async_fifo` with a one-line CDC fix;
-/// switch back when std is fixed.
+/// `hns::async_fifo` is a copy of `std::async_fifo` with a one-line CDC fix
+/// that std v0.22.0 also has.
 pub module tlp_cdc #(
     /// FIFO depth: how much it absorbs when the receiver stalls.
     param DEPTH: u32 = 8,

@@ -6,7 +6,7 @@
 #[test(dma_gate_does_not_let_a_descriptor_leave_the_window)]
 module test_dma_gate {
     const BASE: logic<64> = 64'h0000_0004_3420_0000;
-    const SIZE: logic<32> = 32'h0020_0000; // 2 MB (one buffer from hio dma-check)
+    const SIZE: logic<32> = 32'h0020_0000; // 2 MB (one huge page, the buffer `hio` uses)
 
     inst clk: $tb::clock_gen;
     inst rst: $tb::reset_gen (

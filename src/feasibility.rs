@@ -308,6 +308,87 @@ fn ps7_described(
     Ok(())
 }
 
+/// A DDR4 controller without a board interface: the IP settings a board file
+/// would give, and an XDC that places every memory port.
+fn ddr4_pins_described(
+    bundle: &str,
+    target: &crate::target::Target,
+    dram: &hns_targets::Dram,
+) -> Result<(), FeasibilityError> {
+    let missing: Vec<&str> = [
+        ("memory_type", dram.memory_type.is_some()),
+        ("data_mask", dram.data_mask.is_some()),
+        ("ranks", dram.ranks.is_some()),
+        ("pins_xdc", dram.pins_xdc.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, present)| !present)
+    .map(|(key, _)| key)
+    .collect();
+    if !missing.is_empty() {
+        return Err(FeasibilityError::DramNotDescribed {
+            bundle: bundle.to_string(),
+            target: target.name.clone(),
+            missing: missing.join(", "),
+        });
+    }
+    let name = dram.pins_xdc.clone().expect("checked above");
+    let Some(xdc) = crate::target::read_beside(target, &name) else {
+        return Err(FeasibilityError::DramPinsXdcMissing {
+            target: target.name.clone(),
+            looked: target.source.beside(&name),
+            name,
+        });
+    };
+    let placed = crate::emit::placed_ports(&xdc);
+    let mut wanted = Vec::new();
+    let mut unplaced = Vec::new();
+    for (port, _dir, width) in crate::emit::memory_pins(dram) {
+        let bits: Vec<String> = if width == 1 {
+            vec![port.clone()]
+        } else {
+            (0..width).map(|i| format!("{port}[{i}]")).collect()
+        };
+        let missed = bits.iter().filter(|b| !placed.contains(b)).count();
+        if width == 1 && missed == 1 {
+            unplaced.push(port.clone());
+        } else if missed == width {
+            unplaced.push(format!("{port} (all {width})"));
+        } else if missed > 0 {
+            let list: Vec<&str> = bits
+                .iter()
+                .filter(|b| !placed.contains(b))
+                .map(|b| b.as_str())
+                .collect();
+            unplaced.push(list.join(", "));
+        }
+        wanted.extend(bits);
+    }
+    let unknown: Vec<&str> = placed
+        .iter()
+        .filter(|p| !wanted.contains(p))
+        .map(|p| p.as_str())
+        .collect();
+    let mut detail = Vec::new();
+    if !unplaced.is_empty() {
+        detail.push(format!("Not placed: {}.", unplaced.join(", ")));
+    }
+    if !unknown.is_empty() {
+        detail.push(format!(
+            "Not memory ports of the harness: {}.",
+            unknown.join(", ")
+        ));
+    }
+    if !detail.is_empty() {
+        return Err(FeasibilityError::DramPinsIncomplete {
+            target: target.name.clone(),
+            name,
+            detail: detail.join("\n"),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error, Diagnostic)]
 pub enum FeasibilityError {
     #[error("`{target}` does not describe its memory controller fully enough to build against")]
@@ -333,6 +414,36 @@ pub enum FeasibilityError {
         )
     )]
     DramHasNoIpRecipe { bundle: String, target: String },
+
+    /// `gen` copies the file into `hns/syn/`. Without it the memory ports
+    /// have no pins, and only `opt_design` fails.
+    #[error("`{target}` names `{name}` in `[provides.dram] pins_xdc`, but the file is not there")]
+    #[diagnostic(
+        code(harness::feasibility::dram_pins_xdc_missing),
+        help(
+            "It is looked for beside the target description:\n\n    {looked}\n\nPut an XDC there that places the memory pins, with the harness port names (`c0_ddr4_*`)."
+        )
+    )]
+    DramPinsXdcMissing {
+        target: String,
+        name: String,
+        looked: String,
+    },
+
+    /// Vivado only warns about a constraint on a port that does not exist, and
+    /// an unplaced port fails late, at `opt_design`. Both are caught here.
+    #[error("`{name}` of `{target}` does not place the memory ports of the harness")]
+    #[diagnostic(
+        code(harness::feasibility::dram_pins_incomplete),
+        help(
+            "{detail}\n\nGive each bit its own line with the harness port name, for example:\n\n    set_property PACKAGE_PIN <pin> [get_ports {{c0_ddr4_dq[0]}}]\n\nThe widths come from `[provides.dram]` (`width`, `row_bits`, `bank_bits`, `bank_group_bits`, `ranks`)."
+        )
+    )]
+    DramPinsIncomplete {
+        target: String,
+        name: String,
+        detail: String,
+    },
 
     /// `gen` copies the file into `hns/syn/`; the MIG cannot be made without it.
     #[error("`{target}` names `{name}` in `[vivado] mig_prj`, but the file is not there")]
@@ -506,8 +617,8 @@ pub enum FeasibilityError {
     },
 
     /// A wrapped address makes the host and the DUT silently read the wrong
-    /// word. The harness path also uses the DUT's AXI4 package, so a port
-    /// narrower than the controller limits both sides.
+    /// word. The limit is the controller's AXI4 address, or the DUT's own when
+    /// the controller does not state one.
     #[error(
         "[bundle.{bundle}] asks for {needed_bytes} bytes of DRAM; only {reach_bytes} can be addressed"
     )]
@@ -721,6 +832,9 @@ pub fn check(
                         bundle: plan.bundle.clone(),
                         target: target.name.clone(),
                     });
+                }
+                if dram.is_ddr4_ip() && dram.board_interface.is_none() {
+                    ddr4_pins_described(&plan.bundle, target, &dram)?;
                 }
             }
 
@@ -1355,6 +1469,101 @@ mod tests {
         // With the file in place, the same target passes.
         std::fs::write(dir.path().join("mig.prj"), "<Project/>").unwrap();
         assert!(check(&manifest, &[], &[], &plans, &target, Some("jtag")).is_ok());
+    }
+
+    /// A DDR4 controller without a board interface needs the settings a board
+    /// file would give, and an XDC beside the description that places every
+    /// memory port, bit by bit, and nothing else.
+    #[test]
+    fn a_ddr4_without_board_files_needs_its_settings_and_every_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.toml");
+        let base = "kind = \"ddr4\", channels = 1, gb = 16, width = 64, controller = \"ddr4\", part = \"MTA16ATF2G64HZ-2G3\", mem_clk_ps = 1600, sys_clk_ps = 9600, axi_data_bits = 512, axi_addr_bits = 34, axi_id_bits = 8, ui_clk_mhz = 156.25, sys_clk_mhz = 104.167, row_bits = 17, bank_bits = 2, bank_group_bits = 2, sys_rst_active = \"high\"";
+        let write = |extra: &str| {
+            std::fs::write(
+                &path,
+                format!("[board]\nprovider = \"acme\"\nname = \"proto\"\n\n[device]\nvendor = \"xilinx\"\nfamily = \"virtexu\"\npart = \"xcvu440-flga2892-2-e\"\n\n[provides]\ntransport = [\"jtag\"]\ndram = {{{base}{extra}}}\n"),
+            )
+            .unwrap();
+            target::load_file(&path, &[]).unwrap()
+        };
+        let plans = vec![crate::terminator::AxiMemPlan {
+            bundle: "mem".to_string(),
+            backing: Backing::Dram,
+            port: "axi".to_string(),
+            pkg: "$std::axi4_pkg::<30, 16, 4, 1, 1, 1, 1, 1>".to_string(),
+            addr_width: 30,
+            data_bytes: 16,
+            id_width: 4,
+            depth: 256,
+            depth_defaulted: false,
+            aperture_bytes: Some(256 * 16),
+            dut_base: 0,
+            xfer: None,
+        }];
+        let manifest = manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n");
+        let run = |target: &crate::target::Target| {
+            check(&manifest, &[], &[], &plans, target, Some("jtag"))
+        };
+
+        // The keys a board file would fill in are asked for by name.
+        let err = run(&write("")).unwrap_err();
+        let FeasibilityError::DramNotDescribed { missing, .. } = &err else {
+            panic!("expected DramNotDescribed, got {err:?}");
+        };
+        assert_eq!(missing, "memory_type, data_mask, ranks, pins_xdc");
+
+        // The XDC is looked for beside the description.
+        let target = write(
+            ", memory_type = \"SODIMMs\", data_mask = \"DM_NO_DBI\", ranks = 2, pins_xdc = \"ddr4.xdc\"",
+        );
+        let err = run(&target).unwrap_err();
+        let FeasibilityError::DramPinsXdcMissing { looked, .. } = &err else {
+            panic!("expected DramPinsXdcMissing, got {err:?}");
+        };
+        assert!(looked.ends_with("ddr4.xdc"), "{looked}");
+
+        // Every bit of every port, two per rank where the rank decides.
+        let dram = hns_targets::dram(&target).unwrap();
+        let mut lines = Vec::new();
+        for (port, _dir, width) in crate::emit::memory_pins(&dram) {
+            if width == 1 {
+                lines.push(format!("set_property PACKAGE_PIN A1 [get_ports {port}]"));
+            } else {
+                for i in 0..width {
+                    lines.push(format!(
+                        "set_property PACKAGE_PIN A1 [get_ports {{{port}[{i}]}}]"
+                    ));
+                }
+            }
+        }
+        assert!(lines.iter().any(|l| l.contains("c0_ddr4_cs_n[1]")));
+        let full = lines.join("\n");
+
+        // A bit left out, and a name that is not a port, are both named.
+        let broken = full
+            .replace(
+                "set_property PACKAGE_PIN A1 [get_ports {c0_ddr4_cs_n[1]}]",
+                "",
+            )
+            .replace("[get_ports c0_ddr4_act_n]", "[get_ports c0_ddr4_actn]");
+        std::fs::write(dir.path().join("ddr4.xdc"), &broken).unwrap();
+        let err = run(&target).unwrap_err();
+        let FeasibilityError::DramPinsIncomplete { detail, .. } = &err else {
+            panic!("expected DramPinsIncomplete, got {err:?}");
+        };
+        assert!(
+            detail.contains("Not placed: c0_ddr4_act_n, c0_ddr4_cs_n[1]."),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("Not memory ports of the harness: c0_ddr4_actn."),
+            "{detail}"
+        );
+
+        // With every pin placed, the same target passes.
+        std::fs::write(dir.path().join("ddr4.xdc"), &full).unwrap();
+        assert!(run(&target).is_ok());
     }
 
     /// A Zynq PS's memory needs `base` aligned to its window and the PS
