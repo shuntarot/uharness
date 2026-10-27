@@ -6,8 +6,9 @@
 ///
 /// Inside are five async FIFOs, one per channel. Each carries one struct with
 /// all signals of its channel, so no hand-written gray pointers or
-/// synchronizer stages are needed. The FIFO is `hns::async_fifo`, a copy of
-/// `std::async_fifo` with a one-line CDC fix that std v0.22.0 also has.
+/// synchronizer stages are needed. The FIFO is `std::async_fifo`, which needs
+/// Veryl v0.22.0 or later: before that, its read pointer reached the
+/// synchronizer through combinational logic (CDC-10 in `report_cdc`).
 ///
 /// Order is kept: each channel has one FIFO, so nothing can overtake. AXI4
 /// does not require order between channels, so this is enough.
@@ -93,7 +94,7 @@ pub module axi_cdc::<PKG: $std::axi4_prototype> #(
         user  : s_axi.awuser,
     };
 
-    inst u_aw: async_fifo::<$std::synchronizer_basic> #(
+    inst u_aw: $std::async_fifo::<$std::synchronizer_basic> #(
         TYPE : aw_t ,
         DEPTH: DEPTH,
     ) (
@@ -122,7 +123,7 @@ pub module axi_cdc::<PKG: $std::axi4_prototype> #(
         user: s_axi.wuser,
     };
 
-    inst u_w: async_fifo::<$std::synchronizer_basic> #(
+    inst u_w: $std::async_fifo::<$std::synchronizer_basic> #(
         TYPE : w_t  ,
         DEPTH: DEPTH,
     ) (
@@ -150,7 +151,7 @@ pub module axi_cdc::<PKG: $std::axi4_prototype> #(
         user: m_axi.buser,
     };
 
-    inst u_b: async_fifo::<$std::synchronizer_basic> #(
+    inst u_b: $std::async_fifo::<$std::synchronizer_basic> #(
         TYPE : b_t  ,
         DEPTH: DEPTH,
     ) (
@@ -186,7 +187,7 @@ pub module axi_cdc::<PKG: $std::axi4_prototype> #(
         user  : s_axi.aruser,
     };
 
-    inst u_ar: async_fifo::<$std::synchronizer_basic> #(
+    inst u_ar: $std::async_fifo::<$std::synchronizer_basic> #(
         TYPE : ar_t ,
         DEPTH: DEPTH,
     ) (
@@ -216,7 +217,7 @@ pub module axi_cdc::<PKG: $std::axi4_prototype> #(
         user: m_axi.ruser,
     };
 
-    inst u_r: async_fifo::<$std::synchronizer_basic> #(
+    inst u_r: $std::async_fifo::<$std::synchronizer_basic> #(
         TYPE : r_t  ,
         DEPTH: DEPTH,
     ) (

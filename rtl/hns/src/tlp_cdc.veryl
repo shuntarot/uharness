@@ -9,10 +9,9 @@
 /// The instance decides the direction. `is_*` is the source and `od_*` the
 /// destination: harness to hard block for RQ, the reverse for RC.
 ///
-/// The logic is one `hns::async_fifo`. Keep it that way: like `hns::axi_cdc`,
-/// this has no test bench yet, so correctness is kept inside the FIFO.
-/// `hns::async_fifo` is a copy of `std::async_fifo` with a one-line CDC fix
-/// that std v0.22.0 also has.
+/// The logic is one `std::async_fifo` (Veryl v0.22.0 or later, as in
+/// `hns::axi_cdc`). Keep it that way: like `hns::axi_cdc`, this has no test
+/// bench yet, so correctness is kept inside the FIFO.
 pub module tlp_cdc #(
     /// FIFO depth: how much it absorbs when the receiver stalls.
     param DEPTH: u32 = 8,
@@ -74,7 +73,7 @@ pub module tlp_cdc #(
     // MERGE_RESET option for this. It assumes active-low resets: std merges
     // them as `is_rst & id_rst`, so with an active-high `reset_type` the FIFO
     // never leaves reset.
-    inst u_fifo: async_fifo::<$std::synchronizer_basic> #(
+    inst u_fifo: $std::async_fifo::<$std::synchronizer_basic> #(
         TYPE       : beat_t,
         DEPTH      : DEPTH ,
         MERGE_RESET: true  ,

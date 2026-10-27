@@ -76,10 +76,24 @@ Each one in `examples/hw/` is a project with a `Harness.toml` and a
 | `dma` | a small DMA engine that copies within a memory; `Harness.dram.toml` puts it on the board's DDR |
 | `rocket` | a rocket-chip RISC-V core running a program from DRAM |
 
-## Build
+## Install
 
 ```bash
-cargo build --release   # gives veryl-harness and hio
+git clone https://github.com/shuntarot/uharness
+cd uharness
+cargo install --locked --path .             # veryl-harness
+cargo install --locked --path crates/host   # hio
+```
+
+Both go to `~/.cargo/bin`. With `veryl-harness` on `PATH`, Veryl runs it as
+`veryl harness`. A machine that only talks to a board needs `hio` alone.
+`cargo build --release` builds both in `target/release` instead, without
+installing them.
+
+To remove both, name their packages:
+
+```bash
+cargo uninstall harness hns-host
 ```
 
 Needs `veryl` on `PATH` (the version pinned in `Cargo.toml`), and Vivado for
