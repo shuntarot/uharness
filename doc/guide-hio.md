@@ -13,6 +13,7 @@ Generating the harness is in [guide-harness.md](guide-harness.md).
 - [`hio load` and `memtest`](#hio-load-and-memtest)
 - [`hio cpu boot` and `cpu console`: run firmware](#hio-cpu-boot-and-cpu-console-run-firmware)
 - [`hio cpu halt`, `step`, `regs`: debug the CPU](#hio-cpu-halt-step-regs-debug-the-cpu)
+- [`hio trace`: the last instructions](#hio-trace-the-last-instructions)
 - [`hio program` and `erase`](#hio-program-and-erase)
 - [`hio sysmon`: temperature and voltages](#hio-sysmon-temperature-and-voltages)
 - [`hio dap`: the Zynq-7000 PS](#hio-dap-the-zynq-7000-ps)
