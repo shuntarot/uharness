@@ -17,7 +17,9 @@ use crate::heartbeat;
 use crate::manifest::{self, Loaded};
 use crate::regmap::{self, RegisterMap};
 use crate::target::Target;
-use crate::terminator::{self, ApbPlan, AxiMemPlan, FifoPlan, HostMemPlan, MemPlan, SlavePlan};
+use crate::terminator::{
+    self, ApbPlan, AxiMemPlan, FifoPlan, HostMemPlan, MemPlan, SlavePlan, TracePlan,
+};
 use crate::unconnected::{self, Unconnected};
 
 pub struct Plan {
@@ -34,6 +36,9 @@ pub struct Plan {
 
     /// `host_poll_fifo` terminators, sorted by bundle name.
     pub fifos: Vec<FifoPlan>,
+
+    /// `trace` terminators, sorted by bundle name.
+    pub traces: Vec<TracePlan>,
 
     /// `bram` / `bram_preload` terminators, sorted by bundle name.
     pub memories: Vec<MemPlan>,
@@ -273,7 +278,7 @@ pub enum PlanError {
     #[diagnostic(
         code(harness::plan::no_terminator),
         help(
-            "The generator can terminate `reg`, `slave`, `host_poll_fifo`, `bram`, `bram_preload`, `dram`, `host_irq`, and `pcie_flr`. `{backing}` is not supported yet.\n\n`check` without `--target` still tells you whether the manifest is feasible."
+            "The generator can terminate `reg`, `slave`, `dmi`, `host_poll_fifo`, `trace`, `bram`, `bram_preload`, `dram`, `host_irq`, and `pcie_flr`. `{backing}` is not supported yet.\n\n`check` without `--target` still tells you whether the manifest is feasible."
         )
     )]
     NoTerminator { bundle: String, backing: String },
@@ -370,6 +375,8 @@ pub fn build(
     // Terminators come before the register map, which records FIFO depth
     // and width.
     let fifos = terminator::resolve(&dut, &loaded.manifest, &bindings, &contracts)?;
+    let traces =
+        terminator::resolve_traces(&dut, &loaded.manifest, &bindings, &contracts, &prefixes)?;
     let memories = terminator::resolve_memories(&dut, &loaded.manifest, &bindings, &contracts)?;
     let host_mems = terminator::resolve_host_mem(&dut, &loaded.manifest, &bindings, &contracts)?;
     let slaves = terminator::resolve_slaves(&dut, &loaded.manifest, &bindings, &contracts)?;
@@ -388,6 +395,7 @@ pub fn build(
         &loaded.manifest,
         &bindings,
         &fifos,
+        &traces,
         &memories,
         &host_mems,
         &slaves,
@@ -411,7 +419,9 @@ pub fn build(
                     &target,
                     transport,
                 )?;
-                feasibility::check_capacity(&target, &memories, &axi_mems, &host_mems, &fifos)?;
+                feasibility::check_capacity(
+                    &target, &memories, &axi_mems, &host_mems, &fifos, &traces,
+                )?;
                 verdict
             },
             target,
@@ -434,6 +444,7 @@ pub fn build(
         &bindings,
         &contracts,
         &fifos,
+        &traces,
         &memories,
         &host_mems,
         &slaves,
@@ -466,6 +477,7 @@ pub fn build(
         contracts,
         unconnected,
         fifos,
+        traces,
         memories,
         host_mems,
         slaves,
@@ -623,6 +635,7 @@ fn generatable(plan: &Plan) -> Result<(), PlanError> {
                 | Backing::Slave
                 | Backing::Dmi
                 | Backing::HostPollFifo
+                | Backing::Trace
                 | Backing::Bram
                 | Backing::BramPreload
                 | Backing::Dram

@@ -151,6 +151,29 @@ pub struct RegisterMap {
     /// does not see what the program stored. Not in the hash: it follows from
     /// the backing, which shapes the registers anyway.
     pub dut_read_only: Vec<String>,
+
+    /// The record layout of each `trace`, in bundle order. The host decodes
+    /// the ring with it. In the hash: the same bits mean other fields with
+    /// another layout.
+    pub traces: Vec<TraceLayout>,
+}
+
+/// How the bits of a trace record split into fields.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TraceLayout {
+    pub bundle: String,
+    /// `rvfi`, or none for plain fields.
+    pub format: Option<&'static str>,
+    pub record_bits: usize,
+    /// From the lowest bit up. The first is the cycle count.
+    pub fields: Vec<TraceFieldLayout>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct TraceFieldLayout {
+    pub name: String,
+    pub lsb: usize,
+    pub width: usize,
 }
 
 impl RegisterMap {
@@ -178,6 +201,8 @@ pub enum RegionKind {
     Dut,
     /// The DMI of a Debug Module in the DUT. Reads change state, as for `Dut`.
     Dmi,
+    /// The ring of a `trace`. Read only; reads change nothing.
+    Trace,
 }
 
 impl RegionKind {
@@ -186,6 +211,7 @@ impl RegionKind {
             RegionKind::Memory => "memory",
             RegionKind::Dut => "dut",
             RegionKind::Dmi => "dmi",
+            RegionKind::Trace => "trace",
         }
     }
 }
@@ -485,6 +511,7 @@ pub fn build(
     bindings: &[Binding],
     contracts: &[crate::contract::BundleContract],
     fifos: &[crate::terminator::FifoPlan],
+    traces: &[crate::terminator::TracePlan],
     memories: &[crate::terminator::MemPlan],
     host_mems: &[crate::terminator::HostMemPlan],
     slaves: &[crate::terminator::SlavePlan],
@@ -572,6 +599,16 @@ pub fn build(
             )
             .held(apb.reset.is_none()),
         );
+    }
+    // Last, so that adding a trace moves no other region.
+    for trace in traces {
+        wanted.push(Wanted::new(
+            &trace.bundle,
+            RegionKind::Trace,
+            trace.entry_words() * (WORD_BITS / 8),
+            u64::from(trace.depth),
+            None,
+        ));
     }
     let regions = place_regions(manifest, wanted)?;
     let mut offset = regions
@@ -739,6 +776,42 @@ pub fn build(
                 invert: false,
                 role: "level",
             }),
+        ));
+    }
+
+    // Trace control and status. The ring itself is a region.
+    for trace in traces {
+        let mut place = |name: &str, width: usize, access: Access, role, value| {
+            let register = Register {
+                name: format!("{}_{name}", trace.bundle),
+                kind: Kind::Terminator,
+                offset,
+                words: 1,
+                width,
+                access,
+                bundle: Some(trace.bundle.clone()),
+                value,
+                self_clearing: None,
+                role: Some(role),
+            };
+            offset += WORD_BITS / 8;
+            register
+        };
+        // 1 records; a write of 1 after 0 starts over.
+        registers.push(place("run", 1, Access::ReadWrite, "run", None));
+        // 1 holds the recording without starting over. A debugger sets it
+        // while a CPU is halted, so its own instructions stay out.
+        registers.push(place("pause", 1, Access::ReadWrite, "pause", None));
+        // Records written since the start. It wraps at 2^32, so `wrapped`
+        // tells a full ring.
+        registers.push(place("count", WORD_BITS, Access::ReadOnly, "count", None));
+        registers.push(place("wrapped", 1, Access::ReadOnly, "wrapped", None));
+        registers.push(place(
+            "depth",
+            WORD_BITS,
+            Access::ReadOnly,
+            "depth",
+            Some(trace.depth),
         ));
     }
 
@@ -1195,7 +1268,26 @@ pub fn build(
         .filter(|(_, base)| *base != 0)
         .collect();
     dut_bases.sort();
-    let map_hash = hash(&registers, &regions, &dut_bases);
+    let traces: Vec<TraceLayout> = traces
+        .iter()
+        .map(|trace| TraceLayout {
+            bundle: trace.bundle.clone(),
+            format: trace.format.map(|format| format.as_str()),
+            record_bits: trace.record_width(),
+            fields: std::iter::once(TraceFieldLayout {
+                name: crate::terminator::TRACE_CYCLE.to_string(),
+                lsb: 0,
+                width: crate::terminator::TRACE_CYCLE_BITS,
+            })
+            .chain(trace.fields.iter().map(|field| TraceFieldLayout {
+                name: field.name.clone(),
+                lsb: field.lsb,
+                width: field.width,
+            }))
+            .collect(),
+        })
+        .collect();
+    let map_hash = hash(&registers, &regions, &dut_bases, &traces);
     if let Some(register) = registers
         .iter_mut()
         .find(|register| register.name == MAP_HASH_NAME)
@@ -1215,6 +1307,7 @@ pub fn build(
             .filter(|mem| mem.read_only)
             .map(|mem| mem.bundle.clone())
             .collect(),
+        traces,
     })
 }
 
@@ -1412,14 +1505,20 @@ fn direction_of(dut: &Dut, name: &str) -> Option<PortDirection> {
 /// The input is `name|kind|offset|width|words|access|clear` for each register
 /// (`clear` is the other side of self-clearing, or `-`), then
 /// `region|bundle|kind|base|size|entry|total` for each region, then
-/// `dut_base|bundle|base` for each memory with a `dut_base`, joined with
-/// `\n`. `value` is not included: the hash is itself a value, so it would
+/// `dut_base|bundle|base` for each memory with a `dut_base`, then
+/// `trace|bundle|format|name:lsb:width,...` for each trace (`format` is `-`
+/// without one), joined with `\n`. `value` is not included: the hash is itself a value, so it would
 /// refer to itself.
 ///
 /// Regions are in it because `window_base` can move one without moving any register.
-/// A map without `dut_base` hashes as it did before `dut_base` existed.
-pub fn hash(registers: &[Register], regions: &[Region], dut_bases: &[(String, u64)]) -> u32 {
-    let canonical = canonical_text(registers, regions, dut_bases);
+/// A map without `dut_base` or a trace hashes as it did before they existed.
+pub fn hash(
+    registers: &[Register],
+    regions: &[Region],
+    dut_bases: &[(String, u64)],
+    traces: &[TraceLayout],
+) -> u32 {
+    let canonical = canonical_text(registers, regions, dut_bases, traces);
 
     let mut hash: u32 = 0x811c_9dc5;
     for byte in canonical.as_bytes() {
@@ -1435,6 +1534,7 @@ pub fn canonical_text(
     registers: &[Register],
     regions: &[Region],
     dut_bases: &[(String, u64)],
+    traces: &[TraceLayout],
 ) -> String {
     let regions = regions.iter().map(|region| {
         format!(
@@ -1470,6 +1570,19 @@ pub fn canonical_text(
                 .iter()
                 .map(|(bundle, base)| format!("dut_base|{bundle}|{base}")),
         )
+        .chain(traces.iter().map(|trace| {
+            format!(
+                "trace|{}|{}|{}",
+                trace.bundle,
+                trace.format.unwrap_or("-"),
+                trace
+                    .fields
+                    .iter()
+                    .map(|field| format!("{}:{}:{}", field.name, field.lsb, field.width))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1500,6 +1613,7 @@ mod tests {
                 &dut,
                 manifest,
                 &bindings,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -1588,6 +1702,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1645,6 +1760,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1664,6 +1780,7 @@ mod tests {
             &dut,
             &manifest(CSR),
             &[binding("csr", &["i_en"])],
+            &[],
             &[],
             &[],
             &[],
@@ -1701,6 +1818,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1729,6 +1847,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1744,6 +1863,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1751,6 +1871,7 @@ mod tests {
             &b,
             &manifest(CSR),
             &[binding("csr", &["i_csr_addr"])],
+            &[],
             &[],
             &[],
             &[],
@@ -1790,13 +1911,14 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
 
         // User ports first, header last. The window covers 4 (port) + 8 (DUT
         // reset) + 12 (header), so it is 32 bytes: magic at 24, hash at 28.
-        let text = canonical_text(&map.registers, &map.regions, &map.dut_bases);
+        let text = canonical_text(&map.registers, &map.regions, &map.dut_bases, &map.traces);
         assert!(text.starts_with("i_csr_addr|port|0|32|1|rw|-\n"), "{text}");
         assert!(
             text.ends_with("harness_map_hash|header|28|32|1|ro|-"),
@@ -1811,6 +1933,7 @@ mod tests {
             &dut,
             &manifest(CSR),
             &[binding("csr", &[MAGIC_NAME])],
+            &[],
             &[],
             &[],
             &[],
@@ -1841,6 +1964,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap_err();
@@ -1861,6 +1985,7 @@ mod tests {
             &dut,
             &manifest(CSR),
             &[binding("csr", &["i_x"])],
+            &[],
             &[],
             &[],
             &[],
@@ -1921,6 +2046,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1962,6 +2088,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -1985,6 +2112,7 @@ mod tests {
             &dut,
             &manifest(CSR),
             &bindings,
+            &[],
             &[],
             &[],
             &[],
@@ -2026,6 +2154,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -2060,6 +2189,7 @@ mod tests {
                 &dut,
                 &manifest(CSR),
                 &bindings,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -2163,6 +2293,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 &slaves,
                 &[],
                 &[],
@@ -2228,6 +2359,7 @@ mod tests {
             &dut,
             &manifest(&format!("{CSR}window_base = 0\n")),
             &[binding("csr", &["i_csr_addr"])],
+            &[],
             &[],
             &[],
             &[],

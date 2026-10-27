@@ -588,6 +588,145 @@ fn a_valid_only_stream_gets_a_drop_counter() {
     harness::dut::analyze(&mut metadata).expect("the generated harness must compile");
 }
 
+/// A DUT with an RVFI port, for `trace`. `o_rvfi_rd_wdata` is narrower than
+/// RVFI allows.
+fn trace_fixture(harness_toml: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("Veryl.toml"), veryl_toml()).unwrap();
+    fs::write(dir.path().join("Harness.toml"), harness_toml).unwrap();
+    fs::create_dir(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src").join("fixture.veryl"),
+        r#"
+module dut_top (
+    i_clk          : input  clock    ,
+    i_rst          : input  reset    ,
+    i_run          : input  logic    ,
+    o_rvfi_valid   : output logic    ,
+    o_rvfi_pc_rdata: output logic<32>,
+    o_rvfi_insn    : output logic<32>,
+    o_rvfi_mode    : output logic<2> ,
+    o_rvfi_rd_wdata: output logic<16>,
+) {
+    var pc: logic<32>;
+    always_ff {
+        if_reset {
+            pc = 0;
+        } else if i_run {
+            pc = pc + 4;
+        }
+    }
+    assign o_rvfi_valid    = i_run;
+    assign o_rvfi_pc_rdata = pc;
+    assign o_rvfi_insn     = 32'h0000_0013;
+    assign o_rvfi_mode     = 2'd3;
+    assign o_rvfi_rd_wdata = pc[15:0];
+}
+"#,
+    )
+    .unwrap();
+    dir
+}
+
+const TRACE_HEAD: &str = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.run]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"i_run\"]\n\n";
+
+/// `trace`: a ring, its registers, and the record layout in regs.json.
+#[test]
+fn a_trace_becomes_a_ring_with_its_record_layout() {
+    let dir = trace_fixture(&format!(
+        "{TRACE_HEAD}[leave_open]\nports = [\"o_rvfi_rd_wdata\"]\n\n[bundle.rvfi]\nbacking = \"trace\"\nformat = \"rvfi\"\ndepth = 512\nports = [\"o_rvfi_valid\", \"o_rvfi_pc_rdata\", \"o_rvfi_insn\", \"o_rvfi_mode\"]\n"
+    ));
+    let output = run_gen(&dir, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let text = fs::read_to_string(dir.path().join("hns/regs.json")).unwrap();
+    let map: hns_regs::RegisterMap = hns_regs::RegisterMap::from_json(&text).unwrap();
+    let trace = &map.traces[0];
+    assert_eq!(trace.name, "rvfi");
+    assert_eq!(trace.format.as_deref(), Some("rvfi"));
+    let fields: Vec<(&str, usize, usize)> = trace
+        .fields
+        .iter()
+        .map(|f| (f.name.as_str(), f.lsb, f.width))
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            ("cycle", 0, 32),
+            ("pc_rdata", 32, 32),
+            ("insn", 64, 32),
+            ("mode", 96, 2)
+        ]
+    );
+    assert_eq!(trace.record_bits, 98);
+    // 4 words of record take 4 in the window.
+    let region = map.region("rvfi").unwrap();
+    assert_eq!(region.kind.as_deref(), Some("trace"));
+    assert_eq!((region.entry_bytes, region.depth), (16, 512));
+    for (name, role) in [
+        ("rvfi_run", "run"),
+        ("rvfi_pause", "pause"),
+        ("rvfi_count", "count"),
+        ("rvfi_wrapped", "wrapped"),
+        ("rvfi_depth", "depth"),
+    ] {
+        assert_eq!(map.get(name).unwrap().role.as_deref(), Some(role), "{name}");
+    }
+
+    let top = tight(&fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap());
+    assert!(top.contains("inst u_trace_rvfi: hns::trace #("), "{top}");
+    assert!(top.contains("WIDTH: 66 ,"), "{top}");
+    assert!(
+        top.contains("i_data : {w_o_rvfi_mode, w_o_rvfi_insn, w_o_rvfi_pc_rdata},"),
+        "{top}"
+    );
+
+    let mut metadata = veryl_metadata::Metadata::load(dir.path().join("Veryl.toml")).unwrap();
+    harness::dut::analyze(&mut metadata).expect("the generated harness must compile");
+}
+
+/// An RVFI trace names the port that does not fit, and a trace says how deep
+/// it is.
+#[test]
+fn a_trace_names_what_does_not_fit() {
+    let cases = [
+        (
+            "[bundle.rvfi]\nbacking = \"trace\"\nformat = \"rvfi\"\ndepth = 64\n",
+            "harness::terminator::rvfi_width",
+            "o_rvfi_rd_wdata",
+        ),
+        (
+            "[leave_open]\nports = [\"o_rvfi_insn\"]\n\n[bundle.rvfi]\nbacking = \"trace\"\nformat = \"rvfi\"\ndepth = 64\nports = [\"o_rvfi_valid\", \"o_rvfi_pc_rdata\", \"o_rvfi_mode\", \"o_rvfi_rd_wdata\"]\n",
+            "harness::terminator::rvfi_missing",
+            "insn",
+        ),
+        (
+            "[bundle.rvfi]\nbacking = \"trace\"\n",
+            "harness::terminator::trace_depth_missing",
+            "depth = 1024",
+        ),
+        (
+            "[bundle.rvfi]\nbacking = \"host_poll_fifo\"\nformat = \"rvfi\"\nports = [\"o_rvfi_valid\", \"o_rvfi_pc_rdata\"]\n\n[leave_open]\nports = [\"o_rvfi_insn\", \"o_rvfi_mode\", \"o_rvfi_rd_wdata\"]\n",
+            "harness::terminator::key_not_applicable",
+            "format",
+        ),
+    ];
+    for (bundles, code, said) in cases {
+        let dir = trace_fixture(&format!("{TRACE_HEAD}{bundles}"));
+        let output = run_gen(&dir, &["--json"]);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{value}");
+        assert_eq!(value["error"]["code"], code, "{value}");
+        let text = format!("{} {}", value["error"]["message"], value["error"]["help"]);
+        assert!(text.contains(said), "{code}: {text}");
+    }
+}
+
 /// The other direction (host to DUT) is not built. gen must not silently
 /// generate something else.
 #[test]
@@ -1951,6 +2090,31 @@ module dut_top (
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("led0"), "{stderr}");
     assert!(stderr.contains("uart_tx"), "{stderr}");
+    assert!(
+        !dir.path().join("hns").exists(),
+        "nothing should be written"
+    );
+}
+
+/// On a board whose USB-UART the FPGA cannot drive, `[heartbeat]` is refused
+/// with the fix: remove it, not name the same pin again.
+#[test]
+fn a_heartbeat_on_a_board_without_output_pins_says_to_remove_it() {
+    let dir = fixture(
+        &veryl_toml(),
+        "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 100\n\n\
+         [heartbeat]\npin = \"uart_tx\"\n\n\
+         [bundle.csr]\ncontract = \"fixed_latency\"\nlatency = 1\nbacking = \"reg\"\n",
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+        .args(["gen", "--target", "digilent/pynq-z1"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no_output_pin"), "{stderr}");
+    assert!(stderr.contains("Remove [heartbeat]"), "{stderr}");
     assert!(
         !dir.path().join("hns").exists(),
         "nothing should be written"

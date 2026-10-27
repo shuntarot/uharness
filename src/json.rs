@@ -561,6 +561,11 @@ pub struct RegisterMapOutput {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dut_read_only: Vec<String>,
 
+    /// The record layout of each trace ring. The host decodes the ring with
+    /// it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub traces: Vec<TraceOutput>,
+
     /// Only for a PCIe design. The host needs it to find the card.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pcie: Option<PcieOutput>,
@@ -627,13 +632,32 @@ pub struct SelfClearingOutput {
     pub invert: bool,
 }
 
+/// How the bits of a trace record split into fields.
+#[derive(Debug, Serialize)]
+pub struct TraceOutput {
+    /// The bundle, and the name of its region.
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<&'static str>,
+    pub record_bits: usize,
+    /// From the lowest bit up; the first is `cycle`.
+    pub fields: Vec<TraceFieldOutput>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TraceFieldOutput {
+    pub name: String,
+    pub lsb: usize,
+    pub width: usize,
+}
+
 /// A contiguous range in the window. Addresses count from 0 inside it; the
 /// host adds `window_base`.
 #[derive(Debug, Serialize)]
 pub struct RegionOutput {
     pub name: String,
-    /// `memory` (harness storage; accesses are idempotent) or `dut` (a DUT
-    /// slave port).
+    /// `memory` (harness storage; accesses are idempotent), `dut` (a DUT
+    /// slave port), `dmi` (a Debug Module) or `trace` (a trace ring).
     pub kind: &'static str,
     pub window_base: usize,
     pub size_bytes: usize,
@@ -717,6 +741,24 @@ pub fn register_map(
             .collect(),
         dut_base: map.dut_bases.iter().cloned().collect(),
         dut_read_only: map.dut_read_only.clone(),
+        traces: map
+            .traces
+            .iter()
+            .map(|trace| TraceOutput {
+                name: trace.bundle.clone(),
+                format: trace.format,
+                record_bits: trace.record_bits,
+                fields: trace
+                    .fields
+                    .iter()
+                    .map(|field| TraceFieldOutput {
+                        name: field.name.clone(),
+                        lsb: field.lsb,
+                        width: field.width,
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 

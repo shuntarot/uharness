@@ -2100,6 +2100,37 @@ fn core_body(
         out.push_str(&format!("    var t_{}_pop: {domain}logic;\n", fifo.bundle));
     }
 
+    // trace wires: `w_<port>` on the DUT side, `t_<bundle>_*` on the host side.
+    for trace in &plan.traces {
+        let bundle = &trace.bundle;
+        out.push_str(&format!("    var w_{}: {domain}logic;\n", trace.valid));
+        for field in &trace.fields {
+            out.push_str(&format!(
+                "    var w_{}: {domain}{};\n",
+                field.port,
+                logic(field.width)
+            ));
+        }
+        out.push_str(&format!("    var t_{bundle}_run: {domain}logic;\n"));
+        out.push_str(&format!("    var t_{bundle}_pause: {domain}logic;\n"));
+        out.push_str(&format!(
+            "    var t_{bundle}_count: {domain}logic<{WORD_BITS}>;\n"
+        ));
+        out.push_str(&format!("    var t_{bundle}_wrapped: {domain}logic;\n"));
+        out.push_str(&format!(
+            "    var t_{bundle}_maddr: {domain}logic<{}>;\n",
+            trace.depth.trailing_zeros()
+        ));
+        out.push_str(&format!(
+            "    var t_{bundle}_hrdata: {domain}logic<{}>;\n",
+            trace.record_width()
+        ));
+        out.push_str(&format!(
+            "    var t_{bundle}_mrdata: {domain}logic<{}>;\n",
+            trace.entry_words() * WORD_BITS
+        ));
+    }
+
     // bram / bram_preload wires: `w_<port>` on the DUT side, `t_<bundle>_m*`
     // on the host side.
     for mem in &plan.memories {
@@ -2552,10 +2583,13 @@ fn core_body(
                 }
                 continue;
             }
-            out.push_str(&format!(
-                "    var t_{bundle}_mstrb: {domain}logic<{}>;\n",
-                region.entry_bytes
-            ));
+            // A trace ring is read only: nothing to strobe.
+            if region.kind != crate::regmap::RegionKind::Trace {
+                out.push_str(&format!(
+                    "    var t_{bundle}_mstrb: {domain}logic<{}>;\n",
+                    region.entry_bytes
+                ));
+            }
             if per_entry > 1 {
                 let bits = per_entry.trailing_zeros() as usize;
                 out.push_str(&format!(
@@ -2666,6 +2700,21 @@ fn core_body(
             // low bits select the word inside the entry.
             let per_entry = region.entry_bytes / word;
             let lo = shift + per_entry.trailing_zeros() as usize;
+
+            // A trace ring is read only. A write is accepted and dropped, so
+            // that the window does not hang on it.
+            if region.kind == crate::regmap::RegionKind::Trace {
+                out.push_str(&format!(
+                    "    assign t_{bundle}_maddr = bus_addr[{entry_hi}:{lo}];\n"
+                ));
+                if per_entry > 1 {
+                    out.push_str(&format!(
+                        "    assign t_{bundle}_mword = bus_addr[{}:{shift}];\n",
+                        lo - 1
+                    ));
+                }
+                continue;
+            }
             let strb_w = region.entry_bytes;
 
             // Reuse the wires of the indirect port. The memory does not care
@@ -3129,6 +3178,51 @@ fn core_body(
                 format!("t_{bundle}_ready")
             };
             out.push_str(&format!("    assign w_{} = {expr};\n\n", ready.port));
+        }
+    }
+
+    // trace terminators. The payload goes in above the cycle count, the first
+    // field lowest.
+    for trace in &plan.traces {
+        let bundle = &trace.bundle;
+        out.push_str(&format!("    inst u_trace_{bundle}: hns::trace #(\n"));
+        out.push_str(&format!("        WIDTH: {},\n", trace.payload_width()));
+        out.push_str(&format!("        DEPTH: {},\n", trace.depth));
+        out.push_str("    ) (\n");
+        out.push_str(&format!("        i_clk: {clk},\n"));
+        out.push_str(&format!("        i_rst: {rst},\n"));
+        out.push_str(&format!("        i_run: t_{bundle}_run,\n"));
+        out.push_str(&format!("        i_pause: t_{bundle}_pause,\n"));
+        let valid = if trace.valid_invert {
+            format!("~w_{}", trace.valid)
+        } else {
+            format!("w_{}", trace.valid)
+        };
+        out.push_str(&format!("        i_valid: {valid},\n"));
+        let data = trace
+            .fields
+            .iter()
+            .rev()
+            .map(|field| format!("w_{}", field.port))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("        i_data: {{{data}}},\n"));
+        out.push_str(&format!("        o_count: t_{bundle}_count,\n"));
+        out.push_str(&format!("        o_wrapped: t_{bundle}_wrapped,\n"));
+        out.push_str(&format!("        i_haddr: t_{bundle}_maddr,\n"));
+        out.push_str(&format!("        o_hrdata: t_{bundle}_hrdata,\n"));
+        out.push_str("    );\n");
+        // The window reads whole entries of a power of two of words; the
+        // words above the record read as 0.
+        let pad = trace.entry_words() * WORD_BITS - trace.record_width();
+        if pad == 0 {
+            out.push_str(&format!(
+                "    assign t_{bundle}_mrdata = t_{bundle}_hrdata;\n\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "    assign t_{bundle}_mrdata = {{{pad}'h0, t_{bundle}_hrdata}};\n\n"
+            ));
         }
     }
 
@@ -6675,6 +6769,9 @@ pub fn regs_md(plan: &Plan) -> String {
                         "Debug Module (DMI); one word per register, `hio cpu`".to_string()
                     }
                     crate::regmap::RegionKind::Memory => format!("`{}`", declared.backing),
+                    crate::regmap::RegionKind::Trace => {
+                        "trace ring, read only; `hio trace`".to_string()
+                    }
                 });
                 if region.is_aperture() {
                     notes.push(format!(
@@ -6804,6 +6901,18 @@ fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
             "the DUT's interrupt line now; each change is sent to the host as Assert_INTA or Deassert_INTA".to_string(),
         ),
         Some("depth") => notes.push("entries the terminator holds".to_string()),
+        Some("run") => notes.push(
+            "1 records into the ring; writing 1 after 0 starts over from an empty ring".to_string(),
+        ),
+        Some("pause") => notes.push(
+            "1 holds the recording without starting over; `hio cpu` sets it while the hart is halted".to_string(),
+        ),
+        Some("count") => notes.push(format!(
+            "records written since the start; wraps at 2^32, so `{bundle}_wrapped` tells a full ring"
+        )),
+        Some("wrapped") => notes.push(
+            "1 once the ring is full: the oldest records are being overwritten".to_string(),
+        ),
         Some("drops") => notes.push(
             "beats lost because the FIFO was full; saturates instead of wrapping".to_string(),
         ),

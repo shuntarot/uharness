@@ -174,6 +174,10 @@ fn checked_always() -> Vec<Item> {
             "every host_poll_fifo bundle is a stream from the DUT with a power-of-two depth, and counts drops when it cannot stall the DUT",
         ),
         Item::new(
+            "trace_terminator",
+            "every trace bundle records DUT outputs marked by one valid, with a power-of-two depth that fits the target's BRAM, and an rvfi trace has RVFI names and widths",
+        ),
+        Item::new(
             "host_mem_port",
             "every bundle with transfer-level roles names the whole read port (rd_cmd_* and rd_*)",
         ),
@@ -472,7 +476,17 @@ fn print_bundles(plan: &crate::plan::Plan) {
         // The other terminators. Defaults are marked, as for FIFOs and
         // memories.
         let defaulted = |declared: bool| if declared { "" } else { " (defaulted)" };
-        let other = if let Some(mem) = plan.host_mems.iter().find(|m| m.bundle == binding.bundle) {
+        let other = if let Some(trace) = plan.traces.iter().find(|t| t.bundle == binding.bundle) {
+            format!(
+                " depth={} record={} bits{}",
+                trace.depth,
+                trace.record_width(),
+                match trace.format {
+                    Some(format) => format!(" format={}", format.as_str()),
+                    None => String::new(),
+                }
+            )
+        } else if let Some(mem) = plan.host_mems.iter().find(|m| m.bundle == binding.bundle) {
             let ports = match (&mem.read, &mem.write) {
                 (Some(_), Some(_)) => "read+write",
                 (Some(_), None) => "read",
@@ -801,6 +815,13 @@ fn print_summary(plan: &plan::Plan, emit_regs: Option<&Path>) {
             .find(|mem| mem.bundle == binding.bundle)
         {
             value += &format!(", depth {}", size_str(mem.depth));
+        }
+        if let Some(trace) = plan.traces.iter().find(|t| t.bundle == binding.bundle) {
+            value += &format!(
+                ", depth {}, {}-bit records",
+                trace.depth,
+                trace.record_width()
+            );
         }
         let depth = plan
             .axi_mems

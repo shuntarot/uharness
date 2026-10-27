@@ -82,13 +82,14 @@ data lives (`backing`); the shape of the port is read from the DUT.**
 | `ports` | array, or a table of roles | matched by name |
 | `contract` | see below | **follows from the ports**; if written, it is checked |
 | `latency` | integer | required for a fixed-latency memory port, for `slave`, and wherever `contract = "fixed_latency"` is written; only for ports without a handshake |
-| `depth` | power of two | 256 for `host_poll_fifo`; for memory, from the address width; for `dram`, the whole memory |
+| `depth` | power of two | 256 for `host_poll_fifo`; for memory, from the address width; for `dram`, the whole memory; **required** for `trace` |
 | `addressing` | `"byte"` / `"word"` | fixed-latency memory port only; required when a word is wider than 8 bits |
 | `access` | `"indirect"` / `"region"` | fixed-latency memory port only; default `region` |
 | `aperture` | size, power of two | a region or an AXI4 port; default is the whole memory. Required for `dram` |
 | `window_base` | byte offset in the window | a region only (`region` memory, `dram`, `slave`); default is the first free place |
 | `dut_base` | byte address | a memory; the DUT address of its first byte, default 0. A multiple of 4 KB on AXI4 |
 | `reset` | port name | `dmi` only: the Debug Module's own reset port |
+| `format` | `"rvfi"` | `trace` only: the records are RVFI; names and widths are checked |
 
 A key the bundle's shape does not use is an error, not ignored.
 
@@ -103,6 +104,7 @@ Sizes accept a suffix: `4k`, `256M` (1024-based). `depth`, `aperture`,
 | `slave` | **inside the DUT**: it offers a RAM port, an APB slave or an AXI4 slave, the host drives it | works |
 | `dmi` | **inside the DUT**: a RISC-V Debug Module's DMI, an APB slave the host drives | works |
 | `host_poll_fifo` | a harness FIFO the host polls | works |
+| `trace` | a ring in FPGA memory that keeps the last records of a stream, such as an execution trace | works |
 | `bram` | FPGA memory | works |
 | `bram_preload` | FPGA memory the host fills and the DUT only reads | works |
 | `dram` | the board's DRAM | works |
@@ -125,7 +127,7 @@ means "check that this is what I think", and a mismatch is an error.
 | `apb` | — | **APB**: `psel` `penable` `pwrite` `paddr` `pwdata` `prdata` (`pready`, `pslverr`) — `slave` and `dmi` |
 
 A `valid_only` sink cannot be stalled, so the harness counts what it drops in
-`<bundle>_drops`.
+`<bundle>_drops`. A `trace` drops nothing: it overwrites its oldest record.
 
 Which combinations exist today, by the shapes above:
 
@@ -135,6 +137,7 @@ Which combinations exist today, by the shapes above:
 | `slave` | | ✅ | | | | ✅ | ✅ |
 | `dmi` | | | | | | | ✅ |
 | `host_poll_fifo` | | | ✅ | | ✅ | | |
+| `trace` | | | | | ✅ | | |
 | `bram` | | ✅ | | ✅ | | ✅ | |
 | `bram_preload` | | ✅ read only | | | | | |
 | `dram` | | | | ✅ | | ✅ | |
@@ -199,6 +202,22 @@ ports   = ["i_start", "i_addr", "o_busy", "o_done"]
 backing = "host_poll_fifo"
 depth   = 16
 ports   = { valid = "o_tx_valid", ready = "i_tx_ready", data = "o_tx_data" }
+```
+
+**An execution trace.** The ring keeps the last `depth` instructions. A
+record is the ports of the bundle, lowest first, above a cycle count the
+harness adds. With `format = "rvfi"` the names are checked against the
+RISC-V Formal Interface (`rvfi_valid`, `rvfi_pc_rdata`, `rvfi_insn`, ...), and
+`hio trace dump` prints instructions. Name only the ports you need: each bit
+costs `depth` bits of block RAM.
+
+```toml
+[bundle.rvfi]
+backing = "trace"
+format  = "rvfi"
+depth   = 1024
+ports   = ["o_rvfi_valid", "o_rvfi_pc_rdata", "o_rvfi_insn", "o_rvfi_mode",
+           "o_rvfi_rd_addr", "o_rvfi_rd_wdata", "o_rvfi_trap", "o_rvfi_intr"]
 ```
 
 **Memory the DUT reads and writes.**

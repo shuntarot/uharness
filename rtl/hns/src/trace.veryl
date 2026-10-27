@@ -1,0 +1,83 @@
+/// A ring of the records a DUT stream carries: an execution trace, for one.
+///
+/// While `i_run` is high, each beat writes one record into the next entry,
+/// and once the ring is full the oldest entry is overwritten. A record is the
+/// payload with the cycle count since the start below it. A rise of `i_run`
+/// starts over: the count, the cycle count and the write pointer return to 0.
+///
+/// While `i_pause` is high, beats are not recorded, but the cycle count goes
+/// on, so the gap shows when recording resumes. A debugger pauses it while a
+/// CPU is halted: the instructions it injects then are its own, not the
+/// program's.
+///
+/// The host reads the ring through port B, one cycle. `o_count` and
+/// `o_wrapped` tell it where the oldest record is. The stream is never
+/// stalled: a DUT that has no `ready` cannot wait, and the ring always has
+/// room.
+pub module trace #(
+    param WIDTH: u32 = 32  ,
+    param DEPTH: u32 = 1024,
+) (
+    i_clk    : input  clock               ,
+    i_rst    : input  reset               ,
+    i_run    : input  logic               ,
+    i_pause  : input  logic               ,
+    i_valid  : input  logic               ,
+    i_data   : input  logic<WIDTH>        ,
+    o_count  : output logic<32>           ,
+    o_wrapped: output logic               ,
+    i_haddr  : input  logic<$clog2(DEPTH)>,
+    o_hrdata : output logic<WIDTH + 32>   ,
+) {
+    const INDEX_W: u32 = $clog2(DEPTH);
+
+    var mem    : logic<WIDTH + 32> [DEPTH];
+    var running: logic                    ;
+    var cycle  : logic<32>                ;
+    var count  : logic<32>                ;
+    var wrapped: logic                    ;
+
+    let start: logic          = i_run & ~running;
+    let take : logic          = running & i_run & ~i_pause & i_valid;
+    let wp   : logic<INDEX_W> = count[INDEX_W - 1:0];
+
+    always_ff {
+        if_reset {
+            running = 0;
+            cycle   = 0;
+            count   = 0;
+            wrapped = 0;
+        } else {
+            running = i_run;
+            if start {
+                cycle   = 0;
+                count   = 0;
+                wrapped = 0;
+            } else if running {
+                cycle = cycle + 1;
+                if take {
+                    count = count + 1;
+                    // The count itself wraps at 2^32, so it cannot tell a
+                    // full ring from a short one.
+                    if wp == DEPTH - 1 {
+                        wrapped = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // The vendor's RAM template: a bare write under its enable and a bare
+    // read. Anything more and Vivado stops inferring a block RAM.
+    var hrdata: logic<WIDTH + 32>;
+    always_ff {
+        if take {
+            mem[wp] = {i_data, cycle};
+        }
+        hrdata = mem[i_haddr];
+    }
+
+    assign o_count   = count;
+    assign o_wrapped = wrapped;
+    assign o_hrdata  = hrdata;
+}
