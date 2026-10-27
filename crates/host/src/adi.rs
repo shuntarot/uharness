@@ -40,6 +40,19 @@ impl<C: Chan> Tap for Mpsse<C> {
     }
 }
 
+/// A borrowed TAP, so a probe held elsewhere can reach the DAP for a while.
+impl<T: Tap + ?Sized> Tap for &mut T {
+    type Error = T::Error;
+
+    fn ir(&mut self, ir: u32, len: u8) -> Result<u32, T::Error> {
+        (**self).ir(ir, len)
+    }
+
+    fn dr(&mut self, bits: &[bool]) -> Result<Vec<bool>, T::Error> {
+        (**self).dr(bits)
+    }
+}
+
 /// The DAP's IR length, the same on every ADIv5 JTAG-DP.
 pub const IR_LEN: u8 = 4;
 pub const IR_ABORT: u32 = 0b1000;

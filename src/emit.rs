@@ -5802,7 +5802,7 @@ pub fn cdc_instances(plan: &Plan) -> Vec<(String, f64, &'static str)> {
             "flag_sync_reg",
         ));
         // The requester streams cross between the same two clocks
-        // (`hns::tlp_cdc`). Inside is the same `hns::async_fifo` as in
+        // (`hns::tlp_cdc`). Inside is the same `std::async_fifo` as in
         // `hns::axi_cdc`, so the bound is the same.
         if !dma_registers(&plan.registers).is_empty() {
             out.push(("u_rq_cdc".to_string(), 1000.0 / fastest, "rg_reg"));
@@ -5929,7 +5929,7 @@ pub fn harness_xdc(
     // AXI4 CDCs (`hns::axi_cdc`). Only synchronizers the harness inserted
     // itself are relaxed.
     //
-    // Inside is `hns::async_fifo` (a copy of `std::async_fifo`). It passes
+    // Inside is `std::async_fifo`. It passes
     // Gray pointers from flops through 2FF synchronizers and reads the RAM
     // only when the read address is stable. Vivado does not know that and
     // fails timing on the crossing (measured on Arty: WNS -2.9 ns, all

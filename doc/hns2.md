@@ -47,6 +47,7 @@ HNS2 closes it without an answer.
 | `0x01` | `BATCH` | `flags: u8`, `count: u32`, then `count` ops |
 | `0x02` | `FINISH` | empty |
 | `0x03` | `PROGRAM` | `erase_wait_ms: u32`, `map_len: u32`, `map_len` bytes of regs.json, then the bitstream |
+| `0x04` | `FILE` | `name_len: u32`, `name_len` bytes of the name (UTF-8), then the contents |
 
 An op is 9 bytes: `op: u8`, `addr: u32`, `data: u32`.
 
@@ -70,8 +71,8 @@ no values, then stops. A board server answers `ERROR`.
 `PROGRAM` has the server program the board with the bitstream (a `.bit`
 file, up to 512 MB) and take the regs.json as its map. The server answers a
 new `INFO` once the window answers with that map's magic and map hash, or
-`ERROR`. `hio serve` over PCIe does it without the machine enumerating the
-card again:
+`ERROR`. `hio serve` over JTAG checks the bitstream's device as `hio program`
+does. Over PCIe it does it without the machine enumerating the card again:
 
 - It refuses a design that looks different from the bus (ID, class, BAR size,
   interrupt pin) before programming. The machine would have to enumerate the
@@ -81,6 +82,14 @@ card again:
 
 Other servers answer `ERROR`. While programming, `map_hash` in `INFO` is
 `null`; it stays `null` when the window does not answer with the map.
+
+`FILE` hands the server a file for the next `PROGRAM` on the same
+connection. The server names the files it uses in `program_files` in `INFO`;
+a client sends those it finds beside the bitstream, before `PROGRAM`. The
+server answers `READS` with no values, or `ERROR` for a name it did not ask
+for. `hio serve` over JTAG on a Zynq-7000 asks for `ps7_init.tcl` and sets the
+PS up from it after programming, as `hio program` does with the file beside
+the bitstream. A design that uses the PS's memory is refused without it.
 
 ### Server to client
 
@@ -114,6 +123,7 @@ whether to go on.
 | `master` | `"jtag"` or `"pcie"`: which master the window sees |
 | `map_hash` | the map hash of the `regs.json` the server uses, or `null` (changes with `PROGRAM`) |
 | `max_ops` | the most ops one `BATCH` may carry |
+| `program_files` | the file names `PROGRAM` uses from beside the bitstream (sent with `FILE`); left out when none |
 
 A client ignores keys it does not know. `master` matters for windows with a
 movable base: there is one base register per master.

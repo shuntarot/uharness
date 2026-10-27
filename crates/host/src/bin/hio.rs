@@ -141,9 +141,9 @@ struct Cli {
     /// Reach the window through a server, e.g. localhost:5555.
     ///
     /// The server is `hio serve` on the machine the board is on, or `veryl harness sim
-    /// --addr`. Use the same regs.json as the server. `program` sends the bitstream to a
-    /// PCIe server; the other commands that need the cable or the card's memory (probe,
-    /// DMA) run only on the server's machine.
+    /// --addr`. Use the same regs.json as the server. `program` sends the bitstream to the
+    /// server; the other commands that need the cable or the card's memory (probe, DMA)
+    /// run only on the server's machine.
     #[arg(
         long,
         value_name = "HOST:PORT",
@@ -542,12 +542,15 @@ enum DapCmd {
 }
 
 /// The DAP and the access port the `ps7` steps run through.
-struct DapMem<'a> {
-    dap: &'a mut DapLink,
+struct DapMem<'a, T: hns_host::adi::Tap> {
+    dap: &'a mut hns_host::adi::Dap<T>,
     ap: u8,
 }
 
-impl hns_host::ps7::Mem for DapMem<'_> {
+impl<T: hns_host::adi::Tap> hns_host::ps7::Mem for DapMem<'_, T>
+where
+    T::Error: std::fmt::Debug,
+{
     type Error = String;
     fn read32(&mut self, addr: u32) -> Result<u32, String> {
         self.dap.read32(self.ap, addr).map_err(|e| e.to_string())
@@ -1581,6 +1584,15 @@ type DapLink = hns_host::adi::Dap<Mpsse<Ftdi>>;
 /// Every other TAP, the FPGA included, gets BYPASS. Returns the DAP and the
 /// target's `mem_ap`.
 fn open_dap(cli: &Cli) -> Result<(DapLink, Option<u8>), String> {
+    let (cfg, mem_ap) = dap_probe(cli)?;
+    let m = Mpsse::attach(Ftdi::open(&cfg).map_err(|e| e.to_string())?, &cfg)
+        .map_err(|e| e.to_string())?;
+    Ok((hns_host::adi::Dap::new(m), mem_ap))
+}
+
+/// The probe settings with the scans padded for the DAP, and the access
+/// port of the system memory. Touches no probe.
+fn dap_probe(cli: &Cli) -> Result<(ProbeConfig, Option<u8>), String> {
     let jtag = load_target(cli)?;
     let Some(dap) = jtag.dap.clone() else {
         return Err(
@@ -1594,9 +1606,7 @@ fn open_dap(cli: &Cli) -> Result<(DapLink, Option<u8>), String> {
     let (tdo, tdi) = dap_sides(&jtag, &dap, cfg.ir_length)?;
     cfg.chain = hns_host::mpsse::Chain::new(&tdo, &tdi);
     cfg.ir_length = hns_host::adi::IR_LEN;
-    let m = Mpsse::attach(Ftdi::open(&cfg).map_err(|e| e.to_string())?, &cfg)
-        .map_err(|e| e.to_string())?;
-    Ok((hns_host::adi::Dap::new(m), dap.mem_ap))
+    Ok((cfg, dap.mem_ap))
 }
 
 /// The IR lengths of the other TAPs on each side of the DAP: (TDO side, TDI
@@ -1729,6 +1739,19 @@ fn dap_cmd(cli: &Cli, cmd: &DapCmd) -> Result<(), String> {
 fn ps7_init(dap: &mut DapLink, ap: u8, file: &std::path::Path, post: bool) -> Result<(), String> {
     let text = std::fs::read_to_string(file).map_err(|e| read_error(file, e))?;
     let init = hns_host::ps7::Ps7Init::parse(&text)?;
+    ps7_run(dap, ap, &init, post)
+}
+
+/// Runs the steps of a `ps7_init.tcl` through the DAP.
+fn ps7_run<T: hns_host::adi::Tap>(
+    dap: &mut hns_host::adi::Dap<T>,
+    ap: u8,
+    init: &hns_host::ps7::Ps7Init,
+    post: bool,
+) -> Result<(), String>
+where
+    T::Error: std::fmt::Debug,
+{
     let code = dap
         .read32(ap, hns_host::ps7::PS_VERSION_ADDR)
         .map_err(|e| e.to_string())?
@@ -1985,6 +2008,41 @@ fn configure(
     allow_any_device: bool,
     erase_wait: std::time::Duration,
 ) -> Result<(Mpsse<Ftdi>, ProbeConfig), String> {
+    let (ir, chunks) = config_plan(target, bit, allow_any_device)?;
+    let cfg = resolve_probe(cli)?;
+    let mut m = Mpsse::attach(Ftdi::open(&cfg).map_err(|e| e.to_string())?, &cfg)
+        .map_err(|e| e.to_string())?;
+    send_config(&mut m, &ir, cfg.ir_length, bit, &chunks, erase_wait)?;
+    Ok((m, cfg))
+}
+
+/// Sends the bitstream through a probe already set up.
+fn send_config(
+    m: &mut Mpsse<Ftdi>,
+    ir: &hns_host::config::ConfigIr,
+    ir_length: u8,
+    bit: &hns_host::bitstream::Bitstream,
+    chunks: &[hns_host::config::Chunk],
+    erase_wait: std::time::Duration,
+) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    hns_host::config::program(m, ir, ir_length, &bit.data, chunks, erase_wait)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "sent {} bytes in {:.2} s",
+        bit.data.len(),
+        start.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// Checks the bitstream's device against the target, and works out the IR
+/// values and which part of the bitstream goes where. Touches no probe.
+fn config_plan(
+    target: Option<&hns_targets::Target>,
+    bit: &hns_host::bitstream::Bitstream,
+    allow_any_device: bool,
+) -> Result<(hns_host::config::ConfigIr, Vec<hns_host::config::Chunk>), String> {
     // Check the device before writing. Without a target there is nothing to
     // compare with, so do not go on silently.
     match (target, allow_any_device) {
@@ -2040,20 +2098,7 @@ fn configure(
         }
     };
     let chunks = split(bit, &jtag)?;
-
-    let cfg = resolve_probe(cli)?;
-    let mut m = Mpsse::attach(Ftdi::open(&cfg).map_err(|e| e.to_string())?, &cfg)
-        .map_err(|e| e.to_string())?;
-
-    let start = std::time::Instant::now();
-    hns_host::config::program(&mut m, &ir, cfg.ir_length, &bit.data, &chunks, erase_wait)
-        .map_err(|e| e.to_string())?;
-    println!(
-        "sent {} bytes in {:.2} s",
-        bit.data.len(),
-        start.elapsed().as_secs_f64()
-    );
-    Ok((m, cfg))
+    Ok((ir, chunks))
 }
 
 /// `id`, given a moment to come back after the PS was set up.
@@ -2891,6 +2936,7 @@ fn serve(cli: &Cli, bus: &mut Bus, map: &RegisterMap, listen: &str) -> Result<()
         master: bus.master().to_string(),
         map_hash: Some(map.map_hash),
         max_ops: hns2::MAX_OPS,
+        program_files: program_files(bus, resolve_target(cli)?.as_ref()),
     };
     // Saved while the card answers, to be written back after programming.
     let saved = match &*bus {
@@ -2922,6 +2968,18 @@ fn serve(cli: &Cli, bus: &mut Bus, map: &RegisterMap, listen: &str) -> Result<()
     hns2::serve(listener, &mut window, |line| println!("hio: {line}")).map_err(|e| e.to_string())
 }
 
+/// The name of a Zynq-7000's PS setup, beside the bitstream.
+const PS7_INIT_FILE: &str = "ps7_init.tcl";
+
+/// The files `hio serve` asks for with a bitstream: those `hio program`
+/// reads from beside it on this board.
+fn program_files(bus: &Bus, target: Option<&hns_targets::Target>) -> Vec<String> {
+    match bus {
+        Bus::Jtag(_) if uses_ps7(target) => vec![PS7_INIT_FILE.to_string()],
+        _ => Vec::new(),
+    }
+}
+
 /// What `hio serve` serves: the window, and programming the board under it.
 struct BoardWindow<'a> {
     cli: &'a Cli,
@@ -2951,26 +3009,12 @@ impl hns_host::hns2::Window for BoardWindow<'_> {
 }
 
 impl BoardWindow<'_> {
-    /// Programs over JTAG while the machine keeps the card, then writes the
-    /// card's config space back, so the window answers at the same address.
-    ///
-    /// A design that looks different from the bus is refused before anything
-    /// is programmed: the machine would have to enumerate the card again.
+    /// Programs the board and takes the map sent with the bitstream, once the
+    /// window answers with it.
     fn reprogram(
         &mut self,
         request: &hns_host::hns2::Program,
     ) -> Result<hns_host::hns2::Info, String> {
-        use hns_host::reprogram::{self, Shape};
-
-        let Bus::Pcie(bar) = &*self.bus else {
-            return Err(
-                "this server reaches the window over JTAG, and programming through \
-                 `hio serve` works over PCIe only so far.\n\
-                 Run `hio program` on the machine the board is on."
-                    .to_string(),
-            );
-        };
-        let bdf = bar.info().bdf.clone();
         let next = std::str::from_utf8(request.map)
             .map_err(|_| "the regs.json sent is not UTF-8".to_string())
             .and_then(|text| {
@@ -2985,6 +3029,138 @@ impl BoardWindow<'_> {
                 self.map.target.as_deref().unwrap_or("no named target"),
             ));
         }
+        let bit = hns_host::bitstream::parse(request.bitstream).map_err(|e| e.to_string())?;
+        let target = resolve_target(self.cli)?;
+        let erase_wait = std::time::Duration::from_millis(u64::from(request.erase_wait_ms));
+        match &*self.bus {
+            Bus::Pcie(_) => self.reprogram_pcie(&next, target.as_ref(), &bit, erase_wait)?,
+            Bus::Jtag(_) => self.reprogram_jtag(
+                &next,
+                target.as_ref(),
+                &bit,
+                erase_wait,
+                request.file(PS7_INIT_FILE),
+            )?,
+            Bus::Net(_) => unreachable!("`hio serve` opens a board, not a server"),
+        }
+        check_identity_settled(self.bus, &next)?;
+        self.map = next;
+        self.info.map_hash = Some(self.map.map_hash);
+        Ok(self.info.clone())
+    }
+
+    /// Programs through the probe the window already holds, then selects the
+    /// window again. The new design's window may be a different size, so the
+    /// DR length follows the new map.
+    ///
+    /// Nothing about the PCIe side is checked, as with `hio program`: whether
+    /// the machine also has the board as a card is the user's business.
+    ///
+    /// On a Zynq, the PS is set up from the `ps7_init.tcl` the client sent,
+    /// through the DAP on the same probe.
+    fn reprogram_jtag(
+        &mut self,
+        next: &RegisterMap,
+        target: Option<&hns_targets::Target>,
+        bit: &hns_host::bitstream::Bitstream,
+        erase_wait: std::time::Duration,
+        ps7_init: Option<&[u8]>,
+    ) -> Result<(), String> {
+        let ps7 = match ps7_init {
+            _ if !uses_ps7(target) => None,
+            Some(text) => {
+                let text = std::str::from_utf8(text)
+                    .map_err(|_| "the ps7_init.tcl sent is not UTF-8".to_string())?;
+                let init = hns_host::ps7::Ps7Init::parse(text)
+                    .map_err(|e| format!("the ps7_init.tcl sent: {e}"))?;
+                let (dap_cfg, mem_ap) = dap_probe(self.cli)?;
+                let Some(ap) = mem_ap else {
+                    return Err(
+                        "the PS must be set up, and the target's `dap` has no `mem_ap`.\n\
+                         Add the access port of the system memory (`hio dap info` lists them)."
+                            .to_string(),
+                    );
+                };
+                Some((init, dap_cfg.chain, ap))
+            }
+            None if next
+                .registers
+                .iter()
+                .any(|r| r.role.as_deref() == Some("calib")) =>
+            {
+                return Err(
+                    "the new design reaches the PS's memory, so the PS must be set up after \
+                     programming, and no ps7_init.tcl came with the bitstream. Nothing was \
+                     programmed.\n\
+                     `make` writes ps7_init.tcl beside the bitstream, and `hio --connect … \
+                     program` sends it from there."
+                        .to_string(),
+                );
+            }
+            None => None,
+        };
+        let (ir, chunks) = config_plan(target, bit, false)?;
+        let cfg = resolve_probe(self.cli)?;
+        let Bus::Jtag(bridge) = &mut *self.bus else {
+            unreachable!("called for a JTAG window")
+        };
+
+        // From here the board no longer runs the map the server had.
+        self.info.map_hash = None;
+        let m = bridge.io_mut();
+        // The gap is for window commands; configuration runs without it.
+        m.set_update_gap(0);
+        let mut cmds = Vec::new();
+        hns_host::mpsse::push_tap_reset(&mut cmds);
+        m.send(&cmds).map_err(|e| e.to_string())?;
+        send_config(m, &ir, cfg.ir_length, bit, &chunks, erase_wait)?;
+
+        // The DAP is on the same chain: pad the scans for it for a while.
+        if let Some((init, chain, ap)) = &ps7 {
+            let fpga = m.chain();
+            m.set_chain(*chain);
+            let done = (|| {
+                let mut cmds = Vec::new();
+                hns_host::mpsse::push_tap_reset(&mut cmds);
+                m.send(&cmds).map_err(|e| e.to_string())?;
+                let mut dap = hns_host::adi::Dap::new(&mut *m);
+                dap.power_up().map_err(|e| e.to_string())?;
+                println!("setting the PS up from the ps7_init.tcl sent");
+                ps7_run(&mut dap, *ap, init, true)
+            })();
+            m.set_chain(fpga);
+            done?;
+        }
+
+        // After configuration, reset the TAP, then select the USER slot again.
+        let mut cmds = Vec::new();
+        hns_host::mpsse::push_tap_reset(&mut cmds);
+        m.send(&cmds).map_err(|e| e.to_string())?;
+        m.scan_ir(cfg.user1_ir, cfg.ir_length)
+            .map_err(|e| e.to_string())?;
+        set_update_gap(self.cli, next, m);
+        bridge.set_addr_bits(next.addr_bits() as u32);
+        Ok(())
+    }
+
+    /// Programs over JTAG while the machine keeps the card, then writes the
+    /// card's config space back, so the window answers at the same address.
+    ///
+    /// A design that looks different from the bus is refused before anything
+    /// is programmed: the machine would have to enumerate the card again.
+    fn reprogram_pcie(
+        &mut self,
+        next: &RegisterMap,
+        target: Option<&hns_targets::Target>,
+        bit: &hns_host::bitstream::Bitstream,
+        erase_wait: std::time::Duration,
+    ) -> Result<(), String> {
+        use hns_host::reprogram::{self, Shape};
+
+        let Bus::Pcie(bar) = &*self.bus else {
+            unreachable!("called for a PCIe window")
+        };
+        let bdf = bar.info().bdf.clone();
         let Some(pcie) = &next.pcie else {
             return Err(
                 "the regs.json sent has no `pcie` section: that design has no PCIe \
@@ -2993,7 +3169,6 @@ impl BoardWindow<'_> {
                     .to_string(),
             );
         };
-        let bit = hns_host::bitstream::parse(request.bitstream).map_err(|e| e.to_string())?;
 
         let root = std::path::Path::new(hns_host::pcie::SYSFS);
         let card = hns_host::pcie::info_at(root, &bdf).map_err(|e| e.to_string())?;
@@ -3037,14 +3212,7 @@ impl BoardWindow<'_> {
 
         // From here the board no longer runs the map the server had.
         self.info.map_hash = None;
-        let target = resolve_target(self.cli)?;
-        let (m, _) = configure(
-            self.cli,
-            target.as_ref(),
-            &bit,
-            false,
-            std::time::Duration::from_millis(u64::from(request.erase_wait_ms)),
-        )?;
+        let (m, _) = configure(self.cli, target, bit, false, erase_wait)?;
         drop(m);
         reprogram::wait_for_card(
             root,
@@ -3054,11 +3222,7 @@ impl BoardWindow<'_> {
             std::time::Duration::from_secs(10),
         )?;
         reprogram::write_config(root, &bdf, &reprogram::restore_plan(&saved))
-            .map_err(|e| format!("cannot write the config space of {bdf} back: {e}"))?;
-        check_identity_settled(self.bus, &next)?;
-        self.map = next;
-        self.info.map_hash = Some(self.map.map_hash);
-        Ok(self.info.clone())
+            .map_err(|e| format!("cannot write the config space of {bdf} back: {e}"))
     }
 }
 
@@ -3105,6 +3269,24 @@ fn program_remote(cli: &Cli, file: &std::path::Path, erase_wait_ms: u64) -> Resu
             map.target.as_deref().unwrap_or("another board"),
         ));
     }
+    // The server names the files it uses from beside the bitstream (a
+    // Zynq's PS setup), and decides whether a missing one matters.
+    let beside = file.parent().unwrap_or(std::path::Path::new("."));
+    for name in link.info().program_files.clone() {
+        if !plain_file_name(&name) {
+            return Err(format!(
+                "the server at {addr} asks for a file named {name:?}, which is not a plain \
+                 file name. Nothing was sent."
+            ));
+        }
+        let path = beside.join(&name);
+        if path.is_file() {
+            let contents = std::fs::read(&path).map_err(|e| read_error(&path, e))?;
+            link.send_file(&name, &contents)
+                .map_err(|e| format!("the server at {addr} did not take {name}: {e}"))?;
+            println!("sent {}", path.display());
+        }
+    }
     let start = std::time::Instant::now();
     link.program(erase_wait_ms, &map_text, &bytes)
         .map_err(|e| e.to_string())?;
@@ -3114,6 +3296,14 @@ fn program_remote(cli: &Cli, file: &std::path::Path, erase_wait_ms: u64) -> Resu
         start.elapsed().as_secs_f64()
     );
     id(&mut Bus::Net(link), &map)
+}
+
+/// A name with no directory in it. A server names files for the client to
+/// send, and must not reach anything but the ones beside the bitstream.
+fn plain_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && std::path::Path::new(name).file_name() == Some(std::ffi::OsStr::new(name))
 }
 
 /// Sets the TCK gap between scans (`hns_host::mpsse::update_gap`).
@@ -9751,6 +9941,7 @@ mod tests {
             master: "pcie".to_string(),
             map_hash: Some(map.map_hash),
             max_ops: 16,
+            program_files: Vec::new(),
         };
         let addr = start(info.clone());
         let cli = Cli::parse_from(["hio", "--connect", &addr, "id"]);
@@ -9773,6 +9964,14 @@ mod tests {
         let cli = Cli::parse_from(["hio", "--connect", &sim, "id"]);
         let err = open_bus(&cli, "regs.json", &map).err().unwrap();
         assert!(err.contains("a simulation"), "{err}");
+    }
+
+    #[test]
+    fn a_server_names_only_files_beside_the_bitstream() {
+        assert!(plain_file_name("ps7_init.tcl"));
+        for name in ["", ".", "..", ".hidden", "../x", "a/b", "/etc/passwd"] {
+            assert!(!plain_file_name(name), "{name:?}");
+        }
     }
 
     #[test]

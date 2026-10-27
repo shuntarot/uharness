@@ -27,6 +27,7 @@ pub const GREETING: &[u8; 4] = b"HNS2";
 pub const BATCH: u8 = 0x01;
 pub const FINISH: u8 = 0x02;
 pub const PROGRAM: u8 = 0x03;
+pub const FILE: u8 = 0x04;
 pub const INFO: u8 = 0x80;
 pub const READS: u8 = 0x81;
 pub const ERROR: u8 = 0x82;
@@ -60,6 +61,10 @@ pub struct Info {
     pub master: String,
     pub map_hash: Option<u32>,
     pub max_ops: u32,
+    /// The files, beside the bitstream, that `PROGRAM` uses on this board
+    /// (a Zynq-7000's `ps7_init.tcl`). A client sends each with `FILE` first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub program_files: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -232,6 +237,38 @@ pub struct Program<'a> {
     /// The regs.json of the design, as its file holds it.
     pub map: &'a [u8],
     pub bitstream: &'a [u8],
+    /// The files sent with `FILE` before this request: name, contents.
+    pub files: Vec<(&'a str, &'a [u8])>,
+}
+
+impl Program<'_> {
+    /// A file sent with this request, by name.
+    pub fn file(&self, name: &str) -> Option<&[u8]> {
+        self.files.iter().find(|(n, _)| *n == name).map(|(_, f)| *f)
+    }
+}
+
+/// The body of `FILE`: the name, then the contents.
+pub fn encode_file(name: &str, contents: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + name.len() + contents.len());
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(contents);
+    out
+}
+
+pub fn decode_file(body: &[u8]) -> Result<(&str, &[u8]), String> {
+    let Some(len) = body.get(..4) else {
+        return Err("a FILE shorter than its header".to_string());
+    };
+    let len = u32::from_le_bytes(len.try_into().unwrap()) as usize;
+    let Some(name) = body.get(4..4 + len) else {
+        return Err(format!(
+            "a FILE whose name of {len} bytes runs past its end"
+        ));
+    };
+    let name = std::str::from_utf8(name).map_err(|_| "a FILE whose name is not UTF-8")?;
+    Ok((name, &body[4 + len..]))
 }
 
 pub fn decode_program(body: &[u8]) -> Result<Program<'_>, String> {
@@ -248,6 +285,7 @@ pub fn decode_program(body: &[u8]) -> Result<Program<'_>, String> {
         erase_wait_ms: u32::from_le_bytes(wait.try_into().unwrap()),
         map,
         bitstream: &body[8 + len..],
+        files: Vec::new(),
     })
 }
 
@@ -397,6 +435,13 @@ impl Link {
         let reads = self.run(&batch)?;
         out.copy_from_slice(reads.values());
         Ok(())
+    }
+
+    /// Hands the server a file for the next `program` on this connection.
+    /// The server names the ones it uses in `program_files`.
+    pub fn send_file(&mut self, name: &str, contents: &[u8]) -> Result<(), Error> {
+        send_message(&mut self.stream, FILE, &encode_file(name, contents))?;
+        self.reply(&[]).map(|_| ())
     }
 
     /// Has the server program the board, and take `map` as its map. The
@@ -558,6 +603,8 @@ fn serve_one(
     stream.set_read_timeout(None)?;
     stream.write_all(GREETING)?;
     send_message(stream, INFO, &info_body(&info))?;
+    // Kept for the next PROGRAM on this connection only.
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     loop {
         let max_of = |kind| match kind {
             PROGRAM => MAX_PROGRAM,
@@ -571,8 +618,31 @@ fn serve_one(
                 return Err(e);
             }
         };
+        if kind == FILE {
+            let taken = decode_file(&body).and_then(|(name, contents)| {
+                let wanted = window.info().program_files;
+                if !wanted.iter().any(|w| w == name) {
+                    return Err(format!(
+                        "this server does not use a file named {name:?} (it uses {wanted:?})"
+                    ));
+                }
+                files.retain(|(n, _)| n != name);
+                files.push((name.to_string(), contents.to_vec()));
+                Ok(())
+            });
+            match taken {
+                Ok(()) => send_message(stream, READS, &encode_reads(&[]))?,
+                Err(message) => send_message(stream, ERROR, &encode_error(NO_OP, 0, &message))?,
+            }
+            continue;
+        }
         if kind == PROGRAM {
-            let done = decode_program(&body).and_then(|request| {
+            let pending = std::mem::take(&mut files);
+            let done = decode_program(&body).and_then(|mut request| {
+                request.files = pending
+                    .iter()
+                    .map(|(n, f)| (n.as_str(), f.as_slice()))
+                    .collect();
                 log(&format!(
                     "programming {} bytes; batches wait",
                     request.bitstream.len()
@@ -748,6 +818,7 @@ mod tests {
             master: "jtag".to_string(),
             map_hash: Some(0x1234),
             max_ops: 2,
+            program_files: Vec::new(),
         }
     }
 
@@ -896,6 +967,7 @@ mod tests {
                 erase_wait_ms: 200,
                 map: b"{}",
                 bitstream: &[1, 2, 3],
+                files: Vec::new(),
             }
         );
         assert!(decode_program(&body[..9]).is_err());
@@ -904,6 +976,8 @@ mod tests {
     /// A board that takes the map hash from the first byte of the bitstream.
     struct Board {
         info: Info,
+        /// The `setup.tcl` each program request carried.
+        files: std::sync::Arc<std::sync::Mutex<Vec<Option<Vec<u8>>>>>,
     }
 
     impl Window for Board {
@@ -916,6 +990,10 @@ mod tests {
         }
 
         fn program(&mut self, request: &Program) -> Result<Info, String> {
+            self.files
+                .lock()
+                .unwrap()
+                .push(request.file("setup.tcl").map(<[u8]>::to_vec));
             match request.bitstream.first() {
                 Some(&hash) => {
                     self.info.map_hash = Some(u32::from(hash));
@@ -931,7 +1009,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
-            let mut board = Board { info: info() };
+            let mut board = Board {
+                info: info(),
+                files: Default::default(),
+            };
             serve(listener, &mut board, |_| {}).unwrap();
         });
         let mut link = Link::connect(&addr).unwrap();
@@ -945,6 +1026,55 @@ mod tests {
         drop(link);
         let link = Link::connect(&addr).unwrap();
         assert_eq!(link.info().map_hash, Some(0x42));
+    }
+
+    #[test]
+    fn a_file_request_carries_the_name_and_the_contents() {
+        let body = encode_file("setup.tcl", b"mwr");
+        assert_eq!(decode_file(&body).unwrap(), ("setup.tcl", &b"mwr"[..]));
+        assert!(decode_file(&body[..6]).is_err());
+    }
+
+    #[test]
+    fn a_file_goes_with_the_next_program_only() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen = std::sync::Arc::default();
+        let mut board = Board {
+            info: Info {
+                program_files: vec!["setup.tcl".to_string()],
+                ..info()
+            },
+            files: std::sync::Arc::clone(&seen),
+        };
+        std::thread::spawn(move || serve(listener, &mut board, |_| {}).unwrap());
+        let mut link = Link::connect(&addr).unwrap();
+        assert_eq!(link.info().program_files, ["setup.tcl"]);
+        // A name the server did not ask for is refused, and the connection
+        // stays usable.
+        let err = link.send_file("other.tcl", b"x").unwrap_err();
+        assert!(err.to_string().contains("other.tcl"), "{err}");
+        link.send_file("setup.tcl", b"first").unwrap();
+        link.program(200, b"{}", &[1]).unwrap();
+        link.program(200, b"{}", &[2]).unwrap();
+        // One sent and never used does not reach the next client.
+        link.send_file("setup.tcl", b"left over").unwrap();
+        drop(link);
+        let mut link = Link::connect(&addr).unwrap();
+        link.program(200, b"{}", &[3]).unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some(b"first".to_vec()), None, None]
+        );
+    }
+
+    #[test]
+    fn an_info_without_program_files_is_read() {
+        let info: Info = serde_json::from_str(
+            r#"{"server":"s","kind":"sim","target":null,"master":"jtag","map_hash":null,"max_ops":1}"#,
+        )
+        .unwrap();
+        assert!(info.program_files.is_empty());
     }
 
     #[test]

@@ -270,6 +270,18 @@ impl<J: JtagIo> Bridge<J> {
         &self.io
     }
 
+    /// The underlying transport, for scans that are not window commands
+    /// (programming the device through the probe the bridge holds).
+    pub fn io_mut(&mut self) -> &mut J {
+        &mut self.io
+    }
+
+    /// Changes the address width, for a new design whose window is a
+    /// different size. The DR length follows it.
+    pub fn set_addr_bits(&mut self, aw: u32) {
+        self.aw = aw;
+    }
+
     /// Write consecutive words.
     pub fn write_burst(&mut self, addr: u32, data: &[u32]) -> Result<(), Error<J::Error>> {
         let mut b = Batch::new();

@@ -177,18 +177,23 @@ hio --regs regs.json --connect localhost:5555 id
   `dma-fire`) run on the server's machine.
 - A simulation is served the same way: `veryl harness sim --addr`.
 
-Over PCIe, the server also programs the board, so you can change the design
-without a reboot:
+The server also programs the board, so you can change the design without
+going to its machine:
 
 ```bash
-sudo "$(command -v hio)" -p --serial <probe> serve --listen 127.0.0.1:5555   # once, on the board's machine
+hio --serial <probe> serve --listen 127.0.0.1:5555                       # once, on the board's machine
 hio --connect localhost:5555 program                                     # elsewhere, from the project
 ```
 
-`program` sends the `.bit` and its `regs.json`. The server programs over JTAG,
-writes the card's PCI config space back, and serves the new map. It refuses a
-design whose ID, class, BAR size or interrupt pin differs from the card's: the
-machine would have to find the card again (remove and rescan, or reboot).
+`program` sends the `.bit` and its `regs.json`, and the files the server asks
+for from beside the `.bit` (a Zynq's `ps7_init.tcl`). The server checks the device name as `hio program`
+does, programs over JTAG, sets a Zynq's PS up, and serves the new map.
+
+Over PCIe (`sudo "$(command -v hio)" -p --serial <probe> serve`), you can
+change the design without a reboot. The server writes the card's PCI config
+space back after programming. It refuses a design whose ID, class, BAR size or
+interrupt pin differs from the card's: the machine would have to find the card
+again (remove and rescan, or reboot).
 
 ## `hio reset`
 

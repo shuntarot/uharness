@@ -569,6 +569,12 @@ impl<C: Chan> Mpsse<C> {
         self.chain
     }
 
+    /// Pads the scans for another TAP on the same chain (the ARM DAP of a
+    /// Zynq instead of the FPGA), without opening the probe again.
+    pub fn set_chain(&mut self, chain: Chain) {
+        self.chain = chain;
+    }
+
     /// Set up MPSSE and put the TAP in Run-Test/Idle. No IR is selected.
     ///
     /// Use this to find out what is connected: IDCODE reads work without
