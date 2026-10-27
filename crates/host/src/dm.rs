@@ -18,6 +18,16 @@ use std::fmt;
 /// in order, and the result holds one value per read.
 pub trait Dmi {
     fn run(&mut self, ops: &[Op]) -> Result<Vec<u32>, String>;
+
+    /// Told just before the hart is let run (`true`), and just after it is
+    /// seen halted, before anything runs on it for the debugger (`false`).
+    ///
+    /// A trace of the retired instructions pauses in between. A debugger
+    /// reads registers by running instructions on the halted hart, and those
+    /// would push the program's own out of the ring.
+    fn hart_runs(&mut self, _runs: bool) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// One DMI access. The address is the DMI register number, not a byte offset.
@@ -537,6 +547,9 @@ impl<D: Dmi> Debug<D> {
         let abstractcs = dm.read(reg::ABSTRACTCS)?;
         dm.progbuf_size = (abstractcs >> 24) & 0x1f;
         dm.impebreak = status & IMPEBREAK != 0;
+        if all_halted(status) {
+            dm.dmi.hart_runs(false)?;
+        }
         Ok(dm)
     }
 
@@ -639,6 +652,7 @@ impl<D: Dmi> Debug<D> {
         let waited = self.wait("the hart to halt", |dm| dm.is_halted());
         self.write(reg::DMCONTROL, self.control(0))?;
         waited?;
+        self.dmi.hart_runs(false)?;
         self.catch_ebreak()
     }
 
@@ -664,6 +678,7 @@ impl<D: Dmi> Debug<D> {
     }
 
     fn run(&mut self) -> Result<(), String> {
+        self.dmi.hart_runs(true)?;
         self.write(reg::DMCONTROL, self.control(RESUMEREQ))?;
         let waited = self.wait("the hart to resume", |dm| {
             Ok(dm.status()? & (ALLRESUMEACK | ALLRUNNING) != 0)
@@ -700,6 +715,7 @@ impl<D: Dmi> Debug<D> {
     fn step_once(&mut self) -> Result<(), String> {
         let dcsr = self.read_reg(Reg::Csr(DCSR))?;
         self.write_reg(Reg::Csr(DCSR), dcsr | DCSR_STEP)?;
+        self.dmi.hart_runs(true)?;
         self.write(reg::DMCONTROL, self.control(RESUMEREQ))?;
         let waited = self.wait("the hart to finish the step", |dm| dm.is_halted());
         self.write(reg::DMCONTROL, self.control(0))?;
@@ -707,6 +723,7 @@ impl<D: Dmi> Debug<D> {
             // It ran away (a WFI, or a step the hart ignored): stop it.
             self.halt()?;
         }
+        self.dmi.hart_runs(false)?;
         let dcsr = self.read_reg(Reg::Csr(DCSR))?;
         self.write_reg(Reg::Csr(DCSR), dcsr & !DCSR_STEP)?;
         waited
@@ -729,6 +746,7 @@ impl<D: Dmi> Debug<D> {
             // hart may run a few instructions first.
             HALTREQ
         };
+        self.dmi.hart_runs(true)?;
         self.write(reg::DMCONTROL, self.control(NDMRESET | hold))?;
         self.write(reg::DMCONTROL, self.control(hold))?;
         self.wait("the reset to finish", |dm| {
@@ -737,6 +755,7 @@ impl<D: Dmi> Debug<D> {
         })?;
         if halt {
             self.wait("the hart to halt after the reset", |dm| dm.is_halted())?;
+            self.dmi.hart_runs(false)?;
         }
         let mut done = ACKHAVERESET;
         if catch {
@@ -769,6 +788,7 @@ impl<D: Dmi> Debug<D> {
     /// halt-on-reset, and acknowledges the reset.
     pub fn wait_halted(&mut self) -> Result<(), String> {
         self.wait("the hart to halt", |dm| dm.is_halted())?;
+        self.dmi.hart_runs(false)?;
         self.write(reg::DMCONTROL, self.control(ACKHAVERESET))?;
         self.write(reg::DMCONTROL, self.control(0))?;
         self.catch_ebreak()
@@ -1303,6 +1323,11 @@ mod tests {
         /// instruction count, and an exception trigger.
         tdata: [[u64; 2]; 3],
         log: Vec<Op>,
+        /// What `hart_runs` said last.
+        told_runs: Option<bool>,
+        /// Commands run, and resumes asked for, while the debugger said the
+        /// other thing: either would put its own work in a trace.
+        mistold: usize,
     }
 
     impl Model {
@@ -1488,9 +1513,19 @@ mod tests {
                     Op::Write(r, v) => match r {
                         reg::DATA0 => self.data[0] = v,
                         reg::DATA1 => self.data[1] = v,
-                        reg::DMCONTROL => self.dmcontrol(v),
+                        reg::DMCONTROL => {
+                            if v & RESUMEREQ != 0 && self.told_runs != Some(true) {
+                                self.mistold += 1;
+                            }
+                            self.dmcontrol(v)
+                        }
                         reg::ABSTRACTCS => self.cmderr &= !((v >> 8) & 0x7),
-                        reg::COMMAND => self.command(v),
+                        reg::COMMAND => {
+                            if self.told_runs != Some(false) {
+                                self.mistold += 1;
+                            }
+                            self.command(v)
+                        }
                         r if r == reg::PROGBUF0 || r == reg::PROGBUF0 + 1 => {
                             self.progbuf[(r - reg::PROGBUF0) as usize] = v;
                         }
@@ -1500,6 +1535,38 @@ mod tests {
             }
             Ok(out)
         }
+
+        fn hart_runs(&mut self, runs: bool) -> Result<(), String> {
+            self.told_runs = Some(runs);
+            Ok(())
+        }
+    }
+
+    /// A trace pauses on these calls, so a register read on a halted hart
+    /// must come after "halted", and a resume after "runs".
+    #[test]
+    fn the_debugger_says_when_the_hart_runs() {
+        let mut m = Model::new(32);
+        {
+            let mut dm = Debug::attach(&mut m, 0).unwrap();
+            dm.halt().unwrap();
+            dm.read_reg(Reg::Gpr(10)).unwrap();
+            dm.step().unwrap();
+            dm.read_reg(Reg::parse("pc").unwrap()).unwrap();
+            dm.resume().unwrap();
+            dm.halt().unwrap();
+            dm.reset(true).unwrap();
+            dm.read_reg(Reg::Gpr(10)).unwrap();
+        }
+        assert_eq!(m.mistold, 0);
+        assert_eq!(m.told_runs, Some(false));
+
+        // Attaching to a halted hart says so before any command.
+        Debug::attach(&mut m, 0)
+            .unwrap()
+            .read_reg(Reg::Gpr(10))
+            .unwrap();
+        assert_eq!(m.mistold, 0);
     }
 
     #[test]

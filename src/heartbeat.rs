@@ -58,6 +58,15 @@ pub enum HeartbeatError {
         available: String,
     },
 
+    #[error("[heartbeat] needs a pin the FPGA drives, and target `{target}` has none")]
+    #[diagnostic(
+        code(harness::heartbeat::no_output_pin),
+        help(
+            "On this board the USB-UART is not wired to the FPGA (on a Zynq board it belongs to the PS). Remove [heartbeat] from the manifest. `hio id` still checks which design is running."
+        )
+    )]
+    NoOutputPin { target: String },
+
     #[error("[pins.{resource}] of target `{target}` is not an FPGA output")]
     #[diagnostic(
         code(harness::heartbeat::pin_direction_mismatch),
@@ -154,6 +163,11 @@ pub fn resolve(
     let resource = &config.pin;
 
     let found = crate::target::pin_resource(target, resource).ok_or_else(|| {
+        if !has_output_pin(target) {
+            return HeartbeatError::NoOutputPin {
+                target: target.name.clone(),
+            };
+        }
         HeartbeatError::UnknownPinResource {
             resource: resource.clone(),
             target: target.name.clone(),
@@ -223,6 +237,18 @@ pub fn resolve(
 
 /// Returns the divider and the resulting baud rate. Too much rounding error
 /// is an error, not a silent approximation.
+/// Whether the target has any pin resource the FPGA drives.
+fn has_output_pin(target: &Target) -> bool {
+    target
+        .table
+        .get("pins")
+        .and_then(|value| value.as_table())
+        .is_some_and(|pins| {
+            pins.values()
+                .any(|pin| pin.get("direction").and_then(|value| value.as_str()) == Some("output"))
+        })
+}
+
 fn divide(clk_hz: u64, baud: u64) -> Result<(u64, u64), HeartbeatError> {
     if baud == 0 {
         return Err(HeartbeatError::ZeroBaud);

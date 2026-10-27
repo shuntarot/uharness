@@ -18,10 +18,10 @@
 use miette::Diagnostic;
 use thiserror::Error;
 
-use crate::bundle::Binding;
+use crate::bundle::{Binding, DirectionPrefixes};
 use crate::contract::BundleContract;
 use crate::dut::{Dut, Port, PortDirection};
-use crate::manifest::{Addressing, Backing, Contract, Manifest, Role};
+use crate::manifest::{Addressing, Backing, Contract, Manifest, Role, TraceFormat};
 
 /// The default number of entries. It is readable on the board from the
 /// `<bundle>_depth` register, so a default never takes effect unseen.
@@ -69,6 +69,68 @@ impl FifoPlan {
     /// only confuse the reader.
     pub fn counts_drops(&self) -> bool {
         self.ready.is_none()
+    }
+}
+
+/// The resolved plan of one `trace` bundle.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TracePlan {
+    pub bundle: String,
+
+    /// The beat strobe (a DUT output).
+    pub valid: String,
+    pub valid_invert: bool,
+
+    /// The payload, in the order of the bundle's ports. The first field sits
+    /// right above the cycle count.
+    pub fields: Vec<TraceField>,
+
+    pub depth: u32,
+
+    pub format: Option<TraceFormat>,
+}
+
+/// One field of a trace record.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TraceField {
+    /// The port name without its direction prefix and the bundle name
+    /// (`o_rvfi_pc_rdata` in bundle `rvfi` is `pc_rdata`).
+    pub name: String,
+    pub port: String,
+    /// The lowest bit in the record.
+    pub lsb: usize,
+    pub width: usize,
+}
+
+/// The name of the field the harness adds: cycles since the start, in the
+/// lowest bits of every record.
+pub const TRACE_CYCLE: &str = "cycle";
+
+/// The width of the cycle count. It wraps after 2^32 cycles.
+pub const TRACE_CYCLE_BITS: usize = 32;
+
+impl TracePlan {
+    /// The payload bits, without the cycle count.
+    pub fn payload_width(&self) -> usize {
+        self.fields.iter().map(|field| field.width).sum()
+    }
+
+    /// The bits of one record.
+    pub fn record_width(&self) -> usize {
+        TRACE_CYCLE_BITS + self.payload_width()
+    }
+
+    /// Window words per entry. The window picks a word inside an entry with
+    /// the low address bits, so it is a power of two; the words above the
+    /// record read as 0.
+    pub fn entry_words(&self) -> usize {
+        self.record_width().div_ceil(32).next_power_of_two()
+    }
+
+    /// The block RAM it takes, in bytes. The words the window adds are not
+    /// stored.
+    pub fn bytes(&self) -> u64 {
+        (self.record_width() as u64 * u64::from(self.depth)).div_ceil(8)
     }
 }
 
@@ -542,7 +604,7 @@ pub enum TerminatorError {
     #[diagnostic(
         code(harness::terminator::unresolved_width),
         help(
-            "The FIFO needs the payload width. Widths in Harness.toml are not supported yet, so use a port whose width the analyzer can resolve."
+            "The terminator needs the payload width. Widths in Harness.toml are not supported yet, so use a port whose width the analyzer can resolve."
         )
     )]
     UnresolvedWidth { bundle: String, port: String },
@@ -859,12 +921,89 @@ pub enum TerminatorError {
         above: u64,
     },
 
+    #[error("[bundle.{bundle}] is `trace` with contract `{contract}`")]
+    #[diagnostic(
+        code(harness::terminator::trace_contract),
+        help(
+            "A trace records the beats a DUT output marks with `valid`, and never stalls the DUT: the ring overwrites its oldest record instead. Give the bundle a `valid` and no `ready`:\n\n    contract = \"valid_only\""
+        )
+    )]
+    TraceContract { bundle: String, contract: String },
+
+    #[error("[bundle.{bundle}] is `trace` with nothing to record")]
+    #[diagnostic(
+        code(harness::terminator::trace_no_payload),
+        help(
+            "The bundle has a `valid` and no other port. List the ports to record:\n\n    ports = [\"o_rvfi_valid\", \"o_rvfi_pc_rdata\", \"o_rvfi_insn\"]"
+        )
+    )]
+    TraceNoPayload { bundle: String },
+
+    #[error("[bundle.{bundle}] is `trace` with no `depth`")]
+    #[diagnostic(
+        code(harness::terminator::trace_depth_missing),
+        help(
+            "Say how many records the ring keeps, a power of two. It takes block RAM: depth x record bits. For example:\n\n    depth = 1024"
+        )
+    )]
+    TraceDepthMissing { bundle: String },
+
+    #[error("[bundle.{bundle}] records `{port}` as field `{field}`, which is taken")]
+    #[diagnostic(
+        code(harness::terminator::trace_field_clash),
+        help(
+            "A field is the port name without its direction prefix and the bundle name, and the harness adds `cycle` itself. Rename the port in the wrapper you point [dut] at."
+        )
+    )]
+    TraceFieldClash {
+        bundle: String,
+        port: String,
+        field: String,
+    },
+
+    #[error("[bundle.{bundle}] is an RVFI trace with no `{field}`")]
+    #[diagnostic(
+        code(harness::terminator::rvfi_missing),
+        help(
+            "Without `pc_rdata` and `insn` a record does not say which instruction it is. Add the port (for example `o_rvfi_{field}`) to the bundle, or remove `format = \"rvfi\"`."
+        )
+    )]
+    RvfiMissing { bundle: String, field: &'static str },
+
+    #[error("[bundle.{bundle}] has `{port}`, which is no RVFI signal (`{field}`)")]
+    #[diagnostic(
+        code(harness::terminator::rvfi_unknown),
+        help(
+            "With `format = \"rvfi\"`, each port is `rvfi_<name>`, where <name> is one of: {known}, or `csr_*`. Check the spelling, or move the port to another bundle."
+        )
+    )]
+    RvfiUnknown {
+        bundle: String,
+        port: String,
+        field: String,
+        known: String,
+    },
+
+    #[error("[bundle.{bundle}] has `{port}` of {width} bits")]
+    #[diagnostic(
+        code(harness::terminator::rvfi_width),
+        help(
+            "RVFI makes it {want}. A core that retires more than one instruction per cycle (NRET > 1) is not supported yet."
+        )
+    )]
+    RvfiWidth {
+        bundle: String,
+        port: String,
+        width: usize,
+        want: String,
+    },
+
     /// Ignoring it silently would make the manifest disagree with the hardware.
     #[error("[bundle.{bundle}] has `depth`, which `{backing}` does not use")]
     #[diagnostic(
         code(harness::terminator::depth_not_applicable),
         help(
-            "Only a host_poll_fifo or a memory uses `depth`, so `{backing}` would ignore it. Remove it, or change the backing."
+            "Only a host_poll_fifo, a trace or a memory uses `depth`, so `{backing}` would ignore it. Remove it, or change the backing."
         )
     )]
     DepthNotApplicable { bundle: String, backing: String },
@@ -2319,7 +2458,8 @@ pub fn resolve(
             // `dram` has a size too. It is not in `is_memory`, because then
             // `resolve_memories` would take it and silently build a BRAM in
             // place of the controller. So `depth` is checked separately.
-            let sized = declared.backing.is_memory() || declared.backing == Backing::Dram;
+            let sized = declared.backing.is_memory()
+                || matches!(declared.backing, Backing::Dram | Backing::Trace);
             if declared.depth.is_some() && !sized && !stand_in_memory {
                 return Err(TerminatorError::DepthNotApplicable {
                     bundle: binding.bundle.clone(),
@@ -2445,6 +2585,230 @@ pub fn resolve(
     }
 
     Ok(plans)
+}
+
+/// The RVFI signals a trace knows, with their widths.
+const RVFI_FIELDS: &[(&str, RvfiWidth)] = &[
+    ("order", RvfiWidth::Bits(64)),
+    ("insn", RvfiWidth::Bits(32)),
+    ("trap", RvfiWidth::Bits(1)),
+    ("halt", RvfiWidth::Bits(1)),
+    ("intr", RvfiWidth::Bits(1)),
+    ("mode", RvfiWidth::Bits(2)),
+    ("ixl", RvfiWidth::Bits(2)),
+    ("rs1_addr", RvfiWidth::Bits(5)),
+    ("rs2_addr", RvfiWidth::Bits(5)),
+    ("rs1_rdata", RvfiWidth::Xlen),
+    ("rs2_rdata", RvfiWidth::Xlen),
+    ("rd_addr", RvfiWidth::Bits(5)),
+    ("rd_wdata", RvfiWidth::Xlen),
+    ("pc_rdata", RvfiWidth::Xlen),
+    ("pc_wdata", RvfiWidth::Xlen),
+    ("mem_addr", RvfiWidth::Xlen),
+    ("mem_rmask", RvfiWidth::Bytes),
+    ("mem_wmask", RvfiWidth::Bytes),
+    ("mem_rdata", RvfiWidth::Xlen),
+    ("mem_wdata", RvfiWidth::Xlen),
+    ("mem_fault", RvfiWidth::Bits(1)),
+    ("mem_fault_rmask", RvfiWidth::Bytes),
+    ("mem_fault_wmask", RvfiWidth::Bytes),
+];
+
+/// Without these, a record does not say which instruction it is.
+const RVFI_REQUIRED: &[&str] = &["pc_rdata", "insn"];
+
+#[derive(Clone, Copy)]
+enum RvfiWidth {
+    Bits(usize),
+    /// The width of `pc_rdata`.
+    Xlen,
+    /// XLEN / 8: a byte mask.
+    Bytes,
+}
+
+/// Resolves the `trace` bundles, in bundle name order.
+pub fn resolve_traces(
+    dut: &Dut,
+    manifest: &Manifest,
+    bindings: &[Binding],
+    contracts: &[BundleContract],
+    prefixes: &DirectionPrefixes,
+) -> Result<Vec<TracePlan>, TerminatorError> {
+    let mut plans = Vec::new();
+
+    for binding in bindings {
+        let declared = &manifest.bundle[&binding.bundle];
+        if declared.backing != Backing::Trace {
+            continue;
+        }
+        let bundle = &binding.bundle;
+        let contract = contracts
+            .iter()
+            .find(|contract| &contract.bundle == bundle)
+            .expect("every bundle gets a contract");
+
+        // The ring always has room, so it never needs to stall the DUT.
+        if contract.contract != Contract::ValidOnly {
+            return Err(TerminatorError::TraceContract {
+                bundle: bundle.clone(),
+                contract: contract.contract.as_str().to_string(),
+            });
+        }
+
+        let mut valid = None;
+        let mut payload = Vec::new();
+        for assignment in &contract.roles {
+            match assignment.role {
+                Role::Valid => valid = Some(assignment),
+                _ => payload.push(assignment),
+            }
+        }
+        let valid = valid.expect("valid_only always resolves a valid");
+        let valid_port = port_of(dut, &valid.port);
+        expect_direction(
+            Shape::Trace,
+            bundle,
+            valid_port,
+            Role::Valid.as_str(),
+            PortDirection::Output,
+        )?;
+        expect_single_bit(bundle, valid_port, Role::Valid.as_str())?;
+
+        if payload.is_empty() {
+            return Err(TerminatorError::TraceNoPayload {
+                bundle: bundle.clone(),
+            });
+        }
+
+        let mut fields: Vec<TraceField> = Vec::new();
+        let mut lsb = TRACE_CYCLE_BITS;
+        for assignment in payload {
+            let port = port_of(dut, &assignment.port);
+            expect_direction(
+                Shape::Trace,
+                bundle,
+                port,
+                assignment.role.as_str(),
+                PortDirection::Output,
+            )?;
+            let width = port
+                .width()
+                .ok_or_else(|| TerminatorError::UnresolvedWidth {
+                    bundle: bundle.clone(),
+                    port: assignment.port.clone(),
+                })?;
+            let bare = prefixes.strip(&assignment.port, port.direction);
+            let mut name = bare
+                .strip_prefix(bundle.as_str())
+                .and_then(|rest| rest.strip_prefix('_'))
+                .unwrap_or(bare);
+            if declared.format == Some(TraceFormat::Rvfi) {
+                name = name.strip_prefix("rvfi_").unwrap_or(name);
+            }
+            if name == TRACE_CYCLE || fields.iter().any(|field| field.name == name) {
+                return Err(TerminatorError::TraceFieldClash {
+                    bundle: bundle.clone(),
+                    port: assignment.port.clone(),
+                    field: name.to_string(),
+                });
+            }
+            fields.push(TraceField {
+                name: name.to_string(),
+                port: assignment.port.clone(),
+                lsb,
+                width,
+            });
+            lsb += width;
+        }
+
+        if declared.format == Some(TraceFormat::Rvfi) {
+            check_rvfi(bundle, &fields)?;
+        }
+
+        // Not a fact about the DUT, but the records are what is being looked
+        // for: a ring too short to hold them is not noticed until it is read.
+        let depth = declared
+            .depth
+            .ok_or_else(|| TerminatorError::TraceDepthMissing {
+                bundle: bundle.clone(),
+            })?;
+        if depth < 2 || !depth.is_power_of_two() {
+            return Err(TerminatorError::DepthNotPowerOfTwo {
+                bundle: bundle.clone(),
+                depth,
+                suggestion: depth.max(2).next_power_of_two(),
+            });
+        }
+
+        plans.push(TracePlan {
+            bundle: bundle.clone(),
+            valid: valid.port.clone(),
+            valid_invert: valid.invert,
+            fields,
+            depth,
+            format: declared.format,
+        });
+    }
+
+    Ok(plans)
+}
+
+/// Checks the fields against RVFI: known names, widths that agree with
+/// XLEN, and the fields that say which instruction a record is.
+fn check_rvfi(bundle: &str, fields: &[TraceField]) -> Result<(), TerminatorError> {
+    for want in RVFI_REQUIRED {
+        if fields.iter().all(|field| field.name != *want) {
+            return Err(TerminatorError::RvfiMissing {
+                bundle: bundle.to_string(),
+                field: want,
+            });
+        }
+    }
+    let pc = fields
+        .iter()
+        .find(|field| field.name == "pc_rdata")
+        .expect("checked above");
+    if pc.width != 32 && pc.width != 64 {
+        return Err(TerminatorError::RvfiWidth {
+            bundle: bundle.to_string(),
+            port: pc.port.clone(),
+            width: pc.width,
+            want: "32 or 64 bits (XLEN)".to_string(),
+        });
+    }
+    let xlen = pc.width;
+    for field in fields {
+        // The CSR extension names its fields after the CSR.
+        if field.name.starts_with("csr_") {
+            continue;
+        }
+        let Some((_, width)) = RVFI_FIELDS.iter().find(|(name, _)| *name == field.name) else {
+            return Err(TerminatorError::RvfiUnknown {
+                bundle: bundle.to_string(),
+                port: field.port.clone(),
+                field: field.name.clone(),
+                known: RVFI_FIELDS
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        };
+        let (want, text) = match width {
+            RvfiWidth::Bits(bits) => (*bits, format!("{bits} bits")),
+            RvfiWidth::Xlen => (xlen, format!("{xlen} bits, as wide as `pc_rdata`")),
+            RvfiWidth::Bytes => (xlen / 8, format!("{} bits, one per byte of XLEN", xlen / 8)),
+        };
+        if field.width != want {
+            return Err(TerminatorError::RvfiWidth {
+                bundle: bundle.to_string(),
+                port: field.port.clone(),
+                width: field.width,
+                want: text,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The resolved plan of one memory that the DUT presents as an AXI4 master.
@@ -2922,6 +3286,7 @@ pub fn check_claimed(
     manifest: &Manifest,
     bindings: &[Binding],
     fifos: &[FifoPlan],
+    traces: &[TracePlan],
     memories: &[MemPlan],
     host_mems: &[HostMemPlan],
     slaves: &[SlavePlan],
@@ -2937,6 +3302,7 @@ pub fn check_claimed(
     const APERTURE: &str = "aperture";
     const DUT_BASE: &str = "dut_base";
     const RESET: &str = "reset";
+    const FORMAT: &str = "format";
 
     for binding in bindings {
         let name = binding.bundle.as_str();
@@ -2946,6 +3312,11 @@ pub fn check_claimed(
                 fifos.iter().any(|p| p.bundle == name),
                 "a `host_poll_fifo`",
                 &[DEPTH][..],
+            ),
+            (
+                traces.iter().any(|p| p.bundle == name),
+                "a `trace`",
+                &[DEPTH, FORMAT][..],
             ),
             (
                 memories.iter().any(|p| p.bundle == name),
@@ -3028,6 +3399,7 @@ pub fn check_claimed(
             (APERTURE, declared.aperture.is_some()),
             (DUT_BASE, declared.dut_base.is_some()),
             (RESET, declared.reset.is_some()),
+            (FORMAT, declared.format.is_some()),
         ] {
             if set && !takes.contains(&key) {
                 return Err(TerminatorError::KeyNotApplicable {
@@ -3035,7 +3407,7 @@ pub fn check_claimed(
                     key,
                     shape,
                     takes: if takes.is_empty() {
-                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`, `reset`"
+                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`, `reset`, `format`"
                             .to_string()
                     } else {
                         takes
@@ -3079,6 +3451,7 @@ fn expect_single_bit(bundle: &str, port: &Port, role: &'static str) -> Result<()
 #[derive(Clone, Copy)]
 enum Shape {
     Fifo,
+    Trace,
     Memory,
     TransferLevel,
     Slave,
@@ -3094,6 +3467,11 @@ impl Shape {
                 "a `host_poll_fifo`",
                 "In a host_poll_fifo, `valid` and `data` are DUT outputs and `ready` is a DUT input.",
                 "If the host feeds the DUT, use `reg` instead. Each host write then sends one beat.",
+            ),
+            Shape::Trace => (
+                "a `trace`",
+                "In a trace, `valid` and every field it records are DUT outputs.",
+                "A trace only records what the DUT drives. Move the input to another bundle.",
             ),
             Shape::Memory => (
                 "a memory port",

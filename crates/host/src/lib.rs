@@ -30,6 +30,7 @@ pub mod rtt;
 pub mod semihosting;
 pub mod svf;
 pub mod sysmon;
+pub mod trace;
 
 #[cfg(test)]
 mod model;

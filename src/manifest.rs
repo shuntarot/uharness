@@ -144,6 +144,9 @@ pub enum Backing {
     /// The DMI of a RISC-V Debug Module inside the DUT, as an APB slave. The
     /// host reaches it through the window, and `hio cpu` finds it by kind.
     Dmi,
+    /// A ring in the FPGA that keeps the last records of a DUT stream, such
+    /// as an execution trace. The host starts and stops it, and reads it.
+    Trace,
     /// Output for observation only.
     Observe,
 }
@@ -160,6 +163,7 @@ const BACKING_VALUES: &[&str] = &[
     "pcie_flr",
     "host_poll_fifo",
     "dmi",
+    "trace",
     "observe",
 ];
 
@@ -180,6 +184,7 @@ impl<'de> Deserialize<'de> for Backing {
             "pcie_flr" => Ok(Backing::PcieFlr),
             "host_poll_fifo" => Ok(Backing::HostPollFifo),
             "dmi" => Ok(Backing::Dmi),
+            "trace" => Ok(Backing::Trace),
             "observe" => Ok(Backing::Observe),
             // `host_bar` became `reg` or `slave`. Only the author knows which,
             // so it cannot be mapped automatically.
@@ -208,6 +213,7 @@ impl Backing {
             Backing::PcieFlr => "pcie_flr",
             Backing::HostPollFifo => "host_poll_fifo",
             Backing::Dmi => "dmi",
+            Backing::Trace => "trace",
             Backing::Observe => "observe",
         }
     }
@@ -682,6 +688,30 @@ pub struct Bundle {
     /// DUT reset, and the Debug Module's own reset requests.
     #[serde(default)]
     pub reset: Option<String>,
+
+    /// What the records of a `trace` are (`trace` only).
+    ///
+    /// With `"rvfi"`, the port names are checked against the RISC-V Formal
+    /// Interface, and the host shows the records as instructions. Without
+    /// it, the records are plain fields.
+    #[serde(default)]
+    pub format: Option<TraceFormat>,
+}
+
+/// What the records of a `trace` are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceFormat {
+    /// The RISC-V Formal Interface (`rvfi_*`), one instruction per record.
+    Rvfi,
+}
+
+impl TraceFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TraceFormat::Rvfi => "rvfi",
+        }
+    }
 }
 
 /// Sizes may also be written like `4k` or `256M`.

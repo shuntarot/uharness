@@ -1,0 +1,113 @@
+/// `hns::trace`: records only while running, keeps the last DEPTH records,
+/// and starts over on the next run.
+#[test(trace_keeps_the_last_records)]
+module test_trace {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen (
+        clk: clk,
+    );
+
+    var run    : logic    ;
+    var pause  : logic    ;
+    var valid  : logic    ;
+    var data   : logic<8> ;
+    var count  : logic<32>;
+    var wrapped: logic    ;
+    var haddr  : logic<2> ;
+    var hrdata : logic<40>;
+
+    inst u_trace: trace #(
+        WIDTH: 8,
+        DEPTH: 4,
+    ) (
+        i_clk    : clk    ,
+        i_rst    : rst    ,
+        i_run    : run    ,
+        i_pause  : pause  ,
+        i_valid  : valid  ,
+        i_data   : data   ,
+        o_count  : count  ,
+        o_wrapped: wrapped,
+        i_haddr  : haddr  ,
+        o_hrdata : hrdata ,
+    );
+
+    initial {
+        run   = 0;
+        pause = 0;
+        valid = 0;
+        data  = 0;
+        haddr = 0;
+        rst.assert(4);
+        clk.next(2);
+
+        // Stopped: beats are not recorded.
+        valid = 1;
+        clk.next(3);
+        $assert(count == 0, "recorded while stopped");
+
+        // Start, then one beat every other cycle: 0xa0, 0xa1, 0xa2.
+        valid = 0;
+        run   = 1;
+        clk.next(1);
+        for i in 0..3 {
+            valid = 1;
+            data  = 8'ha0 + i;
+            clk.next(1);
+            valid = 0;
+            clk.next(1);
+        }
+        $assert(count == 3 && !wrapped, "three beats, not wrapped");
+
+        // Each record is the payload above the cycle count since the start.
+        haddr = 0;
+        clk.next(1);
+        $assert(hrdata == {8'ha0, 32'd0}, "first record");
+        haddr = 2;
+        clk.next(1);
+        $assert(hrdata == {8'ha2, 32'd4}, "third record, four cycles later");
+
+        // Two more: the fifth overwrites the first.
+        valid = 1;
+        data  = 8'hb0;
+        clk.next(1);
+        data = 8'hb1;
+        clk.next(1);
+        valid = 0;
+        clk.next(1);
+        $assert(count == 5 && wrapped, "wrapped after five");
+        haddr = 0;
+        clk.next(1);
+        $assert(hrdata[39:32] == 8'hb1, "the oldest was overwritten");
+        haddr = 1;
+        clk.next(1);
+        $assert(hrdata[39:32] == 8'ha1, "the second stays");
+
+        // Paused: nothing is recorded, and the cycle count goes on.
+        pause = 1;
+        valid = 1;
+        clk.next(3);
+        $assert(count == 5, "recorded while paused");
+        pause = 0;
+        data  = 8'hc0;
+        clk.next(1);
+        valid = 0;
+        $assert(count == 6, "not recorded after the pause");
+        haddr = 1;
+        clk.next(1);
+        $assert(hrdata[39:32] == 8'hc0, "the beat after the pause");
+
+        // Stop: the ring holds still.
+        run   = 0;
+        valid = 1;
+        clk.next(3);
+        $assert(count == 6, "recorded after the stop");
+
+        // A new run starts over.
+        valid = 0;
+        run   = 1;
+        clk.next(2);
+        $assert(count == 0 && !wrapped, "a new run did not start over");
+        $finish();
+    }
+}

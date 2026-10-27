@@ -40,7 +40,9 @@ several, pass `--regs`). The target is recorded inside it. A map generated with
 `hio` with `--target-file`. Probe details are
 discovered from the FTDI device, and whatever is guessed is **verified against
 magic and the map hash before anything else happens** (`--no-verify` skips it).
-`hio probe` shows what would be used.
+`hio probe` shows what would be used. With several probes of one type plugged
+in, pick one with `--serial`; a part of the serial that no other probe has is
+enough (`--serial 8107`).
 
 | subcommand | |
 |---|---|
@@ -53,6 +55,7 @@ magic and the map hash before anything else happens** (`--no-verify` skips it).
 | `load <bundle> <file>` | put a `.bin` or `.elf` in a memory |
 | `memtest <bundle>` | write a pattern and read it back; **the contents are lost** |
 | `drain <bundle>` | empty a `host_poll_fifo`, oldest first |
+| `trace …` | a `trace` ring: `start`, `stop`, `status`, `dump`; see [`hio trace`](#hio-trace-the-last-instructions) |
 | `dump` | read every register |
 | `reset` | reset the DUT only; `--hold` / `--release` keep it in reset |
 | `bench` | how fast the window is; `<region> --both` measures writes too |
@@ -185,6 +188,10 @@ hio --serial <probe> serve --listen 127.0.0.1:5555                       # once,
 hio --connect localhost:5555 program                                     # elsewhere, from the project
 ```
 
+On a board with nothing programmed yet, start the server with
+`hio --no-verify serve` from the project; the first `program` checks the board.
+Until then, the window answers with meaningless values.
+
 `program` sends the `.bit` and its `regs.json`, and the files the server asks
 for from beside the `.bit` (a Zynq's `ps7_init.tcl`). The server checks the device name as `hio program`
 does, programs over JTAG, sets a Zynq's PS up, and serves the new map.
@@ -204,7 +211,7 @@ hio reset --release         # let it run
 ```
 
 **Only the DUT is reset.** The window, memory contents and `reg` registers keep
-their state, and a `host_poll_fifo` keeps what it has queued (`drain` it if the
+their state, a `trace` keeps recording, and a `host_poll_fifo` keeps what it has queued (`drain` it if the
 test needs it empty). So a test can start the same way every time:
 
 ```bash
@@ -415,6 +422,43 @@ fires before the instruction runs.
 A halt also makes `ebreak` in the program halt into the debugger. CSRs the
 Debug Module cannot reach directly go through its program buffer, with `s0`
 saved and put back.
+
+## `hio trace`: the last instructions
+
+A `trace` bundle is a ring in the FPGA. While it runs, it records every beat
+and overwrites the oldest record once full, so it holds what led up to the
+moment it stopped. With a CPU, that moment is usually a breakpoint:
+
+```bash
+hio cpu break 0x80001234    # or `hio cpu catch` for a fault
+hio trace start             # empty the ring and record
+hio cpu resume
+hio trace dump --last 50    # once the hart has halted; oldest first
+```
+
+A halted hart retires nothing, so the ring stops by itself. `hio cpu` also
+pauses an instruction trace (`format = "rvfi"`) while the hart is halted: a
+debugger reads registers by running instructions on the halted hart, and
+those would push the program's own out of the ring. `resume` and `step`
+record again, so a step shows up as one record.
+
+`start` always starts over; `stop` stops. `dump` also works while the trace
+runs; if records arrive meanwhile, it says so. At the `(hio cpu)` prompt,
+`trace …` works without `hio`. The bundle name may be left out when the design
+has one trace, or one instruction trace.
+
+Each line starts with the cycle of the record, counted from `start`, and the
+cycles since the record before it. An instruction trace then shows the mode,
+the pc, the instruction, and what it did:
+
+```
+  52050803    +12  M 8001ffa8  00fa2423  sw      a5,8(s4)                  st [8003831c]=00000e89 m1111
+  52050863    +60  M 8001ffac  00da2023  sw      a3,0(s4)                  st [80038314]=00000004 m1111
+  52050947    +72  M 8001ffb4  00caa783  lw      a5,12(s5)                 a5=00000000  ld [80038310]=00000000 m1111
+```
+
+`hio reset` leaves the trace running, so it also records the reset and what
+follows.
 
 ## `hio program` and `erase`
 

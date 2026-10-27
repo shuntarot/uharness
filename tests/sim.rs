@@ -360,6 +360,112 @@ module valid_only_drops {{
     );
 }
 
+/// `trace`: the ring keeps the last records, each with its cycle count, and
+/// the window reads them, the words above the record as 0.
+#[test]
+fn a_trace_ring_keeps_the_last_records() {
+    let dut = r#"
+module dut_top (
+    i_clk          : input  clock    ,
+    i_rst          : input  reset    ,
+    i_go           : input  logic    ,
+    o_rvfi_valid   : output logic    ,
+    o_rvfi_pc_rdata: output logic<32>,
+    o_rvfi_insn    : output logic<32>,
+    o_rvfi_rd_addr : output logic<5> ,
+    o_rvfi_rd_wdata: output logic<32>,
+) {
+    var phase: logic    ;
+    var pc   : logic<32>;
+    var n    : logic<5> ;
+    // Exactly 20 instructions, one every other cycle, however long `go` is
+    // high.
+    let active: logic = i_go & (n != 20);
+    always_ff {
+        if_reset {
+            phase = 0;
+            pc    = 0;
+            n     = 0;
+        } else if active {
+            phase = ~phase;
+            if phase {
+                pc = pc + 4;
+                n  = n + 1;
+            }
+        }
+    }
+    assign o_rvfi_valid    = active & phase;
+    assign o_rvfi_pc_rdata = pc;
+    assign o_rvfi_insn     = 32'h0000_0013;
+    assign o_rvfi_rd_addr  = 5'd10;
+    assign o_rvfi_rd_wdata = ~pc;
+}
+"#;
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.go]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"i_go\"]\n\n[bundle.rvfi]\nbacking = \"trace\"\nformat = \"rvfi\"\ndepth = 8\n";
+
+    let dir = fixture(manifest, dut, "");
+    let map = offsets(dir.path());
+    // cycle, pc_rdata, insn, rd_addr, rd_wdata: 133 bits, 5 words, padded to 8.
+    assert_eq!(map["traces"][0]["record_bits"], 133);
+    let entry = 32;
+    let (go, run, count, wrapped, base) = (
+        offset_of(&map, "i_go"),
+        offset_of(&map, "rvfi_run"),
+        offset_of(&map, "rvfi_count"),
+        offset_of(&map, "rvfi_wrapped"),
+        region_base(&map, "rvfi"),
+    );
+    let at = |index: u64, word: u64| base + index * entry + 4 * word;
+    let (e3, e4, e4c, e5c, e4rd, e4pad) =
+        (at(3, 1), at(4, 1), at(4, 0), at(5, 0), at(4, 4), at(4, 7));
+    let tb = format!(
+        r#"
+#[test(trace_ring)]
+module trace_ring {{
+{BUS}
+    initial {{
+        start();
+
+        $assert(rd({count}) == 0);
+
+        // 20 instructions into 8 entries.
+        wr({run}, 1);
+        wr({go}, 1);
+        clk.next(60);
+        wr({run}, 0);
+        $assert(rd({count}) == 20);
+        $assert(rd({wrapped}) == 1);
+
+        // The oldest is entry 20 % 8 = 4. Entries 4 and 3 are the oldest and
+        // the newest records.
+        $assert(rd({e4}) + 28 == rd({e3}));
+        // One instruction every other cycle.
+        $assert(rd({e5c}) - rd({e4c}) == 2);
+        // rd_wdata starts at bit 101: 27 bits of it in word 3, the rest in 4.
+        $assert(rd({e4rd}) == (~rd({e4}) >> 27) & 32'h1f);
+        $assert(rd({e4pad}) == 0);
+
+        // A write is dropped, and the window does not hang on it.
+        wr({e4}, 32'hdead_beef);
+        $assert(rd({e4}) != 32'hdead_beef);
+
+        // A new run starts over.
+        wr({run}, 1);
+        $assert(rd({count}) == 0);
+        $assert(rd({wrapped}) == 0);
+        $finish();
+    }}
+}}
+"#
+    );
+
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
 /// Reads offsets from `regs.json`, so test benches do not hard-code addresses.
 fn offsets(dir: &Path) -> serde_json::Value {
     serde_json::from_str(&fs::read_to_string(dir.join("hns/regs.json")).unwrap()).unwrap()

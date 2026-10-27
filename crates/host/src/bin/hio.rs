@@ -82,9 +82,11 @@ struct Cli {
     #[arg(long, value_name = "STRING", hide_short_help = true)]
     product: Option<String>,
 
-    /// Match the serial number.
+    /// Match the serial number, or a part of it that only one probe has.
     ///
     /// Required when more than one probe of the same type is plugged in.
+    /// `--serial 8107` picks `210319788107` when no other serial contains
+    /// `8107`.
     #[arg(long, value_name = "STRING")]
     serial: Option<String>,
 
@@ -478,6 +480,10 @@ enum Cmd {
         max: Option<usize>,
     },
 
+    /// Start, stop and read a trace ring (`backing = "trace"`).
+    #[command(subcommand)]
+    Trace(TraceCmd),
+
     /// Serve the window to `hio --connect` on other machines.
     ///
     /// Opens the window as any command does (JTAG, or PCIe with `-p`) and keeps it
@@ -575,6 +581,28 @@ struct ApArg {
     /// (privileged, secure, debug). The size is always set to 32 bits.
     #[arg(long, value_parser = parse_u32)]
     csw: Option<u32>,
+}
+
+/// `hio trace`: the ring of a `trace` bundle. Each command takes the bundle
+/// name, which may be left out when the design has one trace.
+#[derive(Subcommand)]
+enum TraceCmd {
+    /// Empty the ring and record from now on.
+    Start { bundle: Option<String> },
+    /// Stop recording. The ring keeps the last records.
+    Stop { bundle: Option<String> },
+    /// Say whether it records, and how many records the ring holds.
+    Status { bundle: Option<String> },
+    /// Print the records, oldest first.
+    ///
+    /// Stop the trace first, or halt the CPU: records that arrive while the
+    /// ring is read are mixed in, and a warning says so.
+    Dump {
+        bundle: Option<String>,
+        /// Only the newest N records.
+        #[arg(long, value_name = "N")]
+        last: Option<usize>,
+    },
 }
 
 /// `hio cpu`: what needs a CPU in the DUT and an ELF for it.
@@ -885,6 +913,21 @@ fn main() {
     }
 }
 
+/// The probes `--serial` names. A serial equal to the value wins, so a full
+/// serial still picks one probe when it is also a part of another's.
+fn by_serial(found: Vec<hns_host::ftdi::Found>, part: &str) -> Vec<hns_host::ftdi::Found> {
+    if found.iter().any(|f| f.serial.as_deref() == Some(part)) {
+        return found
+            .into_iter()
+            .filter(|f| f.serial.as_deref() == Some(part))
+            .collect();
+    }
+    found
+        .into_iter()
+        .filter(|f| f.serial.as_deref().is_some_and(|s| s.contains(part)))
+        .collect()
+}
+
 /// Builds a `ProbeConfig` from what is plugged in.
 ///
 /// It does not guess. A value it cannot fill stops it with a message that says
@@ -905,11 +948,22 @@ fn resolve_probe(cli: &Cli) -> Result<ProbeConfig, String> {
                 None => true,
             },
         )
-        .filter(|f| match &cli.serial {
-            Some(s) => f.serial.as_deref() == Some(s.as_str()),
-            None => true,
-        })
         .collect();
+    let found = match &cli.serial {
+        Some(s) => {
+            let named = by_serial(found.clone(), s);
+            if named.is_empty() && !found.is_empty() {
+                let list: Vec<String> = found.iter().map(|f| format!("  {f}")).collect();
+                return Err(format!(
+                    "no probe's serial contains {s:?}. These are plugged in:\n{}\n\
+                     Pass one of their serials, or a part of it, with --serial.",
+                    list.join("\n")
+                ));
+            }
+            named
+        }
+        None => found,
+    };
 
     let one = match found.len() {
         0 => {
@@ -923,7 +977,8 @@ fn resolve_probe(cli: &Cli) -> Result<ProbeConfig, String> {
             let list: Vec<String> = found.iter().map(|f| format!("  {f}")).collect();
             return Err(format!(
                 "{} probes match, so hio cannot choose:\n{}\n\
-                 Pick one with --serial (or --product).",
+                 Pick one with --serial (a part of it is enough when only one has it), \
+                 or with --product.",
                 found.len(),
                 list.join("\n")
             ));
@@ -1198,6 +1253,7 @@ fn run_step(cli: &Cli, bus: &mut Bus, map: &RegisterMap, step: Step) -> Result<(
         Cmd::Reset { hold, release } => reset(bus, map, hold, release),
         Cmd::Check => unreachable!("refused by parse_step"),
         Cmd::Drain { bundle, max } => drain(bus, map, &bundle, max),
+        Cmd::Trace(cmd) => trace(bus, map, &cmd),
         Cmd::Bench {
             reads,
             repeat,
@@ -2702,6 +2758,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
         Cmd::Dump => dump(&mut bus, &map),
         Cmd::Reset { hold, release } => reset(&mut bus, &map, hold, release),
         Cmd::Drain { bundle, max } => drain(&mut bus, &map, &bundle, max),
+        Cmd::Trace(ref cmd) => trace(&mut bus, &map, cmd),
         Cmd::Memtest {
             ref bundle,
             base,
@@ -3815,7 +3872,7 @@ fn dma_fire(
             let memories: Vec<&str> = map
                 .regions
                 .iter()
-                .filter(|r| r.is_idempotent())
+                .filter(|r| r.kind.as_deref() == Some("memory"))
                 .map(|r| r.name.as_str())
                 .collect();
             match memories.as_slice() {
@@ -4798,9 +4855,17 @@ fn reset(bus: &mut Bus, map: &RegisterMap, hold: bool, release: bool) -> Result<
         );
     };
     let (req, state) = (req.offset as u32, state.offset as u32);
+    // Out of reset the hart runs, so an instruction trace records again. If
+    // it halts at reset instead, `hio cpu` pauses the trace before it acts.
+    let pauses = trace_pauses(map);
 
     let mut set = |on: bool| -> Result<(), String> {
         let mut b = Batch::new();
+        if !on {
+            for pause in &pauses {
+                b.write(*pause, 0);
+            }
+        }
         b.write(req, u32::from(on));
         bus.run(&b)?;
         // One read takes about 1ms over JTAG and microseconds over PCIe.
@@ -4910,8 +4975,11 @@ fn check_identity_values(magic: u32, hash: u32, map: &RegisterMap) -> Result<(),
     if magic != map.magic {
         return Err(format!(
             "the window answered with magic {magic:#010x}, not {:#010x}.\n\
-             The bitstream is not a veryl-harness build, or the transport does not reach \
-             the window. If every bit is 0 or every bit is 1, suspect the JTAG chain.\n\
+             The board does not run a veryl-harness design, or the transport does not \
+             reach its window.\n\
+             If the board was just powered on, or runs another design (from flash or an \
+             SD card), run `hio program` first.\n\
+             If every bit is 0 or every bit is 1, suspect the JTAG chain.\n\
              If only some bits are wrong, --tck-hz is probably too fast for the cable. \
              Lower it and try again.\n\
              If the USER slot is the default, --user1-ir may be wrong: the wrong slot \
@@ -6993,7 +7061,7 @@ fn debug_module<'a>(
     map: &RegisterMap,
 ) -> Result<hns_host::dm::Debug<WindowDmi<'a>>, String> {
     let base = dmi_base(map, None)?;
-    hns_host::dm::Debug::attach(WindowDmi { bus, base }, 0).map_err(|e| {
+    hns_host::dm::Debug::attach(WindowDmi::new(bus, map, base), 0).map_err(|e| {
         format!(
             "{e}\n`--halt` needs the Debug Module up while the DUT is held in reset. \
              Give its reset port in the `dmi` bundle (`reset = \"<port>\"`), so it \
@@ -7687,6 +7755,11 @@ fn prompt_action(level: Level, in_console: bool, line: &str) -> Result<PromptAct
             format!("`{what}` takes over the terminal; run it on its own, outside the prompt.")
         })
     };
+    // The instruction trace goes with the debugger: `trace dump` right
+    // after a breakpoint, without `hio`.
+    if level == Level::Cpu && first == "trace" {
+        return prompt_action(Level::Top, in_console, line);
+    }
     match level {
         Level::Top => {
             if let Err(e) = Line::try_parse_from(&words)
@@ -8117,7 +8190,12 @@ impl HaltWatch {
 
     fn halted_now(bus: &mut Bus, base: u32) -> Result<bool, String> {
         use hns_host::dm::{Dmi, Op, reg};
-        let status = WindowDmi { bus, base }.run(&[Op::Read(reg::DMSTATUS)])?[0];
+        let status = WindowDmi {
+            bus,
+            base,
+            pauses: Vec::new(),
+        }
+        .run(&[Op::Read(reg::DMSTATUS)])?[0];
         Ok(hns_host::dm::all_halted(status))
     }
 
@@ -8178,7 +8256,7 @@ fn semihosting_call(
     let base = dmi_base(mem.map, None)?;
     let pc = Reg::parse("pc").expect("pc is a name");
     let (at, op, param, xlen) = {
-        let mut dm = Debug::attach(WindowDmi { bus: mem.bus, base }, 0)?;
+        let mut dm = Debug::attach(WindowDmi::new(mem.bus, mem.map, base), 0)?;
         if dm.cause()? != 1 {
             return Ok(None);
         }
@@ -8204,7 +8282,7 @@ fn semihosting_call(
     let mut said = Output::default();
     let outcome = serve(mem, op, param, xlen, started, &mut said)?;
     if let Outcome::Return(value) = outcome {
-        let mut dm = Debug::attach(WindowDmi { bus: mem.bus, base }, 0)?;
+        let mut dm = Debug::attach(WindowDmi::new(mem.bus, mem.map, base), 0)?;
         dm.write_reg(Reg::Gpr(10), value)?;
         // On to the `srai` after the `ebreak`, which does nothing.
         dm.write_reg(pc, at + 4)?;
@@ -8222,7 +8300,7 @@ fn stop_line(
     use hns_host::dm::Stop;
     use hns_host::dm::{Debug, Reg};
     let base = dmi_base(map, None)?;
-    let mut dm = Debug::attach(WindowDmi { bus, base }, 0)?;
+    let mut dm = Debug::attach(WindowDmi::new(bus, map, base), 0)?;
     let pc = dm.read_reg(Reg::parse("pc").expect("pc is a name"))?;
     let xlen = dm.xlen()?;
     let at = |addr: u64| format!("{}{}", word(addr, xlen), symbolize(elf, addr));
@@ -8268,9 +8346,44 @@ fn catching(causes: u64) -> String {
 struct WindowDmi<'a> {
     bus: &'a mut Bus,
     base: u32,
+    /// The `pause` registers of the instruction traces, set while the hart
+    /// is halted.
+    pauses: Vec<u32>,
+}
+
+impl<'a> WindowDmi<'a> {
+    fn new(bus: &'a mut Bus, map: &RegisterMap, base: u32) -> WindowDmi<'a> {
+        WindowDmi {
+            bus,
+            base,
+            pauses: trace_pauses(map),
+        }
+    }
+}
+
+/// The `pause` registers of the traces that record instructions (`rvfi`).
+/// A trace of something else goes on while the hart is halted.
+fn trace_pauses(map: &RegisterMap) -> Vec<u32> {
+    map.traces
+        .iter()
+        .filter(|t| t.format.as_deref() == Some("rvfi"))
+        .filter_map(|t| role_of(map, &t.name, "pause"))
+        .map(|r| r.offset as u32)
+        .collect()
 }
 
 impl hns_host::dm::Dmi for WindowDmi<'_> {
+    fn hart_runs(&mut self, runs: bool) -> Result<(), String> {
+        if self.pauses.is_empty() {
+            return Ok(());
+        }
+        let mut b = Batch::new();
+        for pause in &self.pauses {
+            b.write(*pause, u32::from(!runs));
+        }
+        self.bus.run(&b).map(|_| ())
+    }
+
     fn run(&mut self, ops: &[hns_host::dm::Op]) -> Result<Vec<u32>, String> {
         use hns_host::dm::Op;
         // Not replayable: a Debug Module read can change state.
@@ -8428,7 +8541,7 @@ fn cpu_debug(
         }
         (Err(e), _, _) => return Err(e),
     };
-    let window = WindowDmi { bus, base };
+    let window = WindowDmi::new(bus, map, base);
 
     // Raw access needs no attach: it is for when the debugger cannot.
     if let CpuCmd::Dmi {
@@ -8826,6 +8939,135 @@ fn drain(bus: &mut Bus, map: &RegisterMap, bundle: &str, max: Option<usize>) -> 
     Ok(())
 }
 
+/// `hio trace`: starts, stops, and reads the ring of a `trace` bundle.
+fn trace(bus: &mut Bus, map: &RegisterMap, cmd: &TraceCmd) -> Result<(), String> {
+    let (TraceCmd::Start { bundle }
+    | TraceCmd::Stop { bundle }
+    | TraceCmd::Status { bundle }
+    | TraceCmd::Dump { bundle, .. }) = cmd;
+    let names: Vec<&str> = map.traces.iter().map(|t| t.name.as_str()).collect();
+    let layout = match (bundle, names.as_slice()) {
+        (_, []) => {
+            return Err("this design has no trace: no bundle in Harness.toml has                  `backing = \"trace\"`."
+                .to_string());
+        }
+        (Some(name), _) => map.traces.iter().find(|t| &t.name == name).ok_or_else(|| {
+            format!(
+                "`{name}` is not a trace. Traces here: {}.",
+                names.join(", ")
+            )
+        })?,
+        (None, [_]) => &map.traces[0],
+        // The CPU's own, when it is the only instruction trace.
+        (None, many) => {
+            let mut rvfi = map
+                .traces
+                .iter()
+                .filter(|t| t.format.as_deref() == Some("rvfi"));
+            match (rvfi.next(), rvfi.next()) {
+                (Some(only), None) => only,
+                _ => return Err(format!("say which trace: {}.", many.join(", "))),
+            }
+        }
+    };
+    let name = layout.name.as_str();
+    let reg = |role: &str| {
+        role_of(map, name, role).ok_or_else(|| {
+            format!("regs.json has no `{name}_{role}`. Regenerate it with this veryl-harness.")
+        })
+    };
+    let run = reg("run")?.offset as u32;
+    let pause = reg("pause")?.offset as u32;
+    let count = reg("count")?.offset as u32;
+    let wrapped = reg("wrapped")?.offset as u32;
+    let region = map
+        .region(name)
+        .ok_or_else(|| format!("regs.json has no region `{name}`. Regenerate it."))?;
+    let depth = region.depth as u32;
+
+    match cmd {
+        TraceCmd::Start { .. } => {
+            // 0 then 1: a rise starts over, also when it is recording already.
+            let mut b = Batch::new();
+            b.write(run, 0);
+            b.write(pause, 0);
+            b.write(run, 1);
+            bus.run(&b)?;
+            println!("{name}: recording");
+            Ok(())
+        }
+        TraceCmd::Stop { .. } => {
+            let mut b = Batch::new();
+            b.write(run, 0);
+            bus.run(&b)?;
+            println!("{name}: stopped");
+            Ok(())
+        }
+        TraceCmd::Status { .. } => {
+            let (on, paused) = (rd(bus, run)?, rd(bus, pause)?);
+            let (n, full) = (rd(bus, count)?, rd(bus, wrapped)?);
+            let held = if full == 1 {
+                format!("{depth} (full: older ones were overwritten)")
+            } else {
+                n.to_string()
+            };
+            let state = match (on, paused) {
+                (0, _) => "stopped",
+                (_, 0) => "recording",
+                _ => "paused while the hart is halted",
+            };
+            println!("{name}: {state}, {n} records since the start, {held} in the ring of {depth}");
+            Ok(())
+        }
+        TraceCmd::Dump { last, .. } => {
+            // Recording is fine while nothing arrives, as on a halted hart.
+            // Whether something did is told by the count, read again after.
+            let (n, full) = (rd(bus, count)?, rd(bus, wrapped)? == 1);
+            let mut picked = hns_host::trace::entries(n, full, depth);
+            if let Some(last) = last {
+                picked.drain(..picked.len().saturating_sub(*last));
+            }
+            // Only the words that hold the record; the window pads an entry
+            // to a power of two of words.
+            let words = layout.record_bits.div_ceil(32);
+            let mut printer = hns_host::trace::Printer::new(layout);
+            for chunk in picked.chunks((1024 / words).max(1)) {
+                let mut b = region_batch(region);
+                let handles: Vec<Vec<_>> = chunk
+                    .iter()
+                    .map(|entry| {
+                        let base = region.window_base + *entry as usize * region.entry_bytes;
+                        (0..words).map(|w| b.read((base + 4 * w) as u32)).collect()
+                    })
+                    .collect();
+                let got = bus.run(&b)?;
+                for record in handles {
+                    let record: Vec<u32> = record.into_iter().map(|h| got[h]).collect();
+                    println!("{}", printer.line(&record));
+                }
+            }
+            if picked.is_empty() {
+                println!("{name}: empty");
+            } else if full {
+                println!(
+                    "({} of {n} records; the older ones were overwritten)",
+                    picked.len()
+                );
+            }
+            let later = rd(bus, count)?;
+            if later != n {
+                eprintln!(
+                    "warning: {} records arrived while the ring was read, so some lines may be \
+                     newer than the ones around them. Stop it first (`hio trace stop {name}`), \
+                     or halt the CPU.",
+                    later.wrapping_sub(n)
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Reads every register in one round trip. A round trip per register is slow,
 /// because a JTAG round trip is expensive.
 fn dump(bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
@@ -8902,6 +9144,35 @@ fn size_note(r: &hns_regs::Register, words: &[u32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn probe_with(serial: &str) -> hns_host::ftdi::Found {
+        hns_host::ftdi::Found {
+            vid: 0x0403,
+            pid: 0x6010,
+            product: None,
+            serial: Some(serial.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_part_of_a_serial_picks_the_one_probe_that_has_it() {
+        let serials = |found: Vec<hns_host::ftdi::Found>| -> Vec<String> {
+            found.into_iter().filter_map(|f| f.serial).collect()
+        };
+        let plugged = || {
+            vec![
+                probe_with("210319788107"),
+                probe_with("210319A8F2D1"),
+                probe_with("8107"),
+            ]
+        };
+        assert_eq!(serials(by_serial(plugged(), "8F2D")), ["210319A8F2D1"]);
+        // Two have `2103`, so it does not choose.
+        assert_eq!(by_serial(plugged(), "2103").len(), 2);
+        // `8107` is a whole serial, and a part of another: the whole one wins.
+        assert_eq!(serials(by_serial(plugged(), "8107")), ["8107"]);
+        assert!(by_serial(plugged(), "9999").is_empty());
+    }
     use clap::CommandFactory;
 
     /// Wide values go out lowest word first. Reversed, a descriptor address
@@ -9125,6 +9396,24 @@ mod tests {
             Ok(PromptAction::Cpu(CpuCmd::Reset { halt: true, .. }))
         ));
         assert!(matches!(cpu("up"), Ok(PromptAction::Enter(Level::Top))));
+        // The trace is the same command at both levels.
+        for line in ["trace dump --last 5", "cpu trace dump --last 5"] {
+            assert!(
+                matches!(
+                    top(line).or_else(|_| cpu(line)),
+                    Ok(PromptAction::Hio(Step::Window(Cmd::Trace(
+                        TraceCmd::Dump { last: Some(5), .. }
+                    ))))
+                ),
+                "{line}"
+            );
+        }
+        assert!(matches!(
+            cpu("trace stop"),
+            Ok(PromptAction::Hio(Step::Window(Cmd::Trace(
+                TraceCmd::Stop { .. }
+            ))))
+        ));
         assert!(matches!(top("   "), Ok(PromptAction::Nothing)));
         assert!(matches!(top("help"), Ok(PromptAction::Say(_))));
         assert!(matches!(top("help read"), Ok(PromptAction::Say(_))));

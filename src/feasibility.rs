@@ -185,6 +185,16 @@ pub fn capability(backing: Backing) -> Capability {
 
         // Observe-only output. It only holds a sample, so any transport works.
         //
+        // A ring in BRAM. Not a `sink`: it never drops a beat, it overwrites
+        // the oldest record, and keeping the last records is its purpose.
+        Backing::Trace => Capability {
+            serves_dut_requests: false,
+            deterministic: true,
+            sink: false,
+            needs_pcie: false,
+            needs: &[],
+        },
+
         // Not a `sink`: that would require a drop counter. Whether `observe`
         // drops values depends on its implementation (a sample register or a
         // trace ring), which is not decided yet.
@@ -597,6 +607,24 @@ pub enum FeasibilityError {
         target: String,
         depth: u64,
         width: usize,
+    },
+
+    #[error(
+        "[bundle.{bundle}] needs {needed_kb} kB of BRAM; target `{target}` has {available_kb} kB"
+    )]
+    #[diagnostic(
+        code(harness::feasibility::trace_too_large),
+        help(
+            "The ring keeps {depth} records of {record_bits} bits. Make `depth` smaller, or record fewer ports."
+        )
+    )]
+    TraceTooLarge {
+        bundle: String,
+        needed_kb: u64,
+        available_kb: u64,
+        target: String,
+        record_bits: usize,
+        depth: u32,
     },
 
     /// Each memory fits alone, but not all together.
@@ -1044,6 +1072,7 @@ pub fn check_capacity(
     axi_mems: &[crate::terminator::AxiMemPlan],
     host_mems: &[crate::terminator::HostMemPlan],
     fifos: &[crate::terminator::FifoPlan],
+    traces: &[crate::terminator::TracePlan],
 ) -> Result<(), FeasibilityError> {
     let mut parts: Vec<(String, u64)> = Vec::new();
     parts.extend(memories.iter().map(|m| (m.bundle.clone(), m.bytes())));
@@ -1065,6 +1094,7 @@ pub fn check_capacity(
             u64::from(f.depth) * f.width.div_ceil(8) as u64,
         )
     }));
+    parts.extend(traces.iter().map(|t| (t.bundle.clone(), t.bytes())));
     let needed_kb = parts
         .iter()
         .map(|(_, bytes)| bytes)
@@ -1078,6 +1108,21 @@ pub fn check_capacity(
         .and_then(|x| x.as_integer())
         .unwrap_or(0)
         .max(0) as u64;
+    // A memory that does not fit alone is caught by `check`; a trace here.
+    if available_kb > 0
+        && let Some(trace) = traces
+            .iter()
+            .find(|t| t.bytes().div_ceil(1024) > available_kb)
+    {
+        return Err(FeasibilityError::TraceTooLarge {
+            bundle: trace.bundle.clone(),
+            needed_kb: trace.bytes().div_ceil(1024),
+            available_kb,
+            target: target.name.clone(),
+            record_bits: trace.record_width(),
+            depth: trace.depth,
+        });
+    }
     if parts.len() > 1 && needed_kb > available_kb {
         parts.sort_by_key(|part| std::cmp::Reverse(part.1));
         return Err(FeasibilityError::NotEnoughBramTogether {
@@ -1178,6 +1223,7 @@ fn alternatives_over(transport: &str) -> String {
         Backing::HostIrq,
         Backing::PcieFlr,
         Backing::HostPollFifo,
+        Backing::Trace,
         Backing::Observe,
     ];
     all.iter()
@@ -1931,10 +1977,10 @@ mod tests {
             xfer: None,
         };
         let one = [mem("a")];
-        assert!(check_capacity(&arty(), &[], &one, &[], &[]).is_ok());
+        assert!(check_capacity(&arty(), &[], &one, &[], &[], &[]).is_ok());
 
         let two = [mem("a"), mem("b")];
-        let err = check_capacity(&arty(), &[], &two, &[], &[]).unwrap_err();
+        let err = check_capacity(&arty(), &[], &two, &[], &[], &[]).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1960,6 +2006,6 @@ mod tests {
                 ..mem("b")
             },
         ];
-        assert!(check_capacity(&arty(), &[], &dram, &[], &[]).is_ok());
+        assert!(check_capacity(&arty(), &[], &dram, &[], &[], &[]).is_ok());
     }
 }

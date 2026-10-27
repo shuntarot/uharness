@@ -134,6 +134,12 @@ pub struct RegisterMap {
     #[serde(default)]
     pub dut_read_only: Vec<String>,
 
+    /// The record layout of each trace ring (`backing = "trace"`). The ring
+    /// is the region of the same name. Empty when the design has none, and
+    /// in older `regs.json`.
+    #[serde(default)]
+    pub traces: Vec<Trace>,
+
     /// Present only for a PCIe design; the host needs it to find the card.
     ///
     /// Absent means the design has no PCIe port. On a JTAG design, it would
@@ -163,6 +169,34 @@ pub struct Pcie {
     pub requester: Option<String>,
 }
 
+/// How the bits of a trace record split into fields.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Trace {
+    /// The bundle, and the name of its region and its registers
+    /// (`<name>_run`, `_pause`, `_count`, `_wrapped`, `_depth`).
+    pub name: String,
+    /// `rvfi` for the RISC-V Formal Interface. Absent for plain fields.
+    #[serde(default)]
+    pub format: Option<String>,
+    pub record_bits: usize,
+    /// From the lowest bit up. The first is `cycle`, the cycles since the
+    /// start, which the harness adds.
+    pub fields: Vec<TraceField>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct TraceField {
+    pub name: String,
+    pub lsb: usize,
+    pub width: usize,
+}
+
+impl Trace {
+    pub fn field(&self, name: &str) -> Option<&TraceField> {
+        self.fields.iter().find(|field| field.name == name)
+    }
+}
+
 /// A contiguous range in the window. Addresses start at 0 inside it; the host
 /// adds `window_base`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -171,7 +205,8 @@ pub struct Region {
     pub name: String,
 
     /// What is behind the range: `memory` (harness memory), `dut` (a DUT
-    /// slave interface) or `dmi` (a Debug Module, which `hio cpu` looks for).
+    /// slave interface), `dmi` (a Debug Module, which `hio cpu` looks for) or
+    /// `trace` (a trace ring, read only).
     ///
     /// This decides whether a batch may be sent again. `memory` gives the
     /// same result twice, so a batch the bridge dropped can be resent. A read
@@ -225,7 +260,7 @@ impl Region {
     /// An unknown kind counts as not idempotent: an older `regs.json` has no
     /// `kind`, and its regions may include DUT slave interfaces.
     pub fn is_idempotent(&self) -> bool {
-        self.kind.as_deref() == Some("memory")
+        matches!(self.kind.as_deref(), Some("memory" | "trace"))
     }
 
     /// Total bytes that can be reached: the whole memory.
