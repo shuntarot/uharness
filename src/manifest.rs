@@ -696,6 +696,13 @@ pub struct Bundle {
     /// it, the records are plain fields.
     #[serde(default)]
     pub format: Option<TraceFormat>,
+
+    /// The ports a `trace` may trigger on (`trace` only), from its own
+    /// ports. Only these get a comparator, as a logic analyzer has its
+    /// trigger probes fixed before synthesis. Without it, a trace can still
+    /// trigger on its first beat (`hio trace start --now`), on no condition.
+    #[serde(default)]
+    pub trigger: Option<Vec<String>>,
 }
 
 /// What the records of a `trace` are.

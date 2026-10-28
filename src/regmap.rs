@@ -174,6 +174,8 @@ pub struct TraceFieldLayout {
     pub name: String,
     pub lsb: usize,
     pub width: usize,
+    /// Where it sits in `<bundle>_tmask` / `_tvalue`, if it may trigger.
+    pub trigger_lsb: Option<usize>,
 }
 
 impl RegisterMap {
@@ -782,11 +784,12 @@ pub fn build(
     // Trace control and status. The ring itself is a region.
     for trace in traces {
         let mut place = |name: &str, width: usize, access: Access, role, value| {
+            let words = width.div_ceil(WORD_BITS).max(1);
             let register = Register {
                 name: format!("{}_{name}", trace.bundle),
                 kind: Kind::Terminator,
                 offset,
-                words: 1,
+                words,
                 width,
                 access,
                 bundle: Some(trace.bundle.clone()),
@@ -794,7 +797,7 @@ pub fn build(
                 self_clearing: None,
                 role: Some(role),
             };
-            offset += WORD_BITS / 8;
+            offset += words * (WORD_BITS / 8);
             register
         };
         // 1 records; a write of 1 after 0 starts over.
@@ -813,6 +816,19 @@ pub fn build(
             "depth",
             Some(trace.depth),
         ));
+        // The trigger: armed at the start, it freezes the ring `after`
+        // records past the first beat that matches. A mask of 0 matches the
+        // first beat, so a trace without `trigger` has no mask but can
+        // still trigger.
+        registers.push(place("arm", 1, Access::ReadWrite, "arm", None));
+        registers.push(place("after", WORD_BITS, Access::ReadWrite, "after", None));
+        if trace.trigger_width() > 0 {
+            let width = trace.trigger_width();
+            registers.push(place("tmask", width, Access::ReadWrite, "tmask", None));
+            registers.push(place("tvalue", width, Access::ReadWrite, "tvalue", None));
+        }
+        registers.push(place("hit", 1, Access::ReadOnly, "hit", None));
+        registers.push(place("hit_at", WORD_BITS, Access::ReadOnly, "hit_at", None));
     }
 
     // The APB transfers the slave ended with `pslverr`. A write is answered
@@ -1278,11 +1294,13 @@ pub fn build(
                 name: crate::terminator::TRACE_CYCLE.to_string(),
                 lsb: 0,
                 width: crate::terminator::TRACE_CYCLE_BITS,
+                trigger_lsb: None,
             })
             .chain(trace.fields.iter().map(|field| TraceFieldLayout {
                 name: field.name.clone(),
                 lsb: field.lsb,
                 width: field.width,
+                trigger_lsb: field.trigger_lsb,
             }))
             .collect(),
         })
@@ -1506,8 +1524,8 @@ fn direction_of(dut: &Dut, name: &str) -> Option<PortDirection> {
 /// (`clear` is the other side of self-clearing, or `-`), then
 /// `region|bundle|kind|base|size|entry|total` for each region, then
 /// `dut_base|bundle|base` for each memory with a `dut_base`, then
-/// `trace|bundle|format|name:lsb:width,...` for each trace (`format` is `-`
-/// without one), joined with `\n`. `value` is not included: the hash is itself a value, so it would
+/// `trace|bundle|format|name:lsb:width[:trigger_lsb],...` for each trace
+/// (`format` is `-` without one), joined with `\n`. `value` is not included: the hash is itself a value, so it would
 /// refer to itself.
 ///
 /// Regions are in it because `window_base` can move one without moving any register.
@@ -1578,7 +1596,10 @@ pub fn canonical_text(
                 trace
                     .fields
                     .iter()
-                    .map(|field| format!("{}:{}:{}", field.name, field.lsb, field.width))
+                    .map(|field| match field.trigger_lsb {
+                        Some(at) => format!("{}:{}:{}:{at}", field.name, field.lsb, field.width),
+                        None => format!("{}:{}:{}", field.name, field.lsb, field.width),
+                    })
                     .collect::<Vec<_>>()
                     .join(",")
             )

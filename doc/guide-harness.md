@@ -90,6 +90,7 @@ data lives (`backing`); the shape of the port is read from the DUT.**
 | `dut_base` | byte address | a memory; the DUT address of its first byte, default 0. A multiple of 4 KB on AXI4 |
 | `reset` | port name | `dmi` only: the Debug Module's own reset port |
 | `format` | `"rvfi"` | `trace` only: the records are RVFI; names and widths are checked |
+| `trigger` | array of ports | `trace` only: the ports `hio trace start --when` may test, from `ports`; only these get a comparator. Default: none |
 
 A key the bundle's shape does not use is an error, not ignored.
 
@@ -209,7 +210,11 @@ record is the ports of the bundle, lowest first, above a cycle count the
 harness adds. With `format = "rvfi"` the names are checked against the
 RISC-V Formal Interface (`rvfi_valid`, `rvfi_pc_rdata`, `rvfi_insn`, ...), and
 `hio trace dump` prints instructions. Name only the ports you need: each bit
-costs `depth` bits of block RAM.
+costs `depth` bits of block RAM. `trigger` names the ports a trigger may
+test, as a logic analyzer fixes its trigger probes before synthesis; the
+others are recorded but cannot trigger. The fields are named after the ports,
+without the direction prefix and the bundle name (`o_rvfi_pc_rdata` is
+`pc_rdata`).
 
 ```toml
 [bundle.rvfi]
@@ -218,6 +223,7 @@ format  = "rvfi"
 depth   = 1024
 ports   = ["o_rvfi_valid", "o_rvfi_pc_rdata", "o_rvfi_insn", "o_rvfi_mode",
            "o_rvfi_rd_addr", "o_rvfi_rd_wdata", "o_rvfi_trap", "o_rvfi_intr"]
+trigger = ["o_rvfi_pc_rdata", "o_rvfi_trap"]
 ```
 
 **Memory the DUT reads and writes.**

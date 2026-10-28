@@ -173,7 +173,8 @@ pub struct Pcie {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Trace {
     /// The bundle, and the name of its region and its registers
-    /// (`<name>_run`, `_pause`, `_count`, `_wrapped`, `_depth`).
+    /// (`<name>_run`, `_pause`, `_count`, `_wrapped`, `_depth`, and the
+    /// trigger's `_arm`, `_after`, `_tmask`, `_tvalue`, `_hit`, `_hit_at`).
     pub name: String,
     /// `rvfi` for the RISC-V Formal Interface. Absent for plain fields.
     #[serde(default)]
@@ -189,6 +190,10 @@ pub struct TraceField {
     pub name: String,
     pub lsb: usize,
     pub width: usize,
+    /// Where it sits in `<trace>_tmask` / `_tvalue`. Absent when the field
+    /// may not trigger (it is not in `trigger` in Harness.toml).
+    #[serde(default)]
+    pub trigger_lsb: Option<usize>,
 }
 
 impl Trace {

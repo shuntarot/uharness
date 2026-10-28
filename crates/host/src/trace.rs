@@ -48,6 +48,118 @@ pub fn hex(words: &[u32], lsb: usize, width: usize) -> String {
     format!("0x{text}")
 }
 
+/// The trigger condition for `<trace>_tmask` and `<trace>_tvalue`, built
+/// from `--when` terms, each `field=value` or `field=value/mask`. Several
+/// terms must all hold. The words are lowest first, as the registers take
+/// them.
+pub fn trigger_words(trace: &Trace, when: &[String]) -> Result<(Vec<u32>, Vec<u32>), String> {
+    let bits = trace
+        .fields
+        .iter()
+        .filter_map(|f| f.trigger_lsb.map(|at| at + f.width))
+        .max()
+        .unwrap_or(0);
+    let words = bits.div_ceil(32);
+    let (mut mask, mut value) = (vec![0u32; words], vec![0u32; words]);
+    let mut seen: Vec<&str> = Vec::new();
+    for term in when {
+        let (name, rest) = term.split_once('=').ok_or_else(|| {
+            format!(
+                "`{term}` is not a condition. Write `<field>=<value>`, or \
+                 `<field>=<value>/<mask>` for some of its bits, such as `pc_rdata=0x80001234`."
+            )
+        })?;
+        let name = name.trim();
+        let field = trace.field(name).ok_or_else(|| {
+            let names: Vec<&str> = trace
+                .fields
+                .iter()
+                .filter(|f| f.name != "cycle")
+                .map(|f| f.name.as_str())
+                .collect();
+            format!(
+                "`{name}` is not a field of `{}`. Its fields: {}.",
+                trace.name,
+                names.join(", ")
+            )
+        })?;
+        let Some(at) = field.trigger_lsb else {
+            let can: Vec<&str> = trace
+                .fields
+                .iter()
+                .filter(|f| f.trigger_lsb.is_some())
+                .map(|f| f.name.as_str())
+                .collect();
+            return Err(format!(
+                "`{name}` is recorded but cannot trigger: only the ports in `trigger` of \
+                 [bundle.{}] in Harness.toml get a comparator. {}",
+                trace.name,
+                if can.is_empty() {
+                    "It lists none. Add the port there and generate again; `--now` needs none."
+                        .to_string()
+                } else {
+                    format!(
+                        "These can: {}. Or add the port there and generate again.",
+                        can.join(", ")
+                    )
+                }
+            ));
+        };
+        if seen.contains(&name) {
+            return Err(format!(
+                "`{name}` is in two conditions. Give it once, with a mask if needed."
+            ));
+        }
+        seen.push(name);
+        if field.width > 64 {
+            return Err(format!(
+                "`{name}` is {} bits; a condition takes at most 64.",
+                field.width
+            ));
+        }
+        let all = if field.width == 64 {
+            u64::MAX
+        } else {
+            (1u64 << field.width) - 1
+        };
+        let (v, m) = match rest.split_once('/') {
+            Some((v, m)) => (number(v)?, number(m)?),
+            None => (number(rest)?, all),
+        };
+        if v & !all != 0 || m & !all != 0 {
+            return Err(format!(
+                "`{term}` does not fit `{name}`, which is {} bits.",
+                field.width
+            ));
+        }
+        if v & !m != 0 {
+            return Err(format!(
+                "`{term}` sets bits outside its mask, which would never match. Clear them in the value."
+            ));
+        }
+        for i in 0..field.width {
+            let bit = at + i;
+            if m >> i & 1 == 1 {
+                mask[bit / 32] |= 1 << (bit % 32);
+            }
+            if v >> i & 1 == 1 {
+                value[bit / 32] |= 1 << (bit % 32);
+            }
+        }
+    }
+    Ok((mask, value))
+}
+
+/// A number as people type it: decimal, or hex with `0x`, `_` allowed.
+fn number(text: &str) -> Result<u64, String> {
+    let t = text.trim().replace('_', "");
+    let parsed = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => t.parse(),
+    };
+    parsed.map_err(|_| format!("`{text}` is not a number. Write it in decimal or as 0x..."))
+}
+
 /// Prints records one line each. It remembers the previous cycle, so that
 /// each line shows the cycles since the record before it.
 pub struct Printer<'a> {
@@ -212,6 +324,7 @@ mod tests {
             name: name.to_string(),
             lsb,
             width,
+            trigger_lsb: None,
         }
     }
 
@@ -277,6 +390,51 @@ mod tests {
         words[0] = 9;
         let line = printer.line(&words);
         assert!(line.contains("     9     +4  "), "{line}");
+    }
+
+    #[test]
+    fn conditions_become_mask_and_value_words() {
+        let mut trace = Trace {
+            name: "rvfi".to_string(),
+            format: Some("rvfi".to_string()),
+            record_bits: 32 + 32 + 32 + 1,
+            fields: vec![
+                field("cycle", 0, 32),
+                field("pc_rdata", 32, 32),
+                field("insn", 64, 32),
+                field("trap", 96, 1),
+            ],
+        };
+        // pc_rdata and trap may trigger: bits 0..32 and 32.
+        trace.fields[1].trigger_lsb = Some(0);
+        trace.fields[3].trigger_lsb = Some(32);
+
+        let (mask, value) = trigger_words(&trace, &["pc_rdata=0x8000_1234".to_string()]).unwrap();
+        assert_eq!((mask, value), (vec![0xffff_ffff, 0], vec![0x8000_1234, 0]));
+
+        let when = [
+            "trap=1".to_string(),
+            "pc_rdata=0x80038000/0xfffff000".to_string(),
+        ];
+        let (mask, value) = trigger_words(&trace, &when).unwrap();
+        assert_eq!((mask, value), (vec![0xffff_f000, 1], vec![0x8003_8000, 1]));
+
+        // No condition: a mask of 0, which the first beat matches.
+        assert_eq!(
+            trigger_words(&trace, &[]).unwrap(),
+            (vec![0, 0], vec![0, 0])
+        );
+
+        for (term, says) in [
+            ("insn=0x13", "cannot trigger"),
+            ("rd=1", "not a field"),
+            ("trap=2", "does not fit"),
+            ("pc_rdata", "not a condition"),
+            ("pc_rdata=0x10/0x0f", "outside its mask"),
+        ] {
+            let err = trigger_words(&trace, &[term.to_string()]).unwrap_err();
+            assert!(err.contains(says), "{term}: {err}");
+        }
     }
 
     #[test]

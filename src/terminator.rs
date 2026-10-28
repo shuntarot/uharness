@@ -100,6 +100,9 @@ pub struct TraceField {
     /// The lowest bit in the record.
     pub lsb: usize,
     pub width: usize,
+    /// Where it sits in the trigger comparison, if it may trigger. The
+    /// trigger fields are packed in record order from bit 0.
+    pub trigger_lsb: Option<usize>,
 }
 
 /// The name of the field the harness adds: cycles since the start, in the
@@ -125,6 +128,15 @@ impl TracePlan {
     /// record read as 0.
     pub fn entry_words(&self) -> usize {
         self.record_width().div_ceil(32).next_power_of_two()
+    }
+
+    /// The bits the trigger compares. 0 without `trigger`.
+    pub fn trigger_width(&self) -> usize {
+        self.fields
+            .iter()
+            .filter(|field| field.trigger_lsb.is_some())
+            .map(|field| field.width)
+            .sum()
     }
 
     /// The block RAM it takes, in bytes. The words the window adds are not
@@ -959,6 +971,19 @@ pub enum TerminatorError {
         bundle: String,
         port: String,
         field: String,
+    },
+
+    #[error("[bundle.{bundle}] triggers on `{port}`, which it does not record")]
+    #[diagnostic(
+        code(harness::terminator::trigger_not_recorded),
+        help(
+            "A trace triggers on what it records. Add the port to `ports`, or trigger on one of:\n\n    {recorded}\n\n`valid` is not one: every record has it."
+        )
+    )]
+    TriggerNotRecorded {
+        bundle: String,
+        port: String,
+        recorded: String,
     },
 
     #[error("[bundle.{bundle}] is an RVFI trace with no `{field}`")]
@@ -2717,12 +2742,39 @@ pub fn resolve_traces(
                 port: assignment.port.clone(),
                 lsb,
                 width,
+                trigger_lsb: None,
             });
             lsb += width;
         }
 
         if declared.format == Some(TraceFormat::Rvfi) {
             check_rvfi(bundle, &fields)?;
+        }
+
+        for port in declared.trigger.iter().flatten() {
+            if !fields.iter().any(|field| &field.port == port) {
+                return Err(TerminatorError::TriggerNotRecorded {
+                    bundle: bundle.clone(),
+                    port: port.clone(),
+                    recorded: fields
+                        .iter()
+                        .map(|field| format!("\"{}\"", field.port))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            }
+        }
+        let mut trigger_lsb = 0;
+        for field in &mut fields {
+            if declared
+                .trigger
+                .iter()
+                .flatten()
+                .any(|port| *port == field.port)
+            {
+                field.trigger_lsb = Some(trigger_lsb);
+                trigger_lsb += field.width;
+            }
         }
 
         // Not a fact about the DUT, but the records are what is being looked
@@ -3303,6 +3355,7 @@ pub fn check_claimed(
     const DUT_BASE: &str = "dut_base";
     const RESET: &str = "reset";
     const FORMAT: &str = "format";
+    const TRIGGER: &str = "trigger";
 
     for binding in bindings {
         let name = binding.bundle.as_str();
@@ -3316,7 +3369,7 @@ pub fn check_claimed(
             (
                 traces.iter().any(|p| p.bundle == name),
                 "a `trace`",
-                &[DEPTH, FORMAT][..],
+                &[DEPTH, FORMAT, TRIGGER][..],
             ),
             (
                 memories.iter().any(|p| p.bundle == name),
@@ -3400,6 +3453,7 @@ pub fn check_claimed(
             (DUT_BASE, declared.dut_base.is_some()),
             (RESET, declared.reset.is_some()),
             (FORMAT, declared.format.is_some()),
+            (TRIGGER, declared.trigger.is_some()),
         ] {
             if set && !takes.contains(&key) {
                 return Err(TerminatorError::KeyNotApplicable {
@@ -3407,7 +3461,7 @@ pub fn check_claimed(
                     key,
                     shape,
                     takes: if takes.is_empty() {
-                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`, `reset`, `format`"
+                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`, `reset`, `format`, `trigger`"
                             .to_string()
                     } else {
                         takes

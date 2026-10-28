@@ -588,7 +588,24 @@ struct ApArg {
 #[derive(Subcommand)]
 enum TraceCmd {
     /// Empty the ring and record from now on.
-    Start { bundle: Option<String> },
+    ///
+    /// Without a trigger it records until `stop`. With one, it keeps
+    /// `--after` records past the trigger and then freezes.
+    Start {
+        bundle: Option<String>,
+        /// Trigger when a field has this value, such as `pc_rdata=0x80001234`.
+        ///
+        /// `field=value/mask` tests some bits. Repeat it for an AND. Only the
+        /// ports in `trigger` in Harness.toml can trigger.
+        #[arg(long, value_name = "FIELD=VALUE[/MASK]")]
+        when: Vec<String>,
+        /// Trigger on the first beat, on no condition.
+        #[arg(long, conflicts_with = "when")]
+        now: bool,
+        /// Records to keep after the trigger, then freeze (default 0).
+        #[arg(long, value_name = "N")]
+        after: Option<u32>,
+    },
     /// Stop recording. The ring keeps the last records.
     Stop { bundle: Option<String> },
     /// Say whether it records, and how many records the ring holds.
@@ -8941,7 +8958,7 @@ fn drain(bus: &mut Bus, map: &RegisterMap, bundle: &str, max: Option<usize>) -> 
 
 /// `hio trace`: starts, stops, and reads the ring of a `trace` bundle.
 fn trace(bus: &mut Bus, map: &RegisterMap, cmd: &TraceCmd) -> Result<(), String> {
-    let (TraceCmd::Start { bundle }
+    let (TraceCmd::Start { bundle, .. }
     | TraceCmd::Stop { bundle }
     | TraceCmd::Status { bundle }
     | TraceCmd::Dump { bundle, .. }) = cmd;
@@ -8978,6 +8995,10 @@ fn trace(bus: &mut Bus, map: &RegisterMap, cmd: &TraceCmd) -> Result<(), String>
     };
     let run = reg("run")?.offset as u32;
     let pause = reg("pause")?.offset as u32;
+    let arm = reg("arm")?.offset as u32;
+    let after_reg = reg("after")?.offset as u32;
+    let hit = reg("hit")?.offset as u32;
+    let hit_at = reg("hit_at")?.offset as u32;
     let count = reg("count")?.offset as u32;
     let wrapped = reg("wrapped")?.offset as u32;
     let region = map
@@ -8986,14 +9007,47 @@ fn trace(bus: &mut Bus, map: &RegisterMap, cmd: &TraceCmd) -> Result<(), String>
     let depth = region.depth as u32;
 
     match cmd {
-        TraceCmd::Start { .. } => {
+        TraceCmd::Start {
+            when, now, after, ..
+        } => {
+            let armed = *now || !when.is_empty();
+            if after.is_some() && !armed {
+                return Err(
+                    "`--after` counts from a trigger: give `--when` or `--now` too.".to_string(),
+                );
+            }
+            let after = after.unwrap_or(0);
+            if after >= depth {
+                return Err(format!(
+                    "`--after {after}` keeps more than the ring holds ({depth}), so the trigger \
+                     would be overwritten. Give at most {}.",
+                    depth - 1
+                ));
+            }
+            let (mask, value) = hns_host::trace::trigger_words(layout, when)?;
             // 0 then 1: a rise starts over, also when it is recording already.
             let mut b = Batch::new();
             b.write(run, 0);
             b.write(pause, 0);
+            b.write(arm, u32::from(armed));
+            b.write(after_reg, after);
+            if let (Some(m), Some(v)) = (role_of(map, name, "tmask"), role_of(map, name, "tvalue"))
+            {
+                for (i, (mw, vw)) in mask.iter().zip(&value).enumerate() {
+                    b.write(m.offset as u32 + 4 * i as u32, *mw);
+                    b.write(v.offset as u32 + 4 * i as u32, *vw);
+                }
+            }
             b.write(run, 1);
             bus.run(&b)?;
-            println!("{name}: recording");
+            let how = if *now {
+                format!(", triggering on the first beat and keeping {after} after it")
+            } else if !when.is_empty() {
+                format!(", until {} and {after} after", when.join(" and "))
+            } else {
+                String::new()
+            };
+            println!("{name}: recording{how}");
             Ok(())
         }
         TraceCmd::Stop { .. } => {
@@ -9005,18 +9059,38 @@ fn trace(bus: &mut Bus, map: &RegisterMap, cmd: &TraceCmd) -> Result<(), String>
         }
         TraceCmd::Status { .. } => {
             let (on, paused) = (rd(bus, run)?, rd(bus, pause)?);
-            let (n, full) = (rd(bus, count)?, rd(bus, wrapped)?);
-            let held = if full == 1 {
-                format!("{depth} (full: older ones were overwritten)")
-            } else {
-                n.to_string()
+            let (n, full) = (rd(bus, count)?, rd(bus, wrapped)? == 1);
+            // Exactly `depth` records fill the ring without overwriting one.
+            let held = match (full, n == depth) {
+                (false, _) => n.to_string(),
+                (true, true) => format!("{depth} (full)"),
+                (true, false) => format!("{depth} (full: older ones were overwritten)"),
             };
-            let state = match (on, paused) {
-                (0, _) => "stopped",
-                (_, 0) => "recording",
+            let trigger = if rd(bus, hit)? == 1 {
+                let (at, kept) = (rd(bus, hit_at)?, rd(bus, after_reg)?);
+                let since = n.wrapping_sub(at);
+                Some((at, kept, since > kept, since))
+            } else {
+                None
+            };
+            let state = match (on, paused, trigger) {
+                (0, _, _) => "stopped",
+                (_, _, Some((_, _, true, _))) => "frozen after the trigger",
+                (_, 0, _) => "recording",
                 _ => "paused while the hart is halted",
             };
             println!("{name}: {state}, {n} records since the start, {held} in the ring of {depth}");
+            match trigger {
+                Some((at, kept, true, _)) => {
+                    println!("{name}: triggered at record {at}, and kept {kept} after it")
+                }
+                Some((at, kept, false, since)) => println!(
+                    "{name}: triggered at record {at}; {} of {kept} after it so far",
+                    since - 1
+                ),
+                None if rd(bus, arm)? == 1 => println!("{name}: waiting for the trigger"),
+                None => {}
+            }
             Ok(())
         }
         TraceCmd::Dump { last, .. } => {
@@ -9031,6 +9105,9 @@ fn trace(bus: &mut Bus, map: &RegisterMap, cmd: &TraceCmd) -> Result<(), String>
             // to a power of two of words.
             let words = layout.record_bits.div_ceil(32);
             let mut printer = hns_host::trace::Printer::new(layout);
+            // The record number of each line, to mark the trigger.
+            let trigger = (rd(bus, hit)? == 1).then_some(rd(bus, hit_at)?);
+            let mut seq = n.wrapping_sub(picked.len() as u32);
             for chunk in picked.chunks((1024 / words).max(1)) {
                 let mut b = region_batch(region);
                 let handles: Vec<Vec<_>> = chunk
@@ -9043,12 +9120,18 @@ fn trace(bus: &mut Bus, map: &RegisterMap, cmd: &TraceCmd) -> Result<(), String>
                 let got = bus.run(&b)?;
                 for record in handles {
                     let record: Vec<u32> = record.into_iter().map(|h| got[h]).collect();
-                    println!("{}", printer.line(&record));
+                    let mark = if trigger == Some(seq) {
+                        "  <= trigger"
+                    } else {
+                        ""
+                    };
+                    println!("{}{mark}", printer.line(&record));
+                    seq = seq.wrapping_add(1);
                 }
             }
             if picked.is_empty() {
                 println!("{name}: empty");
-            } else if full {
+            } else if full && n != depth {
                 println!(
                     "({} of {n} records; the older ones were overwritten)",
                     picked.len()
