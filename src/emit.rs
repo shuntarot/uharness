@@ -2117,6 +2117,25 @@ fn core_body(
             "    var t_{bundle}_count: {domain}logic<{WORD_BITS}>;\n"
         ));
         out.push_str(&format!("    var t_{bundle}_wrapped: {domain}logic;\n"));
+        out.push_str(&format!("    var t_{bundle}_arm: {domain}logic;\n"));
+        out.push_str(&format!(
+            "    var t_{bundle}_after: {domain}logic<{WORD_BITS}>;\n"
+        ));
+        let twidth = trace.trigger_width();
+        if twidth > 0 {
+            out.push_str(&format!(
+                "    var t_{bundle}_tmask: {domain}{};\n",
+                logic(twidth)
+            ));
+            out.push_str(&format!(
+                "    var t_{bundle}_tvalue: {domain}{};\n",
+                logic(twidth)
+            ));
+        }
+        out.push_str(&format!("    var t_{bundle}_hit: {domain}logic;\n"));
+        out.push_str(&format!(
+            "    var t_{bundle}_hit_at: {domain}logic<{WORD_BITS}>;\n"
+        ));
         out.push_str(&format!(
             "    var t_{bundle}_maddr: {domain}logic<{}>;\n",
             trace.depth.trailing_zeros()
@@ -3186,7 +3205,10 @@ fn core_body(
     for trace in &plan.traces {
         let bundle = &trace.bundle;
         out.push_str(&format!("    inst u_trace_{bundle}: hns::trace #(\n"));
+        let twidth = trace.trigger_width();
         out.push_str(&format!("        WIDTH: {},\n", trace.payload_width()));
+        // Without `trigger` the comparison is one constant bit, masked off.
+        out.push_str(&format!("        TWIDTH: {},\n", twidth.max(1)));
         out.push_str(&format!("        DEPTH: {},\n", trace.depth));
         out.push_str("    ) (\n");
         out.push_str(&format!("        i_clk: {clk},\n"));
@@ -3207,8 +3229,29 @@ fn core_body(
             .collect::<Vec<_>>()
             .join(", ");
         out.push_str(&format!("        i_data: {{{data}}},\n"));
+        if twidth > 0 {
+            let tdata = trace
+                .fields
+                .iter()
+                .rev()
+                .filter(|field| field.trigger_lsb.is_some())
+                .map(|field| format!("w_{}", field.port))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("        i_tdata: {{{tdata}}},\n"));
+            out.push_str(&format!("        i_tmask: t_{bundle}_tmask,\n"));
+            out.push_str(&format!("        i_tvalue: t_{bundle}_tvalue,\n"));
+        } else {
+            out.push_str("        i_tdata: 1'b0,\n");
+            out.push_str("        i_tmask: 1'b0,\n");
+            out.push_str("        i_tvalue: 1'b0,\n");
+        }
+        out.push_str(&format!("        i_arm: t_{bundle}_arm,\n"));
+        out.push_str(&format!("        i_after: t_{bundle}_after,\n"));
         out.push_str(&format!("        o_count: t_{bundle}_count,\n"));
         out.push_str(&format!("        o_wrapped: t_{bundle}_wrapped,\n"));
+        out.push_str(&format!("        o_hit: t_{bundle}_hit,\n"));
+        out.push_str(&format!("        o_hit_at: t_{bundle}_hit_at,\n"));
         out.push_str(&format!("        i_haddr: t_{bundle}_maddr,\n"));
         out.push_str(&format!("        o_hrdata: t_{bundle}_hrdata,\n"));
         out.push_str("    );\n");
@@ -6910,6 +6953,20 @@ fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
         Some("count") => notes.push(format!(
             "records written since the start; wraps at 2^32, so `{bundle}_wrapped` tells a full ring"
         )),
+        Some("arm") => notes.push(
+            "1 at the start: the first beat that matches `_tmask` / `_tvalue` triggers (with no mask, the first beat)".to_string(),
+        ),
+        Some("after") => notes.push(
+            "records kept after the trigger; then the ring freezes".to_string(),
+        ),
+        Some("tmask") => notes.push(
+            "the bits of the trigger fields that must match; `hio trace start --when` writes it".to_string(),
+        ),
+        Some("tvalue") => notes.push("what those bits must be".to_string()),
+        Some("hit") => notes.push("1 once the trigger has matched".to_string()),
+        Some("hit_at") => notes.push(
+            "the record number of the trigger, counted from the start".to_string(),
+        ),
         Some("wrapped") => notes.push(
             "1 once the ring is full: the oldest records are being overwritten".to_string(),
         ),

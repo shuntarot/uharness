@@ -634,7 +634,7 @@ const TRACE_HEAD: &str = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz
 #[test]
 fn a_trace_becomes_a_ring_with_its_record_layout() {
     let dir = trace_fixture(&format!(
-        "{TRACE_HEAD}[leave_open]\nports = [\"o_rvfi_rd_wdata\"]\n\n[bundle.rvfi]\nbacking = \"trace\"\nformat = \"rvfi\"\ndepth = 512\nports = [\"o_rvfi_valid\", \"o_rvfi_pc_rdata\", \"o_rvfi_insn\", \"o_rvfi_mode\"]\n"
+        "{TRACE_HEAD}[leave_open]\nports = [\"o_rvfi_rd_wdata\"]\n\n[bundle.rvfi]\nbacking = \"trace\"\nformat = \"rvfi\"\ndepth = 512\nports = [\"o_rvfi_valid\", \"o_rvfi_pc_rdata\", \"o_rvfi_insn\", \"o_rvfi_mode\"]\ntrigger = [\"o_rvfi_mode\", \"o_rvfi_pc_rdata\"]\n"
     ));
     let output = run_gen(&dir, &[]);
     assert_eq!(
@@ -664,6 +664,24 @@ fn a_trace_becomes_a_ring_with_its_record_layout() {
         ]
     );
     assert_eq!(trace.record_bits, 98);
+    // The trigger fields pack in record order, whatever order `trigger`
+    // lists them in.
+    let trigger: Vec<(&str, Option<usize>)> = trace
+        .fields
+        .iter()
+        .map(|f| (f.name.as_str(), f.trigger_lsb))
+        .collect();
+    assert_eq!(
+        trigger,
+        [
+            ("cycle", None),
+            ("pc_rdata", Some(0)),
+            ("insn", None),
+            ("mode", Some(32))
+        ]
+    );
+    assert_eq!(map.get("rvfi_tmask").unwrap().width, 34);
+    assert_eq!(map.get("rvfi_tvalue").unwrap().words, 2);
     // 4 words of record take 4 in the window.
     let region = map.region("rvfi").unwrap();
     assert_eq!(region.kind.as_deref(), Some("trace"));
@@ -671,6 +689,10 @@ fn a_trace_becomes_a_ring_with_its_record_layout() {
     for (name, role) in [
         ("rvfi_run", "run"),
         ("rvfi_pause", "pause"),
+        ("rvfi_arm", "arm"),
+        ("rvfi_after", "after"),
+        ("rvfi_hit", "hit"),
+        ("rvfi_hit_at", "hit_at"),
         ("rvfi_count", "count"),
         ("rvfi_wrapped", "wrapped"),
         ("rvfi_depth", "depth"),
@@ -680,7 +702,12 @@ fn a_trace_becomes_a_ring_with_its_record_layout() {
 
     let top = tight(&fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap());
     assert!(top.contains("inst u_trace_rvfi: hns::trace #("), "{top}");
-    assert!(top.contains("WIDTH: 66 ,"), "{top}");
+    assert!(top.contains("WIDTH : 66 ,"), "{top}");
+    assert!(top.contains("TWIDTH: 34 ,"), "{top}");
+    assert!(
+        top.contains("i_tdata : {w_o_rvfi_mode, w_o_rvfi_pc_rdata},"),
+        "{top}"
+    );
     assert!(
         top.contains("i_data : {w_o_rvfi_mode, w_o_rvfi_insn, w_o_rvfi_pc_rdata},"),
         "{top}"
@@ -709,6 +736,11 @@ fn a_trace_names_what_does_not_fit() {
             "[bundle.rvfi]\nbacking = \"trace\"\n",
             "harness::terminator::trace_depth_missing",
             "depth = 1024",
+        ),
+        (
+            "[leave_open]\nports = [\"o_rvfi_rd_wdata\"]\n\n[bundle.rvfi]\nbacking = \"trace\"\ndepth = 64\nports = [\"o_rvfi_valid\", \"o_rvfi_pc_rdata\", \"o_rvfi_insn\", \"o_rvfi_mode\"]\ntrigger = [\"o_rvfi_valid\"]\n",
+            "harness::terminator::trigger_not_recorded",
+            "o_rvfi_pc_rdata",
         ),
         (
             "[bundle.rvfi]\nbacking = \"host_poll_fifo\"\nformat = \"rvfi\"\nports = [\"o_rvfi_valid\", \"o_rvfi_pc_rdata\"]\n\n[leave_open]\nports = [\"o_rvfi_insn\", \"o_rvfi_mode\", \"o_rvfi_rd_wdata\"]\n",

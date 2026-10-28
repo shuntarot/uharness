@@ -649,6 +649,10 @@ pub struct TraceFieldOutput {
     pub name: String,
     pub lsb: usize,
     pub width: usize,
+    /// Where it sits in `<name>_tmask` / `_tvalue`. Absent when it may not
+    /// trigger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_lsb: Option<usize>,
 }
 
 /// A contiguous range in the window. Addresses count from 0 inside it; the
@@ -755,6 +759,7 @@ pub fn register_map(
                         name: field.name.clone(),
                         lsb: field.lsb,
                         width: field.width,
+                        trigger_lsb: field.trigger_lsb,
                     })
                     .collect(),
             })

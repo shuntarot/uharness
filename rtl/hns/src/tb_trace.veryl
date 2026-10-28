@@ -1,5 +1,5 @@
-/// `hns::trace`: records only while running, keeps the last DEPTH records,
-/// and starts over on the next run.
+/// `hns::trace`: records only while running and not paused, keeps the last
+/// DEPTH records, freezes after a trigger, and starts over on the next run.
 #[test(trace_keeps_the_last_records)]
 module test_trace {
     inst clk: $tb::clock_gen;
@@ -11,14 +11,21 @@ module test_trace {
     var pause  : logic    ;
     var valid  : logic    ;
     var data   : logic<8> ;
+    var arm    : logic    ;
+    var tmask  : logic<8> ;
+    var tvalue : logic<8> ;
+    var after  : logic<32>;
     var count  : logic<32>;
     var wrapped: logic    ;
+    var hit    : logic    ;
+    var hit_at : logic<32>;
     var haddr  : logic<2> ;
     var hrdata : logic<40>;
 
     inst u_trace: trace #(
-        WIDTH: 8,
-        DEPTH: 4,
+        WIDTH : 8,
+        TWIDTH: 8,
+        DEPTH : 4,
     ) (
         i_clk    : clk    ,
         i_rst    : rst    ,
@@ -26,29 +33,42 @@ module test_trace {
         i_pause  : pause  ,
         i_valid  : valid  ,
         i_data   : data   ,
+        i_tdata  : data   ,
+        i_arm    : arm    ,
+        i_tmask  : tmask  ,
+        i_tvalue : tvalue ,
+        i_after  : after  ,
         o_count  : count  ,
         o_wrapped: wrapped,
+        o_hit    : hit    ,
+        o_hit_at : hit_at ,
         i_haddr  : haddr  ,
         o_hrdata : hrdata ,
     );
 
+    // A beat is taken one cycle after it is presented.
     initial {
-        run   = 0;
-        pause = 0;
-        valid = 0;
-        data  = 0;
-        haddr = 0;
+        run    = 0;
+        pause  = 0;
+        valid  = 0;
+        data   = 0;
+        arm    = 0;
+        tmask  = 0;
+        tvalue = 0;
+        after  = 0;
+        haddr  = 0;
         rst.assert(4);
         clk.next(2);
 
         // Stopped: beats are not recorded.
         valid = 1;
         clk.next(3);
+        valid = 0;
+        clk.next(1);
         $assert(count == 0, "recorded while stopped");
 
         // Start, then one beat every other cycle: 0xa0, 0xa1, 0xa2.
-        valid = 0;
-        run   = 1;
+        run = 1;
         clk.next(1);
         for i in 0..3 {
             valid = 1;
@@ -62,10 +82,10 @@ module test_trace {
         // Each record is the payload above the cycle count since the start.
         haddr = 0;
         clk.next(1);
-        $assert(hrdata == {8'ha0, 32'd0}, "first record");
+        $assert(hrdata == {8'ha0, 32'd1}, "first record");
         haddr = 2;
         clk.next(1);
-        $assert(hrdata == {8'ha2, 32'd4}, "third record, four cycles later");
+        $assert(hrdata == {8'ha2, 32'd5}, "third record, four cycles later");
 
         // Two more: the fifth overwrites the first.
         valid = 1;
@@ -83,31 +103,76 @@ module test_trace {
         clk.next(1);
         $assert(hrdata[39:32] == 8'ha1, "the second stays");
 
-        // Paused: nothing is recorded, and the cycle count goes on.
+        // Paused: nothing is recorded.
         pause = 1;
         valid = 1;
+        data  = 8'hc0;
         clk.next(3);
+        valid = 0;
+        clk.next(1);
         $assert(count == 5, "recorded while paused");
         pause = 0;
-        data  = 8'hc0;
+        valid = 1;
+        data  = 8'hc1;
         clk.next(1);
         valid = 0;
+        clk.next(1);
         $assert(count == 6, "not recorded after the pause");
         haddr = 1;
         clk.next(1);
-        $assert(hrdata[39:32] == 8'hc0, "the beat after the pause");
+        $assert(hrdata[39:32] == 8'hc1, "the beat after the pause");
 
         // Stop: the ring holds still.
         run   = 0;
         valid = 1;
         clk.next(3);
+        valid = 0;
+        clk.next(1);
         $assert(count == 6, "recorded after the stop");
 
-        // A new run starts over.
+        // Armed on 0x13 with two after it: 0x10 to 0x17 in a row keep 0x10 to
+        // 0x15, and the ring freezes.
+        arm    = 1;
+        tmask  = 8'hff;
+        tvalue = 8'h13;
+        after  = 2;
+        run    = 1;
+        clk.next(1);
+        $assert(count == 0 && !hit, "a new run did not start over");
+        valid = 1;
+        for i in 0..8 {
+            data = 8'h10 + i;
+            clk.next(1);
+        }
         valid = 0;
-        run   = 1;
         clk.next(2);
-        $assert(count == 0 && !wrapped, "a new run did not start over");
+        $assert(hit && hit_at == 3, "the trigger is record 3");
+        $assert(count == 6, "not frozen two records after the trigger");
+        haddr = 3;
+        clk.next(1);
+        $assert(hrdata[39:32] == 8'h13, "the trigger record");
+        haddr = 1;
+        clk.next(1);
+        $assert(hrdata[39:32] == 8'h15, "the last record");
+
+        // A mask picks bits: 0x2? matches 0x24.
+        run = 0;
+        clk.next(1);
+        tmask  = 8'hf0;
+        tvalue = 8'h20;
+        after  = 0;
+        run    = 1;
+        clk.next(1);
+        valid = 1;
+        data  = 8'h14;
+        clk.next(1);
+        data = 8'h24;
+        clk.next(1);
+        data = 8'h25;
+        clk.next(1);
+        valid = 0;
+        clk.next(2);
+        $assert(hit && hit_at == 1 && count == 2, "the mask did not pick 0x24");
         $finish();
     }
 }

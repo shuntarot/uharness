@@ -10,13 +10,21 @@
 /// CPU is halted: the instructions it injects then are its own, not the
 /// program's.
 ///
+/// With `i_arm`, a beat whose `i_tdata` matches `i_tvalue` on the bits of
+/// `i_tmask` is the trigger. It is recorded, then `i_after` more, and then
+/// the ring freezes, so it holds what led up to the trigger and what came
+/// right after. `o_hit_at` is the trigger's record number. `i_tdata` is the
+/// part of the payload that may trigger; with a mask of 0, the first beat
+/// does.
+///
 /// The host reads the ring through port B, one cycle. `o_count` and
 /// `o_wrapped` tell it where the oldest record is. The stream is never
 /// stalled: a DUT that has no `ready` cannot wait, and the ring always has
 /// room.
 pub module trace #(
-    param WIDTH: u32 = 32  ,
-    param DEPTH: u32 = 1024,
+    param WIDTH : u32 = 32  ,
+    param TWIDTH: u32 = 1   ,
+    param DEPTH : u32 = 1024,
 ) (
     i_clk    : input  clock               ,
     i_rst    : input  reset               ,
@@ -24,8 +32,15 @@ pub module trace #(
     i_pause  : input  logic               ,
     i_valid  : input  logic               ,
     i_data   : input  logic<WIDTH>        ,
+    i_tdata  : input  logic<TWIDTH>       ,
+    i_arm    : input  logic               ,
+    i_tmask  : input  logic<TWIDTH>       ,
+    i_tvalue : input  logic<TWIDTH>       ,
+    i_after  : input  logic<32>           ,
     o_count  : output logic<32>           ,
     o_wrapped: output logic               ,
+    o_hit    : output logic               ,
+    o_hit_at : output logic<32>           ,
     i_haddr  : input  logic<$clog2(DEPTH)>,
     o_hrdata : output logic<WIDTH + 32>   ,
 ) {
@@ -36,23 +51,47 @@ pub module trace #(
     var cycle  : logic<32>                ;
     var count  : logic<32>                ;
     var wrapped: logic                    ;
+    var hit    : logic                    ;
+    var hit_at : logic<32>                ;
+    var left   : logic<32>                ;
 
-    let start: logic          = i_run & ~running;
-    let take : logic          = running & i_run & ~i_pause & i_valid;
-    let wp   : logic<INDEX_W> = count[INDEX_W - 1:0];
+    // The beat, one cycle late. The comparison below then starts from a
+    // flip-flop, not from the DUT's own logic.
+    var valid_q: logic        ;
+    var data_q : logic<WIDTH> ;
+    var tdata_q: logic<TWIDTH>;
+
+    let frozen: logic          = hit & (left == 0);
+    let start : logic          = i_run & ~running;
+    let take  : logic          = running & i_run & ~i_pause & valid_q & ~frozen;
+    let equal : logic          = ((tdata_q ^ i_tvalue) & i_tmask) == 0;
+    let fire  : logic          = take & i_arm & ~hit & equal;
+    let wp    : logic<INDEX_W> = count[INDEX_W - 1:0];
 
     always_ff {
         if_reset {
+            valid_q = 0;
+            data_q  = 0;
+            tdata_q = 0;
             running = 0;
             cycle   = 0;
             count   = 0;
             wrapped = 0;
+            hit     = 0;
+            hit_at  = 0;
+            left    = 0;
         } else {
+            valid_q = i_valid;
+            data_q  = i_data;
+            tdata_q = i_tdata;
             running = i_run;
             if start {
                 cycle   = 0;
                 count   = 0;
                 wrapped = 0;
+                hit     = 0;
+                hit_at  = 0;
+                left    = 0;
             } else if running {
                 cycle = cycle + 1;
                 if take {
@@ -61,6 +100,13 @@ pub module trace #(
                     // full ring from a short one.
                     if wp == DEPTH - 1 {
                         wrapped = 1;
+                    }
+                    if fire {
+                        hit    = 1;
+                        hit_at = count;
+                        left   = i_after;
+                    } else if hit {
+                        left = left - 1;
                     }
                 }
             }
@@ -72,12 +118,14 @@ pub module trace #(
     var hrdata: logic<WIDTH + 32>;
     always_ff {
         if take {
-            mem[wp] = {i_data, cycle};
+            mem[wp] = {data_q, cycle};
         }
         hrdata = mem[i_haddr];
     }
 
     assign o_count   = count;
     assign o_wrapped = wrapped;
+    assign o_hit     = hit;
+    assign o_hit_at  = hit_at;
     assign o_hrdata  = hrdata;
 }

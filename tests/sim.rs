@@ -360,11 +360,9 @@ module valid_only_drops {{
     );
 }
 
-/// `trace`: the ring keeps the last records, each with its cycle count, and
-/// the window reads them, the words above the record as 0.
-#[test]
-fn a_trace_ring_keeps_the_last_records() {
-    let dut = r#"
+/// A core that retires exactly 20 instructions, one every other cycle,
+/// with RVFI-style ports, for the `trace` tests.
+const TRACE_DUT: &str = r#"
 module dut_top (
     i_clk          : input  clock    ,
     i_rst          : input  reset    ,
@@ -401,6 +399,12 @@ module dut_top (
     assign o_rvfi_rd_wdata = ~pc;
 }
 "#;
+
+/// `trace`: the ring keeps the last records, each with its cycle count, and
+/// the window reads them, the words above the record as 0.
+#[test]
+fn a_trace_ring_keeps_the_last_records() {
+    let dut = TRACE_DUT;
     let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.go]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"i_go\"]\n\n[bundle.rvfi]\nbacking = \"trace\"\nformat = \"rvfi\"\ndepth = 8\n";
 
     let dir = fixture(manifest, dut, "");
@@ -453,6 +457,66 @@ module trace_ring {{
         wr({run}, 1);
         $assert(rd({count}) == 0);
         $assert(rd({wrapped}) == 0);
+        $finish();
+    }}
+}}
+"#
+    );
+
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
+/// `trace` with a trigger: armed on a pc, it keeps two records after it and
+/// freezes, whatever comes later.
+#[test]
+fn a_trace_trigger_freezes_the_ring_after_it() {
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.go]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"i_go\"]\n\n[bundle.rvfi]\nbacking = \"trace\"\nformat = \"rvfi\"\ndepth = 8\ntrigger = [\"o_rvfi_pc_rdata\"]\n";
+
+    let dir = fixture(manifest, TRACE_DUT, "");
+    let map = offsets(dir.path());
+    let entry = 32;
+    let (go, run, count, arm, after, tmask, tvalue, hit, hit_at, base) = (
+        offset_of(&map, "i_go"),
+        offset_of(&map, "rvfi_run"),
+        offset_of(&map, "rvfi_count"),
+        offset_of(&map, "rvfi_arm"),
+        offset_of(&map, "rvfi_after"),
+        offset_of(&map, "rvfi_tmask"),
+        offset_of(&map, "rvfi_tvalue"),
+        offset_of(&map, "rvfi_hit"),
+        offset_of(&map, "rvfi_hit_at"),
+        region_base(&map, "rvfi"),
+    );
+    // The trigger compares pc_rdata alone, so the mask is one word.
+    let at = |index: u64| base + index * entry + 4;
+    let (e2, e4) = (at(2), at(4));
+    let tb = format!(
+        r#"
+#[test(trace_trigger)]
+module trace_trigger {{
+{BUS}
+    initial {{
+        start();
+
+        // pc 40 is the 11th instruction (record 10); keep 2 after it.
+        wr({tmask}, 32'hffff_ffff);
+        wr({tvalue}, 40);
+        wr({after}, 2);
+        wr({arm}, 1);
+        wr({run}, 1);
+        wr({go}, 1);
+        clk.next(60);
+
+        $assert(rd({hit}) == 1);
+        $assert(rd({hit_at}) == 10);
+        // Frozen at 13 records, though the core ran 20.
+        $assert(rd({count}) == 13);
+        $assert(rd({e2}) == 40);
+        $assert(rd({e4}) == 48);
         $finish();
     }}
 }}
