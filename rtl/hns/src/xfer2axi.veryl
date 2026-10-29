@@ -120,15 +120,29 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
     let rq_align: logic         = (rq_data[CMD_W - 1:SIZE_W] & (BYTES - 1)) == 0;
     let rq_beats: logic<SIZE_W> = (rq_data[SIZE_W - 1:0] + (BYTES - 1)) >> SHIFT;
     let rq_room : logic<SIZE_W> = if rq_align && rq_first <: DEPTH ? (DEPTH - rq_first[SIZE_W - 1:0]) : 0;
-    let rq_serve: logic<SIZE_W> = if rq_beats <: rq_room ? rq_beats : rq_room;
-    let rq_short: logic         = rq_serve != rq_beats || rq_beats == 0;
 
     let wq_first: logic<ADDR_W> = wq_data[CMD_W - 1:SIZE_W] >> SHIFT;
     let wq_align: logic         = (wq_data[CMD_W - 1:SIZE_W] & (BYTES - 1)) == 0;
     let wq_beats: logic<SIZE_W> = (wq_data[SIZE_W - 1:0] + (BYTES - 1)) >> SHIFT;
     let wq_room : logic<SIZE_W> = if wq_align && wq_first <: DEPTH ? (DEPTH - wq_first[SIZE_W - 1:0]) : 0;
-    let wq_serve: logic<SIZE_W> = if wq_beats <: wq_room ? wq_beats : wq_room;
-    let wq_short: logic         = wq_serve != wq_beats || wq_beats == 0;
+
+    // --- a decoded command, one stage after the queue ---
+    // The decode is split over two cycles: the queue to `room` here, and
+    // `room` to how many beats are served below. In one cycle it missed
+    // 100 MHz on an Arty's DRAM, where `DEPTH` is 2^26 beats.
+    var rs_ok   : logic        ;
+    var rs_first: logic<ADDR_W>;
+    var rs_beats: logic<SIZE_W>;
+    var rs_room : logic<SIZE_W>;
+    var ws_ok   : logic        ;
+    var ws_first: logic<ADDR_W>;
+    var ws_beats: logic<SIZE_W>;
+    var ws_room : logic<SIZE_W>;
+
+    let rs_serve: logic<SIZE_W> = if rs_beats <: rs_room ? rs_beats : rs_room;
+    let rs_short: logic         = rs_serve != rs_beats || rs_beats == 0;
+    let ws_serve: logic<SIZE_W> = if ws_beats <: ws_room ? ws_beats : ws_room;
+    let ws_short: logic         = ws_serve != ws_beats || ws_beats == 0;
 
     // --- the read side ---
     var r_active: logic        ;
@@ -167,6 +181,40 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
     let w_go : logic = axi.wvalid && axi.wready;
     let b_go : logic = axi.bvalid && axi.bready;
 
+    // A walker that is idle takes the decoded command.
+    let r_take: logic = !r_active && rs_ok;
+    let w_take: logic = !w_active && ws_ok;
+
+    always_ff {
+        if_reset {
+            rs_ok    = 0;
+            rs_first = 0;
+            rs_beats = 0;
+            rs_room  = 0;
+            ws_ok    = 0;
+            ws_first = 0;
+            ws_beats = 0;
+            ws_room  = 0;
+        } else {
+            if rq_pop {
+                rs_ok    = 1;
+                rs_first = rq_first;
+                rs_beats = rq_beats;
+                rs_room  = rq_room;
+            } else if r_take {
+                rs_ok = 0;
+            }
+            if wq_pop {
+                ws_ok    = 1;
+                ws_first = wq_first;
+                ws_beats = wq_beats;
+                ws_room  = wq_room;
+            } else if w_take {
+                ws_ok = 0;
+            }
+        }
+    }
+
     var oor  : logic<32>;
     var wdone: logic    ;
     var wderr: logic    ;
@@ -178,12 +226,23 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
 
     // Up to four things can go wrong in one cycle (a bad read command, a bad
     // write command, an error on R and one on B), so the counter adds them at
-    // once. Separate increments would lose all but one.
-    let oor_add: logic<3> = {2'b0, rq_pop && rq_short} + {2'b0, wq_pop && wq_short} + {2'b0, rd_go && r_mem && axi.rresp != 0} + {2'b0, b_go && axi.bresp != 0};
+    // once. Separate increments would lose all but one. The flags are
+    // registered before they are added, to keep the range check and the
+    // counter off one path, as in `hns::hmem`.
+    var oor_bad: logic<4>;
+    always_ff {
+        if_reset {
+            oor_bad = 0;
+        } else {
+            oor_bad = {r_take && rs_short, w_take && ws_short, rd_go && r_mem && axi.rresp != 0, b_go && axi.bresp != 0};
+        }
+    }
+    let oor_add: logic<3> = {2'b0, oor_bad[0]} + {2'b0, oor_bad[1]} + {2'b0, oor_bad[2]} + {2'b0, oor_bad[3]};
 
     always_comb {
-        rq_pop = !r_active && rq_level != 0;
-        wq_pop = !w_active && wq_level != 0;
+        // The stage takes the next command as the walker takes its own.
+        rq_pop = rq_level != 0 && (!rs_ok || r_take);
+        wq_pop = wq_level != 0 && (!ws_ok || w_take);
 
         o_rd_valid = r_active && (!r_mem || axi.rvalid);
         o_rd_data  = if r_mem ? axi.rdata : 0;
@@ -275,12 +334,12 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
                         r_active = 0;
                     }
                 }
-            } else if rq_level != 0 {
-                ar_next = rq_first;
-                ar_left = rq_serve;
-                r_axi   = rq_serve;
+            } else if rs_ok {
+                ar_next = rs_first;
+                ar_left = rs_serve;
+                r_axi   = rs_serve;
                 // A read of 0 bytes still ends with one beat, an error one.
-                r_left   = if rq_beats == 0 ? 1 : rq_beats;
+                r_left   = if rs_beats == 0 ? 1 : rs_beats;
                 r_active = 1;
             }
 
@@ -309,18 +368,18 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
                     wdone    = 1;
                     wderr    = w_err;
                 }
-            } else if wq_level != 0 {
-                aw_next = wq_first;
-                aw_left = wq_serve;
-                w_next  = wq_first;
-                w_store = wq_serve;
+            } else if ws_ok {
+                aw_next = ws_first;
+                aw_left = ws_serve;
+                w_next  = ws_first;
+                w_store = ws_serve;
                 w_burst = 0;
                 // A write takes every beat it was promised, so the DUT never
                 // stalls on beats that have nowhere to go.
-                w_left = wq_beats;
+                w_left = ws_beats;
                 b_wait = 0;
-                w_err  = wq_short;
-                if wq_beats == 0 {
+                w_err  = ws_short;
+                if ws_beats == 0 {
                     wdone = 1;
                     wderr = 1;
                 } else {
