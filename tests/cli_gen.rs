@@ -403,31 +403,42 @@ fn the_csr_decodes_the_offsets_the_register_map_publishes() {
 
 /// A backing with no terminator is an error, not silently dropped.
 #[test]
-fn gen_refuses_a_backing_it_cannot_terminate_yet() {
-    let dir = fixture(
-        &veryl_toml(),
-        "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.csr]\ncontract = \"fixed_latency\"\nlatency = 1\nbacking = \"observe\"\n",
+fn gen_refuses_host_mem_until_it_is_built() {
+    let dir = fifo_fixture(
+        "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.run]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"i_run\"]\n\n[bundle.tx]\ncontract = \"valid_ready\"\nbacking = \"host_mem\"\nports = { valid = \"o_valid\", ready = \"i_ready\", data = \"o_data\" }\n",
     );
+    // `host_mem` needs PCIe.
+    let target = "xilinx/vcu118";
 
-    let output = run_gen(&dir, &["--json"]);
+    let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+        .args(["gen", "--target", target, "--transport", "pcie", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(value["error"]["code"], "harness::plan::no_terminator");
-    // The help lists what can be built.
+    assert_eq!(
+        value["error"]["code"],
+        "harness::plan::host_mem_not_generated"
+    );
+    // The help offers a BRAM in its place.
     let help = value["error"]["help"].as_str().unwrap();
-    assert!(help.contains("reg"), "{help}");
+    assert!(help.contains("bram"), "{help}");
 
     // `check --target` refuses it for the same reason, so `check` does not
     // pass what `gen` then refuses.
     let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
-        .args(["check", "--json", "--target", "digilent/arty-a7-35"])
+        .args(["check", "--json", "--target", target, "--transport", "pcie"])
         .current_dir(dir.path())
         .output()
         .unwrap();
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(value["error"]["code"], "harness::plan::no_terminator");
+    assert_eq!(
+        value["error"]["code"],
+        "harness::plan::host_mem_not_generated"
+    );
 
     // Without a target this is not about generation, so it passes.
     let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
@@ -665,22 +676,22 @@ fn a_trace_becomes_a_ring_with_its_record_layout() {
     );
     assert_eq!(trace.record_bits, 98);
     // The trigger fields pack in record order, whatever order `trigger`
-    // lists them in.
-    let trigger: Vec<(&str, Option<usize>)> = trace
+    // lists them in, and their "not 0" bits follow.
+    let trigger: Vec<(&str, Option<usize>, Option<usize>)> = trace
         .fields
         .iter()
-        .map(|f| (f.name.as_str(), f.trigger_lsb))
+        .map(|f| (f.name.as_str(), f.trigger_lsb, f.nonzero_lsb))
         .collect();
     assert_eq!(
         trigger,
         [
-            ("cycle", None),
-            ("pc_rdata", Some(0)),
-            ("insn", None),
-            ("mode", Some(32))
+            ("cycle", None, None),
+            ("pc_rdata", Some(0), Some(34)),
+            ("insn", None, None),
+            ("mode", Some(32), Some(35))
         ]
     );
-    assert_eq!(map.get("rvfi_tmask").unwrap().width, 34);
+    assert_eq!(map.get("rvfi_tmask").unwrap().width, 36);
     assert_eq!(map.get("rvfi_tvalue").unwrap().words, 2);
     // 4 words of record take 4 in the window.
     let region = map.region("rvfi").unwrap();
@@ -703,9 +714,11 @@ fn a_trace_becomes_a_ring_with_its_record_layout() {
     let top = tight(&fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap());
     assert!(top.contains("inst u_trace_rvfi: hns::trace #("), "{top}");
     assert!(top.contains("WIDTH : 66 ,"), "{top}");
-    assert!(top.contains("TWIDTH: 34 ,"), "{top}");
+    assert!(top.contains("TWIDTH: 36 ,"), "{top}");
     assert!(
-        top.contains("i_tdata : {w_o_rvfi_mode, w_o_rvfi_pc_rdata},"),
+        top.contains(
+            "i_tdata : {|w_o_rvfi_mode, |w_o_rvfi_pc_rdata, w_o_rvfi_mode, w_o_rvfi_pc_rdata},"
+        ),
         "{top}"
     );
     assert!(
@@ -2706,6 +2719,7 @@ module dut_top (
     o_r_ready : output logic    ,
     i_r_data  : input  logic<64>,
     i_r_last  : input  logic    ,
+    i_r_error : input  logic    ,
 ) {
     assign o_rc_valid = 0;
     assign o_rc_addr  = 0;
@@ -2715,7 +2729,7 @@ module dut_top (
 "#,
     )
     .unwrap();
-    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 100\n\n[bundle.mem]\nbacking = \"dram\"\naperture = 256\nports = { rd_cmd_valid = \"o_rc_valid\", rd_cmd_ready = \"i_rc_ready\", rd_cmd_addr = \"o_rc_addr\", rd_cmd_size = \"o_rc_size\", rd_valid = \"i_r_valid\", rd_ready = \"o_r_ready\", rd_data = \"i_r_data\", rd_last = \"i_r_last\" }\n";
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 100\n\n[bundle.mem]\nbacking = \"dram\"\naperture = 256\nports = { rd_cmd_valid = \"o_rc_valid\", rd_cmd_ready = \"i_rc_ready\", rd_cmd_addr = \"o_rc_addr\", rd_cmd_size = \"o_rc_size\", rd_valid = \"i_r_valid\", rd_ready = \"o_r_ready\", rd_data = \"i_r_data\", rd_last = \"i_r_last\", rd_error = \"i_r_error\" }\n";
     fs::write(dir.path().join("Harness.toml"), manifest).unwrap();
     let output = run_gen(&dir, &["--json"]);
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -2729,6 +2743,7 @@ module dut_top (
     assert!(squashed.contains("i_rst:drst_"), "{top}");
     assert!(squashed.contains("axi:axi_mem,"), "{top}");
     assert!(squashed.contains("o_oor:t_mem_oor,"), "{top}");
+    assert!(squashed.contains("o_rd_error:w_i_r_error,"), "{top}");
 
     fs::write(
         dir.path().join("Harness.toml"),

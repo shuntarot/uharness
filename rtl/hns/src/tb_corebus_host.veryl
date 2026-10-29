@@ -1,0 +1,172 @@
+/// `hns::corebus_host` against a pzcorebus CSR slave written in plain wires:
+/// each window access is one command, a write is answered (non-posted), a read
+/// that comes during a write waits for it, and nothing reaches the slave while
+/// it is held in reset.
+#[test(corebus_host_makes_one_command_per_access)]
+module test_corebus_host {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var addr  : logic<6> ;
+    var wdata : logic<32>;
+    var we    : logic    ;
+    var re    : logic    ;
+    var rdata : logic<32>;
+    var rvalid: logic    ;
+    var wready: logic    ;
+    var hold  : logic    ;
+
+    var mcmd_valid : logic    ;
+    var mcmd       : logic<4> ;
+    var mid        : logic<8> ;
+    var maddr      : logic<8> ;
+    var mdata      : logic<32>;
+    var scmd_accept: logic    ;
+    var sresp_valid: logic    ;
+    var sdata      : logic<32>;
+
+    inst u: corebus_host #(
+        ADDR_W: 6,
+        ID_W  : 8,
+    ) (
+        i_clk         : clk        ,
+        i_rst         : rst        ,
+        i_hold        : hold       ,
+        o_mcmd_valid  : mcmd_valid ,
+        o_mcmd        : mcmd       ,
+        o_mid         : mid        ,
+        o_maddr       : maddr      ,
+        i_scmd_accept : scmd_accept,
+        o_mdata       : mdata      ,
+        o_mdata_byteen: _          ,
+        o_mdata_valid : _          ,
+        i_sdata_accept: 1'b0       ,
+        o_mresp_accept: _          ,
+        i_sresp_valid : sresp_valid,
+        i_sdata       : sdata      ,
+        i_haddr       : addr       ,
+        i_hwdata      : wdata      ,
+        i_hwe         : we         ,
+        i_hre         : re         ,
+        o_hrdata      : rdata      ,
+        o_hrvalid     : rvalid     ,
+        o_hwready     : wready     ,
+    );
+
+    // The slave: 64 words. It takes a command when it has no answer pending,
+    // and answers on the next cycle. It counts what it was given.
+    var mem   : logic<32> [64];
+    var reads : logic<32>     ;
+    var writes: logic<32>     ;
+
+    assign scmd_accept = !sresp_valid;
+
+    always_ff (clk, rst) {
+        if_reset {
+            sresp_valid = 0;
+            sdata       = 0;
+            reads       = 0;
+            writes      = 0;
+        } else {
+            sresp_valid = 0;
+            if mcmd_valid && scmd_accept {
+                sresp_valid = 1;
+                if mcmd == 4'b1001 {
+                    sdata = mem[maddr[7:2]];
+                    reads = reads + 1;
+                } else if mcmd == 4'b1100 {
+                    writes = writes + 1;
+                }
+            }
+        }
+    }
+
+    // Storage has no reset, as in a real register file.
+    always_ff (clk) {
+        if mcmd_valid && scmd_accept && mcmd == 4'b1100 {
+            mem[maddr[7:2]] = mdata;
+        }
+    }
+
+    var got: logic<32>;
+
+    /// Writes one word through the window.
+    function put (
+        a: input logic<6> ,
+        d: input logic<32>,
+    ) {
+        for _i in 0..64 {
+            if wready {
+                break;
+            }
+            clk.next(1);
+        }
+        addr  = a;
+        wdata = d;
+        we    = 1;
+        clk.next(1);
+        we = 0;
+    }
+
+    /// Reads one word through the window into `got`.
+    function get (
+        a: input logic<6>,
+    ) {
+        addr = a;
+        re   = 1;
+        clk.next(1);
+        re = 0;
+        for _i in 0..64 {
+            if rvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        got = rdata;
+        clk.next(1);
+    }
+
+    initial {
+        we   = 0;
+        re   = 0;
+        hold = 0;
+        rst.assert(4);
+        clk.next(4);
+
+        put(6'h04, 32'h1111_0000);
+        put(6'h3f, 32'h2222_0000);
+        clk.next(4);
+        $assert(writes == 2 && reads == 0);
+
+        get(6'h04);
+        $assert(got == 32'h1111_0000 && reads == 1);
+        get(6'h3f);
+        $assert(got == 32'h2222_0000 && reads == 2);
+
+        // A read while a write is open waits for it, then reads what was
+        // written.
+        addr  = 6'h08;
+        wdata = 32'h3333_0000;
+        we    = 1;
+        clk.next(1);
+        we = 0;
+        get(6'h08);
+        $assert(got == 32'h3333_0000 && reads == 3 && writes == 3);
+
+        // Held: nothing reaches the slave, not even after.
+        hold = 1;
+        clk.next(1);
+        $assert(!wready);
+        addr = 6'h04;
+        re   = 1;
+        clk.next(1);
+        re = 0;
+        clk.next(8);
+        $assert(!rvalid && !mcmd_valid);
+        hold = 0;
+        clk.next(8);
+        $assert(reads == 3 && writes == 3);
+
+        $finish();
+    }
+}

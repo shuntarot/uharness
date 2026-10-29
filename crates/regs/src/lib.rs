@@ -194,6 +194,10 @@ pub struct TraceField {
     /// may not trigger (it is not in `trigger` in Harness.toml).
     #[serde(default)]
     pub trigger_lsb: Option<usize>,
+    /// Where its "not 0" bit sits there: 1 when the field is not 0. A
+    /// trigger field wider than one bit has one.
+    #[serde(default)]
+    pub nonzero_lsb: Option<usize>,
 }
 
 impl Trace {

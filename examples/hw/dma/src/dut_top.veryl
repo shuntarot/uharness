@@ -16,6 +16,11 @@
 /// backdoor -- **what was loaded is what should be there**, so the write side
 /// needs no expected value of its own.
 ///
+/// **A failed beat is counted, not hidden.** A read beat that could not be read
+/// comes with `i_rd_error` and data 0, and a write that did not land whole ends
+/// with `i_w_done_error`. Both add to `o_errors`, so a copy that went past the
+/// end of memory does not pass for a good one.
+///
 /// Each beat is forwarded as it arrives: the read side is only made ready when
 /// the write side can take one. Nothing is buffered here, which is the point --
 /// **the queues that make that work belong to the terminator, not to the DUT.**
@@ -34,6 +39,7 @@ module dut_top (
     // --- summary of what moved (reg) ---
     o_sum  : output logic<64>, // sum of the beats seen
     o_beats: output logic<32>, // how many beats were seen
+    o_errors: output logic<32>, // failed read beats and failed writes
 
     // --- the read port into host memory (this is what `host_mem` terminates) ---
     o_cmd_valid: output logic    ,
@@ -44,6 +50,7 @@ module dut_top (
     o_rd_ready : output logic    ,
     i_rd_data  : input  logic<64>,
     i_rd_last  : input  logic    ,
+    i_rd_error : input  logic    ,
 
     // --- the write port back into host memory ---
     o_wcmd_valid: output logic    ,
@@ -55,6 +62,7 @@ module dut_top (
     o_w_data    : output logic<64>,
     o_w_last    : output logic    ,
     i_w_done    : input  logic    ,
+    i_w_done_error: input logic   ,
 ) {
     const S_IDLE: logic<2> = 2'd0;
     const S_CMD : logic<2> = 2'd1; // commands offered until they are accepted
@@ -67,6 +75,7 @@ module dut_top (
     var size     : logic<32>;
     var sum      : logic<64>;
     var beats    : logic<32>;
+    var errors   : logic<32>;
     var done     : logic    ;
     var rd_posted: logic    ;
     var wr_posted: logic    ;
@@ -92,6 +101,7 @@ module dut_top (
         o_done  = done;
         o_sum   = sum;
         o_beats = beats;
+        o_errors = errors;
     }
 
     always_ff {
@@ -102,6 +112,7 @@ module dut_top (
             size      = 0;
             sum       = 0;
             beats     = 0;
+            errors    = 0;
             done      = 0;
             rd_posted = 0;
             wr_posted = 0;
@@ -118,6 +129,7 @@ module dut_top (
                         // impossible to explain.
                         sum       = 0;
                         beats     = 0;
+                        errors    = 0;
                         rd_posted = 0;
                         wr_posted = 0;
                         state     = S_CMD;
@@ -140,6 +152,9 @@ module dut_top (
                     if beat_taken {
                         sum   = sum + i_rd_data;
                         beats = beats + 1;
+                        if i_rd_error {
+                            errors = errors + 1;
+                        }
                         if i_rd_last {
                             state = S_WAIT;
                         }
@@ -151,6 +166,9 @@ module dut_top (
                     if i_w_done {
                         state = S_IDLE;
                         done  = 1;
+                        if i_w_done_error {
+                            errors = errors + 1;
+                        }
                     }
                 }
                 default: {

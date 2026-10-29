@@ -43,23 +43,18 @@ fn veryl_test(dir: &Path) -> bool {
 }
 
 fn fixture(harness_toml: &str, dut: &str, tb: &str) -> tempfile::TempDir {
+    fixture_with(&veryl_toml(), harness_toml, dut, tb)
+}
+
+/// `fixture` with a Veryl.toml of its own, for a DUT that has dependencies.
+fn fixture_with(veryl_toml: &str, harness_toml: &str, dut: &str, tb: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("Veryl.toml"), veryl_toml()).unwrap();
+    fs::write(dir.path().join("Veryl.toml"), veryl_toml).unwrap();
     fs::write(dir.path().join("Harness.toml"), harness_toml).unwrap();
     fs::create_dir(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src").join("dut_top.veryl"), dut).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
-        .args(["gen", "--target", "digilent/arty-a7-35"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "gen failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    gen_for_sim(dir.path());
 
     // The test bench is not generated, so it is written after gen. If `tb` is
     // empty, the caller writes it later, after reading the map offsets.
@@ -70,6 +65,20 @@ fn fixture(harness_toml: &str, dut: &str, tb: &str) -> tempfile::TempDir {
         write_tb(dir.path(), tb);
     }
     dir
+}
+
+fn gen_for_sim(root: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+        .args(["gen", "--target", "digilent/arty-a7-35"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "gen failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Writes a test bench into the generated project.
@@ -491,7 +500,8 @@ fn a_trace_trigger_freezes_the_ring_after_it() {
         offset_of(&map, "rvfi_hit_at"),
         region_base(&map, "rvfi"),
     );
-    // The trigger compares pc_rdata alone, so the mask is one word.
+    // pc_rdata is the first word of the mask; its "not 0" bit, in the
+    // second, stays off.
     let at = |index: u64| base + index * entry + 4;
     let (e2, e4) = (at(2), at(4));
     let tb = format!(
@@ -517,6 +527,66 @@ module trace_trigger {{
         $assert(rd({count}) == 13);
         $assert(rd({e2}) == 40);
         $assert(rd({e4}) == 48);
+        $finish();
+    }}
+}}
+"#
+    );
+
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
+/// `pc_rdata!=0`: the field's "not 0" bit, above the fields in the trigger
+/// data. The first record has pc 0, so the trigger is the second.
+#[test]
+fn a_trace_trigger_tests_that_a_field_is_not_0() {
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.go]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"i_go\"]\n\n[bundle.rvfi]\nbacking = \"trace\"\nformat = \"rvfi\"\ndepth = 8\ntrigger = [\"o_rvfi_pc_rdata\"]\n";
+
+    let dir = fixture(manifest, TRACE_DUT, "");
+    let map = offsets(dir.path());
+    let nonzero = map["traces"][0]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|field| field["name"] == "pc_rdata")
+        .unwrap()["nonzero_lsb"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(nonzero, 32);
+    let (go, run, count, arm, tmask, tvalue, hit, hit_at) = (
+        offset_of(&map, "i_go"),
+        offset_of(&map, "rvfi_run"),
+        offset_of(&map, "rvfi_count"),
+        offset_of(&map, "rvfi_arm"),
+        offset_of(&map, "rvfi_tmask"),
+        offset_of(&map, "rvfi_tvalue"),
+        offset_of(&map, "rvfi_hit"),
+        offset_of(&map, "rvfi_hit_at"),
+    );
+    // Bit 32 is bit 0 of the second word.
+    let (tmask1, tvalue1) = (tmask + 4, tvalue + 4);
+    let tb = format!(
+        r#"
+#[test(trace_trigger_not_0)]
+module trace_trigger_not_0 {{
+{BUS}
+    initial {{
+        start();
+
+        wr({tmask1}, 1);
+        wr({tvalue1}, 1);
+        wr({arm}, 1);
+        wr({run}, 1);
+        wr({go}, 1);
+        clk.next(60);
+
+        $assert(rd({hit}) == 1);
+        $assert(rd({hit_at}) == 1);
+        $assert(rd({count}) == 2);
         $finish();
     }}
 }}
@@ -1364,6 +1434,7 @@ module dut_top (
     o_busy      : output logic    ,
     o_sum       : output logic<64>,
     o_beats     : output logic<32>,
+    o_errs      : output logic<32>,
     o_cmd_valid : output logic    ,
     i_cmd_ready : input  logic    ,
     o_cmd_addr  : output logic<64>,
@@ -1372,6 +1443,7 @@ module dut_top (
     o_rd_ready  : output logic    ,
     i_rd_data   : input  logic<64>,
     i_rd_last   : input  logic    ,
+    i_rd_error  : input  logic    ,
 ) {
     const S_IDLE: logic<2> = 2'd0;
     const S_CMD : logic<2> = 2'd1;
@@ -1382,6 +1454,7 @@ module dut_top (
     var nb   : logic<32>;
     var sum  : logic<64>;
     var beats: logic<32>;
+    var errs : logic<32>;
 
     always_comb {
         o_cmd_valid  = state == S_CMD;
@@ -1391,6 +1464,7 @@ module dut_top (
         o_busy       = state != S_IDLE;
         o_sum        = sum;
         o_beats      = beats;
+        o_errs       = errs;
     }
 
     always_ff {
@@ -1400,6 +1474,7 @@ module dut_top (
             nb    = 0;
             sum   = 0;
             beats = 0;
+            errs  = 0;
         } else {
             case state {
                 S_IDLE: {
@@ -1408,6 +1483,7 @@ module dut_top (
                         nb    = i_nbytes;
                         sum   = 0;
                         beats = 0;
+                        errs  = 0;
                         state = S_CMD;
                     }
                 }
@@ -1420,6 +1496,9 @@ module dut_top (
                     if i_rd_valid {
                         sum   = sum + i_rd_data;
                         beats = beats + 1;
+                        if i_rd_error {
+                            errs = errs + 1;
+                        }
                         if i_rd_last {
                             state = S_IDLE;
                         }
@@ -1435,15 +1514,16 @@ module dut_top (
 "#;
     let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n\
          [bundle.ctl]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\n\
-         ports = [\"i_start\", \"i_addr\", \"i_nbytes\", \"o_busy\", \"o_sum\", \"o_beats\"]\n\n\
+         ports = [\"i_start\", \"i_addr\", \"i_nbytes\", \"o_busy\", \"o_sum\", \"o_beats\", \"o_errs\"]\n\n\
          [bundle.hmem]\nbacking = \"bram\"\ndepth = 8\n\
          ports = { rd_cmd_valid = \"o_cmd_valid\", rd_cmd_ready = \"i_cmd_ready\", \
          rd_cmd_addr = \"o_cmd_addr\", rd_cmd_size = \"o_cmd_nbytes\", \
          rd_valid = \"i_rd_valid\", rd_ready = \"o_rd_ready\", \
-         rd_data = \"i_rd_data\", rd_last = \"i_rd_last\" }\n";
+         rd_data = \"i_rd_data\", rd_last = \"i_rd_last\", rd_error = \"i_rd_error\" }\n";
 
     let dir = fixture(manifest, dut, "");
     let map = offsets(dir.path());
+    let errs = offset_of(&map, "o_errs");
     let (start, addr, nbytes, busy, sum, beats, maddr, mdata, depth, oor, delay, jitter) = (
         offset_of(&map, "i_start"),
         offset_of(&map, "i_addr"),
@@ -1513,7 +1593,26 @@ module dma_over_the_window {{
         // The result is the same.
         $assert(rd({beats}) == 4);
         $assert(rd({sum}) == 10);
+        $assert(rd({errs}) == 0);
         $assert(rd({oor}) == 0);
+
+        // Read 4 entries from entry 6: only 6 and 7 are inside. The other two
+        // come back as error beats, and the last one still ends the transfer,
+        // so the DUT is not left waiting. 7 + 8 from the good beats.
+        wr({delay}, 0);
+        wr({addr}, 48);
+        wr({start}, 1);
+        wr({start}, 0);
+        for _i in 0..200 {{
+            if rd({busy}) == 0 {{
+                break;
+            }}
+        }}
+        $assert(rd({busy}) == 0);
+        $assert(rd({beats}) == 4);
+        $assert(rd({errs}) == 2);
+        $assert(rd({sum}) == 15);
+        $assert(rd({oor}) == 1);
 
         $finish();
     }}
@@ -1544,6 +1643,7 @@ module dut_top (
     i_nbytes       : input  logic<32>,
     o_busy         : output logic    ,
     o_dones        : output logic<32>,
+    o_derrs        : output logic<32>,
     o_cmd_valid    : output logic    ,
     i_cmd_ready    : input  logic    ,
     o_cmd_addr     : output logic<64>,
@@ -1554,6 +1654,7 @@ module dut_top (
     o_wr_strb      : output logic<8> ,
     o_wr_last      : output logic    ,
     i_wr_done_valid: input  logic    ,
+    i_wr_done_error: input  logic    ,
 ) {
     const S_IDLE: logic<2> = 2'd0;
     const S_CMD : logic<2> = 2'd1;
@@ -1564,6 +1665,7 @@ module dut_top (
     var n    : logic<32>;
     var bytes: logic<32>;
     var dones: logic<32>;
+    var derrs: logic<32>;
 
     always_comb {
         o_cmd_valid = state == S_CMD;
@@ -1580,6 +1682,7 @@ module dut_top (
         o_wr_last = left == 1;
         o_busy    = state != S_IDLE;
         o_dones   = dones;
+        o_derrs   = derrs;
     }
 
     always_ff {
@@ -1589,9 +1692,13 @@ module dut_top (
             n     = 0;
             bytes = 0;
             dones = 0;
+            derrs = 0;
         } else {
             if i_wr_done_valid {
                 dones = dones + 1;
+                if i_wr_done_error {
+                    derrs = derrs + 1;
+                }
             }
             case state {
                 S_IDLE: {
@@ -1625,16 +1732,17 @@ module dut_top (
 "#;
     let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n\
          [bundle.ctl]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\n\
-         ports = [\"i_start\", \"i_addr\", \"i_nbytes\", \"o_busy\", \"o_dones\"]\n\n\
+         ports = [\"i_start\", \"i_addr\", \"i_nbytes\", \"o_busy\", \"o_dones\", \"o_derrs\"]\n\n\
          [bundle.hmem]\nbacking = \"bram\"\ndepth = 8\n\
          ports = { wr_cmd_valid = \"o_cmd_valid\", wr_cmd_ready = \"i_cmd_ready\", \
          wr_cmd_addr = \"o_cmd_addr\", wr_cmd_size = \"o_cmd_nbytes\", \
          wr_valid = \"o_wr_valid\", wr_ready = \"i_wr_ready\", \
          wr_data = \"o_wr_data\", wr_strb = \"o_wr_strb\", wr_last = \"o_wr_last\", \
-         wr_done_valid = \"i_wr_done_valid\" }\n";
+         wr_done_valid = \"i_wr_done_valid\", wr_done_error = \"i_wr_done_error\" }\n";
 
     let dir = fixture(manifest, dut, "");
     let map = offsets(dir.path());
+    let derrs = offset_of(&map, "o_derrs");
     let (start, addr, nbytes, busy, dones, maddr, mdata, oor) = (
         offset_of(&map, "i_start"),
         offset_of(&map, "i_addr"),
@@ -1688,7 +1796,22 @@ module dma_write_over_the_window {{
         wr({maddr}, 5);
         $assert(rd({mdata}) == 0);
 
+        $assert(rd({derrs}) == 0);
         $assert(rd({oor}) == 0);
+
+        // Write 3 beats from entry 6: the third is past the end. The write
+        // still ends, and says that it did not land whole.
+        wr({addr}, 48);
+        wr({start}, 1);
+        wr({start}, 0);
+        for _i in 0..200 {{
+            if rd({dones}) == 2 {{
+                break;
+            }}
+        }}
+        $assert(rd({dones}) == 2);
+        $assert(rd({derrs}) == 1);
+        $assert(rd({oor}) == 1);
         $finish();
     }}
 }}
@@ -2194,6 +2317,627 @@ module axi_slave_window {{
         veryl_test(&dir.path().join("hns")),
         "the simulation must pass"
     );
+}
+
+/// The part of the pzcorebus package that the harness touches: the interface,
+/// the 13-argument package and the enums. It is a project of its own, because
+/// the DUT and the harness name the interface through the project that has it.
+const COREBUS_STUB: &str = r#"
+pub package pzcorebus_common_pkg {
+    enum pzcorebus_profile: logic<2> {
+        CSR,
+        MEMORY,
+    }
+
+    enum pzcorebus_mcmd: logic<4> {
+        NULL     = 4'b0000,
+        WRITE    = 4'b0100,
+        READ     = 4'b1001,
+        WRITE_NP = 4'b1100,
+        BROADCAST = 4'b0101,
+        ATOMIC_NP = 4'b1110,
+    }
+
+    enum pzcorebus_sresp: logic {
+        RESPONSE           = 1'b0,
+        RESPONSE_WITH_DATA = 1'b1,
+    }
+}
+
+pub proto package pzcorebus_proto_pkg {
+    type pzcorebus_mcmd;
+    type pzcorebus_mid;
+    type pzcorebus_maddr;
+    type pzcorebus_mlength;
+    type pzcorebus_mparam;
+    type pzcorebus_minfo;
+    type pzcorebus_mdata;
+    type pzcorebus_mdata_byteen;
+    type pzcorebus_mdata_last;
+    type pzcorebus_sresp;
+    type pzcorebus_sid;
+    type pzcorebus_serror;
+    type pzcorebus_sdata;
+    type pzcorebus_sinfo;
+    type pzcorebus_sresp_uniten;
+    type pzcorebus_sresp_last;
+}
+
+pub package pzcorebus_pkg::<
+    profile             : pzcorebus_common_pkg::pzcorebus_profile,
+    id_width            : u32,
+    address_width       : u32,
+    data_width          : u32,
+    use_byte_enable     : bbool,
+    max_length          : u32,
+    atomic_command_width: u32,
+    message_code_width  : u32,
+    request_info_width  : u32,
+    response_info_width : u32,
+    unit_data_width     : u32,
+    max_data_width      : u32,
+    response_boundary   : u32,
+> for pzcorebus_proto_pkg {
+    type pzcorebus_mcmd        = pzcorebus_common_pkg::pzcorebus_mcmd ;
+    type pzcorebus_mid         = logic<id_width>                      ;
+    type pzcorebus_maddr       = logic<address_width>                 ;
+    type pzcorebus_mlength     = logic<4>                             ;
+    type pzcorebus_mparam      = logic<4>                             ;
+    type pzcorebus_minfo       = logic<4>                             ;
+    type pzcorebus_mdata       = logic<data_width>                    ;
+    type pzcorebus_mdata_byteen = logic<data_width / 8>               ;
+    type pzcorebus_mdata_last  = logic                                ;
+    type pzcorebus_sresp       = pzcorebus_common_pkg::pzcorebus_sresp;
+    type pzcorebus_sid         = logic<id_width>                      ;
+    type pzcorebus_serror      = logic                                ;
+    type pzcorebus_sdata       = logic<data_width>                    ;
+    type pzcorebus_sinfo       = logic<4>                             ;
+    type pzcorebus_sresp_uniten = logic<4>                            ;
+    type pzcorebus_sresp_last  = logic                                ;
+}
+
+pub interface pzcorebus_if::<PKG: pzcorebus_proto_pkg> {
+    var scmd_accept : logic                      ;
+    var mcmd_valid  : logic                      ;
+    var mcmd        : PKG::pzcorebus_mcmd        ;
+    var mid         : PKG::pzcorebus_mid         ;
+    var maddr       : PKG::pzcorebus_maddr       ;
+    var mlength     : PKG::pzcorebus_mlength     ;
+    var mparam      : PKG::pzcorebus_mparam      ;
+    var minfo       : PKG::pzcorebus_minfo       ;
+    var sdata_accept: logic                      ;
+    var mdata_valid : logic                      ;
+    var mdata       : PKG::pzcorebus_mdata       ;
+    var mdata_byteen: PKG::pzcorebus_mdata_byteen;
+    var mdata_last  : PKG::pzcorebus_mdata_last  ;
+    var mresp_accept: logic                      ;
+    var sresp_valid : logic                      ;
+    var sresp       : PKG::pzcorebus_sresp       ;
+    var sid         : PKG::pzcorebus_sid         ;
+    var serror      : PKG::pzcorebus_serror      ;
+    var sdata       : PKG::pzcorebus_sdata       ;
+    var sinfo       : PKG::pzcorebus_sinfo       ;
+    var sresp_uniten: PKG::pzcorebus_sresp_uniten;
+    var sresp_last  : PKG::pzcorebus_sresp_last  ;
+
+    /// The beats of the command. The real interface works it out from the unit
+    /// size; here `mlength` is the count.
+    function get_mburst_length() -> logic<8> {
+        return {4'b0, mlength};
+    }
+
+    modport master {
+        scmd_accept : input ,
+        mcmd_valid  : output,
+        mcmd        : output,
+        mid         : output,
+        maddr       : output,
+        mlength     : output,
+        mparam      : output,
+        minfo       : output,
+        sdata_accept: input ,
+        mdata_valid : output,
+        mdata       : output,
+        mdata_byteen: output,
+        mdata_last  : output,
+        mresp_accept: output,
+        sresp_valid : input ,
+        sresp       : input ,
+        sid         : input ,
+        serror      : input ,
+        sdata       : input ,
+        sinfo       : input ,
+        sresp_uniten: input ,
+        sresp_last  : input ,
+    }
+
+    modport slave {
+        ..converse(master)
+    }
+}
+"#;
+
+/// A fixture whose DUT uses the stand-in pzcorebus (`cbstub`, a project of its
+/// own beside it).
+fn corebus_fixture(harness_toml: &str, dut: &str) -> tempfile::TempDir {
+    let dir = corebus_project(harness_toml, dut);
+    gen_for_sim(dir.path());
+    dir
+}
+
+/// The same, before `gen`.
+fn corebus_project(harness_toml: &str, dut: &str) -> tempfile::TempDir {
+    let veryl_toml = format!("{}cbstub = {{ path = \"cbstub\" }}\n", veryl_toml());
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("cbstub").join("src")).unwrap();
+    fs::write(
+        dir.path().join("cbstub").join("Veryl.toml"),
+        "[project]\nname = \"cbstub\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("cbstub").join("src").join("cbstub.veryl"),
+        COREBUS_STUB,
+    )
+    .unwrap();
+    fs::write(dir.path().join("Veryl.toml"), &veryl_toml).unwrap();
+    fs::write(dir.path().join("Harness.toml"), harness_toml).unwrap();
+    fs::create_dir(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src").join("dut_top.veryl"), dut).unwrap();
+    dir
+}
+
+/// A pzcorebus CSR slave of the DUT: one register file that counts its reads in
+/// the last word. The host reaches it through `hns::corebus_host`.
+#[test]
+fn a_pzcorebus_slave_is_driven_one_command_per_window_access() {
+    let dut = r#"
+module dut_top (
+    i_clk : input  clock,
+    i_rst : input  reset,
+    csr_if: modport cbstub::pzcorebus_if::<
+        cbstub::pzcorebus_pkg::<cbstub::pzcorebus_common_pkg::pzcorebus_profile::CSR, 8, 12, 32, false, 1, 0, 0, 0, 0, 32, 32, 0>
+    >::slave,
+) {
+    var mem       : logic<32> [1024];
+    var reads     : logic<32>       ;
+    var resp_valid: logic           ;
+    var resp_data : logic<32>       ;
+    var resp_id   : logic<8>        ;
+    var resp_read : logic           ;
+
+    let accept: logic     = !resp_valid || csr_if.mresp_accept;
+    let fire  : logic     = csr_if.mcmd_valid && accept;
+    let index : logic<10> = csr_if.maddr[11:2];
+
+    assign csr_if.scmd_accept  = accept;
+    assign csr_if.sdata_accept = 1;
+    assign csr_if.sresp_valid  = resp_valid;
+    assign csr_if.sresp        = if resp_read ? cbstub::pzcorebus_common_pkg::pzcorebus_sresp::RESPONSE_WITH_DATA : cbstub::pzcorebus_common_pkg::pzcorebus_sresp::RESPONSE;
+    assign csr_if.sid          = resp_id;
+    assign csr_if.serror       = 0;
+    assign csr_if.sdata        = resp_data;
+    assign csr_if.sinfo        = 0;
+    assign csr_if.sresp_uniten = 0;
+    assign csr_if.sresp_last   = 1;
+
+    always_ff {
+        if_reset {
+            reads      = 0;
+            resp_valid = 0;
+            resp_data  = 0;
+            resp_id    = 0;
+            resp_read  = 0;
+        } else {
+            if csr_if.mresp_accept {
+                resp_valid = 0;
+            }
+            if fire {
+                resp_valid = 1;
+                resp_id    = csr_if.mid;
+                case csr_if.mcmd {
+                    cbstub::pzcorebus_common_pkg::pzcorebus_mcmd::WRITE_NP: {
+                        resp_read = 0;
+                    }
+                    cbstub::pzcorebus_common_pkg::pzcorebus_mcmd::READ: {
+                        resp_read = 1;
+                        resp_data = if index == 1023 ? reads : mem[index];
+                        reads     = reads + 1;
+                    }
+                    default: {
+                        resp_valid = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    // Storage has no reset, as in a real register file.
+    always_ff {
+        if fire && csr_if.mcmd == cbstub::pzcorebus_common_pkg::pzcorebus_mcmd::WRITE_NP {
+            mem[index] = csr_if.mdata;
+        }
+    }
+}
+"#;
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.csr]\nbacking = \"slave\"\nports = [\"csr_if\"]\n";
+    let dir = corebus_fixture(manifest, dut);
+
+    let map = offsets(dir.path());
+    let region = map["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|region| region["name"] == "csr")
+        .unwrap();
+    assert_eq!(region["kind"], "dut", "{map:#?}");
+    assert_eq!(region["size_bytes"], 4096, "{map:#?}");
+    let base = region_base(&map, "csr");
+    let (word4, last_word, count) = (base + 16, base + 4092 - 4, base + 4092);
+    let magic = offset_of(&map, "harness_magic");
+
+    let tb = format!(
+        r#"
+#[test(corebus_slave_window)]
+module corebus_slave_window {{
+{BUS}
+    var first : logic<32>;
+    var second: logic<32>;
+
+    initial {{
+        start();
+
+        wr({word4}, 32'h1111_2222);
+        wr({last_word}, 32'h3333_4444);
+        $assert(rd({word4}) == 32'h1111_2222);
+        $assert(rd({last_word}) == 32'h3333_4444);
+        // The second write did not overwrite the first.
+        $assert(rd({word4}) == 32'h1111_2222);
+
+        // One window read is one command: the count moves by one.
+        first  = rd({count});
+        second = rd({count});
+        $display("reads counted: %0d then %0d", first, second);
+        $assert(second == first + 1);
+
+        $assert(rd({magic}) == 32'h5648524e);
+        $finish();
+    }}
+}}
+"#
+    );
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
+/// A pzcorebus memory-profile slave of the DUT (a 64-bit register file with
+/// its data on its own channel), driven from the window. Each window access is
+/// one single-beat command; a write sets only the 4 bytes of its word.
+#[test]
+fn a_pzcorebus_memory_slave_is_driven_one_word_per_window_access() {
+    let dut = r#"
+module dut_top (
+    i_clk: input clock,
+    i_rst: input reset,
+    pio  : modport cbstub::pzcorebus_if::<
+        cbstub::pzcorebus_pkg::<cbstub::pzcorebus_common_pkg::pzcorebus_profile::MEMORY, 4, 16, 64, true, 8, 0, 0, 0, 0, 64, 64, 0>
+    >::slave,
+) {
+    var mem       : logic<64> [256];
+    var reads     : logic<32>      ;
+    var have_wr   : logic          ;
+    var idx       : logic<8>       ;
+    var rid       : logic<4>       ;
+    var resp_valid: logic          ;
+    var resp_read : logic          ;
+    var rdata     : logic<64>      ;
+
+    let take_cmd : logic = pio.mcmd_valid && !have_wr && !resp_valid;
+    let take_data: logic = have_wr && pio.mdata_valid;
+
+    assign pio.scmd_accept  = !have_wr && !resp_valid;
+    assign pio.sdata_accept = have_wr;
+    assign pio.sresp_valid  = resp_valid;
+    assign pio.sresp        = if resp_read ? cbstub::pzcorebus_common_pkg::pzcorebus_sresp::RESPONSE_WITH_DATA : cbstub::pzcorebus_common_pkg::pzcorebus_sresp::RESPONSE;
+    assign pio.sid          = rid;
+    assign pio.serror       = 0;
+    assign pio.sdata        = rdata;
+    assign pio.sinfo        = 0;
+    assign pio.sresp_uniten = 0;
+    assign pio.sresp_last   = 1;
+
+    always_ff {
+        if_reset {
+            reads      = 0;
+            have_wr    = 0;
+            idx        = 0;
+            rid        = 0;
+            resp_valid = 0;
+            resp_read  = 0;
+            rdata      = 0;
+        } else {
+            if resp_valid && pio.mresp_accept {
+                resp_valid = 0;
+            }
+            if take_cmd {
+                idx = pio.maddr[10:3];
+                rid = pio.mid;
+                if pio.mcmd == cbstub::pzcorebus_common_pkg::pzcorebus_mcmd::READ {
+                    resp_valid = 1;
+                    resp_read  = 1;
+                    rdata      = if pio.maddr[10:3] == 255 ? {32'h0, reads} : mem[pio.maddr[10:3]];
+                    reads      = reads + 1;
+                } else {
+                    have_wr = 1;
+                }
+            }
+            if take_data {
+                have_wr    = 0;
+                resp_valid = 1;
+                resp_read  = 0;
+            }
+        }
+    }
+
+    // Storage has no reset, as in a real register file.
+    always_ff {
+        if take_data {
+            for i in 0..8 {
+                if pio.mdata_byteen[i] {
+                    mem[idx][i * 8+:8] = pio.mdata[i * 8+:8];
+                }
+            }
+        }
+    }
+}
+"#;
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.pio]\nbacking = \"slave\"\nports = [\"pio\"]\n";
+
+    let dir = corebus_fixture(manifest, dut);
+    let map = offsets(dir.path());
+    let base = region_base(&map, "pio");
+    let (lo, hi, count) = (base + 0x10, base + 0x14, base + 0x7f8);
+
+    let tb = format!(
+        r#"
+#[test(corebus_memory_slave)]
+module corebus_memory_slave {{
+{BUS}
+    var first : logic<32>;
+    var second: logic<32>;
+
+    initial {{
+        start();
+
+        wr({lo}, 32'h1111_2222);
+        wr({hi}, 32'h3333_4444);
+        // Each write set only its own word of the 64-bit entry.
+        $assert(rd({lo}) == 32'h1111_2222);
+        $assert(rd({hi}) == 32'h3333_4444);
+
+        first  = rd({count});
+        second = rd({count});
+        $display("reads counted: %0d then %0d", first, second);
+        $assert(second == first + 1);
+
+        $finish();
+    }}
+}}
+"#
+    );
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
+/// A pzcorebus memory master of the DUT. It writes four beats (posted), two
+/// more (non-posted, and waits for the answer), then reads both back and
+/// compares. The host sees the same memory through the region. Then a
+/// broadcast and a non-posted atomic: neither is run, the atomic is answered
+/// with an error, and both are counted in `ddr_refused`.
+#[test]
+fn a_pzcorebus_memory_master_shares_its_memory_with_the_host() {
+    let dut = r#"
+module dut_top (
+    i_clk   : input  clock   ,
+    i_rst   : input  reset   ,
+    i_run   : input  logic   ,
+    o_status: output logic<2>,
+    mem_if  : modport cbstub::pzcorebus_if::<
+        cbstub::pzcorebus_pkg::<cbstub::pzcorebus_common_pkg::pzcorebus_profile::MEMORY, 4, 32, 64, true, 8, 0, 0, 0, 0, 64, 64, 0>
+    >::master,
+) {
+    var phase: logic<4>;
+    var beat : logic<4>;
+    var ok   : logic   ;
+    var done : logic   ;
+
+    function pat (
+        k: input logic<4>,
+        i: input logic<4>,
+    ) -> logic<64> {
+        return {24'ha00000, k, i, 24'h100000, k, i};
+    }
+
+    let cmd_phase : logic    = phase == 1 || phase == 3 || phase == 6 || phase == 8 || phase == 10 || phase == 12;
+    let data_phase: logic    = phase == 2 || phase == 4 || phase == 11 || phase == 13;
+    let read_phase: logic    = phase == 7 || phase == 9;
+    let refused   : logic    = phase >= 10;
+    let k         : logic<4> = if phase <: 5 ? (if phase <: 3 ? 1 : 2) : (if phase <: 8 ? 1 : 2);
+    let last_beat : logic    = if refused ? beat == 0 : if k == 1 ? beat == 3 : beat == 1;
+
+    assign o_status = {ok, done};
+
+    assign mem_if.mcmd_valid = cmd_phase;
+    assign mem_if.mcmd = if phase == 1 ? cbstub::pzcorebus_common_pkg::pzcorebus_mcmd::WRITE : if phase == 3 ? cbstub::pzcorebus_common_pkg::pzcorebus_mcmd::WRITE_NP : if phase == 10 ? cbstub::pzcorebus_common_pkg::pzcorebus_mcmd::BROADCAST : if phase == 12 ? cbstub::pzcorebus_common_pkg::pzcorebus_mcmd::ATOMIC_NP : cbstub::pzcorebus_common_pkg::pzcorebus_mcmd::READ;
+    assign mem_if.mid = 4'h5;
+    assign mem_if.maddr = if refused ? 32'h100 : if k == 1 ? 32'h20 : 32'h80;
+    assign mem_if.mlength = if refused ? 1 : if k == 1 ? 4 : 2;
+    assign mem_if.mparam = 0;
+    assign mem_if.minfo = 0;
+    assign mem_if.mdata_valid = data_phase;
+    assign mem_if.mdata = pat(k, beat);
+    assign mem_if.mdata_byteen = '1;
+    assign mem_if.mdata_last = last_beat;
+    assign mem_if.mresp_accept = 1;
+
+    always_ff {
+        if_reset {
+            phase = 0;
+            beat  = 0;
+            ok    = 1;
+            done  = 0;
+        } else {
+            if phase == 0 {
+                if i_run {
+                    phase = 1;
+                }
+            } else if cmd_phase {
+                if mem_if.scmd_accept {
+                    phase = phase + 1;
+                    beat  = 0;
+                }
+            } else if data_phase {
+                if mem_if.sdata_accept {
+                    beat = beat + 1;
+                    if last_beat {
+                        phase = phase + 1;
+                    }
+                }
+            } else if phase == 5 {
+                if mem_if.sresp_valid {
+                    if mem_if.sresp != cbstub::pzcorebus_common_pkg::pzcorebus_sresp::RESPONSE || mem_if.sid != 4'h5 || mem_if.serror == 1 {
+                        ok = 0;
+                    }
+                    phase = 6;
+                }
+            } else if read_phase {
+                if mem_if.sresp_valid {
+                    if mem_if.sdata != pat(k, beat) || mem_if.sid != 4'h5 || mem_if.serror == 1 || mem_if.sresp_last != last_beat {
+                        ok = 0;
+                    }
+                    beat = beat + 1;
+                    if mem_if.sresp_last == 1 {
+                        phase = phase + 1;
+                    }
+                }
+            } else if phase == 14 {
+                if mem_if.sresp_valid {
+                    if mem_if.sresp != cbstub::pzcorebus_common_pkg::pzcorebus_sresp::RESPONSE_WITH_DATA || mem_if.sid != 4'h5 || mem_if.serror != 1 {
+                        ok = 0;
+                    }
+                    phase = 15;
+                }
+            } else if phase == 15 {
+                done = 1;
+            }
+        }
+    }
+}
+"#;
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.run]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"i_run\"]\n\n[bundle.status]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"o_status\"]\n\n[bundle.ddr]\nbacking = \"bram\"\ndepth = 64\nports = [\"mem_if\"]\n";
+
+    let dir = corebus_fixture(manifest, dut);
+    let map = offsets(dir.path());
+    let (base, run, status, refused) = (
+        region_base(&map, "ddr"),
+        offset_of(&map, "i_run"),
+        offset_of(&map, "o_status"),
+        offset_of(&map, "ddr_refused"),
+    );
+
+    let tb = format!(
+        r#"
+#[test(corebus_memory_master)]
+module corebus_memory_master {{
+{BUS}
+    var seen: logic<32>;
+
+    initial {{
+        start();
+
+        wr({run}, 1);
+        clk.next(1);
+        wr({run}, 0);
+        for _i in 0..200 {{
+            seen = rd({status});
+            if seen[0] {{
+                break;
+            }}
+            clk.next(4);
+        }}
+        $display("status = %h", seen);
+        // Done, and every read came back as written.
+        $assert(seen == 3);
+
+        // The host sees the posted burst (address 0x20, 8-byte beats) ...
+        $assert(rd({base} + 32'h20) == 32'h1000_0010);
+        $assert(rd({base} + 32'h24) == 32'ha000_0010);
+        $assert(rd({base} + 32'h38) == 32'h1000_0013);
+        $assert(rd({base} + 32'h3c) == 32'ha000_0013);
+        // ... and the non-posted one (address 0x80).
+        $assert(rd({base} + 32'h80) == 32'h1000_0020);
+        $assert(rd({base} + 32'h8c) == 32'ha000_0021);
+        // Nothing past the bursts.
+        $assert(rd({base} + 32'h40) == 0);
+        $assert(rd({base} + 32'h90) == 0);
+
+        // The broadcast and the atomic were not run, and were counted.
+        $assert(rd({base} + 32'h100) == 0);
+        $assert(rd({refused}) == 2);
+
+        $finish();
+    }}
+}}
+"#
+    );
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
+/// A pzcorebus port the harness cannot serve is refused at `gen`, with the
+/// error that says why. The DUT only holds the port; it never drives it.
+#[test]
+fn a_pzcorebus_memory_port_that_cannot_be_served_is_refused() {
+    let dut = |modport: &str, profile: &str, atomic: u32| {
+        format!(
+            r#"
+module dut_top (
+    i_clk : input clock,
+    i_rst : input reset,
+    mem_if: modport cbstub::pzcorebus_if::<
+        cbstub::pzcorebus_pkg::<cbstub::pzcorebus_common_pkg::pzcorebus_profile::{profile}, 4, 32, 64, true, 8, {atomic}, 0, 0, 0, 64, 64, 0>
+    >::{modport},
+) {{
+}}
+"#
+        )
+    };
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.ddr]\nbacking = \"bram\"\ndepth = 64\nports = [\"mem_if\"]\n";
+    for (modport, profile, atomic, code) in [
+        ("slave", "MEMORY", 0, "corebus_mem_not_a_master"),
+        ("master", "CSR", 0, "corebus_mem_unsupported"),
+        ("master", "MEMORY", 4, "corebus_mem_unsupported"),
+    ] {
+        let dir = corebus_project(manifest, &dut(modport, profile, atomic));
+        let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+            .args(["gen", "--target", "digilent/arty-a7-35"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).to_string()
+            + &String::from_utf8_lossy(&output.stderr);
+        assert_ne!(output.status.code(), Some(0), "{modport} {profile}: {text}");
+        assert!(text.contains(code), "{modport} {profile} {atomic}: {text}");
+    }
 }
 
 /// A Debug Module's DMI, an APB slave the harness drives (`dmi`).

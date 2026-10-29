@@ -274,15 +274,6 @@ pub enum PlanError {
     )]
     SimSvBlackbox { names: String },
 
-    #[error("[bundle.{bundle}] uses backing `{backing}`, which has no terminator yet")]
-    #[diagnostic(
-        code(harness::plan::no_terminator),
-        help(
-            "The generator can terminate `reg`, `slave`, `dmi`, `host_poll_fifo`, `trace`, `bram`, `bram_preload`, `dram`, `host_irq`, and `pcie_flr`. `{backing}` is not supported yet.\n\n`check` without `--target` still tells you whether the manifest is feasible."
-        )
-    )]
-    NoTerminator { bundle: String, backing: String },
-
     /// The decoder waits with one flip-flop per cycle, and the window gives
     /// up on an answer after 10 us.
     #[error("[bundle.{bundle}] is a `slave` with `latency = {latency}`, more than {max}")]
@@ -527,8 +518,6 @@ pub const MAX_SLAVE_LATENCY: u32 = 64;
 ///
 /// Exit 0 from `check --target` means that `gen` succeeds.
 fn generatable(plan: &Plan) -> Result<(), PlanError> {
-    use crate::manifest::Backing;
-
     let board = plan.board();
 
     // The output uses the `hns` package, which needs std.
@@ -627,24 +616,6 @@ fn generatable(plan: &Plan) -> Result<(), PlanError> {
         if backing.is_host_mem() {
             return Err(PlanError::HostMemNotGenerated {
                 bundle: binding.bundle.clone(),
-            });
-        }
-        if !matches!(
-            backing,
-            Backing::Reg
-                | Backing::Slave
-                | Backing::Dmi
-                | Backing::HostPollFifo
-                | Backing::Trace
-                | Backing::Bram
-                | Backing::BramPreload
-                | Backing::Dram
-                | Backing::HostIrq
-                | Backing::PcieFlr
-        ) {
-            return Err(PlanError::NoTerminator {
-                bundle: binding.bundle.clone(),
-                backing: backing.to_string(),
             });
         }
     }

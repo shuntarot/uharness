@@ -152,6 +152,15 @@ pub enum ContractError {
     )]
     Axi4NotAlone { bundle: String, others: String },
 
+    #[error("[bundle.{bundle}] mixes a pzcorebus interface with other ports")]
+    #[diagnostic(
+        code(harness::contract::corebus_not_alone),
+        help(
+            "A bundle with a pzcorebus interface holds only that interface. These ports are also in it: {others}.\n\nMove them to their own bundle."
+        )
+    )]
+    CorebusNotAlone { bundle: String, others: String },
+
     #[error("[bundle.{bundle}] is `reg`, but `{port}` says the DUT drives the address")]
     #[diagnostic(
         code(harness::contract::memory_driven_by_the_dut),
@@ -193,7 +202,7 @@ pub enum ContractError {
     #[diagnostic(
         code(harness::contract::host_mem_incomplete),
         help(
-            "Each half of a transfer-level port is stated whole or left out. Reading needs `rd_cmd_valid` / `rd_cmd_ready` / `rd_cmd_addr` / `rd_cmd_size` and `rd_valid` / `rd_ready` / `rd_data` / `rd_last`; writing needs the `wr_` equivalents plus `wr_done_valid`, which is what ends the transfer. A DUT that only reads leaves every `wr_` role out.
+            "Each half of a transfer-level port is stated whole or left out. Reading needs `rd_cmd_valid` / `rd_cmd_ready` / `rd_cmd_addr` / `rd_cmd_size` and `rd_valid` / `rd_ready` / `rd_data` / `rd_last` / `rd_error`; writing needs the `wr_` equivalents plus `wr_done_valid` / `wr_done_error`, which end the transfer. A DUT that only reads leaves every `wr_` role out.
 
 Without `{missing}` the terminator cannot tell {why}."
         )
@@ -356,6 +365,13 @@ fn resolve_one(
         {
             assignment.role = Role::Axi4;
         }
+        if dut
+            .ports
+            .iter()
+            .any(|port| port.name == assignment.port && port.corebus.is_some())
+        {
+            assignment.role = Role::Corebus;
+        }
     }
 
     // Memory roles on a non-memory backing. The dictionary gives memory roles
@@ -477,6 +493,37 @@ fn resolve_one(
         });
     }
 
+    // pzcorebus the same way: the interface carries the protocol.
+    if roles.iter().any(|r| r.role == Role::Corebus) {
+        if roles.len() > 1 {
+            return Err(ContractError::CorebusNotAlone {
+                bundle: binding.bundle.clone(),
+                others: roles
+                    .iter()
+                    .filter(|r| r.role != Role::Corebus)
+                    .map(|r| r.port.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+        if let Some(declared) = declared
+            && declared != Contract::Corebus
+        {
+            return Err(ContractError::ContractNotYours {
+                bundle: binding.bundle.clone(),
+                declared: declared.as_str(),
+                inferred: Contract::Corebus.as_str(),
+                why: "the port is a pzcorebus interface, and the protocol comes with it",
+            });
+        }
+        return Ok(BundleContract {
+            bundle: binding.bundle.clone(),
+            contract: Contract::Corebus,
+            declared: declared.is_some(),
+            roles,
+        });
+    }
+
     // A transfer-level port skips the contract check too. It has two
     // valid/ready pairs (commands and data), and the check assumes one.
     // Instead, check that the roles are complete. The contract is
@@ -592,22 +639,22 @@ fn check_apb(bundle: &str, roles: &[RoleAssignment]) -> Result<(), ContractError
 /// Checks that a transfer-level bundle has all the roles it needs.
 ///
 /// The contract check does not apply: there are two valid/ready pairs
-/// (commands and data). Instead, each started side must have all 8 roles.
-/// `*_tag` is optional.
+/// (commands and data). Instead, each started side must have all its roles.
+/// Only `wr_strb` is optional; `*_tag` is not generated yet.
+///
+/// The error roles are required because a transfer can fail: past the end of
+/// the memory, off a beat boundary, or on a real link. A DUT without them
+/// would get data 0 with nothing to say it was not read.
 fn check_host_mem(bundle: &str, roles: &[RoleAssignment]) -> Result<(), ContractError> {
     let has = |role: Role| roles.iter().any(|r| r.role == role);
 
     // Roles that are known but not generated yet. The error says "not yet",
     // not "unknown".
-    // `wr_done_valid` is optional, so a DUT that does not wait for completion
-    // still works. Without it, the DUT cannot know when its writes are
-    // visible; that is the DUT author's choice.
     for (role, name) in [
         (Role::RdCmdTag, "rd_cmd_tag"),
         (Role::RdTag, "rd_tag"),
         (Role::WrCmdTag, "wr_cmd_tag"),
         (Role::WrDoneTag, "wr_done_tag"),
-        (Role::WrDoneError, "wr_done_error"),
     ] {
         if has(role) {
             return Err(ContractError::HostMemRoleUnsupported {
@@ -634,6 +681,11 @@ fn check_host_mem(bundle: &str, roles: &[RoleAssignment]) -> Result<(), Contract
         (Role::RdReady, "rd_ready", "when the DUT can take a beat"),
         (Role::RdData, "rd_data", "what to hand back"),
         (Role::RdLast, "rd_last", "how to say the transfer is over"),
+        (
+            Role::RdError,
+            "rd_error",
+            "that a beat could not be read (past the end, off a beat boundary, or a failed link)",
+        ),
     ];
     const WRITE: &[(Role, &str, &str)] = &[
         (
@@ -652,6 +704,16 @@ fn check_host_mem(bundle: &str, roles: &[RoleAssignment]) -> Result<(), Contract
         (Role::WrReady, "wr_ready", "when the memory can take a beat"),
         (Role::WrData, "wr_data", "what to store"),
         (Role::WrLast, "wr_last", "when the DUT has no more beats"),
+        (
+            Role::WrDoneValid,
+            "wr_done_valid",
+            "when the write has landed, so a later read sees it",
+        ),
+        (
+            Role::WrDoneError,
+            "wr_done_error",
+            "that some beat was not stored (past the end, off a beat boundary, or a failed link)",
+        ),
     ];
 
     // A DUT that only reads has no `wr_*`, and one that only writes has no
@@ -902,6 +964,7 @@ mod tests {
             name: name.to_string(),
             direction,
             axi4: None,
+            corebus: None,
             signals: vec![Signal {
                 path: name.to_string(),
                 role: SignalRole::Data,
@@ -938,7 +1001,7 @@ mod tests {
     // `host_mem`
     // -----------------------------------------------------------------------
 
-    /// A transfer-level port with all 8 read roles.
+    /// A transfer-level port with all 9 read roles.
     const HMEM_PORTS: &[&str] = &[
         "o_cmd_valid",
         "i_cmd_ready",
@@ -948,6 +1011,7 @@ mod tests {
         "o_rd_ready",
         "i_rd_data",
         "i_rd_last",
+        "i_rd_error",
     ];
 
     fn hmem_dut() -> Dut {
@@ -960,6 +1024,7 @@ mod tests {
             port("o_rd_ready", PortDirection::Output),
             port("i_rd_data", PortDirection::Input),
             port("i_rd_last", PortDirection::Input),
+            port("i_rd_error", PortDirection::Input),
         ])
     }
 
@@ -972,7 +1037,8 @@ mod tests {
     const HMEM_READ_ROLES: &str = "rd_cmd_valid = \"o_cmd_valid\", rd_cmd_ready = \"i_cmd_ready\", \
          rd_cmd_addr = \"o_cmd_addr\", rd_cmd_size = \"o_cmd_size\", \
          rd_valid = \"i_rd_valid\", rd_ready = \"o_rd_ready\", \
-         rd_data = \"i_rd_data\", rd_last = \"i_rd_last\"";
+         rd_data = \"i_rd_data\", rd_last = \"i_rd_last\", \
+         rd_error = \"i_rd_error\"";
 
     /// It skips the contract check, which assumes one handshake. This port
     /// has two valid/ready pairs.
@@ -1037,9 +1103,30 @@ mod tests {
         assert!(help.contains("only reads"), "{help}");
     }
 
-    /// The completion is optional, so a DUT that does not wait for it works.
+    /// A read without `rd_error` is refused: a beat that could not be read
+    /// would reach the DUT as data 0 with nothing to say so.
     #[test]
-    fn a_write_without_a_completion_is_allowed() {
+    fn a_read_without_an_error_role_is_refused() {
+        let roles = HMEM_READ_ROLES.replace("rd_error = ", "data = ");
+        let err = resolve(
+            &hmem_dut(),
+            &hmem_manifest(&roles),
+            &[binding("hmem", HMEM_PORTS)],
+            &DirectionPrefixes::default(),
+        )
+        .unwrap_err();
+        let head = err.to_string();
+        let help = miette::Diagnostic::help(&err)
+            .map(|h| h.to_string())
+            .unwrap_or_default();
+        assert!(head.contains("rd_error"), "{head}");
+        assert!(help.contains("could not be read"), "{help}");
+    }
+
+    /// A write must say when it has landed and whether every beat was
+    /// stored, so the completion roles are required too.
+    #[test]
+    fn a_write_without_a_completion_is_refused() {
         let dut = dut(vec![
             port("o_wcmd_valid", PortDirection::Output),
             port("i_wcmd_ready", PortDirection::Input),
@@ -1064,16 +1151,15 @@ mod tests {
             "o_w_data",
             "o_w_last",
         ];
-        let resolved = resolve(
+        let err = resolve(
             &dut,
             &hmem_manifest(roles),
             &[binding("hmem", &ports)],
             &DirectionPrefixes::default(),
         )
-        .unwrap();
-        let got: Vec<Role> = resolved[0].roles.iter().map(|r| r.role).collect();
-        assert!(got.contains(&Role::WrLast), "{got:?}");
-        assert!(!got.contains(&Role::WrDoneValid), "{got:?}");
+        .unwrap_err();
+        let head = err.to_string();
+        assert!(head.contains("wr_done_valid"), "{head}");
     }
 
     /// Tag and completion-detail roles are known but not generated yet.
@@ -1200,8 +1286,7 @@ ports    = { valid = "i_push", ready = "!o_full", data = "i_data" }
     #[test]
     fn an_omitted_contract_is_inferred_from_the_ports() {
         let dut = dut(vec![port("o_dbg_state", PortDirection::Output)]);
-        let manifest =
-            manifest("[dut]\nmodule = \"dut_top\"\n\n[bundle.dbg]\nbacking = \"observe\"\n");
+        let manifest = manifest("[dut]\nmodule = \"dut_top\"\n\n[bundle.dbg]\nbacking = \"reg\"\n");
         let bindings = vec![binding("dbg", &["o_dbg_state"])];
 
         let contracts = resolve(&dut, &manifest, &bindings, &DirectionPrefixes::default()).unwrap();

@@ -108,6 +108,109 @@ impl Axi4Port {
     }
 }
 
+/// Details of a port that is a modport of `pzbcm::pzcorebus_if`.
+///
+/// Like `Axi4Port`, the widths come from the generic arguments on the port, not
+/// from the interface body. `pzcorebus_pkg::<..>` has 13 arguments; the profile
+/// is a name and the others are numbers (a `bool` is 0 or 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorebusPort {
+    /// `master` / `slave` / `monitor` ...
+    pub modport: String,
+
+    /// The project that holds `pzcorebus_if` (`pzbcm`, unless the DUT renamed
+    /// the dependency). The harness names the same interface through it.
+    pub project: String,
+
+    /// The profile name as written (`CSR`, `MEMORY_L`, ...).
+    pub profile: String,
+
+    /// The 12 numeric arguments of `pzcorebus_pkg::<..>`, in the written order:
+    /// `id_width`, `address_width`, `data_width`, `use_byte_enable`,
+    /// `max_length`, `atomic_command_width`, `message_code_width`,
+    /// `request_info_width`, `response_info_width`, `unit_data_width`,
+    /// `max_data_width`, `response_boundary`. The harness must `inst` an
+    /// interface of the same type, so every argument is kept.
+    pub args: Vec<u32>,
+}
+
+impl CorebusPort {
+    pub fn id_width(&self) -> u32 {
+        self.args[0]
+    }
+
+    pub fn addr_width(&self) -> u32 {
+        self.args[1]
+    }
+
+    pub fn data_width(&self) -> u32 {
+        self.args[2]
+    }
+
+    pub fn use_byte_enable(&self) -> bool {
+        self.args[3] != 0
+    }
+
+    /// The most beats one command carries.
+    pub fn max_length(&self) -> u32 {
+        self.args[4]
+    }
+
+    pub fn atomic_width(&self) -> u32 {
+        self.args[5]
+    }
+
+    pub fn message_width(&self) -> u32 {
+        self.args[6]
+    }
+
+    /// The unit of `mlength`, in bits.
+    pub fn unit_width(&self) -> u32 {
+        self.args[9]
+    }
+
+    /// The most beats one command can take: `max_length` units, plus the
+    /// part a start inside a beat adds, in beats of the bus width.
+    pub fn max_beats(&self) -> u32 {
+        let per_beat = (self.data_width() / self.unit_width().max(1)).max(1);
+        (self.max_length() + per_beat - 1).div_ceil(per_beat)
+    }
+
+    /// Whether the DUT is the master side. The harness takes the other side.
+    pub fn is_master(&self) -> bool {
+        self.modport == "master"
+    }
+
+    /// The package type, with the same arguments the DUT used.
+    pub fn pkg(&self) -> String {
+        let project = &self.project;
+        let args = self.arg_text();
+        format!(
+            "{project}::pzcorebus_pkg::<{project}::pzcorebus_common_pkg::pzcorebus_profile::{}, {args}>",
+            self.profile
+        )
+    }
+
+    fn arg_text(&self) -> String {
+        // `use_byte_enable` is a bool in the package, so it is written as one.
+        self.args
+            .iter()
+            .enumerate()
+            .map(|(index, arg)| match (index, arg) {
+                (3, 0) => "false".to_string(),
+                (3, _) => "true".to_string(),
+                _ => arg.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The interface type, with the same arguments the DUT used.
+    pub fn iface(&self) -> String {
+        format!("{}::pzcorebus_if::<{}>", self.project, self.pkg())
+    }
+}
+
 /// One declared port.
 #[derive(Debug)]
 pub struct Port {
@@ -124,6 +227,9 @@ pub struct Port {
 
     /// Set only for a modport of `std::axi4_if`.
     pub axi4: Option<Axi4Port>,
+
+    /// Set only for a modport of `pzbcm::pzcorebus_if`.
+    pub corebus: Option<CorebusPort>,
 }
 
 impl Port {
@@ -292,6 +398,21 @@ pub enum DutError {
         )
     )]
     Axi4ArgsUnreadable {
+        module: String,
+        port: String,
+        why: &'static str,
+    },
+
+    #[error(
+        "[dut] the pzcorebus port `{port}` of module `{module}` has widths the harness cannot read: {why}"
+    )]
+    #[diagnostic(
+        code(harness::dut::corebus_args_unreadable),
+        help(
+            "The harness reads the pzcorebus widths from the port's type, so write them as numbers:\n\n    {port}: modport pzbcm::pzcorebus_if::<pzbcm::pzcorebus_pkg::<pzbcm::pzcorebus_common_pkg::pzcorebus_profile::CSR, 8, 32, 32, false, 1, 0, 0, 0, 0, 32, 32, 0>>::slave,\n\nIf the DUT takes them from constants or `$bits(..)`, give the harness a wrapper whose port spells them out."
+        )
+    )]
+    CorebusArgsUnreadable {
         module: String,
         port: String,
         why: &'static str,
@@ -538,11 +659,13 @@ pub fn resolve(ir: &Ir, project: &str, module: &str) -> Result<Dut, DutError> {
             let name = format!("{}", port.name());
             let signals = signals_of(ir_module, &name);
             let axi4 = axi4_of(module, ir_module, &name)?;
+            let corebus = corebus_of(module, ir_module, &name)?;
             Ok(Port {
                 direction: PortDirection::from(&port.property().direction),
                 name,
                 signals,
                 axi4,
+                corebus,
             })
         })
         .collect::<Result<Vec<_>, DutError>>()?;
@@ -639,6 +762,33 @@ pub fn describe_ports(ir: &Ir, filter: Option<&str>) -> String {
                     axi4.addr_width(),
                     axi4.data_width(),
                     axi4.id_width()
+                );
+                continue;
+            }
+            let corebus = match corebus_of(&name, module, &format!("{path}")) {
+                Ok(corebus) => corebus,
+                Err(err) => {
+                    let _ = writeln!(
+                        out,
+                        "  {:<16} {:<8} corebus ({err})",
+                        format!("{path}"),
+                        dir
+                    );
+                    continue;
+                }
+            };
+            if let Some(corebus) = corebus {
+                let _ = writeln!(
+                    out,
+                    "  {:<16} {:<8} corebus {} {} addr={} data={}bit id={} len={}",
+                    format!("{path}"),
+                    dir,
+                    corebus.modport,
+                    corebus.profile,
+                    corebus.addr_width(),
+                    corebus.data_width(),
+                    corebus.id_width(),
+                    corebus.max_length()
                 );
                 continue;
             }
@@ -778,6 +928,96 @@ fn axi4_of(dut: &str, module: &IrModule, port_name: &str) -> Result<Option<Axi4P
 
     Ok(Some(Axi4Port {
         modport: text_of(modport),
+        args,
+    }))
+}
+
+/// If the port is a modport of `pzbcm::pzcorebus_if`, returns its widths and
+/// modport.
+///
+/// The widths come from the generic arguments, as for `axi4_of`. The analyzer
+/// has already replaced an `alias package` by what it names, so an alias of
+/// `pzcorebus_pkg::<..>` with numbers reads the same as one written in place.
+/// An argument that is a name (a `const`, `$bits(..)`) is an error, not a guess.
+fn corebus_of(
+    dut: &str,
+    module: &IrModule,
+    port_name: &str,
+) -> Result<Option<CorebusPort>, DutError> {
+    use veryl_analyzer::ir::TypeKind;
+
+    let Some((_, (ty, _))) = module.port_types.iter().find(|(path, _)| {
+        path.0
+            .first()
+            .is_some_and(|head| format!("{head}") == port_name)
+    }) else {
+        return Ok(None);
+    };
+    let TypeKind::Modport(sig, modport) = &ty.kind else {
+        return Ok(None);
+    };
+    let last = sig.full_path.last().map(text_of);
+    // A generic interface that has been given its arguments is named
+    // `__pzcorebus_if__<arguments>` in the IR.
+    let is_corebus = last
+        .as_deref()
+        .is_some_and(|last| last == "pzcorebus_if" || last.starts_with("__pzcorebus_if__"));
+    if !is_corebus {
+        return Ok(None);
+    }
+    let unreadable = |why: &'static str| DutError::CorebusArgsUnreadable {
+        module: dut.to_string(),
+        port: port_name.to_string(),
+        why,
+    };
+
+    let (_, path) = sig
+        .generic_parameters
+        .first()
+        .ok_or_else(|| unreadable("it has no package argument"))?;
+    let pkg = path
+        .paths
+        .iter()
+        .find(|p| format!("{}", p.base.text) == "pzcorebus_pkg")
+        .ok_or_else(|| unreadable("its argument is not a `pzbcm::pzcorebus_pkg::<..>`"))?;
+    if pkg.arguments.len() != 13 {
+        return Err(unreadable(
+            "`pzcorebus_pkg` does not have its 13 arguments (profile and 12 numbers)",
+        ));
+    }
+    // The profile is a path (`..::pzcorebus_profile::CSR`): its last name.
+    let profile = pkg.arguments[0]
+        .paths
+        .last()
+        .map(|p| format!("{}", p.base.text))
+        .ok_or_else(|| unreadable("the profile is not a name"))?;
+    let args: Vec<u32> = pkg.arguments[1..]
+        .iter()
+        .map(|arg| {
+            // A number, or `true` / `false`. A path of several names is a constant.
+            let [only] = arg.paths.as_slice() else {
+                return None;
+            };
+            let text = format!("{}", only.base.text);
+            match text.as_str() {
+                "true" => Some(1),
+                "false" => Some(0),
+                _ => text.parse::<u32>().ok(),
+            }
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| unreadable("an argument of `pzcorebus_pkg` is not a number"))?;
+
+    let project = sig
+        .full_path
+        .first()
+        .map(text_of)
+        .ok_or_else(|| unreadable("its interface has no project name"))?;
+
+    Ok(Some(CorebusPort {
+        modport: text_of(modport),
+        project,
+        profile,
         args,
     }))
 }

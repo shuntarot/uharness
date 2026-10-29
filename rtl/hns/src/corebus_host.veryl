@@ -1,0 +1,174 @@
+/// Turns the host window into a pzcorebus master: CSR or memory profile.
+///
+/// A DUT with a pzcorebus `slave` port has no back door either. This is the
+/// master that the window drives: one 32-bit word per access, as a single
+/// beat. A write is non-posted, so the slave answers it and the window knows
+/// when it is done. A read waits for its data.
+///
+/// - CSR (`MEM` false): the data rides with the command, and the bus is 32 bits.
+/// - Memory (`MEM` true): the data goes on its own channel, one beat of one
+///   unit. The bus can be wider than a word: the word is copied to every lane,
+///   `o_mdata_byteen` picks its 4 bytes, and a read takes its lane out of the
+///   beat. The generator allows this only when a unit is the whole bus, so one
+///   unit is one beat.
+///
+/// The ports are plain wires, not an interface. The generated harness joins
+/// them to the `pzcorebus_if` instance of the DUT, so `hns` does not depend on
+/// the pzcorebus package. The command codes are the ones of
+/// `pzcorebus_common_pkg::pzcorebus_mcmd`.
+///
+/// Reads and writes run one at a time. The window (`hns::axil`) takes the next
+/// access only after the answer of the last, so one open transfer is enough.
+///
+/// While `i_hold` is high the slave is being reset and may never answer. No
+/// transfer starts and an open one is dropped, so the window times out on it
+/// instead of waiting for ever. A response that arrives when nothing is open
+/// is dropped.
+pub module corebus_host #(
+    /// Width of the window's 32-bit word index. The byte address is 2 bits more.
+    param ADDR_W    : u32   = 8    ,
+    param ID_W      : u32   = 8    ,
+    /// Bytes of the data bus: 4 for CSR.
+    param DATA_BYTES: u32   = 4    ,
+    /// The memory profile: data on its own channel.
+    param MEM       : bbool = false,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// The slave is being reset. Tie to 0 for a slave that is not.
+    i_hold: input logic,
+
+    o_mcmd_valid : output logic            ,
+    o_mcmd       : output logic<4>         ,
+    o_mid        : output logic<ID_W>      ,
+    o_maddr      : output logic<ADDR_W + 2>,
+    i_scmd_accept: input  logic            ,
+
+    o_mdata       : output logic<DATA_BYTES * 8>,
+    o_mdata_byteen: output logic<DATA_BYTES>    ,
+    /// Memory profile only; 0 for CSR.
+    o_mdata_valid : output logic                ,
+    i_sdata_accept: input  logic                ,
+
+    o_mresp_accept: output logic                ,
+    i_sresp_valid : input  logic                ,
+    i_sdata       : input  logic<DATA_BYTES * 8>,
+
+    i_haddr  : input  logic<ADDR_W>,
+    i_hwdata : input  logic<32>    ,
+    i_hwe    : input  logic        ,
+    i_hre    : input  logic        ,
+    o_hrdata : output logic<32>    ,
+    /// Read data is valid (one cycle). Connect to `i_rvalid` of `hns::axil`.
+    o_hrvalid: output logic        ,
+    /// A write can be accepted. Connect to `i_wready` of `hns::axil`.
+    o_hwready: output logic        ,
+) {
+    /// `pzcorebus_mcmd::READ` and `pzcorebus_mcmd::WRITE_NP`.
+    const CMD_READ    : logic<4> = 4'b1001;
+    const CMD_WRITE_NP: logic<4> = 4'b1100;
+
+    /// 32-bit words per beat, and the bits of the word index that pick one.
+    /// The pick is 1 bit wide even for one word (width 0 is not allowed); it
+    /// is then forced to 0.
+    const WORDS: u32 = DATA_BYTES / 4;
+    const SEL_W: u32 = if WORDS >: 1 ? $clog2(WORDS) : 1;
+
+    var busy     : logic            ;
+    var cmd_done : logic            ;
+    var data_done: logic            ;
+    var is_read  : logic            ;
+    var addr     : logic<ADDR_W + 2>;
+    var lane     : logic<SEL_W>     ;
+    var data     : logic<32>        ;
+    /// A read pulse that came while a transfer was open.
+    var rd_wait  : logic            ;
+    var rd_addr  : logic<ADDR_W>    ;
+    var r_data   : logic<32>        ;
+    var r_out    : logic            ;
+
+    let lane_mask: logic<SEL_W>      = WORDS - 1;
+    let byte_one : logic<DATA_BYTES> = 4'hf;
+    let lane_bit : logic<8>          = {lane, 2'b00};
+
+    always_comb {
+        o_mcmd_valid   = busy & ~cmd_done;
+        o_mcmd         = if is_read ? CMD_READ : CMD_WRITE_NP;
+        o_mid          = 0;
+        o_maddr        = addr;
+        o_mdata        = {data repeat WORDS};
+        o_mdata_byteen = byte_one << lane_bit;
+        o_mdata_valid  = MEM & busy & ~is_read & ~data_done;
+        o_mresp_accept = 1;
+    }
+
+    always_ff {
+        if_reset {
+            busy      = 0;
+            cmd_done  = 0;
+            data_done = 0;
+            is_read   = 0;
+            addr      = 0;
+            lane      = 0;
+            data      = 0;
+            rd_wait   = 0;
+            rd_addr   = 0;
+            r_data    = 0;
+            r_out     = 0;
+        } else {
+            r_out = 0;
+
+            if i_hold {
+                busy    = 0;
+                rd_wait = 0;
+            } else {
+                // The window may start a read while a write is open (or both
+                // at once). Keep the read and run it next.
+                if i_hre && (busy || i_hwe) {
+                    rd_wait = 1;
+                    rd_addr = i_haddr;
+                }
+                if !busy {
+                    if i_hwe {
+                        busy      = 1;
+                        cmd_done  = 0;
+                        data_done = !MEM;
+                        is_read   = 0;
+                        addr      = {i_haddr, 2'b00};
+                        lane      = i_haddr[SEL_W - 1:0] & lane_mask;
+                        data      = i_hwdata;
+                    } else if rd_wait || i_hre {
+                        busy      = 1;
+                        cmd_done  = 0;
+                        data_done = 1;
+                        is_read   = 1;
+                        addr      = {if rd_wait ? rd_addr : i_haddr, 2'b00};
+                        lane      = (if rd_wait ? rd_addr[SEL_W - 1:0] : i_haddr[SEL_W - 1:0]) & lane_mask;
+                        rd_wait   = 0;
+                    }
+                } else {
+                    if o_mcmd_valid && i_scmd_accept {
+                        cmd_done = 1;
+                    }
+                    if o_mdata_valid && i_sdata_accept {
+                        data_done = 1;
+                    }
+                    if i_sresp_valid {
+                        busy = 0;
+                        if is_read {
+                            r_data = i_sdata[lane * 32+:32];
+                            r_out  = 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // A write is done when the answer comes, so a second access never overtakes
+    // it. A read is answered by `o_hrvalid`.
+    assign o_hrvalid = r_out;
+    assign o_hrdata  = r_data;
+    assign o_hwready = ~busy & ~i_hold;
+}

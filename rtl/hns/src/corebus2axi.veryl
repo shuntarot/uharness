@@ -1,0 +1,211 @@
+/// Turns a pzcorebus memory-profile master (the DUT) into an AXI4 master.
+///
+/// The harness is the slave of a DUT's pzcorebus memory port. This module is
+/// the front of it: from here on, the memory (`hns::axi_mem` or the memory
+/// controller) is reached through AXI4 as for any AXI4 DUT.
+///
+/// The ports are plain wires, not an interface, so `hns` does not depend on the
+/// pzcorebus package. The generated harness joins them to the `pzcorebus_if`
+/// of the DUT. The beat count comes from the interface (`get_mburst_length`),
+/// because it depends on the unit size and the address.
+///
+/// - Reads and writes are INCR bursts of full-width beats.
+/// - A write command and its data are separate channels in pzcorebus, as AW and
+///   W are in AXI4. Data is passed only for a command that was taken.
+/// - One write is open at a time: the next write command waits for the answer
+///   (B) of the last. The arbiter in front of the memory gives the write path
+///   to one master until B returns, so a second address sent before that would
+///   leave its data without a grant.
+/// - A read waits until every write before it has been answered (B), so a
+///   read after a write to the same place never sees the old value.
+/// - The AXI4 ID is `{non_posted, mid}`, one bit wider than `mid`. A non-posted
+///   write is answered when B comes; a posted one is dropped there.
+/// - Read data and write answers share the response channel. Read data goes
+///   first. A response that carries an error says so in `o_serror`.
+///
+/// Only READ and WRITE are run. Any other command (broadcast, atomic, message)
+/// is taken and not run: its data is dropped, a non-posted one is answered
+/// with an error, and `o_refused` counts it. A bus can carry atomics even when
+/// its `atomic_command_width` is 0 (the operation can be in the data), so the
+/// width alone does not keep them out.
+pub module corebus2axi::<PKG: $std::axi4_prototype> #(
+    /// Width of `mid`.
+    param ID_W   : u32 = 8,
+    /// Width of the beat count. At most 256 beats go on AXI4.
+    param BURST_W: u32 = 16,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    i_mcmd_valid : input  logic                    ,
+    i_mcmd       : input  logic<4>                 ,
+    i_mid        : input  logic<ID_W>              ,
+    i_maddr      : input  logic<PKG::ADDRESS_WIDTH>,
+    i_mburst     : input  logic<BURST_W>           ,
+    o_scmd_accept: output logic                    ,
+
+    i_mdata_valid : input  logic                          ,
+    i_mdata       : input  logic<PKG::DATA_WIDTH_BYTES * 8>,
+    i_mdata_byteen: input  logic<PKG::DATA_WIDTH_BYTES>   ,
+    i_mdata_last  : input  logic                          ,
+    o_sdata_accept: output logic                          ,
+
+    i_mresp_accept: input  logic                          ,
+    o_sresp_valid : output logic                          ,
+    /// The response carries data (a read). Without it, a write answer.
+    o_sresp_data  : output logic                          ,
+    o_sid         : output logic<ID_W>                    ,
+    o_serror      : output logic                          ,
+    o_sdata       : output logic<PKG::DATA_WIDTH_BYTES * 8>,
+    o_sresp_last  : output logic                          ,
+
+    /// Commands taken and not run (not READ or WRITE). Saturates.
+    o_refused: output logic<32>,
+
+    axi: modport $std::axi4_if::<PKG>::master,
+) {
+    const SHIFT: u32 = $clog2(PKG::DATA_WIDTH_BYTES);
+
+    /// `pzcorebus_mcmd`: bits 2:0 the kind, bit 2 "with data", bit 3
+    /// "non-posted".
+    const KIND_READ  : logic<3> = 3'b001;
+    const KIND_WRITE : logic<3> = 3'b100;
+    const KIND_ATOMIC: logic<3> = 3'b110;
+
+    let kind    : logic<3> = i_mcmd[2:0];
+    let is_read : logic    = kind == KIND_READ;
+    let is_write: logic    = kind == KIND_WRITE;
+    let is_other: logic    = !is_read && !is_write;
+    let is_np   : logic    = i_mcmd[3];
+
+    /// Write commands whose last data beat has not gone yet, and writes whose
+    /// answer has not come yet.
+    var wcmds: logic<2> ;
+    var wouts: logic<16>;
+
+    /// A refused command with data: its beats are dropped until the last.
+    var dropping: logic     ;
+    /// The error answer of a refused non-posted command, waiting to go out.
+    var ref_pend: logic     ;
+    var ref_id  : logic<ID_W>;
+    var ref_data: logic     ;
+    var refused : logic<32> ;
+
+    let aw_fire: logic = axi.awvalid && axi.awready;
+    let wl_fire: logic = axi.wvalid && axi.wready && axi.wlast;
+    let b_fire : logic = axi.bvalid && axi.bready;
+
+    let block_w: logic = wouts != 0 || dropping;
+    let block_r: logic = wouts != 0;
+    /// A refused command waits until no data of an earlier write is due, so
+    /// the beats it drops are its own, and until the last refusal is answered.
+    let take_other: logic = i_mcmd_valid && is_other && wcmds == 0 && !dropping && !ref_pend;
+
+    let beats_m1: logic<BURST_W> = i_mburst - 1;
+    let size_c  : logic<3>       = SHIFT;
+
+    let aw_v: logic = i_mcmd_valid & is_write & ~block_w;
+    let ar_v: logic = i_mcmd_valid & is_read & ~block_r;
+    let w_ok: logic = aw_v | (wcmds != 0);
+
+    /// Which answer goes out: read data, then a non-posted write's B, then a
+    /// refusal.
+    let send_b  : logic = !axi.rvalid && axi.bvalid && axi.bid[ID_W];
+    /// A refusal is answered after its data has been dropped, as a slave
+    /// answers a command only once it has all of it.
+    let send_ref: logic = !axi.rvalid && !send_b && ref_pend && !dropping;
+
+    always_comb {
+        axi.awvalid  = aw_v;
+        axi.awid     = {is_np, i_mid};
+        axi.awaddr   = i_maddr;
+        axi.awlen    = beats_m1[7:0];
+        axi.awsize   = size_c;
+        axi.awburst  = 2'b01;
+        axi.awcache  = 0;
+        axi.awprot   = 0;
+        axi.awlock   = 0;
+        axi.awqos    = 0;
+        axi.awregion = 0;
+        axi.awuser   = 0;
+
+        axi.arvalid  = ar_v;
+        axi.arid     = {1'b0, i_mid};
+        axi.araddr   = i_maddr;
+        axi.arlen    = beats_m1[7:0];
+        axi.arsize   = size_c;
+        axi.arburst  = 2'b01;
+        axi.arcache  = 0;
+        axi.arprot   = 0;
+        axi.arlock   = 0;
+        axi.arqos    = 0;
+        axi.arregion = 0;
+        axi.aruser   = 0;
+
+        o_scmd_accept = if is_write ? axi.awready & ~block_w : if is_read ? axi.arready & ~block_r : take_other;
+
+        // Data goes only for a command that was taken, or is being taken. The
+        // data of a refused command is taken and dropped.
+        axi.wvalid     = i_mdata_valid & w_ok & ~dropping;
+        axi.wdata      = i_mdata;
+        axi.wstrb      = i_mdata_byteen;
+        axi.wlast      = i_mdata_last;
+        axi.wuser      = 0;
+        o_sdata_accept = dropping | (axi.wready & w_ok);
+
+        axi.rready    = i_mresp_accept;
+        axi.bready    = if axi.rvalid ? 1'b0 : if axi.bid[ID_W] ? i_mresp_accept : 1'b1;
+        o_sresp_valid = axi.rvalid | send_b | send_ref;
+        o_sresp_data  = if axi.rvalid ? 1'b1 : if send_b ? 1'b0 : ref_data;
+        o_sid         = if axi.rvalid ? axi.rid[ID_W - 1:0] : if send_b ? axi.bid[ID_W - 1:0] : ref_id;
+        o_serror      = if axi.rvalid ? axi.rresp[1] : if send_b ? axi.bresp[1] : 1'b1;
+        o_sdata       = axi.rdata;
+        o_sresp_last  = if axi.rvalid ? axi.rlast : 1'b1;
+        o_refused     = refused;
+    }
+
+    always_ff {
+        if_reset {
+            wcmds    = 0;
+            wouts    = 0;
+            dropping = 0;
+            ref_pend = 0;
+            ref_id   = 0;
+            ref_data = 0;
+            refused  = 0;
+        } else {
+            if aw_fire && !wl_fire {
+                wcmds = wcmds + 1;
+            } else if !aw_fire && wl_fire {
+                wcmds = wcmds - 1;
+            }
+            if aw_fire && !b_fire {
+                wouts = wouts + 1;
+            } else if !aw_fire && b_fire {
+                wouts = wouts - 1;
+            }
+
+            if dropping && i_mdata_valid && i_mdata_last {
+                dropping = 0;
+            }
+            if send_ref && i_mresp_accept {
+                ref_pend = 0;
+            }
+            if take_other {
+                if refused != '1 {
+                    refused = refused + 1;
+                }
+                // Bit 2 of the command: it carries data.
+                if i_mcmd[2] {
+                    dropping = 1;
+                }
+                if is_np {
+                    ref_pend = 1;
+                    ref_id   = i_mid;
+                    // A non-posted atomic expects data back; a message does not.
+                    ref_data = kind == KIND_ATOMIC;
+                }
+            }
+        }
+    }
+}

@@ -465,6 +465,7 @@ module dut_top (
     o_sum   : output logic<32>,
     o_beats : output logic<32>,
     o_dones : output logic<32>,
+    o_errs  : output logic<32>,
 
     o_rc_valid: output logic    ,
     i_rc_ready: input  logic    ,
@@ -474,6 +475,7 @@ module dut_top (
     o_r_ready : output logic    ,
     i_r_data  : input  logic<32>,
     i_r_last  : input  logic    ,
+    i_r_error : input  logic    ,
     o_wc_valid: output logic    ,
     i_wc_ready: input  logic    ,
     o_wc_addr : output logic<32>,
@@ -483,6 +485,7 @@ module dut_top (
     o_w_data  : output logic<32>,
     o_w_last  : output logic    ,
     i_w_done  : input  logic    ,
+    i_w_derr  : input  logic    ,
 ) {
     enum state_t: logic<3> {
         IDLE,
@@ -520,6 +523,7 @@ module dut_top (
             o_sum   = 0;
             o_beats = 0;
             o_dones = 0;
+            o_errs  = 0;
         } else {
             rd_q = i_go_rd;
             wr_q = i_go_wr;
@@ -539,6 +543,9 @@ module dut_top (
                 state_t::RDATA: if i_r_valid {
                     o_sum   += i_r_data;
                     o_beats += 1;
+                    if i_r_error {
+                        o_errs += 1;
+                    }
                     if i_r_last {
                         state = state_t::IDLE;
                     }
@@ -556,6 +563,9 @@ module dut_top (
                 state_t::WDONE: if i_w_done {
                     state   = state_t::IDLE;
                     o_dones += 1;
+                    if i_w_derr {
+                        o_errs += 1;
+                    }
                 }
                 default: state = state_t::IDLE;
             }
@@ -565,18 +575,18 @@ module dut_top (
 "#;
 
 const XFER_HARNESS_TOML: &str = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 100\n\n\
-[bundle.ctl]\nbacking = \"reg\"\nports = [\"i_go_rd\", \"i_go_wr\", \"i_addr\", \"i_nbytes\", \"i_seed\", \"o_busy\", \"o_sum\", \"o_beats\", \"o_dones\"]\n\n\
+[bundle.ctl]\nbacking = \"reg\"\nports = [\"i_go_rd\", \"i_go_wr\", \"i_addr\", \"i_nbytes\", \"i_seed\", \"o_busy\", \"o_sum\", \"o_beats\", \"o_dones\", \"o_errs\"]\n\n\
 [bundle.mem]\nbacking = \"dram\"\naperture = \"1M\"\n\
 ports = { rd_cmd_valid = \"o_rc_valid\", rd_cmd_ready = \"i_rc_ready\", rd_cmd_addr = \"o_rc_addr\", rd_cmd_size = \"o_rc_size\", \
-rd_valid = \"i_r_valid\", rd_ready = \"o_r_ready\", rd_data = \"i_r_data\", rd_last = \"i_r_last\", \
+rd_valid = \"i_r_valid\", rd_ready = \"o_r_ready\", rd_data = \"i_r_data\", rd_last = \"i_r_last\", rd_error = \"i_r_error\", \
 wr_cmd_valid = \"o_wc_valid\", wr_cmd_ready = \"i_wc_ready\", wr_cmd_addr = \"o_wc_addr\", wr_cmd_size = \"o_wc_size\", \
-wr_valid = \"o_w_valid\", wr_ready = \"i_w_ready\", wr_data = \"o_w_data\", wr_last = \"o_w_last\", wr_done_valid = \"i_w_done\" }\n";
+wr_valid = \"o_w_valid\", wr_ready = \"i_w_ready\", wr_data = \"o_w_data\", wr_last = \"o_w_last\", wr_done_valid = \"i_w_done\", wr_done_error = \"i_w_derr\" }\n";
 
 /// A DUT built for `bram`'s transfer level runs on `dram` unchanged:
 /// `hns::xfer2axi` turns its commands into AXI4 bursts. 300 beats from byte
 /// 4000 cross a 4 KB edge and are longer than one burst; the host sees the
-/// data through the same memory, and a read off the end is served short and
-/// counted.
+/// data through the same memory, and a read off the end ends with error beats
+/// and is counted.
 #[test]
 fn a_transfer_level_dma_engine_runs_on_dram() {
     let dir = fixture(XFER_DUT, XFER_HARNESS_TOML);
@@ -638,8 +648,9 @@ fn a_transfer_level_dma_engine_runs_on_dram() {
         300 * 0x100 + 299 * 300 / 2
     );
     assert_eq!(link.read32(offset("mem_oor")).unwrap(), 0);
+    assert_eq!(link.read32(offset("o_errs")).unwrap(), 0);
 
-    // Off the end: 4 beats asked, 2 inside.
+    // Off the end: 4 beats asked, 2 inside, 2 error beats that carry 0.
     let mut batch = hns_host::Batch::new();
     batch.write(offset("mem_base_jtag"), total / window - 1);
     batch.write(window - 8, 7);
@@ -650,7 +661,8 @@ fn a_transfer_level_dma_engine_runs_on_dram() {
     batch.write(offset("i_go_rd"), 0);
     link.run(&batch).unwrap();
     wait_idle(&mut link);
-    assert_eq!(link.read32(offset("o_beats")).unwrap(), 2);
+    assert_eq!(link.read32(offset("o_beats")).unwrap(), 4);
+    assert_eq!(link.read32(offset("o_errs")).unwrap(), 2);
     assert_eq!(link.read32(offset("o_sum")).unwrap(), 15);
     assert_eq!(link.read32(offset("mem_oor")).unwrap(), 1);
 

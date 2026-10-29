@@ -1,16 +1,19 @@
 /// The transfer-level port as an AXI4 master, so a DUT built against `bram`'s
 /// transfer level (`hns::hmem`) runs on `dram` unchanged.
 ///
-/// A command means what it means to `hns::hmem`: the address is cut down to
-/// a whole beat, the size is rounded up to whole beats, and the memory holds
+/// A command means what it means to `hns::hmem`: the address is on a beat
+/// boundary, the size is rounded up to whole beats, and the memory holds
 /// `DEPTH` beats from address 0.
 ///
-/// - A read that runs off the end delivers the beats that are inside, and
-///   `o_rd_last` marks the last of them. A read with no beat inside ends
-///   nothing: there is no `last` without a beat to carry it.
+/// - A read always hands back `ceil(size / beat)` beats, and at least one, and
+///   `o_rd_last` marks the last. A beat that cannot be read (past the end, off
+///   a beat boundary, a read of 0 bytes, or an error response from the memory)
+///   comes with `o_rd_error` set. The beats the memory is not asked for carry
+///   data 0.
 /// - A write consumes every beat it was promised and stores the ones inside.
 ///   `o_wr_done_valid` comes once the memory has answered every burst, so a
-///   read after it sees the data.
+///   read after it sees the data. `o_wr_done_error` comes with it when a beat
+///   was not stored or the memory answered with an error.
 /// - What cannot be served as asked is counted in `o_oor`, and so is every
 ///   response the memory gives with an error.
 ///
@@ -44,6 +47,7 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
     i_rd_ready: input  logic                           ,
     o_rd_data : output logic<PKG::DATA_WIDTH_BYTES * 8>,
     o_rd_last : output logic                           ,
+    o_rd_error: output logic                           ,
 
     // write command (DUT -> here)
     i_wr_cmd_valid: input  logic        ,
@@ -59,6 +63,7 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
     i_wr_strb      : input  logic<PKG::DATA_WIDTH_BYTES>,
     i_wr_last      : input  logic                       ,
     o_wr_done_valid: output logic                       ,
+    o_wr_done_error: output logic                       ,
 
     axi: modport $std::axi4_if::<PKG>::master,
 
@@ -112,14 +117,16 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
 
     // --- what a queued command means, as in `hns::hmem` ---
     let rq_first: logic<ADDR_W> = rq_data[CMD_W - 1:SIZE_W] >> SHIFT;
+    let rq_align: logic         = (rq_data[CMD_W - 1:SIZE_W] & (BYTES - 1)) == 0;
     let rq_beats: logic<SIZE_W> = (rq_data[SIZE_W - 1:0] + (BYTES - 1)) >> SHIFT;
-    let rq_room : logic<SIZE_W> = if rq_first <: DEPTH ? (DEPTH - rq_first[SIZE_W - 1:0]) : 0;
+    let rq_room : logic<SIZE_W> = if rq_align && rq_first <: DEPTH ? (DEPTH - rq_first[SIZE_W - 1:0]) : 0;
     let rq_serve: logic<SIZE_W> = if rq_beats <: rq_room ? rq_beats : rq_room;
     let rq_short: logic         = rq_serve != rq_beats || rq_beats == 0;
 
     let wq_first: logic<ADDR_W> = wq_data[CMD_W - 1:SIZE_W] >> SHIFT;
+    let wq_align: logic         = (wq_data[CMD_W - 1:SIZE_W] & (BYTES - 1)) == 0;
     let wq_beats: logic<SIZE_W> = (wq_data[SIZE_W - 1:0] + (BYTES - 1)) >> SHIFT;
-    let wq_room : logic<SIZE_W> = if wq_first <: DEPTH ? (DEPTH - wq_first[SIZE_W - 1:0]) : 0;
+    let wq_room : logic<SIZE_W> = if wq_align && wq_first <: DEPTH ? (DEPTH - wq_first[SIZE_W - 1:0]) : 0;
     let wq_serve: logic<SIZE_W> = if wq_beats <: wq_room ? wq_beats : wq_room;
     let wq_short: logic         = wq_serve != wq_beats || wq_beats == 0;
 
@@ -128,6 +135,7 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
     var ar_next : logic<ADDR_W>; // beat index of the next AR
     var ar_left : logic<SIZE_W>; // beats not asked for yet
     var r_left  : logic<SIZE_W>; // beats not handed back yet
+    var r_axi   : logic<SIZE_W>; // of those, how many come from the memory
 
     // The next burst: what is left, at most 256 beats, up to the 4 KB edge.
     let ar_page : logic<SIZE_W> = PAGE - (ar_next % PAGE);
@@ -143,6 +151,7 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
     var w_left  : logic<SIZE_W>; // beats still to take from the DUT
     var w_burst : logic<SIZE_W>; // beats left in the current W burst
     var b_wait  : logic<SIZE_W>; // bursts announced and not answered
+    var w_err   : logic        ; // some beat of this write is not stored
 
     let aw_page : logic<SIZE_W> = PAGE - (aw_next % PAGE);
     let aw_cap  : logic<SIZE_W> = if aw_page <: 256 ? aw_page : 256;
@@ -160,19 +169,32 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
 
     var oor  : logic<32>;
     var wdone: logic    ;
+    var wderr: logic    ;
+
+    // Once the memory's beats are handed back, the rest are error beats made
+    // here, one per cycle.
+    let r_mem : logic = r_axi != 0;
+    let rd_go : logic = o_rd_valid && i_rd_ready;
+
+    // Up to four things can go wrong in one cycle (a bad read command, a bad
+    // write command, an error on R and one on B), so the counter adds them at
+    // once. Separate increments would lose all but one.
+    let oor_add: logic<3> = {2'b0, rq_pop && rq_short} + {2'b0, wq_pop && wq_short} + {2'b0, rd_go && r_mem && axi.rresp != 0} + {2'b0, b_go && axi.bresp != 0};
 
     always_comb {
         rq_pop = !r_active && rq_level != 0;
         wq_pop = !w_active && wq_level != 0;
 
-        o_rd_valid = r_active && axi.rvalid;
-        o_rd_data  = axi.rdata;
+        o_rd_valid = r_active && (!r_mem || axi.rvalid);
+        o_rd_data  = if r_mem ? axi.rdata : 0;
         o_rd_last  = r_left == 1;
+        o_rd_error = !r_mem || axi.rresp != 0;
 
         // Beats inside go to the memory; the rest are taken and dropped.
         o_wr_ready = w_active && w_left != 0 && (w_store == 0 || axi.wready);
 
         o_wr_done_valid = wdone;
+        o_wr_done_error = wderr;
         o_oor           = oor;
     }
 
@@ -211,7 +233,7 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
         axi.arregion = 0;
         axi.aruser   = 0;
 
-        axi.rready = r_active && i_rd_ready;
+        axi.rready = r_active && r_mem && i_rd_ready;
     }
 
     always_ff {
@@ -220,6 +242,7 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
             ar_next  = 0;
             ar_left  = 0;
             r_left   = 0;
+            r_axi    = 0;
             w_active = 0;
             aw_next  = 0;
             aw_left  = 0;
@@ -228,10 +251,14 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
             w_left   = 0;
             w_burst  = 0;
             b_wait   = 0;
+            w_err    = 0;
             oor      = 0;
             wdone    = 0;
+            wderr    = 0;
         } else {
             wdone = 0;
+            wderr = 0;
+            oor   = if oor >: 32'hffff_ffff - oor_add ? 32'hffff_ffff : oor + oor_add;
 
             // --- read ---
             if r_active {
@@ -239,9 +266,9 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
                     ar_next = ar_next + ar_burst;
                     ar_left = ar_left - ar_burst;
                 }
-                if axi.rvalid && axi.rready {
-                    if axi.rresp != 0 && oor != 32'hffff_ffff {
-                        oor += 1;
+                if rd_go {
+                    if r_mem {
+                        r_axi = r_axi - 1;
                     }
                     r_left = r_left - 1;
                     if r_left == 1 {
@@ -251,12 +278,10 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
             } else if rq_level != 0 {
                 ar_next = rq_first;
                 ar_left = rq_serve;
-                r_left  = rq_serve;
-                if rq_short && oor != 32'hffff_ffff {
-                    oor += 1;
-                }
-                // Nothing inside means nothing to hand back.
-                r_active = rq_serve != 0;
+                r_axi   = rq_serve;
+                // A read of 0 bytes still ends with one beat, an error one.
+                r_left   = if rq_beats == 0 ? 1 : rq_beats;
+                r_active = 1;
             }
 
             // --- write ---
@@ -273,8 +298,8 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
                 if o_wr_ready && i_wr_valid {
                     w_left = w_left - 1;
                 }
-                if b_go && axi.bresp != 0 && oor != 32'hffff_ffff {
-                    oor += 1;
+                if b_go && axi.bresp != 0 {
+                    w_err = 1;
                 }
                 // Bursts announced this cycle, less those answered.
                 b_wait = b_wait + (if aw_go ? 1 : 0) - (if b_go ? 1 : 0);
@@ -282,6 +307,7 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
                 if w_left == 0 && aw_left == 0 && b_wait == 0 && !aw_go {
                     w_active = 0;
                     wdone    = 1;
+                    wderr    = w_err;
                 }
             } else if wq_level != 0 {
                 aw_next = wq_first;
@@ -293,11 +319,10 @@ pub module xfer2axi::<PKG: $std::axi4_prototype> #(
                 // stalls on beats that have nowhere to go.
                 w_left = wq_beats;
                 b_wait = 0;
-                if wq_short && oor != 32'hffff_ffff {
-                    oor += 1;
-                }
+                w_err  = wq_short;
                 if wq_beats == 0 {
                     wdone = 1;
+                    wderr = 1;
                 } else {
                     w_active = 1;
                 }

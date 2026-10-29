@@ -103,6 +103,10 @@ pub struct TraceField {
     /// Where it sits in the trigger comparison, if it may trigger. The
     /// trigger fields are packed in record order from bit 0.
     pub trigger_lsb: Option<usize>,
+    /// Where its "not 0" bit sits in the trigger comparison: a trigger field
+    /// wider than one bit gets one, above all the trigger fields, so that a
+    /// condition can say the field is not 0.
+    pub nonzero_lsb: Option<usize>,
 }
 
 /// The name of the field the harness adds: cycles since the start, in the
@@ -130,12 +134,13 @@ impl TracePlan {
         self.record_width().div_ceil(32).next_power_of_two()
     }
 
-    /// The bits the trigger compares. 0 without `trigger`.
+    /// The bits the trigger compares: the trigger fields, then their "not
+    /// 0" bits. 0 without `trigger`.
     pub fn trigger_width(&self) -> usize {
         self.fields
             .iter()
             .filter(|field| field.trigger_lsb.is_some())
-            .map(|field| field.width)
+            .map(|field| field.width + usize::from(field.nonzero_lsb.is_some()))
             .sum()
     }
 
@@ -294,6 +299,8 @@ pub struct HostMemRead {
     pub ready: String,
     pub data: String,
     pub last: String,
+    /// Set on a beat that could not be read.
+    pub error: String,
 }
 
 /// The write side of `host_mem`.
@@ -309,8 +316,9 @@ pub struct HostMemWrite {
     /// Optional. Without it, the whole beat is written.
     pub strb: Option<String>,
     pub last: String,
-    /// Optional. A DUT that does not wait for completion leaves it out.
-    pub done_valid: Option<String>,
+    pub done_valid: String,
+    /// Set with `done_valid` when some beat was not stored.
+    pub done_error: String,
 }
 
 impl HostMemPlan {
@@ -1048,6 +1056,34 @@ pub enum TerminatorError {
         modport: String,
     },
 
+    /// The harness drives the whole interface of a DUT slave.
+    #[error("[bundle.{bundle}] is `slave` but presents `{port}` as `{modport}`, not `slave`")]
+    #[diagnostic(
+        code(harness::terminator::corebus_slave_not_a_slave),
+        help(
+            "In a `slave` bundle the host drives the DUT, so the DUT's pzcorebus port must be `::slave`."
+        )
+    )]
+    CorebusSlaveNotASlave {
+        bundle: String,
+        port: String,
+        modport: String,
+    },
+
+    #[error("[bundle.{bundle}] `{port}` is a pzcorebus {profile} slave with {why}")]
+    #[diagnostic(
+        code(harness::terminator::corebus_slave_unsupported),
+        help(
+            "A pzcorebus `slave` is served one 32-bit word per access, as a single beat. CSR takes `data_width` 32. A memory profile takes a unit as wide as the bus (`unit_data_width` = `data_width`) and, on a bus wider than 32 bits, byte enables (`use_byte_enable = true`)."
+        )
+    )]
+    CorebusSlaveUnsupported {
+        bundle: String,
+        port: String,
+        profile: String,
+        why: String,
+    },
+
     /// The window has a 32-bit address and other regions share it.
     #[error(
         "[bundle.{bundle}] addresses {addr_width} bits on `{port}`, which does not fit the host window"
@@ -1063,6 +1099,34 @@ pub enum TerminatorError {
         port: String,
         addr_width: u32,
         max: u32,
+    },
+
+    #[error("[bundle.{bundle}] presents the pzcorebus port `{port}` as `{modport}`, not `master`")]
+    #[diagnostic(
+        code(harness::terminator::corebus_mem_not_a_master),
+        help(
+            "The harness is the slave, so the DUT must be the master. Use `::master`. A pzcorebus `::slave` is a register file the host drives: use `backing = \"slave\"`."
+        )
+    )]
+    CorebusMemNotAMaster {
+        bundle: String,
+        port: String,
+        modport: String,
+    },
+
+    #[error(
+        "[bundle.{bundle}] the pzcorebus port `{port}` uses {why}, which the harness does not serve"
+    )]
+    #[diagnostic(
+        code(harness::terminator::corebus_mem_unsupported),
+        help(
+            "A pzcorebus memory master is served as AXI4 reads and writes: no atomic or message commands, and bursts up to 256 beats. Declare the port without them (`atomic_command_width` and `message_code_width` 0, a smaller `max_length`)."
+        )
+    )]
+    CorebusMemUnsupported {
+        bundle: String,
+        port: String,
+        why: String,
     },
 
     /// An unconnected channel gives a read that never returns or a write that
@@ -1259,6 +1323,7 @@ fn resolve_xfer_ports(
                 ready: find(Role::RdReady),
                 data: find(Role::RdData),
                 last: find(Role::RdLast),
+                error: find(Role::RdError),
             };
             for (port, role, want) in [
                 (&r.cmd_valid, "rd_cmd_valid", Output),
@@ -1269,6 +1334,7 @@ fn resolve_xfer_ports(
                 (&r.ready, "rd_ready", Output),
                 (&r.data, "rd_data", Input),
                 (&r.last, "rd_last", Input),
+                (&r.error, "rd_error", Input),
             ] {
                 direction(port, role, want)?;
             }
@@ -1278,6 +1344,7 @@ fn resolve_xfer_ports(
                 (&r.valid, "rd_valid"),
                 (&r.ready, "rd_ready"),
                 (&r.last, "rd_last"),
+                (&r.error, "rd_error"),
             ] {
                 single_bit(port, role)?;
             }
@@ -1298,7 +1365,8 @@ fn resolve_xfer_ports(
                 data: find(Role::WrData),
                 strb: want(Role::WrStrb),
                 last: find(Role::WrLast),
-                done_valid: want(Role::WrDoneValid),
+                done_valid: find(Role::WrDoneValid),
+                done_error: find(Role::WrDoneError),
             };
             for (port, role, want) in [
                 (&w.cmd_valid, "wr_cmd_valid", Output),
@@ -1309,6 +1377,8 @@ fn resolve_xfer_ports(
                 (&w.ready, "wr_ready", Input),
                 (&w.data, "wr_data", Output),
                 (&w.last, "wr_last", Output),
+                (&w.done_valid, "wr_done_valid", Input),
+                (&w.done_error, "wr_done_error", Input),
             ] {
                 direction(port, role, want)?;
             }
@@ -1321,12 +1391,10 @@ fn resolve_xfer_ports(
                 (&w.valid, "wr_valid"),
                 (&w.ready, "wr_ready"),
                 (&w.last, "wr_last"),
+                (&w.done_valid, "wr_done_valid"),
+                (&w.done_error, "wr_done_error"),
             ] {
                 single_bit(port, role)?;
-            }
-            if let Some(done) = &w.done_valid {
-                direction(done, "wr_done_valid", Input)?;
-                single_bit(done, "wr_done_valid")?;
             }
             Some(w)
         }
@@ -1670,7 +1738,10 @@ pub fn resolve_slaves(
             .expect("every bundle gets a contract");
         // An APB slave goes to `resolve_apbs`, an AXI4 one to
         // `resolve_axi_slaves`.
-        if matches!(contract.contract, Contract::Apb | Contract::Axi) {
+        if matches!(
+            contract.contract,
+            Contract::Apb | Contract::Axi | Contract::Corebus
+        ) {
             continue;
         }
         let role_port = |role: Role| {
@@ -2060,11 +2131,10 @@ pub fn resolve_memories(
         // The interface shape decides the terminator. For the same `bram`,
         // `resolve_axi_mems` takes AXI4 and `resolve_host_mem` takes the
         // transfer level. Only fixed-latency interfaces are handled here.
-        if binding
-            .ports
-            .iter()
-            .any(|name| port_of(dut, name).axi4.is_some())
-        {
+        if binding.ports.iter().any(|name| {
+            let port = port_of(dut, name);
+            port.axi4.is_some() || port.corebus.is_some()
+        }) {
             continue;
         }
         let backing = declared.backing.as_str().to_string();
@@ -2743,6 +2813,7 @@ pub fn resolve_traces(
                 lsb,
                 width,
                 trigger_lsb: None,
+                nonzero_lsb: None,
             });
             lsb += width;
         }
@@ -2774,6 +2845,13 @@ pub fn resolve_traces(
             {
                 field.trigger_lsb = Some(trigger_lsb);
                 trigger_lsb += field.width;
+            }
+        }
+        // A 1-bit field is its own "not 0".
+        for field in &mut fields {
+            if field.trigger_lsb.is_some() && field.width > 1 {
+                field.nonzero_lsb = Some(trigger_lsb);
+                trigger_lsb += 1;
             }
         }
 
@@ -2904,6 +2982,21 @@ pub struct AxiMemPlan {
     /// A `dram` whose DUT side is a transfer-level port. `hns::xfer2axi`
     /// turns it into the AXI4 master, and `port` is empty.
     pub xfer: Option<XferPorts>,
+
+    /// A DUT port that is a pzcorebus memory master. `hns::corebus2axi` turns
+    /// it into the AXI4 master, and `pkg` is the type it drives.
+    pub corebus: Option<CorebusMaster>,
+}
+
+/// The pzcorebus side of an `AxiMemPlan`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CorebusMaster {
+    /// `<project>::pzcorebus_if::<..>`, with the same arguments the DUT used.
+    pub iface: String,
+    /// `<project>::pzcorebus_pkg::<..>`, for the types of its signals.
+    pub pkg: String,
+    pub id_width: u32,
+    pub use_byte_enable: bool,
 }
 
 impl AxiMemPlan {
@@ -2974,6 +3067,20 @@ pub struct AxiSlavePlan {
     /// The bytes shown in the window. Smaller than the address space means a
     /// moving window.
     pub aperture_bytes: Option<usize>,
+
+    /// Set when the port is a pzcorebus slave instead of AXI4. The window side
+    /// is the same; `hns::corebus_host` replaces `hns::axi_host`.
+    pub corebus: Option<CorebusSlave>,
+}
+
+/// The pzcorebus side of an `AxiSlavePlan`.
+#[derive(Debug)]
+pub struct CorebusSlave {
+    /// `<project>::pzcorebus_if::<..>`, with the same arguments the DUT used.
+    pub iface: String,
+    pub id_width: u32,
+    /// A memory profile: data on its own channel.
+    pub memory: bool,
 }
 
 impl AxiSlavePlan {
@@ -3003,6 +3110,15 @@ pub fn resolve_axi_slaves(
     for binding in bindings {
         let declared = &manifest.bundle[&binding.bundle];
         if declared.backing != Backing::Slave {
+            continue;
+        }
+        if let Some(port) = binding
+            .ports
+            .iter()
+            .map(|name| port_of(dut, name))
+            .find(|port| port.corebus.is_some())
+        {
+            plans.push(resolve_corebus_slave(binding, declared, port)?);
             continue;
         }
         let Some((port, axi4)) = binding.ports.iter().find_map(|name| {
@@ -3048,9 +3164,82 @@ pub fn resolve_axi_slaves(
             addr_width,
             data_bytes: axi4.data_bytes(),
             aperture_bytes,
+            corebus: None,
         });
     }
     Ok(plans)
+}
+
+/// A pzcorebus `slave`: the same plan as an AXI4 one, with 32-bit words.
+fn resolve_corebus_slave(
+    binding: &Binding,
+    declared: &crate::manifest::Bundle,
+    port: &crate::dut::Port,
+) -> Result<AxiSlavePlan, TerminatorError> {
+    let corebus = port.corebus.as_ref().expect("the caller checked it");
+    if corebus.modport != "slave" {
+        return Err(TerminatorError::CorebusSlaveNotASlave {
+            bundle: binding.bundle.clone(),
+            port: port.name.clone(),
+            modport: corebus.modport.clone(),
+        });
+    }
+    let unsupported = |why: String| TerminatorError::CorebusSlaveUnsupported {
+        bundle: binding.bundle.clone(),
+        port: port.name.clone(),
+        profile: corebus.profile.clone(),
+        why,
+    };
+    let memory = corebus.profile != "CSR";
+    let data_width = corebus.data_width();
+    if !memory && data_width != 32 {
+        return Err(unsupported(format!("{data_width} data bits")));
+    }
+    if memory {
+        // One unit is one beat, so a single-unit command is a single beat.
+        if corebus.unit_width() != data_width {
+            return Err(unsupported(format!(
+                "{}-bit units on a {data_width}-bit bus",
+                corebus.unit_width()
+            )));
+        }
+        if data_width < 32 || !data_width.is_power_of_two() {
+            return Err(unsupported(format!("{data_width} data bits")));
+        }
+        // A word is written by its 4 byte enables; without them a write would
+        // overwrite the rest of the beat.
+        if data_width > 32 && !corebus.use_byte_enable() {
+            return Err(unsupported("no byte enables".to_string()));
+        }
+    }
+    let addr_width = corebus.addr_width();
+    if declared.aperture.is_none() && addr_width > AXI_SLAVE_MAX_ADDR_BITS {
+        return Err(TerminatorError::AxiSlaveTooLarge {
+            bundle: binding.bundle.clone(),
+            port: port.name.clone(),
+            addr_width,
+            max: AXI_SLAVE_MAX_ADDR_BITS,
+        });
+    }
+    let aperture_bytes = aperture_of(
+        &binding.bundle,
+        declared.aperture,
+        1u64 << addr_width.min(63),
+        4,
+    )?;
+    Ok(AxiSlavePlan {
+        bundle: binding.bundle.clone(),
+        port: port.name.clone(),
+        pkg: String::new(),
+        addr_width,
+        data_bytes: data_width / 8,
+        aperture_bytes,
+        corebus: Some(CorebusSlave {
+            iface: corebus.iface(),
+            id_width: corebus.id_width(),
+            memory,
+        }),
+    })
 }
 
 /// The number of words the controller can reach, only from a measured value.
@@ -3096,6 +3285,10 @@ pub fn resolve_axi_mems(
             let port = port_of(dut, name);
             port.axi4.as_ref().map(|axi4| (port, axi4))
         });
+        let corebus = binding.ports.iter().find_map(|name| {
+            let port = port_of(dut, name);
+            port.corebus.as_ref().map(|corebus| (port, corebus))
+        });
         // A `dram` with a transfer-level port gets `hns::xfer2axi` in front.
         // `bram` serves that port itself (`resolve_host_mem`).
         let xfer = if axi.is_none()
@@ -3127,6 +3320,20 @@ pub fn resolve_axi_mems(
                     });
                 }
                 (port.name.clone(), axi4.data_bytes(), port.name.clone())
+            }
+            (None, None) if corebus.is_some() => {
+                let (port, corebus) = corebus.expect("checked above");
+                check_corebus_master(&binding.bundle, port, corebus)?;
+                if declared.backing == Backing::BramPreload {
+                    return Err(TerminatorError::AxiPreloadUnsupported {
+                        bundle: binding.bundle.clone(),
+                    });
+                }
+                (
+                    port.name.clone(),
+                    corebus.data_width() / 8,
+                    port.name.clone(),
+                )
             }
             (None, Some(xfer)) => {
                 // A command address is already an offset into the memory.
@@ -3210,9 +3417,21 @@ pub fn resolve_axi_mems(
         // The AXI4 type. A transfer-level port has none, so `hns::xfer2axi`
         // gets one just wide enough for the memory, at least 4 KB, the span
         // of a burst.
-        let (pkg, addr_width, id_width) = match &axi {
-            Some((_, axi4)) => (axi4.pkg(), axi4.addr_width(), axi4.id_width()),
-            None => {
+        let (pkg, addr_width, id_width) = match (&axi, &corebus) {
+            (Some((_, axi4)), _) => (axi4.pkg(), axi4.addr_width(), axi4.id_width()),
+            // One bit more than `mid`: `hns::corebus2axi` keeps whether the
+            // command was non-posted in it.
+            (None, Some((_, corebus))) => (
+                format!(
+                    "$std::axi4_pkg::<{}, {}, {}, 1, 1, 1, 1, 1>",
+                    corebus.addr_width(),
+                    corebus.data_width() / 8,
+                    corebus.id_width() + 1
+                ),
+                corebus.addr_width(),
+                corebus.id_width() + 1,
+            ),
+            (None, None) => {
                 let bytes = u64::from(depth) * u64::from(data_bytes);
                 let bits = bytes.trailing_zeros().max(12);
                 (
@@ -3274,10 +3493,64 @@ pub fn resolve_axi_mems(
             aperture_bytes,
             dut_base,
             xfer,
+            corebus: corebus.map(|(_, corebus)| CorebusMaster {
+                iface: corebus.iface(),
+                pkg: corebus.pkg(),
+                id_width: corebus.id_width(),
+                use_byte_enable: corebus.use_byte_enable(),
+            }),
         });
     }
 
     Ok(plans)
+}
+
+/// What `hns::corebus2axi` takes of a pzcorebus memory master. A port it cannot
+/// serve is refused: a command that is taken and not run leaves the DUT
+/// waiting for an answer that never comes.
+fn check_corebus_master(
+    bundle: &str,
+    port: &crate::dut::Port,
+    corebus: &crate::dut::CorebusPort,
+) -> Result<(), TerminatorError> {
+    if corebus.modport != "master" {
+        return Err(TerminatorError::CorebusMemNotAMaster {
+            bundle: bundle.to_string(),
+            port: port.name.clone(),
+            modport: corebus.modport.clone(),
+        });
+    }
+    let unsupported = |why: String| TerminatorError::CorebusMemUnsupported {
+        bundle: bundle.to_string(),
+        port: port.name.clone(),
+        why,
+    };
+    if corebus.profile == "CSR" {
+        return Err(unsupported(
+            "the CSR profile, which is a register bus, not a memory".to_string(),
+        ));
+    }
+    if corebus.atomic_width() != 0 {
+        return Err(unsupported("atomic commands".to_string()));
+    }
+    if corebus.message_width() != 0 {
+        return Err(unsupported("message commands".to_string()));
+    }
+    let data_width = corebus.data_width();
+    if data_width < 32 || !data_width.is_power_of_two() {
+        return Err(TerminatorError::AxiMemWidthNotAWordMultiple {
+            bundle: bundle.to_string(),
+            port: port.name.clone(),
+            bits: data_width,
+        });
+    }
+    let beats = corebus.max_beats();
+    if beats > 256 {
+        return Err(unsupported(format!(
+            "bursts of up to {beats} beats, and AXI4 has 256"
+        )));
+    }
+    Ok(())
 }
 
 /// Checks `aperture` and returns it.
@@ -3332,7 +3605,7 @@ fn aperture_of(
 ///
 /// `latency` is not checked here. `contract::resolve` reports a mismatch with
 /// the contract, and each `resolve_*` reports a missing one. Backings without a
-/// terminator yet (`observe` and others) are rejected by `gen`.
+/// terminator yet (`host_mem`) are rejected by `gen`.
 #[allow(clippy::too_many_arguments)]
 pub fn check_claimed(
     manifest: &Manifest,
@@ -3435,7 +3708,7 @@ pub fn check_claimed(
             (None, _) => match declared.backing {
                 Backing::Reg => ("a `reg` bundle", &[][..]),
                 // No terminator yet. `gen` rejects it (`plan::generatable`).
-                Backing::HostMem | Backing::Observe => continue,
+                Backing::HostMem => continue,
                 backing => {
                     return Err(TerminatorError::NotTerminated {
                         bundle: name.to_string(),
@@ -3534,7 +3807,7 @@ impl Shape {
             ),
             Shape::TransferLevel => (
                 "a transfer-level memory port",
-                "In a transfer-level port, the DUT drives the commands (`*_cmd_valid`, `*_cmd_addr`, `*_cmd_size`), the write data (`wr_valid`, `wr_data`, `wr_strb`, `wr_last`) and `rd_ready`. The memory drives `*_cmd_ready`, the read data (`rd_valid`, `rd_data`, `rd_last`), `wr_ready` and `wr_done_valid`.",
+                "In a transfer-level port, the DUT drives the commands (`*_cmd_valid`, `*_cmd_addr`, `*_cmd_size`), the write data (`wr_valid`, `wr_data`, `wr_strb`, `wr_last`) and `rd_ready`. The memory drives `*_cmd_ready`, the read data (`rd_valid`, `rd_data`, `rd_last`, `rd_error`), `wr_ready`, `wr_done_valid` and `wr_done_error`.",
                 "Check the role of the port in `ports`. The usual cause is a read and a write role swapped.",
             ),
             Shape::Dmi => (

@@ -34,6 +34,7 @@ module test_delay {
     var t_rd_ready : logic    ;
     var t_rd_data  : logic<64>;
     var t_rd_last  : logic    ;
+    var t_rd_error : logic    ;
 
     var haddr : logic<3> ;
     var hwdata: logic<64>;
@@ -91,6 +92,7 @@ module test_delay {
         i_d_rd_ready    : d_rd_ready       ,
         o_d_rd_data     : d_rd_data        ,
         o_d_rd_last     : d_rd_last        ,
+        o_d_rd_error    : _                ,
         i_d_wr_cmd_valid: 1'b0             ,
         o_d_wr_cmd_ready: _                ,
         i_d_wr_cmd_addr : 64'b0            ,
@@ -101,6 +103,7 @@ module test_delay {
         i_d_wr_strb     : 8'b0             ,
         i_d_wr_last     : 1'b0             ,
         o_d_wr_done     : _                ,
+        o_d_wr_done_error: _               ,
         o_t_rd_cmd_valid: t_cmd_valid      ,
         i_t_rd_cmd_ready: t_cmd_ready      ,
         o_t_rd_cmd_addr : t_cmd_addr       ,
@@ -109,6 +112,7 @@ module test_delay {
         o_t_rd_ready    : t_rd_ready       ,
         i_t_rd_data     : t_rd_data        ,
         i_t_rd_last     : t_rd_last        ,
+        i_t_rd_error    : t_rd_error       ,
         o_t_wr_cmd_valid: _                ,
         i_t_wr_cmd_ready: 1'b1             ,
         o_t_wr_cmd_addr : _                ,
@@ -119,6 +123,7 @@ module test_delay {
         o_t_wr_strb     : _                ,
         o_t_wr_last     : _                ,
         i_t_wr_done     : 1'b0             ,
+        i_t_wr_done_error: 1'b0            ,
     );
 
     inst h: hmem #(
@@ -137,6 +142,7 @@ module test_delay {
         i_rd_ready     : t_rd_ready        ,
         o_rd_data      : t_rd_data         ,
         o_rd_last      : t_rd_last         ,
+        o_rd_error     : t_rd_error        ,
         i_wr_cmd_valid : 1'b0              ,
         o_wr_cmd_ready : _                 ,
         i_wr_cmd_addr  : 64'b0             ,
@@ -147,6 +153,7 @@ module test_delay {
         i_wr_strb      : '1,
         i_wr_last      : 1'b0              ,
         o_wr_done_valid: _                 ,
+        o_wr_done_error: _                 ,
         i_haddr        : haddr             ,
         i_hwdata       : hwdata            ,
         i_hwe          : hwe               ,

@@ -2232,6 +2232,32 @@ fn core_body(
                 out.push_str(&format!("    var w_{port}: {domain}logic<{width}>;\n"));
             }
         }
+        // A pzcorebus port: the DUT side of `hns::corebus2axi`.
+        if let Some(corebus) = &axi_mem.corebus {
+            out.push_str(&format!(
+                "    var t_{bundle}_refused: {domain}logic<{WORD_BITS}>;\n"
+            ));
+            out.push_str(&format!(
+                "    inst cb_{bundle}: {domain}{};\n",
+                corebus.iface
+            ));
+            for (name, width) in [
+                ("mcmd", "4"),
+                ("burst", "16"),
+                ("byteen", &format!("{}", axi_mem.data_bytes)),
+                ("rdata", "1"),
+                ("rlast", "1"),
+            ] {
+                let width = if width == "1" {
+                    String::new()
+                } else {
+                    format!("<{width}>")
+                };
+                out.push_str(&format!(
+                    "    var cbw_{bundle}_{name}: {domain}logic{width};\n"
+                ));
+            }
+        }
     }
 
     // An AXI4 slave of the DUT: the window drives it through `hns::axi_host`,
@@ -2252,6 +2278,10 @@ fn core_body(
         ));
         out.push_str(&format!("    var t_{bundle}_mrvalid: {domain}logic;\n"));
         out.push_str(&format!("    var t_{bundle}_mwready: {domain}logic;\n"));
+        if let Some(corebus) = &axi.corebus {
+            emit_corebus_host(out, axi, corebus, domain, clk, rst);
+            continue;
+        }
         out.push_str(&format!(
             "    inst axi_{bundle}: {domain}$std::axi4_if::<{}>;\n\n",
             axi.pkg
@@ -2376,6 +2406,7 @@ fn core_body(
                 (read.ready.clone(), 1),
                 (read.data.clone(), hmem.data_width),
                 (read.last.clone(), 1),
+                (read.error.clone(), 1),
             ]);
         }
         if let Some(write) = &hmem.write {
@@ -2388,12 +2419,11 @@ fn core_body(
                 (write.ready.clone(), 1),
                 (write.data.clone(), hmem.data_width),
                 (write.last.clone(), 1),
+                (write.done_valid.clone(), 1),
+                (write.done_error.clone(), 1),
             ]);
             if let Some(strb) = &write.strb {
                 wires.push((strb.clone(), hmem.data_width / 8));
-            }
-            if let Some(done) = &write.done_valid {
-                wires.push((done.clone(), 1));
             }
         }
         for (port, width) in wires {
@@ -2427,6 +2457,7 @@ fn core_body(
             ("rd_ready", 1),
             ("rd_data", hmem.data_width),
             ("rd_last", 1),
+            ("rd_error", 1),
             ("wr_cmd_valid", 1),
             ("wr_cmd_ready", 1),
             ("wr_cmd_addr", hmem.cmd_addr_width),
@@ -2437,6 +2468,7 @@ fn core_body(
             ("wr_strb", hmem.data_width / 8),
             ("wr_last", 1),
             ("wr_done", 1),
+            ("wr_done_error", 1),
         ] {
             out.push_str(&format!(
                 "    var h_{bundle}_{role}: {domain}logic<{width}>;\n"
@@ -3230,14 +3262,21 @@ fn core_body(
             .join(", ");
         out.push_str(&format!("        i_data: {{{data}}},\n"));
         if twidth > 0 {
-            let tdata = trace
+            // The "not 0" bits above the fields, the first field lowest in
+            // each group.
+            let nonzero = trace
+                .fields
+                .iter()
+                .rev()
+                .filter(|field| field.nonzero_lsb.is_some())
+                .map(|field| format!("|w_{}", field.port));
+            let fields = trace
                 .fields
                 .iter()
                 .rev()
                 .filter(|field| field.trigger_lsb.is_some())
-                .map(|field| format!("w_{}", field.port))
-                .collect::<Vec<_>>()
-                .join(", ");
+                .map(|field| format!("w_{}", field.port));
+            let tdata = nonzero.chain(fields).collect::<Vec<_>>().join(", ");
             out.push_str(&format!("        i_tdata: {{{tdata}}},\n"));
             out.push_str(&format!("        i_tmask: t_{bundle}_tmask,\n"));
             out.push_str(&format!("        i_tvalue: t_{bundle}_tvalue,\n"));
@@ -3384,6 +3423,9 @@ fn core_body(
         // fence behind it finishes what a reset cuts off.
         if let Some(xfer) = &axi_mem.xfer {
             xfer_adapter(out, clocks, clk, rst, axi_mem, xfer);
+        }
+        if let Some(corebus) = &axi_mem.corebus {
+            corebus_adapter(out, clocks, clk, rst, axi_mem, corebus);
         }
 
         // With `dut_base`, only what is inside the memory goes on, with the
@@ -3566,6 +3608,7 @@ fn core_body(
             ("i_d_rd_ready", read.map(|r| &r.ready), 1, true),
             ("o_d_rd_data", read.map(|r| &r.data), hmem.data_width, false),
             ("o_d_rd_last", read.map(|r| &r.last), 1, false),
+            ("o_d_rd_error", read.map(|r| &r.error), 1, false),
             ("i_d_wr_cmd_valid", write.map(|w| &w.cmd_valid), 1, true),
             ("o_d_wr_cmd_ready", write.map(|w| &w.cmd_ready), 1, false),
             (
@@ -3590,12 +3633,8 @@ fn core_body(
                 true,
             ),
             ("i_d_wr_last", write.map(|w| &w.last), 1, true),
-            (
-                "o_d_wr_done",
-                write.and_then(|w| w.done_valid.as_ref()),
-                1,
-                false,
-            ),
+            ("o_d_wr_done", write.map(|w| &w.done_valid), 1, false),
+            ("o_d_wr_done_error", write.map(|w| &w.done_error), 1, false),
         ] {
             out.push_str(&format!(
                 "        {port}: {},\n",
@@ -3611,6 +3650,7 @@ fn core_body(
             "rd_ready",
             "rd_data",
             "rd_last",
+            "rd_error",
             "wr_cmd_valid",
             "wr_cmd_ready",
             "wr_cmd_addr",
@@ -3621,12 +3661,13 @@ fn core_body(
             "wr_strb",
             "wr_last",
             "wr_done",
+            "wr_done_error",
         ] {
             // Directions seen from the terminator side. The terminator drives
             // ready, data and done.
             let prefix = match role {
-                "rd_cmd_ready" | "rd_valid" | "rd_data" | "rd_last" | "wr_cmd_ready"
-                | "wr_ready" | "wr_done" => "i_t_",
+                "rd_cmd_ready" | "rd_valid" | "rd_data" | "rd_last" | "rd_error"
+                | "wr_cmd_ready" | "wr_ready" | "wr_done" | "wr_done_error" => "i_t_",
                 _ => "o_t_",
             };
             out.push_str(&format!("        {prefix}{role}: h_{bundle}_{role},\n"));
@@ -3654,6 +3695,7 @@ fn core_body(
             ("i_rd_ready", "rd_ready"),
             ("o_rd_data", "rd_data"),
             ("o_rd_last", "rd_last"),
+            ("o_rd_error", "rd_error"),
             ("i_wr_cmd_valid", "wr_cmd_valid"),
             ("o_wr_cmd_ready", "wr_cmd_ready"),
             ("i_wr_cmd_addr", "wr_cmd_addr"),
@@ -3663,6 +3705,7 @@ fn core_body(
             ("i_wr_data", "wr_data"),
             ("i_wr_last", "wr_last"),
             ("o_wr_done_valid", "wr_done"),
+            ("o_wr_done_error", "wr_done_error"),
         ] {
             out.push_str(&format!("        {port}: h_{bundle}_{role},\n"));
         }
@@ -5355,6 +5398,7 @@ fn xfer_wires(xfer: &crate::terminator::XferPorts) -> Vec<(String, usize)> {
             (read.ready.clone(), 1),
             (read.data.clone(), xfer.data_width),
             (read.last.clone(), 1),
+            (read.error.clone(), 1),
         ]);
     }
     if let Some(write) = &xfer.write {
@@ -5367,15 +5411,108 @@ fn xfer_wires(xfer: &crate::terminator::XferPorts) -> Vec<(String, usize)> {
             (write.ready.clone(), 1),
             (write.data.clone(), xfer.data_width),
             (write.last.clone(), 1),
+            (write.done_valid.clone(), 1),
+            (write.done_error.clone(), 1),
         ]);
         if let Some(strb) = &write.strb {
             wires.push((strb.clone(), xfer.data_width / 8));
         }
-        if let Some(done) = &write.done_valid {
-            wires.push((done.clone(), 1));
-        }
     }
     wires
+}
+
+/// The DUT reset of the window's clock, as the DUT gets it. Without a DUT reset
+/// there, the harness reset.
+fn dut_reset_of(clocks: Option<&ClockPlan>, rst: &str) -> String {
+    match clocks {
+        None => "dut_rst".to_string(),
+        Some(clocks) => {
+            let ident = rst.strip_prefix("rst_").unwrap_or("c0");
+            if clocks.resets.iter().any(|(_, owner)| owner == ident) {
+                format!("drst_{ident}")
+            } else {
+                rst.to_string()
+            }
+        }
+    }
+}
+
+/// `hns::corebus2axi`: a `dram` or `bram` whose DUT port is a pzcorebus memory
+/// master. It drives `axi_<bundle>`, where an AXI4 DUT would be connected.
+///
+/// The module has plain wires, so they are joined to the interface members
+/// here. The enums (`mcmd`, `sresp`) are bits in the module, and the beat count
+/// is the interface's own function, which knows the unit size.
+fn corebus_adapter(
+    out: &mut String,
+    clocks: Option<&ClockPlan>,
+    clk: &str,
+    rst: &str,
+    axi_mem: &crate::terminator::AxiMemPlan,
+    corebus: &crate::terminator::CorebusMaster,
+) {
+    let bundle = &axi_mem.bundle;
+    let project = corebus
+        .iface
+        .split("::")
+        .next()
+        .expect("an interface path has a project");
+    let dut_reset = dut_reset_of(clocks, rst);
+    out.push_str(&format!(
+        "    inst u_cb_{bundle}: hns::corebus2axi::<{}> #(\n        ID_W: {},\n        BURST_W: 16,\n    ) (\n",
+        axi_mem.pkg, corebus.id_width
+    ));
+    out.push_str(&format!("        i_clk: {clk},\n"));
+    out.push_str(&format!("        i_rst: {dut_reset},\n"));
+    for (port, member) in [
+        ("i_mcmd_valid", "mcmd_valid"),
+        ("i_mid", "mid"),
+        ("i_maddr", "maddr"),
+        ("o_scmd_accept", "scmd_accept"),
+        ("i_mdata_valid", "mdata_valid"),
+        ("i_mdata", "mdata"),
+        ("i_mdata_last", "mdata_last"),
+        ("o_sdata_accept", "sdata_accept"),
+        ("i_mresp_accept", "mresp_accept"),
+        ("o_sresp_valid", "sresp_valid"),
+        ("o_sid", "sid"),
+        ("o_serror", "serror"),
+        ("o_sdata", "sdata"),
+    ] {
+        out.push_str(&format!("        {port}: cb_{bundle}.{member},\n"));
+    }
+    out.push_str(&format!("        i_mcmd: cbw_{bundle}_mcmd,\n"));
+    out.push_str(&format!("        i_mburst: cbw_{bundle}_burst,\n"));
+    out.push_str(&format!("        i_mdata_byteen: cbw_{bundle}_byteen,\n"));
+    out.push_str(&format!("        o_sresp_data: cbw_{bundle}_rdata,\n"));
+    out.push_str(&format!("        o_sresp_last: cbw_{bundle}_rlast,\n"));
+    out.push_str(&format!("        o_refused: t_{bundle}_refused,\n"));
+    out.push_str(&format!("        axi: axi_{bundle},\n"));
+    out.push_str("    );\n");
+    out.push_str(&format!(
+        "    assign cbw_{bundle}_mcmd = cb_{bundle}.mcmd as 4;\n"
+    ));
+    out.push_str(&format!(
+        "    assign cbw_{bundle}_burst = cb_{bundle}.get_mburst_length() as 16;\n"
+    ));
+    // Without byte enables the bus has none, and the write is a full beat.
+    if corebus.use_byte_enable {
+        out.push_str(&format!(
+            "    assign cbw_{bundle}_byteen = cb_{bundle}.mdata_byteen;\n"
+        ));
+    } else {
+        out.push_str(&format!("    assign cbw_{bundle}_byteen = '1;\n"));
+    }
+    out.push_str(&format!(
+        "    assign cb_{bundle}.sresp = if cbw_{bundle}_rdata ? {project}::pzcorebus_common_pkg::pzcorebus_sresp::RESPONSE_WITH_DATA : {project}::pzcorebus_common_pkg::pzcorebus_sresp::RESPONSE;\n"
+    ));
+    out.push_str(&format!(
+        "    assign cb_{bundle}.sresp_last = if cbw_{bundle}_rlast ? '1 : '0;\n"
+    ));
+    out.push_str(&format!(
+        "    assign cb_{bundle}.sresp_uniten = if cbw_{bundle}_rdata ? '1 : '0;\n"
+    ));
+    out.push_str(&format!("    assign cb_{bundle}.sinfo = 0;\n\n"));
 }
 
 /// `hns::xfer2axi`: a `dram` with a transfer-level port. It drives
@@ -5389,19 +5526,7 @@ fn xfer_adapter(
     xfer: &crate::terminator::XferPorts,
 ) {
     let bundle = &axi_mem.bundle;
-    // The DUT reset of the window's clock, as the DUT gets it. Without a DUT
-    // reset there, the harness reset.
-    let dut_reset = match clocks {
-        None => "dut_rst".to_string(),
-        Some(clocks) => {
-            let ident = rst.strip_prefix("rst_").unwrap_or("c0");
-            if clocks.resets.iter().any(|(_, owner)| owner == ident) {
-                format!("drst_{ident}")
-            } else {
-                rst.to_string()
-            }
-        }
-    };
+    let dut_reset = dut_reset_of(clocks, rst);
     let side = |port: Option<&String>, input: bool| -> String {
         match port {
             Some(name) => format!("w_{name}"),
@@ -5432,6 +5557,7 @@ fn xfer_adapter(
         ("i_rd_ready", read.map(|r| &r.ready), true),
         ("o_rd_data", read.map(|r| &r.data), false),
         ("o_rd_last", read.map(|r| &r.last), false),
+        ("o_rd_error", read.map(|r| &r.error), false),
         ("i_wr_cmd_valid", write.map(|w| &w.cmd_valid), true),
         ("o_wr_cmd_ready", write.map(|w| &w.cmd_ready), false),
         ("i_wr_cmd_addr", write.map(|w| &w.cmd_addr), true),
@@ -5441,11 +5567,8 @@ fn xfer_adapter(
         ("i_wr_data", write.map(|w| &w.data), true),
         ("i_wr_strb", write.and_then(|w| w.strb.as_ref()), true),
         ("i_wr_last", write.map(|w| &w.last), true),
-        (
-            "o_wr_done_valid",
-            write.and_then(|w| w.done_valid.as_ref()),
-            false,
-        ),
+        ("o_wr_done_valid", write.map(|w| &w.done_valid), false),
+        ("o_wr_done_error", write.map(|w| &w.done_error), false),
     ] {
         out.push_str(&format!("        {port}: {},\n", side(chosen, input)));
     }
@@ -5527,14 +5650,111 @@ fn connection(
         .iter()
         .find(|axi_mem| axi_mem.port == port.name)
     {
-        return format!("axi_{}", axi_mem.bundle);
+        // A pzcorebus port is joined to its own interface, and
+        // `hns::corebus2axi` drives `axi_<bundle>` from it.
+        let prefix = if axi_mem.corebus.is_some() {
+            "cb"
+        } else {
+            "axi"
+        };
+        return format!("{prefix}_{}", axi_mem.bundle);
     }
     if let Some(axi) = plan.axi_slaves.iter().find(|axi| axi.port == port.name) {
-        return format!("axi_{}", axi.bundle);
+        let prefix = if axi.corebus.is_some() { "cb" } else { "axi" };
+        return format!("{prefix}_{}", axi.bundle);
     }
 
     // A `reg` register.
     format!("w_{}", port.name)
+}
+
+/// A pzcorebus `slave` of the DUT: the window drives it through
+/// `hns::corebus_host`. The module has plain wires, so they are joined to the
+/// members of the interface here. The command code and the response kind are
+/// enums in the interface, and the module knows only their bits.
+fn emit_corebus_host(
+    out: &mut String,
+    axi: &crate::terminator::AxiSlavePlan,
+    corebus: &crate::terminator::CorebusSlave,
+    domain: &str,
+    clk: &str,
+    rst: &str,
+) {
+    let bundle = &axi.bundle;
+    let project = corebus
+        .iface
+        .split("::")
+        .next()
+        .expect("an interface path has a project");
+    let word_addr = axi.word_addr_width();
+    out.push_str(&format!(
+        "    inst cb_{bundle}: {domain}{};\n",
+        corebus.iface
+    ));
+    out.push_str(&format!("    var cbw_{bundle}_mcmd: {domain}logic<4>;\n"));
+    out.push_str(&format!(
+        "    inst u_hcb_{bundle}: hns::corebus_host #(\n        ADDR_W: {word_addr},\n        ID_W: {},\n        DATA_BYTES: {},\n        MEM: {},\n    ) (\n",
+        corebus.id_width, axi.data_bytes, corebus.memory
+    ));
+    out.push_str(&format!("        i_clk: {clk},\n"));
+    out.push_str(&format!("        i_rst: {rst},\n"));
+    // A DUT slave may stop answering when it is reset.
+    out.push_str("        i_hold: dut_fence,\n");
+    out.push_str(&format!("        o_mcmd_valid: cb_{bundle}.mcmd_valid,\n"));
+    out.push_str(&format!("        o_mcmd: cbw_{bundle}_mcmd,\n"));
+    out.push_str(&format!("        o_mid: cb_{bundle}.mid,\n"));
+    out.push_str(&format!("        o_maddr: cb_{bundle}.maddr,\n"));
+    out.push_str(&format!(
+        "        i_scmd_accept: cb_{bundle}.scmd_accept,\n"
+    ));
+    out.push_str(&format!("        o_mdata: cb_{bundle}.mdata,\n"));
+    if corebus.memory {
+        out.push_str(&format!(
+            "        o_mdata_byteen: cb_{bundle}.mdata_byteen,\n"
+        ));
+        out.push_str(&format!(
+            "        o_mdata_valid: cb_{bundle}.mdata_valid,\n"
+        ));
+        out.push_str(&format!(
+            "        i_sdata_accept: cb_{bundle}.sdata_accept,\n"
+        ));
+    } else {
+        out.push_str("        o_mdata_byteen: _,\n");
+        out.push_str("        o_mdata_valid: _,\n");
+        out.push_str("        i_sdata_accept: 1'b0,\n");
+    }
+    out.push_str(&format!(
+        "        o_mresp_accept: cb_{bundle}.mresp_accept,\n"
+    ));
+    out.push_str(&format!(
+        "        i_sresp_valid: cb_{bundle}.sresp_valid,\n"
+    ));
+    out.push_str(&format!("        i_sdata: cb_{bundle}.sdata,\n"));
+    out.push_str(&format!("        i_haddr: t_{bundle}_maddr,\n"));
+    out.push_str(&format!("        i_hwdata: t_{bundle}_mdata,\n"));
+    out.push_str(&format!("        i_hwe: t_{bundle}_mwe,\n"));
+    out.push_str(&format!("        i_hre: t_{bundle}_mre,\n"));
+    out.push_str(&format!("        o_hrdata: t_{bundle}_mrdata,\n"));
+    out.push_str(&format!("        o_hrvalid: t_{bundle}_mrvalid,\n"));
+    out.push_str(&format!("        o_hwready: t_{bundle}_mwready,\n"));
+    out.push_str("    );\n");
+    // The rest of the master side: one beat, no extra info. A memory command
+    // is one unit long (0 would mean the longest); a CSR one has no length.
+    out.push_str(&format!(
+        "    assign cb_{bundle}.mcmd = cbw_{bundle}_mcmd as {project}::pzcorebus_common_pkg::pzcorebus_mcmd;\n"
+    ));
+    let length = if corebus.memory { 1 } else { 0 };
+    out.push_str(&format!("    assign cb_{bundle}.mlength = {length};\n"));
+    for tied in ["mparam", "minfo"] {
+        out.push_str(&format!("    assign cb_{bundle}.{tied} = 0;\n"));
+    }
+    if corebus.memory {
+        out.push_str(&format!("    assign cb_{bundle}.mdata_last = 1;\n\n"));
+    } else {
+        out.push_str(&format!("    assign cb_{bundle}.mdata_byteen = '1;\n"));
+        out.push_str(&format!("    assign cb_{bundle}.mdata_valid = 0;\n"));
+        out.push_str(&format!("    assign cb_{bundle}.mdata_last = 0;\n\n"));
+    }
 }
 
 /// Escapes an identifier that is a Veryl keyword with `r#`.
@@ -5633,7 +5853,7 @@ fn veryl_ident(name: &str) -> String {
 ///   project analyses the DUT and everything it depends on again, so it fails
 ///   wherever the DUT needed a larger limit or allowed a dependency something.
 /// - `[dependencies]` has `hns` (as the DUT declares it) and a path to the DUT.
-pub fn veryl_toml(plan: &Plan, hns: &str, dut_path: &str) -> String {
+pub fn veryl_toml(plan: &Plan, hns: &str, dut_path: &str, extra: &[(String, String)]) -> String {
     let build = &plan.metadata.build;
     let mut out = format!("# {}\n", crate::generate::MARKER);
     out.push_str("#\n# Generated by veryl-harness. DO NOT EDIT --\n");
@@ -5695,6 +5915,9 @@ pub fn veryl_toml(plan: &Plan, hns: &str, dut_path: &str) -> String {
         "{} = {{ path = \"{dut_path}\" }}\n",
         plan.metadata.project.name
     ));
+    for (name, line) in extra {
+        out.push_str(&format!("{name} = {line}\n"));
+    }
     let allowed = &plan.metadata.lint.portability.allow_in_dependencies;
     if !allowed.is_empty() {
         let items: Vec<String> = allowed.iter().map(|item| format!("\"{item}\"")).collect();
@@ -6960,7 +7183,7 @@ fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
             "records kept after the trigger; then the ring freezes".to_string(),
         ),
         Some("tmask") => notes.push(
-            "the bits of the trigger fields that must match; `hio trace start --when` writes it".to_string(),
+            "the bits of the trigger fields, then one \"not 0\" bit for each field wider than 1, that must match; `hio trace start --when` writes it".to_string(),
         ),
         Some("tvalue") => notes.push("what those bits must be".to_string()),
         Some("hit") => notes.push("1 once the trigger has matched".to_string()),
@@ -7028,6 +7251,9 @@ fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
                 "cycles the DUT held an address at or above the depth (the port has no read enable, so an access cannot be told from an idle cycle); those reads return 0 and their writes are dropped. The address is never folded back into range".to_string()
             });
         }
+        Some("refused") => notes.push(
+            "pzcorebus commands the DUT made that are not a read or a write (broadcast, atomic, message). They were not run: their data was dropped, and a non-posted one was answered with an error".to_string(),
+        ),
         Some("calib") if is_ps7(plan) => notes.push(
             "1 once the PS is set up (`hio program` runs ps7_init after the bitstream). Nothing reaches the memory before that".to_string(),
         ),

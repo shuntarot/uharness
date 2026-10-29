@@ -450,18 +450,22 @@ A trigger stops it without a CPU halting, as on a logic analyzer: the ring
 keeps `--after` records past the first one that matches, then freezes, and
 `dump` marks that record. Only the fields of the ports in `trigger` (in
 `Harness.toml`) can be tested. Several `--when` must all hold; `value/mask`
-tests some bits.
+tests some bits, and `field!=0` that a field is not 0.
 
 ```bash
 hio trace start --when trap=1 --after 100
 hio trace start --when pc_rdata=0x80038000/0xfffff000     # anywhere in a 4 KB page
+hio trace start --when mem_addr=0x80011b94 --when mem_wmask!=0   # a store there
 hio trace start --now --after 1023                        # the first 1024 records
 hio trace status                                          # waiting, or where it triggered
 ```
 
+An RVFI `mem_addr` means something only when `mem_rmask` or `mem_wmask` is
+not 0; on other instructions a core may leave the last address there. So
+test it together with one of them, and list that one in `trigger` too.
+
 `--now` triggers on the first beat, on no condition, so it needs no
-`trigger`. At the `(hio cpu)` prompt,
-`trace …` works without `hio`. The bundle name may be left out when the design
+`trigger`. At the `(hio cpu)` prompt, `trace …` works without `hio`. The bundle name may be left out when the design
 has one trace, or one instruction trace.
 
 Each line starts with the cycle of the record, counted from `start`, and the

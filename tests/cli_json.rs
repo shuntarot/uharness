@@ -272,7 +272,7 @@ fn an_impossible_combination_is_rejected_before_anything_is_generated() {
          ports = { rd_cmd_valid = \"o_cmd_valid\", rd_cmd_ready = \"i_cmd_ready\", \
          rd_cmd_addr = \"o_cmd_addr\", rd_cmd_size = \"o_cmd_nbytes\", \
          rd_valid = \"i_rd_valid\", rd_ready = \"o_rd_ready\", \
-         rd_data = \"i_rd_data\", rd_last = \"i_rd_last\" }\n",
+         rd_data = \"i_rd_data\", rd_last = \"i_rd_last\", rd_error = \"i_rd_error\" }\n",
         Some(
             r#"
 module dut_top (
@@ -286,12 +286,13 @@ module dut_top (
     o_rd_ready  : output logic    ,
     i_rd_data   : input  logic<64>,
     i_rd_last   : input  logic    ,
+    i_rd_error  : input  logic    ,
 ) {
     assign o_cmd_valid  = 0;
     assign o_cmd_addr   = 0;
     assign o_cmd_nbytes = 0;
     assign o_rd_ready   = 0;
-    let _unused: logic = i_clk | i_rst | i_cmd_ready | i_rd_valid | i_rd_data[0] | i_rd_last;
+    let _unused: logic = i_clk | i_rst | i_cmd_ready | i_rd_valid | i_rd_data[0] | i_rd_last | i_rd_error;
 }
 "#,
         ),
@@ -623,12 +624,12 @@ fn ports_in_the_wrong_direction_or_width_are_refused() {
     };
     let read_port = |cmd_valid: &str| {
         format!(
-            "    {cmd_valid},\n    i_cmd_ready: input logic,\n    o_cmd_addr: output logic<32>,\n    o_cmd_size: output logic<16>,\n    i_rd_valid: input logic,\n    o_rd_ready: output logic,\n    i_rd_data: input logic<32>,\n    i_rd_last: input logic,\n"
+            "    {cmd_valid},\n    i_cmd_ready: input logic,\n    o_cmd_addr: output logic<32>,\n    o_cmd_size: output logic<16>,\n    i_rd_valid: input logic,\n    o_rd_ready: output logic,\n    i_rd_data: input logic<32>,\n    i_rd_last: input logic,\n    i_rd_error: input logic,\n"
         )
     };
     let read_roles = |cmd_valid: &str| {
         format!(
-            "[bundle.hmem]\nbacking = \"bram\"\ndepth = 16\nports = {{ rd_cmd_valid = \"{cmd_valid}\", rd_cmd_ready = \"i_cmd_ready\", rd_cmd_addr = \"o_cmd_addr\", rd_cmd_size = \"o_cmd_size\", rd_valid = \"i_rd_valid\", rd_ready = \"o_rd_ready\", rd_data = \"i_rd_data\", rd_last = \"i_rd_last\" }}\n"
+            "[bundle.hmem]\nbacking = \"bram\"\ndepth = 16\nports = {{ rd_cmd_valid = \"{cmd_valid}\", rd_cmd_ready = \"i_cmd_ready\", rd_cmd_addr = \"o_cmd_addr\", rd_cmd_size = \"o_cmd_size\", rd_valid = \"i_rd_valid\", rd_ready = \"o_rd_ready\", rd_data = \"i_rd_data\", rd_last = \"i_rd_last\", rd_error = \"i_rd_error\" }}\n"
         )
     };
     let slave = |rdata: &str, extra: &str, roles: &str| {
@@ -651,8 +652,8 @@ fn ports_in_the_wrong_direction_or_width_are_refused() {
         ),
         // Transfer level: the strobe has one bit per byte.
         (
-            dut("    o_wc_valid: output logic,\n    i_wc_ready: input logic,\n    o_wc_addr: output logic<32>,\n    o_wc_size: output logic<16>,\n    o_w_valid: output logic,\n    i_w_ready: input logic,\n    o_w_data: output logic<32>,\n    o_w_strb: output logic<2>,\n    o_w_last: output logic,\n"),
-            "[bundle.hmem]\nbacking = \"bram\"\ndepth = 16\nports = { wr_cmd_valid = \"o_wc_valid\", wr_cmd_ready = \"i_wc_ready\", wr_cmd_addr = \"o_wc_addr\", wr_cmd_size = \"o_wc_size\", wr_valid = \"o_w_valid\", wr_ready = \"i_w_ready\", wr_data = \"o_w_data\", wr_strb = \"o_w_strb\", wr_last = \"o_w_last\" }\n".to_string(),
+            dut("    o_wc_valid: output logic,\n    i_wc_ready: input logic,\n    o_wc_addr: output logic<32>,\n    o_wc_size: output logic<16>,\n    o_w_valid: output logic,\n    i_w_ready: input logic,\n    o_w_data: output logic<32>,\n    o_w_strb: output logic<2>,\n    o_w_last: output logic,\n    i_w_done: input logic,\n    i_w_derr: input logic,\n"),
+            "[bundle.hmem]\nbacking = \"bram\"\ndepth = 16\nports = { wr_cmd_valid = \"o_wc_valid\", wr_cmd_ready = \"i_wc_ready\", wr_cmd_addr = \"o_wc_addr\", wr_cmd_size = \"o_wc_size\", wr_valid = \"o_w_valid\", wr_ready = \"i_w_ready\", wr_data = \"o_w_data\", wr_strb = \"o_w_strb\", wr_last = \"o_w_last\", wr_done_valid = \"i_w_done\", wr_done_error = \"i_w_derr\" }\n".to_string(),
             "harness::terminator::strobe_width",
             "4 bits wide",
         ),

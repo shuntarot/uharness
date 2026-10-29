@@ -112,7 +112,6 @@ Sizes accept a suffix: `4k`, `256M` (1024-based). `depth`, `aperture`,
 | `host_mem` | host memory | not yet (needs a PCIe requester for the DUT) |
 | `host_irq` | the DUT's interrupt line, sent to the host as INTA (PCIe) | works; one 1-bit output, at most one bundle |
 | `pcie_flr` | the host's Function Level Reset, handed to the DUT (PCIe) | works; one 1-bit input, optionally one 1-bit done output |
-| `observe` | | not yet |
 
 #### contract — how refined the port is
 
@@ -125,6 +124,7 @@ means "check that this is what I think", and a mismatch is an error.
 | `valid_ready` | **stream**: `valid` + `ready` | **request / response**: `rd_cmd_*` / `rd_*`, `wr_*`; the answer comes whenever it is ready |
 | `valid_only` | **stream, no ready**: `valid` alone; **beats can be dropped** | — |
 | `axi` | — | **AXI4**: `modport $std::axi4_if::<..>::master` (`::slave` for `slave`) |
+| `corebus` | — | **pzcorebus**: `modport pzbcm::pzcorebus_if::<..>::slave` (`slave`) or `::master` (`bram`, `dram`) |
 | `apb` | — | **APB**: `psel` `penable` `pwrite` `paddr` `pwdata` `prdata` (`pready`, `pslverr`) — `slave` and `dmi` |
 
 A `valid_only` sink cannot be stalled, so the harness counts what it drops in
@@ -156,7 +156,7 @@ the backings differ only in who holds the memory: with `bram` and
   request / response. A RAM port cannot wait, so it cannot use `dram`.
 - `host_irq` and `pcie_flr` need the PCIe transport: one 1-bit port (plus a
   1-bit done output for `pcie_flr`), at most one bundle each.
-- `host_mem` and `observe` are accepted by `check` but not generated yet.
+- `host_mem` is accepted by `check` but not generated yet.
 
 **On an AXI4 or a request / response port, moving from `bram` to `dram` is one
 word in the manifest** — the DUT does not change (`dram` also needs
@@ -259,7 +259,7 @@ depth   = 256
 ports   = ["axi"]
 ```
 
-For `dram`, the DUT side is 32, 64 or 128 bits wide and the address must be no
+For `dram`, the DUT side is 32, 64, 128 or 256 bits wide and the address must be no
 wider than the controller's. Accesses are held off until calibration finishes
 (tens of ms); `<bundle>_calib` says when. The memory controller's settings
 ship with the target, so no Vivado board files are needed.
@@ -273,23 +273,28 @@ latency assumed.
 
 | | command | data | done |
 |---|---|---|---|
-| read | `rd_cmd_valid` `rd_cmd_ready` `rd_cmd_addr` `rd_cmd_size` | `rd_valid` `rd_ready` `rd_data` `rd_last` | the last beat |
-| write | `wr_cmd_valid` `wr_cmd_ready` `wr_cmd_addr` `wr_cmd_size` | `wr_valid` `wr_ready` `wr_data` `wr_last` (+ optional `wr_strb`) | `wr_done_valid` |
+| read | `rd_cmd_valid` `rd_cmd_ready` `rd_cmd_addr` `rd_cmd_size` | `rd_valid` `rd_ready` `rd_data` `rd_last` `rd_error` | the last beat |
+| write | `wr_cmd_valid` `wr_cmd_ready` `wr_cmd_addr` `wr_cmd_size` | `wr_valid` `wr_ready` `wr_data` `wr_last` (+ optional `wr_strb`) | `wr_done_valid` `wr_done_error` |
 
 Name every role of whichever half the DUT has. `*_cmd_size` is a byte count.
 Write `<bundle>_delay` (0-255) to stall every transfer that many cycles, and
 `<bundle>_jitter` to vary it — FPGA memory is fast and regular, so without this
 "the DUT survives a slow responder" is never actually tested.
 
-The address is cut to a whole beat and the size rounded up to whole beats. A
-read that runs off the end returns the beats inside, `rd_last` on the last of
-them; a write takes every beat and stores the ones inside. Either is counted
-in `<bundle>_oor`. A read with no beat inside returns nothing, so a DUT
-waiting for `rd_last` waits forever.
+The address must be on a beat boundary; the size is rounded up to whole
+beats. Commands may be posted back to back, and they complete in order.
+
+A transfer always ends. A read returns every beat it asked for (at least one)
+with `rd_last` on the last; a beat that cannot be read (past the end, an
+address off a beat boundary, a read of 0 bytes) comes with `rd_error` set and
+data 0. A write takes every beat, stores the ones inside, and sets
+`wr_done_error` with `wr_done_valid` if any beat was not stored. Each such
+command is counted in `<bundle>_oor`.
 
 With `backing = "dram"` the same port is turned into AXI4 bursts (at most 256
 beats, never across 4 KB) on the board's memory. `wr_done_valid` then comes
-once the memory has taken every burst. `<bundle>_delay` is not there: the
+once the memory has taken every burst, and an error response from the memory
+sets `rd_error` or `wr_done_error`. `<bundle>_delay` is not there: the
 memory is slow and uneven by itself.
 
 **A register file inside the DUT.** Same roles as memory; the difference is
@@ -342,6 +347,37 @@ ports   = ["csr"]     # csr : modport $std::axi4_if::<..>::slave
 - The window shows the whole address space (`2^width` bytes), up to 31 bits.
   A wider one needs `aperture`, a moving window as for `dram`.
 - The bus must be 32 bits or a power-of-two multiple.
+
+And with a pzcorebus slave (`pzbcm::pzcorebus_if`), also found by its type:
+
+```toml
+[bundle.csr]
+backing = "slave"
+ports   = ["csr_if"]  # csr_if : modport pzbcm::pzcorebus_if::<pzcorebus_pkg::<..CSR, ..>>::slave
+```
+
+- Each host access is one non-posted 32-bit command (a write is answered).
+- CSR profile: `data_width` 32. Memory profile: one beat of one unit, so the
+  unit must be the whole bus (`unit_data_width` = `data_width`); on a bus wider
+  than 32 bits a write sets only its 4 bytes, so `use_byte_enable = true`.
+- Write every argument of `pzcorebus_pkg::<..>` as a number (or `true` /
+  `false`), not as a constant: the harness has to name the same interface.
+- The DUT project must list the project that has `pzcorebus_if` in its own
+  `[dependencies]`; the harness takes the same line.
+- Same window rules as AXI4: up to 31 address bits, `aperture` for more.
+
+A pzcorebus **memory** master (`pzcorebus_profile::MEMORY_*`, the DUT drives
+it) works for `bram` and `dram`, like an AXI4 master: `ports = ["mem_if"]`.
+
+- Commands are read, write and non-posted write. A port that declares atomic
+  or message commands (`atomic_command_width` or `message_code_width` not 0)
+  is refused, and so are bursts of more than 256 beats.
+- Any other command that still comes (broadcast, or an atomic carried in the
+  data) is not run: its data is dropped, a non-posted one is answered with an
+  error, and `<bundle>_refused` counts it.
+- The harness keeps one write open at a time, and a read waits for the writes
+  before it. A read after a write sees the new data.
+- The same rules for the arguments and the DUT's `[dependencies]` as above.
 
 While the DUT is held in reset (`hio reset --hold`, or during `hio reset`),
 an APB or AXI4 slave is not driven: it may not answer then. `hio` refuses to

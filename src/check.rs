@@ -208,10 +208,6 @@ pub(crate) fn not_checked_items(with_target: bool, sv_blackboxes: &[String]) -> 
             "latency_the_dut_expects",
             "whether the DUT really wants the latency a memory bundle states. The harness builds the memory to that number",
         ),
-        Item::new(
-            "observe_loss",
-            "whether an observe bundle loses samples, which depends on an open design question",
-        ),
     ];
     if !with_target {
         items.push(Item::new(
@@ -359,7 +355,17 @@ fn print_dut(
                     axi4.data_width(),
                     axi4.id_width()
                 ),
-                _ => signal.type_text.clone(),
+                _ => match &port.corebus {
+                    Some(corebus) if index == 0 => format!(
+                        "corebus {} {} addr={} data={} id={}",
+                        corebus.modport,
+                        corebus.profile,
+                        corebus.addr_width(),
+                        corebus.data_width(),
+                        corebus.id_width()
+                    ),
+                    _ => signal.type_text.clone(),
+                },
             };
             println!(
                 "  {:<name_width$}  {:<6}  {:<type_width$}  {:>5}  {:>5}  {:<16}  {bundle:<8}  {role}",
@@ -553,6 +559,8 @@ fn print_bundles(plan: &crate::plan::Plan) {
             };
             let shape = if mem.xfer.is_some() {
                 "transfer-level via axi4"
+            } else if mem.corebus.is_some() {
+                "pzcorebus via axi4"
             } else {
                 "axi4"
             };
@@ -565,8 +573,13 @@ fn print_bundles(plan: &crate::plan::Plan) {
                 .aperture_bytes
                 .map(|bytes| format!(" aperture={}", size_str(bytes as u64)))
                 .unwrap_or_default();
+            let bus = if axi.corebus.is_some() {
+                "pzcorebus"
+            } else {
+                "axi4"
+            };
             format!(
-                " addr={} bits axi4 slave data={} bytes{aperture}",
+                " addr={} bits {bus} slave data={} bytes{aperture}",
                 axi.addr_width, axi.data_bytes
             )
         } else {
@@ -1016,7 +1029,6 @@ fn short_not_checked(id: &str) -> &'static str {
         "reset_and_cdc" => "reset release and CDC",
         "capacity" => "whether the whole design fits",
         "latency_the_dut_expects" => "the latency the DUT expects",
-        "observe_loss" => "observe sample loss",
         "feasibility" => "feasibility (no --target)",
         "board_pins" => "board pins (no --target)",
         "sv_blackbox_sources" => "$sv:: sources",

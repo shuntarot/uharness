@@ -440,6 +440,7 @@ mod tests {
             name: name.to_string(),
             direction,
             axi4: None,
+            corebus: None,
             signals: vec![Signal {
                 path: name.to_string(),
                 role,

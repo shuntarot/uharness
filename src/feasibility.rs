@@ -183,22 +183,9 @@ pub fn capability(backing: Backing) -> Capability {
             needs: &[],
         },
 
-        // Observe-only output. It only holds a sample, so any transport works.
-        //
         // A ring in BRAM. Not a `sink`: it never drops a beat, it overwrites
         // the oldest record, and keeping the last records is its purpose.
         Backing::Trace => Capability {
-            serves_dut_requests: false,
-            deterministic: true,
-            sink: false,
-            needs_pcie: false,
-            needs: &[],
-        },
-
-        // Not a `sink`: that would require a drop counter. Whether `observe`
-        // drops values depends on its implementation (a sample register or a
-        // trace ring), which is not decided yet.
-        Backing::Observe => Capability {
             serves_dut_requests: false,
             deterministic: true,
             sink: false,
@@ -213,7 +200,7 @@ pub fn capability(backing: Backing) -> Capability {
 fn can_stall_the_dut(contract: Contract) -> bool {
     match contract {
         // AXI4 has a ready on each channel.
-        Contract::ValidReady | Contract::Axi => true,
+        Contract::ValidReady | Contract::Axi | Contract::Corebus => true,
         // The DUT is the APB slave; it is never the one kept waiting.
         Contract::FixedLatency | Contract::ValidOnly | Contract::Apb => false,
     }
@@ -514,7 +501,7 @@ pub enum FeasibilityError {
     #[diagnostic(
         code(harness::feasibility::controller_width),
         help(
-            "The harness widens a narrower master only from 32, 64 or 128 bits, and only by a power-of-two factor. Declare the port with one of those:\n\n    axi: modport $std::axi4_if::<$std::axi4_pkg::<..>>::master\n\nThe id width must match only when the data widths are already equal.\n\nTo keep the DUT as it is, use `backing = \"bram\"`. It takes any width."
+            "The harness widens a narrower master only from 32, 64, 128 or 256 bits, and only by a power-of-two factor. Declare the port with one of those:\n\n    axi: modport $std::axi4_if::<$std::axi4_pkg::<..>>::master\n\nThe id width must match only when the data widths are already equal.\n\nTo keep the DUT as it is, use `backing = \"bram\"`. It takes any width."
         )
     )]
     ControllerWidth {
@@ -867,11 +854,11 @@ pub fn check(
             }
 
             // A narrower data width is fine: the harness inserts `hns::axi_dw`. It
-            // takes 32 / 64 / 128, by a power-of-two factor of the controller width.
+            // takes 32 to 256, by a power-of-two factor of the controller width.
             let bits = plan.data_bytes * 8;
             if let Some(want_bits) = dram.axi_data_bits {
                 let (has, want) = (bits, want_bits);
-                let usable = matches!(has, 32 | 64 | 128)
+                let usable = matches!(has, 32 | 64 | 128 | 256)
                     && has <= want
                     && want.is_multiple_of(has)
                     && (want / has).is_power_of_two();
@@ -1224,7 +1211,6 @@ fn alternatives_over(transport: &str) -> String {
         Backing::PcieFlr,
         Backing::HostPollFifo,
         Backing::Trace,
-        Backing::Observe,
     ];
     all.iter()
         .filter(|backing| !(capability(**backing).needs_pcie && transport != "pcie"))
@@ -1292,6 +1278,7 @@ mod tests {
                 name: port.to_string(),
                 direction: PortDirection::Output,
                 axi4: None,
+                corebus: None,
                 signals: vec![Signal {
                     path: port.to_string(),
                     role: SignalRole::Data,
@@ -1417,6 +1404,7 @@ mod tests {
             aperture_bytes: Some(256),
             dut_base: 0,
             xfer: None,
+            corebus: None,
         }];
         let err = check(
             &manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n"),
@@ -1464,6 +1452,7 @@ mod tests {
             aperture_bytes: Some(256),
             dut_base: 0,
             xfer: None,
+            corebus: None,
         }];
         let manifest = manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n");
         let err = check(&manifest, &[], &[], &plans, &target, Some("pcie")).unwrap_err();
@@ -1504,6 +1493,7 @@ mod tests {
             aperture_bytes: Some(256),
             dut_base: 0,
             xfer: None,
+            corebus: None,
         }];
         let manifest = manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n");
         let err = check(&manifest, &[], &[], &plans, &target, Some("jtag")).unwrap_err();
@@ -1546,6 +1536,7 @@ mod tests {
             aperture_bytes: Some(256 * 16),
             dut_base: 0,
             xfer: None,
+            corebus: None,
         }];
         let manifest = manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n");
         let run = |target: &crate::target::Target| {
@@ -1639,6 +1630,7 @@ mod tests {
             aperture_bytes: Some(256),
             dut_base: 0,
             xfer: None,
+            corebus: None,
         }];
         let manifest = manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n");
         let run = |t: &crate::target::Target| check(&manifest, &[], &[], &plans, t, Some("jtag"));
@@ -1684,6 +1676,7 @@ mod tests {
             aperture_bytes: Some(256),
             dut_base: 0,
             xfer: None,
+            corebus: None,
         };
         let m = manifest("[dut]\nmodule = \"t\"\n\n[bundle.mem]\nbacking = \"dram\"\n");
 
@@ -1694,6 +1687,13 @@ mod tests {
         // passes: walking all of it is the only way to toggle the top row and
         // bank pins.
         check(&m, &[], &[], &[plan(512 * 1024 * 1024)], &target, None).unwrap();
+
+        // A 256-bit master is widened to 512 too (a pzcorebus LLC port is).
+        let wide = crate::terminator::AxiMemPlan {
+            data_bytes: 32,
+            ..plan(1024)
+        };
+        check(&m, &[], &[], &[wide], &target, None).unwrap();
 
         // One word more is refused. It would wrap silently.
         let err = check(&m, &[], &[], &[plan(512 * 1024 * 1024 + 1)], &target, None).unwrap_err();
@@ -1752,7 +1752,7 @@ mod tests {
 
     /// A difference the converter can fill passes; others are refused.
     ///
-    /// `hns::axi_dw` widens a 32/64/128-bit master. A wider address is
+    /// `hns::axi_dw` widens a 32- to 256-bit master. A wider address is
     /// different: cutting it makes addresses wrap silently.
     #[test]
     fn a_narrower_axi4_master_is_widened_but_a_wider_address_is_refused() {
@@ -1773,6 +1773,7 @@ mod tests {
             aperture_bytes: None,
             dut_base: 0,
             xfer: None,
+            corebus: None,
         };
         let run = |p: AxiMemPlan| {
             check(
@@ -1975,6 +1976,7 @@ mod tests {
             aperture_bytes: None,
             dut_base: 0,
             xfer: None,
+            corebus: None,
         };
         let one = [mem("a")];
         assert!(check_capacity(&arty(), &[], &one, &[], &[], &[]).is_ok());
