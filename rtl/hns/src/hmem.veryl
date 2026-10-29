@@ -261,8 +261,18 @@ pub module hmem #(
     let r_move: logic = r_active && r_left != 0 && rd_room && (r_good == 0 || !w_move);
 
     // Both walkers can take a bad command in one cycle, so the counter adds
-    // both at once. Two separate increments would lose one.
-    let oor_add: logic<2> = {1'b0, rq_pop && rq_short} + {1'b0, wq_pop && wq_short};
+    // both at once. Two separate increments would lose one. The flags are
+    // registered before they are added: the queue, the range check and the
+    // counter on one path missed 100 MHz on an Arty by 2.4 ns.
+    var oor_bad: logic<2>;
+    always_ff {
+        if_reset {
+            oor_bad = 0;
+        } else {
+            oor_bad = {rq_pop && rq_short, wq_pop && wq_short};
+        }
+    }
+    let oor_add: logic<2> = {1'b0, oor_bad[0]} + {1'b0, oor_bad[1]};
 
     var rdata: logic<DW>;
     // An error beat carries 0, never what the memory happened to return.

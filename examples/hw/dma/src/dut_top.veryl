@@ -29,7 +29,7 @@ module dut_top (
     i_rst: input reset,
 
     // --- control (reg) ---
-    i_start: input  logic    , // 1 starts a transfer; ignored while busy
+    i_start: input  logic    , // a rise starts a transfer; ignored while busy
     i_addr : input  logic<64>, // where to read from (8-byte aligned)
     i_dst  : input  logic<64>, // where to write it back to
     i_size : input  logic<32>, // bytes to move (a multiple of 8)
@@ -79,6 +79,12 @@ module dut_top (
     var done     : logic    ;
     var rd_posted: logic    ;
     var wr_posted: logic    ;
+    var start_q  : logic    ;
+
+    // **Start on the rise, not the level.** The host writes 1 and then 0, and
+    // over JTAG the two writes are tens of microseconds apart. A copy takes a
+    // few cycles, so a level start would run it thousands of times.
+    let start: logic = i_start && !start_q;
 
     // **A beat moves only when both sides agree.** The read side is not made
     // ready unless the write side can take what arrives.
@@ -116,11 +122,13 @@ module dut_top (
             done      = 0;
             rd_posted = 0;
             wr_posted = 0;
+            start_q   = 0;
         } else {
-            done = 0;
+            done    = 0;
+            start_q = i_start;
             case state {
                 S_IDLE: {
-                    if i_start && i_size != 0 {
+                    if start && i_size != 0 {
                         addr = i_addr;
                         dst  = i_dst;
                         size = i_size;
