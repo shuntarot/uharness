@@ -19,6 +19,7 @@ module test_dma {
     var done : logic    ;
     var sum  : logic<64>;
     var beats: logic<32>;
+    var errors: logic<32>;
 
     var cmd_valid: logic    ;
     var cmd_ready: logic    ;
@@ -28,6 +29,7 @@ module test_dma {
     var rd_ready : logic    ;
     var rd_data  : logic<64>;
     var rd_last  : logic    ;
+    var rd_error : logic    ;
 
     var wcmd_valid: logic    ;
     var wcmd_ready: logic    ;
@@ -38,6 +40,7 @@ module test_dma {
     var w_data    : logic<64>;
     var w_last    : logic    ;
     var w_done    : logic    ;
+    var w_done_error: logic  ;
 
     var haddr : logic<4> ;
     var hwdata: logic<64>;
@@ -56,6 +59,7 @@ module test_dma {
         o_done      : done      ,
         o_sum       : sum       ,
         o_beats     : beats     ,
+        o_errors    : errors    ,
         o_cmd_valid : cmd_valid ,
         i_cmd_ready : cmd_ready ,
         o_cmd_addr  : cmd_addr  ,
@@ -64,6 +68,7 @@ module test_dma {
         o_rd_ready  : rd_ready  ,
         i_rd_data   : rd_data   ,
         i_rd_last   : rd_last   ,
+        i_rd_error  : rd_error  ,
         o_wcmd_valid: wcmd_valid,
         i_wcmd_ready: wcmd_ready,
         o_wcmd_addr : wcmd_addr ,
@@ -73,6 +78,7 @@ module test_dma {
         o_w_data    : w_data    ,
         o_w_last    : w_last    ,
         i_w_done    : w_done    ,
+        i_w_done_error: w_done_error,
     );
 
     inst h: hns::hmem #(
@@ -91,6 +97,7 @@ module test_dma {
         i_rd_ready     : rd_ready  ,
         o_rd_data      : rd_data   ,
         o_rd_last      : rd_last   ,
+        o_rd_error     : rd_error  ,
         i_wr_cmd_valid : wcmd_valid,
         o_wr_cmd_ready : wcmd_ready,
         i_wr_cmd_addr  : wcmd_addr ,
@@ -100,6 +107,7 @@ module test_dma {
         i_wr_data      : w_data    ,
         i_wr_last      : w_last    ,
         o_wr_done_valid: w_done    ,
+        o_wr_done_error: w_done_error,
         i_haddr        : haddr     ,
         i_hwdata       : hwdata    ,
         i_hwe          : hwe       ,
@@ -157,6 +165,7 @@ module test_dma {
         // 1+2+3+4. **Check the values too** -- the count can be right while the
         // contents are wrong.
         $assert(sum == 10);
+        $assert(errors == 0);
         $assert(oor == 0);
 
         // **What was loaded is what has to be at the destination.**
@@ -169,5 +178,38 @@ module test_dma {
 
         clk.next(2);
         $assert(busy == 0);
+
+        // Copy four beats from entry 14 onto themselves: only 14 and 15 are
+        // inside. Two read beats fail, and the write does not land whole.
+        // **The DUT is told**, and ends instead of waiting.
+        for i in 14..16 {
+            haddr  = i as 4;
+            hwdata = (i + 1) as 64;
+            hwe    = 1;
+            clk.next(1);
+        }
+        hwe = 0;
+        clk.next(2);
+        addr  = 14 * 8;
+        dst   = 14 * 8;
+        size  = BEATS * 8;
+        start = 1;
+        clk.next(1);
+        start = 0;
+        for _i in 0..200 {
+            if done {
+                break;
+            }
+            clk.next(1);
+        }
+        $display("past the end: beats=%d errors=%d sum=%d oor=%d", beats, errors, sum, oor);
+        $assert(beats == BEATS);
+        $assert(errors == 3);
+        // 15 + 16 from the two good beats; the failed ones carry 0.
+        $assert(sum == 31);
+        // Both commands were short, and taken in the same cycle: both count.
+        $assert(oor == 2);
+        $assert(peek(14) == 15);
+        $assert(peek(15) == 16);
     }
 }

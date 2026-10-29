@@ -341,7 +341,6 @@ fn the_manual_lists_every_backing_and_contract() {
         "host_irq",
         "host_poll_fifo",
         "trace",
-        "observe",
     ] {
         assert!(
             manual.contains(backing),

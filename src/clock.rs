@@ -894,6 +894,7 @@ mod tests {
             name: name.to_string(),
             direction: PortDirection::Input,
             axi4: None,
+            corebus: None,
             signals: vec![Signal {
                 path: name.to_string(),
                 role: SignalRole::Clock,
@@ -910,6 +911,7 @@ mod tests {
             name: name.to_string(),
             direction: PortDirection::Input,
             axi4: None,
+            corebus: None,
             signals: vec![Signal {
                 path: name.to_string(),
                 role: SignalRole::Data,

@@ -176,6 +176,8 @@ pub struct TraceFieldLayout {
     pub width: usize,
     /// Where it sits in `<bundle>_tmask` / `_tvalue`, if it may trigger.
     pub trigger_lsb: Option<usize>,
+    /// Where its "not 0" bit sits there, if it has one.
+    pub nonzero_lsb: Option<usize>,
 }
 
 impl RegisterMap {
@@ -989,6 +991,23 @@ pub fn build(
             });
             offset += WORD_BITS / 8;
         }
+        // A pzcorebus port: `hns::corebus2axi` counts the commands it takes
+        // and does not run (not a read or a write).
+        if dram.corebus.is_some() {
+            registers.push(Register {
+                name: format!("{}_refused", dram.bundle),
+                kind: Kind::Terminator,
+                offset,
+                words: 1,
+                width: WORD_BITS,
+                access: Access::ReadOnly,
+                bundle: Some(dram.bundle.clone()),
+                value: None,
+                self_clearing: None,
+                role: Some("refused"),
+            });
+            offset += WORD_BITS / 8;
+        }
     }
 
     // DUT reset, in every design. The host writes 1 and polls until `state` is
@@ -1295,12 +1314,14 @@ pub fn build(
                 lsb: 0,
                 width: crate::terminator::TRACE_CYCLE_BITS,
                 trigger_lsb: None,
+                nonzero_lsb: None,
             })
             .chain(trace.fields.iter().map(|field| TraceFieldLayout {
                 name: field.name.clone(),
                 lsb: field.lsb,
                 width: field.width,
                 trigger_lsb: field.trigger_lsb,
+                nonzero_lsb: field.nonzero_lsb,
             }))
             .collect(),
         })
@@ -1479,7 +1500,11 @@ fn clear_on(
     let (request, acknowledge) = match resolved.contract {
         Contract::ValidReady => (Role::Valid, Role::Ready),
         // These contracts have no handshake pair to clear on.
-        Contract::FixedLatency | Contract::ValidOnly | Contract::Axi | Contract::Apb => {
+        Contract::FixedLatency
+        | Contract::ValidOnly
+        | Contract::Axi
+        | Contract::Corebus
+        | Contract::Apb => {
             return None;
         }
     };
@@ -1524,7 +1549,7 @@ fn direction_of(dut: &Dut, name: &str) -> Option<PortDirection> {
 /// (`clear` is the other side of self-clearing, or `-`), then
 /// `region|bundle|kind|base|size|entry|total` for each region, then
 /// `dut_base|bundle|base` for each memory with a `dut_base`, then
-/// `trace|bundle|format|name:lsb:width[:trigger_lsb],...` for each trace
+/// `trace|bundle|format|name:lsb:width[:trigger_lsb[:nonzero_lsb]],...` for each trace
 /// (`format` is `-` without one), joined with `\n`. `value` is not included: the hash is itself a value, so it would
 /// refer to itself.
 ///
@@ -1596,9 +1621,13 @@ pub fn canonical_text(
                 trace
                     .fields
                     .iter()
-                    .map(|field| match field.trigger_lsb {
-                        Some(at) => format!("{}:{}:{}:{at}", field.name, field.lsb, field.width),
-                        None => format!("{}:{}:{}", field.name, field.lsb, field.width),
+                    .map(|field| match (field.trigger_lsb, field.nonzero_lsb) {
+                        (Some(at), Some(nz)) => {
+                            format!("{}:{}:{}:{at}:{nz}", field.name, field.lsb, field.width)
+                        }
+                        (Some(at), None) =>
+                            format!("{}:{}:{}:{at}", field.name, field.lsb, field.width),
+                        _ => format!("{}:{}:{}", field.name, field.lsb, field.width),
                     })
                     .collect::<Vec<_>>()
                     .join(",")
@@ -1671,6 +1700,7 @@ mod tests {
             name: name.to_string(),
             direction,
             axi4: None,
+            corebus: None,
             signals: vec![Signal {
                 path: name.to_string(),
                 role: SignalRole::Data,
@@ -1825,7 +1855,7 @@ mod tests {
             port("o_dbg", PortDirection::Output, 8),
         ]);
         let manifest = manifest(
-            "[dut]\nmodule = \"dut_top\"\n\n[bundle.csr]\ncontract = \"fixed_latency\"\nlatency = 1\nbacking = \"reg\"\n\n[bundle.dbg]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"observe\"\n",
+            "[dut]\nmodule = \"dut_top\"\n\n[bundle.csr]\ncontract = \"fixed_latency\"\nlatency = 1\nbacking = \"reg\"\n\n[bundle.dbg]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"host_mem\"\n",
         );
         let map = build(
             &dut,
@@ -2203,6 +2233,7 @@ mod tests {
             aperture_bytes: None,
             dut_base: 0,
             xfer: None,
+            corebus: None,
         };
         let card = crate::manifest::Pcie::default();
         let map = |pcie: Option<&crate::manifest::Pcie>, mems: &[crate::terminator::AxiMemPlan]| {

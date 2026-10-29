@@ -653,6 +653,10 @@ pub struct TraceFieldOutput {
     /// trigger.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_lsb: Option<usize>,
+    /// Where its "not 0" bit sits there: a trigger field wider than one bit
+    /// has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonzero_lsb: Option<usize>,
 }
 
 /// A contiguous range in the window. Addresses count from 0 inside it; the
@@ -760,6 +764,7 @@ pub fn register_map(
                         lsb: field.lsb,
                         width: field.width,
                         trigger_lsb: field.trigger_lsb,
+                        nonzero_lsb: field.nonzero_lsb,
                     })
                     .collect(),
             })

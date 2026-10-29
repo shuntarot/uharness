@@ -325,3 +325,104 @@ module dut_top (
     let clk = dut.ports.iter().find(|p| p.name == "i_clk").unwrap();
     assert!(clk.axi4.is_none());
 }
+
+/// The fixture's stand-in for `pzbcm::pzcorebus_if`: the same names and the same
+/// 13 generic arguments, with none of the real bus. The detection goes by these
+/// names, so the test does not need the pzbcm sources.
+const COREBUS_STAND_IN: &str = r#"
+proto package pzcorebus_proto_pkg {
+    const WIDTH: u32;
+}
+
+package profile_pkg {
+    const CSR: u32 = 0;
+}
+
+package consts_pkg {
+    const ID_WIDTH: u32 = 8;
+}
+
+package pzcorebus_pkg::<
+    PROFILE: u32, ID: u32, ADDR: u32, DATA: u32, BE: u32, LEN: u32,
+    ATOMIC: u32, MSG: u32, REQ: u32, RESP: u32, UNIT: u32, MAXD: u32, BOUND: u32,
+> for pzcorebus_proto_pkg {
+    const WIDTH: u32 = DATA;
+}
+
+interface pzcorebus_if::<PKG: pzcorebus_proto_pkg> {
+    var maddr: logic<PKG::WIDTH>;
+
+    modport slave {
+        maddr: input,
+    }
+    modport master {
+        maddr: output,
+    }
+}
+"#;
+
+/// A `pzcorebus_if` modport port gives its modport and widths, as an AXI4 one
+/// does. An `alias package` is read through: the analyzer has replaced it by
+/// what it names.
+#[test]
+fn a_pzcorebus_modport_port_gives_up_its_modport_and_widths() {
+    let (_metadata, ir, _dir) = analyze(&format!(
+        r#"{COREBUS_STAND_IN}
+alias package CSR_PKG = pzcorebus_pkg::<profile_pkg::CSR, 8, 32, 32, 0, 1, 0, 0, 0, 0, 32, 32, 0>;
+
+module dut_top (
+    i_clk: input clock,
+    csr  : modport pzcorebus_if::<CSR_PKG>::slave,
+    mem  : modport pzcorebus_if::<pzcorebus_pkg::<profile_pkg::CSR, 20, 48, 256, 1, 32, 0, 0, 0, 0, 256, 256, 0>>::master,
+) {{
+    always_comb {{
+        mem.maddr = 0;
+    }}
+}}
+"#
+    ));
+    let dut = harness::dut::resolve(&ir, "fixture", "dut_top").unwrap();
+
+    let csr = dut.ports.iter().find(|p| p.name == "csr").unwrap();
+    let corebus = csr.corebus.as_ref().expect("csr is a pzcorebus_if modport");
+    assert_eq!(corebus.modport, "slave");
+    assert!(!corebus.is_master());
+    assert_eq!(corebus.profile, "CSR");
+    assert_eq!(corebus.id_width(), 8);
+    assert_eq!(corebus.addr_width(), 32);
+    assert_eq!(corebus.data_width(), 32);
+    assert!(!corebus.use_byte_enable());
+    assert_eq!(corebus.max_length(), 1);
+
+    let mem = dut.ports.iter().find(|p| p.name == "mem").unwrap();
+    let corebus = mem.corebus.as_ref().expect("mem is a pzcorebus_if modport");
+    assert!(corebus.is_master());
+    assert_eq!(corebus.addr_width(), 48);
+    assert_eq!(corebus.data_width(), 256);
+    assert!(corebus.use_byte_enable());
+    assert_eq!(corebus.max_length(), 32);
+
+    let clk = dut.ports.iter().find(|p| p.name == "i_clk").unwrap();
+    assert!(clk.corebus.is_none());
+    assert!(csr.axi4.is_none());
+}
+
+/// A width that is a name, not a number, is an error. A guess would give an
+/// interface of another type than the DUT's.
+#[test]
+fn a_pzcorebus_width_that_is_a_constant_is_refused_with_the_fix() {
+    let (_metadata, ir, _dir) = analyze(&format!(
+        r#"{COREBUS_STAND_IN}
+module dut_top (
+    i_clk: input clock,
+    csr  : modport pzcorebus_if::<pzcorebus_pkg::<profile_pkg::CSR, consts_pkg::ID_WIDTH, 32, 32, 0, 1, 0, 0, 0, 0, 32, 32, 0>>::slave,
+) {{
+}}
+"#
+    ));
+    let err = harness::dut::resolve(&ir, "fixture", "dut_top").unwrap_err();
+    assert!(
+        matches!(err, DutError::CorebusArgsUnreadable { ref port, .. } if port == "csr"),
+        "{err:?}"
+    );
+}

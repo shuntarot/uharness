@@ -240,6 +240,7 @@ pub fn run(
             &plan,
             &hns_dependency(&plan, &out)?,
             &hop_to_project(&plan, &out),
+            &interface_dependencies(&plan, &out)?,
         ),
         "Veryl project",
     )?);
@@ -733,7 +734,7 @@ fn print_next_steps(out: &Path) {
     println!("      # veryl build -> IP generation -> synthesis -> bitstream");
     println!();
     println!("NOT GENERATED YET:");
-    println!("  - host_mem / observe terminators");
+    println!("  - host_mem terminators");
     println!();
     println!("The harness uses its own BSCANE2 bridge, which Vivado cannot see, so the");
     println!("window is reached with `hio` rather than hw_server. `make program`");
@@ -842,13 +843,72 @@ fn hns_dependency(plan: &crate::plan::Plan, out: &Path) -> miette::Result<String
     // Without a declaration the default is fine: only the harness project
     // uses the parts. A declaration is kept as is, so a local checkout or a
     // pinned rev is not overridden.
-    let Some(mut value) = table
-        .get("dependencies")
-        .and_then(|deps| deps.get("hns"))
-        .cloned()
-    else {
-        return Ok(default_hns());
-    };
+    Ok(dependency_line(&table, "hns", plan, out).unwrap_or_else(default_hns))
+}
+
+/// The projects whose interfaces the harness names (`pzcorebus_if`). Veryl
+/// lets a project use only its direct dependencies, so the harness needs the
+/// DUT's own line for each of them.
+fn interface_dependencies(
+    plan: &crate::plan::Plan,
+    out: &Path,
+) -> miette::Result<Vec<(String, String)>> {
+    let mut projects: Vec<&str> = plan
+        .axi_slaves
+        .iter()
+        .filter_map(|axi| axi.corebus.as_ref())
+        .map(|corebus| corebus.iface.as_str())
+        .chain(
+            plan.axi_mems
+                .iter()
+                .filter_map(|mem| mem.corebus.as_ref())
+                .map(|corebus| corebus.iface.as_str()),
+        )
+        .filter_map(|iface| iface.split("::").next())
+        .collect();
+    projects.sort_unstable();
+    projects.dedup();
+    if projects.is_empty() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(&plan.metadata_path).map_err(|source| {
+        miette::miette!(
+            code = "harness::gen::unreadable_project",
+            "cannot read `{}`: {source}",
+            plan.metadata_path.display()
+        )
+    })?;
+    let table: toml::Table = text.parse().map_err(|source| {
+        miette::miette!(
+            code = "harness::gen::unparsable_project",
+            "cannot parse `{}`: {source}",
+            plan.metadata_path.display()
+        )
+    })?;
+    projects
+        .into_iter()
+        .map(|project| {
+            dependency_line(&table, project, plan, out)
+                .map(|line| (project.to_string(), line))
+                .ok_or_else(|| {
+                    miette::miette!(
+                        code = "harness::gen::interface_project_not_direct",
+                        help = "The DUT reaches `{project}` through another project. Add it to `[dependencies]` of the DUT's Veryl.toml, so the harness can name the same interface.",
+                        "the DUT port uses an interface of `{project}`, which is not in `[dependencies]` of the DUT project"
+                    )
+                })
+        })
+        .collect()
+}
+
+/// A dependency of the DUT as one inline table, ready for the harness project.
+fn dependency_line(
+    table: &toml::Table,
+    name: &str,
+    plan: &crate::plan::Plan,
+    out: &Path,
+) -> Option<String> {
+    let mut value = table.get("dependencies")?.get(name)?.clone();
 
     if let Some(path) = value.get("path").and_then(|p| p.as_str()) {
         let relative = std::path::Path::new(path);
@@ -872,5 +932,5 @@ fn hns_dependency(plan: &crate::plan::Plan, out: &Path) -> miette::Result<String
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join(", ");
-    Ok(format!("{{ {inline} }}"))
+    Some(format!("{{ {inline} }}"))
 }

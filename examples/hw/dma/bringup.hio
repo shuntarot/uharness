@@ -22,6 +22,7 @@ sleep 10
 read o_busy
 read o_beats
 read o_sum
+read o_errors
 
 echo == read the destination back through the backdoor ==
 # What was loaded is what has to be there. Entries 8..11 must read 1, 2, 3, 4.

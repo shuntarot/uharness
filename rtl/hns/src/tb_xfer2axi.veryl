@@ -1,6 +1,6 @@
 /// `hns::xfer2axi` in front of `hns::axi_mem`: transfers become AXI4 bursts
-/// of at most 256 beats that never cross 4 KB, and what is out of range is
-/// served as `hns::hmem` serves it.
+/// of at most 256 beats that never cross 4 KB, and what cannot be served ends
+/// with an error, as `hns::hmem` ends it.
 #[test(xfer2axi_serves_transfers_over_axi4)]
 module test_xfer2axi {
     const DEPTH: u32 = 2048;
@@ -18,6 +18,7 @@ module test_xfer2axi {
     var r_ready : logic    ;
     var r_data  : logic<32>;
     var r_last  : logic    ;
+    var r_error : logic    ;
     var wc_valid: logic    ;
     var wc_ready: logic    ;
     var wc_addr : logic<32>;
@@ -28,6 +29,7 @@ module test_xfer2axi {
     var w_strb  : logic<4> ;
     var w_last  : logic    ;
     var w_done  : logic    ;
+    var w_derr  : logic    ;
     var oor     : logic<32>;
 
     inst u: xfer2axi::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>> #(
@@ -46,6 +48,7 @@ module test_xfer2axi {
         i_rd_ready     : r_ready ,
         o_rd_data      : r_data  ,
         o_rd_last      : r_last  ,
+        o_rd_error     : r_error ,
         i_wr_cmd_valid : wc_valid,
         o_wr_cmd_ready : wc_ready,
         i_wr_cmd_addr  : wc_addr ,
@@ -56,6 +59,7 @@ module test_xfer2axi {
         i_wr_strb      : w_strb  ,
         i_wr_last      : w_last  ,
         o_wr_done_valid: w_done  ,
+        o_wr_done_error: w_derr  ,
         axi            : bus     ,
         o_oor          : oor     ,
     );
@@ -110,6 +114,8 @@ module test_xfer2axi {
     var stride : logic<32>;
     var from : logic<32>; // `beats` when the expected pattern started
     var dones: logic<32>;
+    var errs : logic<32>; // read beats with an error
+    var derrs: logic<32>; // write completions with an error
 
     always_ff (clk, rst) {
         if_reset {
@@ -117,9 +123,17 @@ module test_xfer2axi {
             lasts = 0;
             bad   = 0;
             dones = 0;
+            errs  = 0;
+            derrs = 0;
         } else {
             if r_valid && r_ready {
-                if r_data != want + (beats - from) * stride {
+                // An error beat carries 0; the others follow the pattern.
+                if r_error {
+                    errs += 1;
+                    if r_data != 0 {
+                        bad += 1;
+                    }
+                } else if r_data != want + (beats - from) * stride {
                     bad += 1;
                 }
                 beats += 1;
@@ -129,6 +143,9 @@ module test_xfer2axi {
             }
             if w_done {
                 dones += 1;
+                if w_derr {
+                    derrs += 1;
+                }
             }
         }
     }
@@ -235,7 +252,7 @@ module test_xfer2axi {
         wait_beats(300);
         $display("read: %d bursts, %d beats, %d last, %d bad", ars, beats, lasts, bad);
         $assert(ars == 3 && beats == 300 && lasts == 1 && bad == 0);
-        $assert(broken == 0 && oor == 0);
+        $assert(broken == 0 && oor == 0 && errs == 0 && derrs == 0);
 
         // A byte write keeps the other bytes.
         write(32'd4000, 1, 32'haabb_ccdd, 4'b0001);
@@ -247,28 +264,42 @@ module test_xfer2axi {
         wait_beats(1);
         $assert(beats - from == 1 && lasts == 2 && bad == 0);
 
-        // Off the end: 16 beats asked from beat 2040, 8 inside. The last of
-        // those carries `last`.
+        // Off the end: 16 beats asked from beat 2040, 8 inside, then 8 error
+        // beats. The last error beat carries `last`.
         write(32'd8160, 8, 32'h500, 4'hf);
         wait_done(3);
         from = beats;
         stride = 3;
         want = 32'h500;
         read(32'd8160, 32'd64);
-        wait_beats(8);
-        $display("off the end: %d beats, %d last, oor %d", beats - from, lasts, oor);
-        $assert(beats - from == 8 && lasts == 3 && bad == 0 && oor == 1);
+        wait_beats(16);
+        $display("off the end: %d beats, %d errors, %d last, oor %d", beats - from, errs, lasts, oor);
+        $assert(beats - from == 16 && errs == 8 && lasts == 3 && bad == 0 && oor == 1);
 
-        // A write off the end takes every beat and answers.
+        // A write off the end takes every beat and answers with an error.
         write(32'd8176, 8, 32'h600, 4'hf);
         wait_done(4);
-        $assert(dones == 4 && oor == 2);
+        $assert(dones == 4 && derrs == 1 && oor == 2);
 
-        // Nothing at all: no beat, counted.
+        // A read of 0 bytes: one error beat, which ends it.
         from = beats;
         read(32'd16, 32'd0);
-        clk.next(32);
-        $assert(beats == from && oor == 3);
+        wait_beats(1);
+        $assert(beats - from == 1 && errs == 9 && lasts == 4 && oor == 3);
+
+        // Off a beat boundary: two error beats, and the memory is not asked.
+        from = beats;
+        read(32'd6, 32'd8);
+        wait_beats(2);
+        $display("misaligned read: %d beats, %d errors, %d bursts", beats - from, errs, ars);
+        $assert(beats - from == 2 && errs == 11 && lasts == 5 && oor == 4);
+        // 3 for the long read, 1 for the byte read, 1 for the read off the end.
+        $assert(ars == 5);
+
+        // A write off a beat boundary takes its beat and stores nothing.
+        write(32'd2, 1, 32'h700, 4'hf);
+        wait_done(5);
+        $assert(dones == 5 && derrs == 2 && oor == 5);
 
         $assert(broken == 0);
         $finish();

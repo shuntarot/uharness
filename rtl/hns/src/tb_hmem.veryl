@@ -20,6 +20,7 @@ module test_hmem {
     var rd_ready     : logic    ;
     var rd_data      : logic<64>;
     var rd_last      : logic    ;
+    var rd_error     : logic    ;
 
     var wr_cmd_valid : logic    ;
     var wr_cmd_ready : logic    ;
@@ -30,6 +31,7 @@ module test_hmem {
     var wr_data      : logic<64>;
     var wr_last      : logic    ;
     var wr_done      : logic    ;
+    var wr_done_error: logic    ;
 
     var haddr : logic<3> ;
     var hwdata: logic<64>;
@@ -39,30 +41,41 @@ module test_hmem {
 
     var beats   : logic<32>;
     var sum     : logic<64>;
+    var errs    : logic<32>; // read beats that came with an error
     var saw_last: logic    ;
     var dones   : logic<32>;
+    var derrs   : logic<32>; // write completions that came with an error
     var clear   : logic    ;
 
     always_ff (clk, rst) {
         if_reset {
             beats    = 0;
             sum      = 0;
+            errs     = 0;
             saw_last = 0;
             dones    = 0;
+            derrs    = 0;
         } else {
             if clear {
                 beats    = 0;
                 sum      = 0;
+                errs     = 0;
                 saw_last = 0;
             } else if rd_valid && rd_ready {
                 beats = beats + 1;
                 sum   = sum + rd_data;
+                if rd_error {
+                    errs = errs + 1;
+                }
                 if rd_last {
                     saw_last = 1;
                 }
             }
             if wr_done {
                 dones = dones + 1;
+                if wr_done_error {
+                    derrs = derrs + 1;
+                }
             }
         }
     }
@@ -83,6 +96,7 @@ module test_hmem {
         i_rd_ready     : rd_ready     ,
         o_rd_data      : rd_data      ,
         o_rd_last      : rd_last      ,
+        o_rd_error     : rd_error     ,
         i_wr_cmd_valid : wr_cmd_valid ,
         o_wr_cmd_ready : wr_cmd_ready ,
         i_wr_cmd_addr  : wr_cmd_addr  ,
@@ -93,6 +107,7 @@ module test_hmem {
         i_wr_strb      : '1,
         i_wr_last      : wr_last      ,
         o_wr_done_valid: wr_done      ,
+        o_wr_done_error: wr_done_error,
         i_haddr        : haddr        ,
         i_hwdata       : hwdata       ,
         i_hwe          : hwe          ,
@@ -154,6 +169,7 @@ module test_hmem {
         $display("read: beats=%d sum=%d oor=%d", beats, sum, oor);
         $assert(beats == 4);
         $assert(sum == 10);
+        $assert(errs == 0);
         $assert(oor == 0);
 
         clear = 1;
@@ -183,6 +199,7 @@ module test_hmem {
         }
         $display("write: dones=%d oor=%d", dones, oor);
         $assert(dones == 1);
+        $assert(derrs == 0);
         // **The backdoor is how the write is checked.** Nothing else can see it.
         $assert(backdoor_read(4) == 16'hbeef);
         $assert(backdoor_read(5) == 16'hbeef * 2);
@@ -212,51 +229,114 @@ module test_hmem {
         $assert(backdoor_read(3) == 12'ha51);
         $assert(backdoor_read(4) == 12'ha52);
 
-        // --- 3. read past the end: entries 6 and 7 only ---
-        rd_cmd_addr   = 6 * 8;
+        // --- 3. read past the end: entries 6 and 7, then four error beats ---
+        rd_cmd_addr = 6 * 8;
         rd_cmd_size = 48;
-        rd_cmd_valid  = 1;
+        rd_cmd_valid = 1;
         clk.next(1);
         rd_cmd_valid = 0;
+        wait_last();
+        // Entry 6 holds 3 * 0xbeef (the write above), entry 7 still holds 8.
+        // The error beats add nothing: they carry 0.
+        $display("past the end: beats=%d errs=%d sum=%h oor=%d", beats, errs, sum, oor);
+        $assert(beats == 6);
+        $assert(errs == 4);
+        $assert(sum == 16'hbeef * 3 + 8);
+        $assert(oor == 1);
+        restart();
+
+        // --- 4. read entirely outside: every beat is an error, and the last
+        //     one still ends the transfer. Before `rd_error`, this read gave
+        //     no beat and no `last`, and the DUT stopped (found on hardware,
+        //     2026-09-05). ---
+        rd_cmd_addr = 16 * 8;
+        rd_cmd_size = 32;
+        rd_cmd_valid = 1;
+        clk.next(1);
+        rd_cmd_valid = 0;
+        wait_last();
+        $display("fully outside: beats=%d errs=%d oor=%d", beats, errs, oor);
+        $assert(saw_last == 1);
+        $assert(beats == 4);
+        $assert(errs == 4);
+        $assert(sum == 0);
+        $assert(oor == 2);
+        restart();
+
+        // --- 4b. a zero-byte read ends with one error beat ---
+        rd_cmd_addr = 0;
+        rd_cmd_size = 0;
+        rd_cmd_valid = 1;
+        clk.next(1);
+        rd_cmd_valid = 0;
+        wait_last();
+        $display("zero read: beats=%d errs=%d oor=%d", beats, errs, oor);
+        $assert(beats == 1);
+        $assert(errs == 1);
+        $assert(oor == 3);
+        restart();
+
+        // --- 4c. an address off a beat boundary reads nothing: two error
+        //     beats, not the two entries around it ---
+        rd_cmd_addr = 4;
+        rd_cmd_size = 16;
+        rd_cmd_valid = 1;
+        clk.next(1);
+        rd_cmd_valid = 0;
+        wait_last();
+        $display("misaligned read: beats=%d errs=%d sum=%d oor=%d", beats, errs, sum, oor);
+        $assert(beats == 2);
+        $assert(errs == 2);
+        $assert(sum == 0);
+        $assert(oor == 4);
+
+        // --- 5. a zero-byte write still ends, with an error ---
+        wr_cmd_addr = 0;
+        wr_cmd_size = 0;
+        wr_cmd_valid = 1;
+        clk.next(1);
+        wr_cmd_valid = 0;
+        clk.next(8);
+        // Step 2 (entries 4..6), step 2b (entries 2..4), and this zero-byte write.
+        $display("zero write: dones=%d derrs=%d oor=%d", dones, derrs, oor);
+        $assert(dones == 3);
+        $assert(derrs == 1);
+        $assert(oor == 5);
+
+        // --- 6. a write off a beat boundary takes its beat, stores nothing,
+        //     and ends with an error ---
+        wr_cmd_addr = 12;
+        wr_cmd_size = 8;
+        wr_cmd_valid = 1;
+        clk.next(1);
+        wr_cmd_valid = 0;
+        wr_data = 64'hdead;
+        wr_last = 1;
+        wr_valid = 1;
+        clk.next(1);
+        wr_valid = 0;
+        wr_last = 0;
+        clk.next(8);
+        $display("misaligned write: dones=%d derrs=%d e1=%h oor=%d", dones, derrs, backdoor_read(1), oor);
+        $assert(dones == 4);
+        $assert(derrs == 2);
+        $assert(backdoor_read(1) == 2);
+        $assert(oor == 6);
+    }
+
+    function wait_last () {
         for _i in 0..64 {
             if saw_last {
                 break;
             }
             clk.next(1);
         }
-        // Entry 6 now holds 3 * 0xbeef (the write above), entry 7 still holds 8.
-        $display("past the end: beats=%d oor=%d", beats, oor);
-        $assert(beats == 2);
-        $assert(oor == 1);
+    }
 
+    function restart () {
         clear = 1;
         clk.next(1);
         clear = 0;
         clk.next(1);
-
-        // --- 4. read entirely outside: no beats, so no `last` either ---
-        //     A DUT waiting for `last` stops here. Found on hardware, 2026-09-05.
-        rd_cmd_addr   = 16 * 8;
-        rd_cmd_size = 32;
-        rd_cmd_valid  = 1;
-        clk.next(1);
-        rd_cmd_valid = 0;
-        clk.next(16);
-        $display("fully outside: beats=%d saw_last=%b oor=%d", beats, saw_last, oor);
-        $assert(beats == 0);
-        $assert(saw_last == 0);
-        $assert(oor == 2);
-
-        // --- 5. a zero-byte write still ends. **The write side can say so.** ---
-        wr_cmd_addr   = 0;
-        wr_cmd_size = 0;
-        wr_cmd_valid  = 1;
-        clk.next(1);
-        wr_cmd_valid = 0;
-        clk.next(8);
-        // Step 2 (entries 4..6), step 2b (entries 2..4), and this zero-byte write.
-        $display("zero write: dones=%d oor=%d", dones, oor);
-        $assert(dones == 3);
-        $assert(oor == 3);
     }
 }

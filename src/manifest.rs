@@ -63,13 +63,22 @@ pub enum Contract {
     ///
     /// The port type already decides it. It can be written only to state it.
     Axi,
+    /// A `pzbcm::pzcorebus_if` modport. Like `Axi`, the port type decides it.
+    Corebus,
     /// AMBA APB, as a RISC-V Debug Module offers its DMI. The `p*` roles
     /// decide it.
     Apb,
 }
 
 /// The values `contract` accepts. Errors list them in this order.
-const CONTRACT_VALUES: &[&str] = &["fixed_latency", "valid_ready", "valid_only", "axi", "apb"];
+const CONTRACT_VALUES: &[&str] = &[
+    "fixed_latency",
+    "valid_ready",
+    "valid_only",
+    "axi",
+    "corebus",
+    "apb",
+];
 
 impl<'de> Deserialize<'de> for Contract {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -82,6 +91,7 @@ impl<'de> Deserialize<'de> for Contract {
             "valid_ready" => Ok(Contract::ValidReady),
             "valid_only" => Ok(Contract::ValidOnly),
             "axi" => Ok(Contract::Axi),
+            "corebus" => Ok(Contract::Corebus),
             "apb" => Ok(Contract::Apb),
             // Removed names: say what replaces them.
             "req_ack" => Err(serde::de::Error::custom(
@@ -102,6 +112,7 @@ impl Contract {
             Contract::ValidReady => "valid_ready",
             Contract::ValidOnly => "valid_only",
             Contract::Axi => "axi",
+            Contract::Corebus => "corebus",
             Contract::Apb => "apb",
         }
     }
@@ -147,8 +158,6 @@ pub enum Backing {
     /// A ring in the FPGA that keeps the last records of a DUT stream, such
     /// as an execution trace. The host starts and stops it, and reads it.
     Trace,
-    /// Output for observation only.
-    Observe,
 }
 
 /// The values `backing` accepts. Errors list them in this order.
@@ -164,7 +173,6 @@ const BACKING_VALUES: &[&str] = &[
     "host_poll_fifo",
     "dmi",
     "trace",
-    "observe",
 ];
 
 impl<'de> Deserialize<'de> for Backing {
@@ -185,7 +193,6 @@ impl<'de> Deserialize<'de> for Backing {
             "host_poll_fifo" => Ok(Backing::HostPollFifo),
             "dmi" => Ok(Backing::Dmi),
             "trace" => Ok(Backing::Trace),
-            "observe" => Ok(Backing::Observe),
             // `host_bar` became `reg` or `slave`. Only the author knows which,
             // so it cannot be mapped automatically.
             "host_bar" => Err(serde::de::Error::custom(
@@ -194,6 +201,10 @@ impl<'de> Deserialize<'de> for Backing {
             // An old name: reject it, and name the new one.
             "host_fifo" => Err(serde::de::Error::custom(
                 "`host_fifo` was renamed to `host_poll_fifo`. Rename it in the manifest",
+            )),
+            // Removed: `reg` and `trace` cover what it was meant for.
+            "observe" => Err(serde::de::Error::custom(
+                "`observe` was removed. Use `reg` to read a port's current value, or `trace` to record its history",
             )),
             other => Err(serde::de::Error::unknown_variant(other, BACKING_VALUES)),
         }
@@ -214,7 +225,6 @@ impl Backing {
             Backing::HostPollFifo => "host_poll_fifo",
             Backing::Dmi => "dmi",
             Backing::Trace => "trace",
-            Backing::Observe => "observe",
         }
     }
 }
@@ -281,6 +291,10 @@ pub enum Role {
     RdReady,
     RdData,
     RdLast,
+    /// Set on a beat that could not be read. Required: a read always ends
+    /// with `rd_last`, and the beats it could not serve carry this instead
+    /// of data.
+    RdError,
     /// Optional. Pairs with `rd_cmd_tag`.
     RdTag,
 
@@ -302,12 +316,14 @@ pub enum Role {
     WrDoneValid,
     /// Optional.
     WrDoneTag,
-    /// Optional.
+    /// Set with `wr_done_valid` when some beat was not stored.
     WrDoneError,
 
     /// A modport port of `std::axi4_if`. The port type decides it, so it does
     /// not need to be in `ports`. It can be written to state it explicitly.
     Axi4,
+    /// A modport of `pzbcm::pzcorebus_if`.
+    Corebus,
 
     // --- APB, for `dmi` and `slave`. The DUT is the slave: `psel` to
     //     `pwdata` are DUT inputs, `prdata`, `pready` and `pslverr` DUT
@@ -363,6 +379,7 @@ impl Role {
             Role::RdReady => "rd_ready",
             Role::RdData => "rd_data",
             Role::RdLast => "rd_last",
+            Role::RdError => "rd_error",
             Role::RdTag => "rd_tag",
             Role::WrCmdValid => "wr_cmd_valid",
             Role::WrCmdReady => "wr_cmd_ready",
@@ -378,6 +395,7 @@ impl Role {
             Role::WrDoneTag => "wr_done_tag",
             Role::WrDoneError => "wr_done_error",
             Role::Axi4 => "axi4",
+            Role::Corebus => "corebus",
             Role::Psel => "psel",
             Role::Penable => "penable",
             Role::Pwrite => "pwrite",
@@ -425,6 +443,7 @@ impl Role {
                 | Role::RdReady
                 | Role::RdData
                 | Role::RdLast
+                | Role::RdError
                 | Role::RdTag
                 | Role::WrCmdValid
                 | Role::WrCmdReady
@@ -1682,7 +1701,7 @@ backing  = "bram"
 backing = "reg"
 
 [bundle.dbg]
-backing = "observe"
+backing = "reg"
 "#;
 
     #[test]
@@ -1849,6 +1868,17 @@ whatever = true
         let err = load(dir.path(), None).unwrap_err();
         let text = format!("{err:?}");
         assert!(text.contains("host_poll_fifo"), "{text}");
+    }
+
+    #[test]
+    fn the_removed_observe_names_reg_and_trace() {
+        let dir = dir_with(&[(
+            MANIFEST_NAME,
+            "[dut]\nmodule = \"t\"\n\n[bundle.dbg]\nbacking = \"observe\"\n",
+        )]);
+        let err = load(dir.path(), None).unwrap_err();
+        let text = format!("{err:?}");
+        assert!(text.contains("`reg`") && text.contains("`trace`"), "{text}");
     }
 
     #[test]

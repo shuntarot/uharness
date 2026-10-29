@@ -39,6 +39,7 @@ pub module delay #(
     i_d_rd_ready    : input  logic          ,
     o_d_rd_data     : output logic<DW>      ,
     o_d_rd_last     : output logic          ,
+    o_d_rd_error    : output logic          ,
     i_d_wr_cmd_valid: input  logic          ,
     o_d_wr_cmd_ready: output logic          ,
     i_d_wr_cmd_addr : input  logic<ADDR_W>  ,
@@ -49,6 +50,7 @@ pub module delay #(
     i_d_wr_strb     : input  logic<DW / 8>  ,
     i_d_wr_last     : input  logic          ,
     o_d_wr_done     : output logic          ,
+    o_d_wr_done_error: output logic         ,
 
     // --- the terminator side ---
     o_t_rd_cmd_valid: output logic          ,
@@ -59,6 +61,7 @@ pub module delay #(
     o_t_rd_ready    : output logic          ,
     i_t_rd_data     : input  logic<DW>      ,
     i_t_rd_last     : input  logic          ,
+    i_t_rd_error    : input  logic          ,
     o_t_wr_cmd_valid: output logic          ,
     i_t_wr_cmd_ready: input  logic          ,
     o_t_wr_cmd_addr : output logic<ADDR_W>  ,
@@ -69,6 +72,7 @@ pub module delay #(
     o_t_wr_strb     : output logic<DW / 8>  ,
     o_t_wr_last     : output logic          ,
     i_t_wr_done     : input  logic          ,
+    i_t_wr_done_error: input  logic         ,
 ) {
     var s_rd_cmd: logic;
     var s_rd    : logic;
@@ -130,6 +134,7 @@ pub module delay #(
         o_t_rd_ready = i_d_rd_ready & ~s_rd;
         o_d_rd_data  = i_t_rd_data;
         o_d_rd_last  = i_t_rd_last;
+        o_d_rd_error = i_t_rd_error;
 
         // Write command.
         o_t_wr_cmd_valid = i_d_wr_cmd_valid & ~s_wr_cmd;
@@ -148,7 +153,8 @@ pub module delay #(
 
         // The completion is not delayed. It carries no handshake, so
         // holding it would drop it rather than postpone it.
-        o_d_wr_done = i_t_wr_done;
+        o_d_wr_done       = i_t_wr_done;
+        o_d_wr_done_error = i_t_wr_done_error;
     }
 }
 

@@ -595,8 +595,9 @@ enum TraceCmd {
         bundle: Option<String>,
         /// Trigger when a field has this value, such as `pc_rdata=0x80001234`.
         ///
-        /// `field=value/mask` tests some bits. Repeat it for an AND. Only the
-        /// ports in `trigger` in Harness.toml can trigger.
+        /// `field=value/mask` tests some bits, and `field!=0` that it is not
+        /// 0. Repeat it for an AND. Only the ports in `trigger` in
+        /// Harness.toml can trigger.
         #[arg(long, value_name = "FIELD=VALUE[/MASK]")]
         when: Vec<String>,
         /// Trigger on the first beat, on no condition.
