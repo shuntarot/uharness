@@ -409,7 +409,7 @@ impl Link {
             .filter_map(|(frame, _)| match frame.op {
                 Op::Read => Some((OP_READ, frame.addr, 0)),
                 Op::Write => Some((OP_WRITE, frame.addr, frame.wdata)),
-                Op::Nop => None,
+                Op::Nop | Op::Resync => None,
             })
             .collect();
         let flags = if batch.is_replayable() { REPLAYABLE } else { 0 };
@@ -840,7 +840,7 @@ mod tests {
                         match frame.op {
                             Op::Read => values.push(mem[*addr as usize / 4]),
                             Op::Write => mem[*addr as usize / 4] = frame.wdata,
-                            Op::Nop => {}
+                            Op::Nop | Op::Resync => {}
                         }
                     }
                     Ok(Reads::new(values))

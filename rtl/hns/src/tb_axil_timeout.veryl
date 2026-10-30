@@ -40,6 +40,17 @@ module test_axil_timeout {
     var hold  : logic<32>       ;
     var pipe  : logic           ;
     var touts : logic<32>       ;
+    var abort : logic           ;
+    // Read timeouts told to the terminator (`o_rd_abort`). A write timeout
+    // is not one: the write was never taken.
+    var aborts: logic<32>       ;
+    always_ff (clk, rst) {
+        if_reset {
+            aborts = 0;
+        } else if abort {
+            aborts = aborts + 1;
+        }
+    }
     var answer: logic           ;
     var saw_we: logic           ;
     var clear : logic           ;
@@ -99,6 +110,7 @@ module test_axil_timeout {
         i_wready  : answer ,
         i_clear   : clear  ,
         o_timeouts: touts  ,
+        o_rd_abort: abort  ,
     );
 
     initial {
@@ -132,6 +144,7 @@ module test_axil_timeout {
         // passed through, a value that was never read would look real.
         $assert(rdata == 0);
         $assert(touts == 1);
+        $assert(aborts == 1);
         arvalid = 0;
         clk.next(2);
 
@@ -152,6 +165,7 @@ module test_axil_timeout {
         $assert(bvalid == 1);
         $assert(bresp == 2'b10);
         $assert(touts == 2);
+        $assert(aborts == 1);
         // A beat the terminator cannot take must not count as written. If
         // this flag is set, the dropped write reached the terminator.
         $assert(saw_we == 0);

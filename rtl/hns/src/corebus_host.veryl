@@ -24,6 +24,12 @@
 /// transfer starts and an open one is dropped, so the window times out on it
 /// instead of waiting for ever. A response that arrives when nothing is open
 /// is dropped.
+///
+/// When the window gives up on a read (`i_rd_abort`, its timeout), the read
+/// is forgotten if it has not started. If it is open, the slave still owes an
+/// answer: the transfer stays open until it comes, and then the answer is
+/// dropped. Passing it on would hand it to the window's next read, and every
+/// read after would get the value of the one before.
 pub module corebus_host #(
     /// Width of the window's 32-bit word index. The byte address is 2 bits more.
     param ADDR_W    : u32   = 8    ,
@@ -62,6 +68,8 @@ pub module corebus_host #(
     o_hrdata : output logic<32>    ,
     /// Read data is valid (one cycle). Connect to `i_rvalid` of `hns::axil`.
     o_hrvalid: output logic        ,
+    /// The window gave up on its read. Connect to `o_rd_abort` of `hns::axil`.
+    i_rd_abort: input logic        ,
     /// A write can be accepted. Connect to `i_wready` of `hns::axil`.
     o_hwready: output logic        ,
 ) {
@@ -84,6 +92,8 @@ pub module corebus_host #(
     var data     : logic<32>        ;
     /// A read pulse that came while a transfer was open.
     var rd_wait  : logic            ;
+    /// The open read was given up by the window: drop its answer.
+    var stale    : logic            ;
     var rd_addr  : logic<ADDR_W>    ;
     var r_data   : logic<32>        ;
     var r_out    : logic            ;
@@ -113,6 +123,7 @@ pub module corebus_host #(
             lane      = 0;
             data      = 0;
             rd_wait   = 0;
+            stale     = 0;
             rd_addr   = 0;
             r_data    = 0;
             r_out     = 0;
@@ -122,7 +133,17 @@ pub module corebus_host #(
             if i_hold {
                 busy    = 0;
                 rd_wait = 0;
+                stale   = 0;
             } else {
+                // The window waits for one read at a time, so the one it gave
+                // up on is the waiting one if there is, else the open one.
+                if i_rd_abort {
+                    if rd_wait {
+                        rd_wait = 0;
+                    } else if busy && is_read {
+                        stale = 1;
+                    }
+                }
                 // The window may start a read while a write is open (or both
                 // at once). Keep the read and run it next.
                 if i_hre && (busy || i_hwe) {
@@ -138,7 +159,7 @@ pub module corebus_host #(
                         addr      = {i_haddr, 2'b00};
                         lane      = i_haddr[SEL_W - 1:0] & lane_mask;
                         data      = i_hwdata;
-                    } else if rd_wait || i_hre {
+                    } else if (rd_wait && !i_rd_abort) || i_hre {
                         busy      = 1;
                         cmd_done  = 0;
                         data_done = 1;
@@ -155,8 +176,9 @@ pub module corebus_host #(
                         data_done = 1;
                     }
                     if i_sresp_valid {
-                        busy = 0;
-                        if is_read {
+                        busy  = 0;
+                        stale = 0;
+                        if is_read && !stale && !(i_rd_abort && !rd_wait) {
                             r_data = i_sdata[lane * 32+:32];
                             r_out  = 1;
                         }

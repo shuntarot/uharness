@@ -48,6 +48,22 @@ impl Shape {
             intx: info.interrupt_pin.unwrap_or(0) != 0,
         }
     }
+
+    /// The card a design will be, from its map. `None` for a design without
+    /// a PCIe endpoint.
+    pub fn of_map(map: &hns_regs::RegisterMap) -> Option<Shape> {
+        let pcie = map.pcie.as_ref()?;
+        Some(Shape {
+            vendor: pcie.vendor_id as u16,
+            device: pcie.device_id as u16,
+            class: pcie.class_code,
+            bar_bytes: u64::from(pcie.bar_bytes),
+            intx: map
+                .registers
+                .iter()
+                .any(|r| r.role.as_deref() == Some("irq_level")),
+        })
+    }
 }
 
 /// What differs between the card now and the design to be programmed, one

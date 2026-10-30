@@ -14,6 +14,7 @@
 pub mod adi;
 pub mod bitstream;
 pub mod bridge;
+pub mod bus;
 pub mod config;
 pub mod disasm;
 pub mod dm;
@@ -24,7 +25,10 @@ pub mod ftdi;
 pub mod hns2;
 pub mod mpsse;
 pub mod pcie;
+pub mod probe;
+pub mod program;
 pub mod ps7;
+pub mod region;
 pub mod reprogram;
 pub mod rtt;
 pub mod semihosting;
@@ -35,7 +39,8 @@ pub mod trace;
 #[cfg(test)]
 mod model;
 
-pub use bridge::{Batch, Bridge, Error, JtagIo, ReadHandle, Reads};
+pub use bridge::{Batch, Bridge, JtagIo, ReadHandle, Reads};
+pub use bus::{Bus, Error};
 pub use frame::{Frame, Op, Response};
 pub use ftdi::Ftdi;
 pub use mpsse::{Chan, Mpsse, ProbeConfig};

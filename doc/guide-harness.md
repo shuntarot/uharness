@@ -91,6 +91,7 @@ data lives (`backing`); the shape of the port is read from the DUT.**
 | `reset` | port name | `dmi` only: the Debug Module's own reset port |
 | `format` | `"rvfi"` | `trace` only: the records are RVFI; names and widths are checked |
 | `trigger` | array of ports | `trace` only: the ports `hio trace start --when` may test, from `ports`; only these get a comparator. Default: none |
+| `timeout` | cycles of the bundle's clock | a slave with a handshake (AXI4, pzcorebus, APB, `dmi`): how long the window waits for an answer before it ends the access with an error. Default 10 us. Set it above the slave's own timeout when the slave answers late on purpose. Over PCIe, more than 50 us is warned about |
 
 A key the bundle's shape does not use is an error, not ignored.
 

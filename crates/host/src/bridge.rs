@@ -39,14 +39,21 @@ pub enum Error<E> {
         addr: u32,
         tries: u32,
     },
-    /// sticky_err is set. It stays set until the bridge is reset.
+    /// sticky_err is set. It stays set until the bridge is reset. Only an
+    /// older bridge (`Response::v2` not set) has it.
     Sticky {
         addr: u32,
     },
+    /// The window answered this access with an error. The bridge keeps
+    /// working; commands after it in the same batch have run.
+    Failed {
+        index: usize,
+        addr: u32,
+    },
     /// The bridge was busy in the middle of a batch, and this command was
-    /// dropped. The bridge decides at Update, but the host only sees busy from
-    /// the Capture before it, so a command reported as dropped may have run.
-    /// That is why only harness memory is resent.
+    /// dropped. Only an older bridge: it decides at Update, but the host only
+    /// sees busy from the Capture before it, so a command reported as dropped
+    /// may have run. That is why only harness memory is resent there.
     Dropped {
         index: usize,
         addr: u32,
@@ -69,8 +76,16 @@ impl<E: std::fmt::Debug> std::fmt::Display for Error<E> {
             Error::Busy { addr, tries } => write!(
                 f,
                 "the bridge stayed busy for address 0x{addr:x} after {tries} scans.\n\
-                 The window's internal bus should answer in a fixed number of cycles. \
-                 Something behind it is stalling, or TCK is too fast. Try a lower --tck-hz."
+                 The window answers every access within its timeout, so something behind \
+                 it is stalling longer than that, or TCK is too fast. Try a lower --tck-hz."
+            ),
+            Error::Failed { index, addr } => write!(
+                f,
+                "the window answered an error for 0x{addr:x} (command {index} of the batch).\n\
+                 The address is outside the window, the write was partial, or what is behind \
+                 it did not answer within the window's timeout (`harness_timeout` counts \
+                 those). A DUT slave that takes longer needs `timeout` on its bundle in \
+                 Harness.toml. The window still works; later commands of the batch have run."
             ),
             Error::Dropped { index, addr } => write!(
                 f,
@@ -193,11 +208,14 @@ const MAX_PAD: usize = 16;
 pub struct Bridge<J: JtagIo> {
     io: J,
     aw: u32,
+    /// The bridge says it is the current one (`Response::v2`). Learned from
+    /// every scan, so a reprogrammed device with the other kind is followed.
+    v2: bool,
 }
 
 impl<J: JtagIo> Bridge<J> {
     pub fn new(io: J, aw: u32) -> Self {
-        Bridge { io, aw }
+        Bridge { io, aw, v2: false }
     }
 
     /// Send one command. Returns what that scan captured: the previous result.
@@ -206,20 +224,29 @@ impl<J: JtagIo> Bridge<J> {
         let got = self.io.scan_dr(&bits).map_err(Error::Io)?;
         check_answered(&got)?;
         check_bypassed(&bits, &got)?;
-        Ok(Response::from_bits(&got))
+        let r = Response::from_bits(&got);
+        self.v2 = r.v2;
+        Ok(r)
     }
 
-    /// Send NOPs until the bridge is free. Returns the Capture at that point,
-    /// which holds the read result.
+    /// Scan until the bridge is free. Returns the Capture at that point, which
+    /// holds the result of the last command that ran.
     ///
     /// Do not wait by resending the command. Capture comes before Update, so the
     /// scan right after an accepted command always looks busy. Resending would
     /// loop forever: accepted, looks busy, resent. A NOP does not change the
-    /// bridge state, so it can wait.
+    /// bridge state, so it can wait. The current bridge also keeps showing busy
+    /// after a drop until a resync, so it gets resyncs instead (a resync runs
+    /// nothing either).
     fn wait_idle(&mut self, addr: u32) -> Result<Response, Error<J::Error>> {
         for _ in 0..BUSY_TRIES {
-            let r = self.scan(Frame::nop())?;
-            if r.err {
+            let frame = if self.v2 {
+                Frame::resync()
+            } else {
+                Frame::nop()
+            };
+            let r = self.scan(frame)?;
+            if r.err && !r.v2 {
                 return Err(Error::Sticky { addr });
             }
             if !r.busy {
@@ -236,11 +263,15 @@ impl<J: JtagIo> Bridge<J> {
     ///
     /// The returned `busy` tells whether the Update just sent was accepted:
     /// Capture comes before Update, and busy cannot rise between them. When it
-    /// was not accepted, wait until the bridge is free and send it again.
+    /// was not accepted, wait until the bridge is free and send it again. On
+    /// the older bridge a command that looked busy may have run anyway (busy
+    /// can fall during the shift); the current one decides at Capture.
     fn send(&mut self, frame: Frame, addr: u32) -> Result<(), Error<J::Error>> {
         for _ in 0..BUSY_TRIES {
             let r = self.scan(frame)?;
-            if r.err {
+            // The current bridge's `err` is about the command before, which
+            // its caller has already collected.
+            if r.err && !r.v2 {
                 return Err(Error::Sticky { addr });
             }
             if !r.busy {
@@ -254,15 +285,26 @@ impl<J: JtagIo> Bridge<J> {
         })
     }
 
+    /// The current bridge waits for the write to finish and reports an error
+    /// answer. The older one returns once the write is accepted, like a posted
+    /// write: its errors stick and show at the next access.
     pub fn write32(&mut self, addr: u32, data: u32) -> Result<(), Error<J::Error>> {
-        self.send(Frame::write(addr, data), addr)
+        self.send(Frame::write(addr, data), addr)?;
+        if self.v2 && self.wait_idle(addr)?.err {
+            return Err(Error::Failed { index: 0, addr });
+        }
+        Ok(())
     }
 
     /// The result comes in the next scan (pipelined), so a read takes at least
     /// 2 scans.
     pub fn read32(&mut self, addr: u32) -> Result<u32, Error<J::Error>> {
         self.send(Frame::read(addr), addr)?;
-        Ok(self.wait_idle(addr)?.rdata)
+        let r = self.wait_idle(addr)?;
+        if r.err {
+            return Err(Error::Failed { index: 0, addr });
+        }
+        Ok(r.rdata)
     }
 
     /// The underlying transport. Tests use it to count round trips.
@@ -351,18 +393,19 @@ impl Reads {
 /// ## Dropped commands
 ///
 /// A batch sends commands packed, so it cannot wait on busy in the middle. The
-/// bridge silently drops an Update while busy, so a write could be lost. So
-/// every response is checked, and any busy or err is an error.
+/// bridge drops an Update while busy, so every response is checked.
 ///
-/// By default dropped commands are not resent. The bridge accepts or drops at
-/// Update, but the host only sees busy from the Capture before it, with a DR
-/// shift of TCK in between. So a command that looks dropped may have run. For
-/// a register with a side effect such as `pop`, a resend advances the FIFO
-/// twice and loses data.
+/// The current bridge decides at Capture and keeps dropping until a resync, so
+/// a busy response means that command and every later one did not run. They
+/// are resent after a resync, whatever the batch is. A resend puts NOPs
+/// between commands to give the window time to answer.
 ///
-/// Only a batch marked `replayable` is resent: if running twice gives the same
-/// result, it does not matter whether it ran. A resend puts NOPs between
-/// commands to give the window time to answer.
+/// The older bridge accepts or drops at Update, but the host only sees busy
+/// from the Capture before it, with a DR shift of TCK in between. So a command
+/// that looks dropped may have run. For a register with a side effect such as
+/// `pop`, a resend advances the FIFO twice and loses data. There, only a batch
+/// marked `replayable` is resent: if running twice gives the same result, it
+/// does not matter whether it ran.
 ///
 /// A batch does not know the transport. It is only a list of "what to do at
 /// which address": JTAG packs it into DR scans and handles resending, PCIe runs
@@ -373,10 +416,11 @@ pub struct Batch {
     ops: Vec<(Frame, u32)>,
     /// Index into `ops` of each read.
     reads: Vec<usize>,
-    /// Whether dropped commands may be resent. Set only when the caller knows
-    /// the batch is idempotent.
+    /// Whether dropped commands may be resent to the older bridge. Set only
+    /// when the caller knows the batch is idempotent.
     ///
-    /// Only JTAG uses it; a BAR does not drop commands.
+    /// Only JTAG uses it; a BAR does not drop commands, and the current bridge
+    /// drops only commands that did not run.
     replay: bool,
 }
 
@@ -443,11 +487,14 @@ impl<J: JtagIo> Bridge<J> {
         }
         let mut values = vec![0u32; reads.len()];
 
-        // On drops, resend with more spacing. A batch that is not replayable
-        // gets one attempt only.
+        // On drops, resend with more spacing. The current bridge always makes
+        // progress (the first command after a resync is taken), so it is not
+        // bounded by attempts; the older one gives a batch that is not
+        // replayable one attempt only.
         let mut next = 0usize;
         let mut pad = 0usize;
-        for attempt in 0..BATCH_TRIES {
+        let mut attempt = 0u32;
+        loop {
             // `1 + pad` scans per command, and one NOP at the end for the
             // result of the last command.
             let stride = 1 + pad;
@@ -467,6 +514,54 @@ impl<J: JtagIo> Bridge<J> {
                 check_bypassed(sent, bits)?;
             }
             let resp: Vec<Response> = got.iter().map(|bits| Response::from_bits(bits)).collect();
+            self.v2 = resp[0].v2;
+            let rest = ops.len() - next;
+
+            if self.v2 {
+                // Busy at a command's own Capture means it was dropped, and so
+                // was every later one: the bridge keeps dropping until a
+                // resync. So the commands before the first busy all ran, in
+                // order, and nothing after.
+                let taken = (0..rest).find(|&k| resp[k * stride].busy).unwrap_or(rest);
+                for k in 0..taken {
+                    let at = next + k;
+                    // The first free Capture after the command holds its
+                    // result. The next command's own Capture is free when it
+                    // was taken, so only the last one taken can lack a result;
+                    // nothing ran after it, so wait for it.
+                    let last = ((k + 1) * stride).min(resp.len() - 1);
+                    let r = match (k * stride + 1..=last).find(|&p| !resp[p].busy) {
+                        Some(p) => resp[p],
+                        None => self.wait_idle(ops[at].1)?,
+                    };
+                    if r.err {
+                        return Err(Error::Failed {
+                            index: at,
+                            addr: ops[at].1,
+                        });
+                    }
+                    if slot[at] != usize::MAX {
+                        values[slot[at]] = r.rdata;
+                    }
+                }
+                next += taken;
+                if next == ops.len() {
+                    return Ok(Reads(values));
+                }
+                // A dropped command never ran, so it can be sent again, even a
+                // `pop`. Resync first, and space the rest out more.
+                self.wait_idle(ops[next].1)?;
+                pad = if pad == 0 { 1 } else { (pad * 2).min(MAX_PAD) };
+                attempt += 1;
+                if attempt as usize > ops.len() + BATCH_TRIES as usize {
+                    return Err(Error::Busy {
+                        addr: ops[next].1,
+                        tries: attempt,
+                    });
+                }
+                continue;
+            }
+
             for (k, r) in resp.iter().enumerate() {
                 if r.err {
                     let at = (next + k / stride).min(ops.len() - 1);
@@ -479,14 +574,14 @@ impl<J: JtagIo> Bridge<J> {
             // The Capture of `resp[k*stride]` comes before the Update of
             // `ops[next+k]`, so busy=0 there means the command is accepted
             // (`hns::dr`). busy=1 means "maybe not accepted", not "surely
-            // dropped", so only a replayable batch is resent.
+            // dropped", so only a replayable batch is resent. (This is the
+            // older bridge; the current one is handled above.)
             //
             // Not every command after a busy is dropped. The bridge becomes
             // free while the rest of the frames arrive, so a middle command can
             // drop while later ones are accepted. So the batch is cut where the
             // last certain value is, and the rest is resent; running twice is
             // fine for a replayable batch.
-            let rest = ops.len() - next;
             let mut taken = rest;
             for k in 0..rest {
                 if resp[k * stride].busy {
@@ -536,11 +631,8 @@ impl<J: JtagIo> Bridge<J> {
             // Wait until the bridge is free before resending. A command from the
             // last attempt may still be running, and would cause new drops.
             self.wait_idle(ops[next].1)?;
+            attempt += 1;
         }
-        Err(Error::Dropped {
-            index: next,
-            addr: ops[next].1,
-        })
     }
 }
 
@@ -620,6 +712,85 @@ mod tests {
         let err = b.read32(0x40).unwrap_err();
         assert!(matches!(err, Error::Busy { .. }));
         let text = err.to_string();
-        assert!(text.contains("fixed number of cycles"), "{text}");
+        assert!(text.contains("within its timeout"), "{text}");
+    }
+
+    #[test]
+    fn the_current_bridge_reads_back_a_write() {
+        let mut b = Bridge::new(FakeBridge::v2(15, 0), 15);
+        b.write32(0x10, 0xa5a5_1234).unwrap();
+        assert_eq!(b.read32(0x10).unwrap(), 0xa5a5_1234);
+    }
+
+    /// An error answer fails that access only. The older bridge would stay
+    /// failed until the FPGA is reconfigured.
+    #[test]
+    fn an_error_answer_fails_one_access_and_the_bridge_goes_on() {
+        let mut b = Bridge::new(FakeBridge::v2(15, 2).fail_at(0x7), 15);
+        b.write32(0x10, 5).unwrap();
+        let err = b.read32(0x7).unwrap_err();
+        assert!(matches!(err, Error::Failed { addr: 0x7, .. }), "{err:?}");
+        assert!(err.to_string().contains("`timeout`"), "{err}");
+        assert_eq!(b.read32(0x10).unwrap(), 5);
+    }
+
+    /// A slow window drops packed commands. The current bridge drops every
+    /// one after the first until a resync, so a resend keeps the order and
+    /// runs each command once, even in a batch that is not replayable.
+    #[test]
+    fn a_slow_window_runs_a_packed_batch_once_and_in_order() {
+        let mut b = Bridge::new(FakeBridge::v2(15, 3), 15);
+        let mut batch = Batch::new();
+        for i in 0..6u32 {
+            batch.write(0x40 + 4 * i, 100 + i);
+        }
+        let reads: Vec<ReadHandle> = (0..6u32).map(|i| batch.read(0x40 + 4 * i)).collect();
+        let got = b.run(&batch).unwrap();
+        for (i, h) in reads.into_iter().enumerate() {
+            assert_eq!(got[h], 100 + i as u32);
+        }
+        let ran: Vec<(u32, u32)> = b.io.ran.iter().map(|f| (f.addr, f.wdata)).collect();
+        let sent: Vec<(u32, u32)> = batch.ops().iter().map(|(f, _)| (f.addr, f.wdata)).collect();
+        assert_eq!(ran, sent);
+    }
+
+    /// The error names the command, and the next batch works.
+    #[test]
+    fn a_failing_command_in_a_batch_is_named() {
+        let mut b = Bridge::new(FakeBridge::v2(15, 1).fail_at(0x8), 15);
+        let mut batch = Batch::new();
+        batch.write(0x4, 1);
+        batch.read(0x8);
+        batch.write(0xc, 3);
+        let err = b.run(&batch).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Failed {
+                    index: 1,
+                    addr: 0x8
+                }
+            ),
+            "{err:?}"
+        );
+
+        let mut batch = Batch::new();
+        let h = batch.read(0xc);
+        assert_eq!(b.run(&batch).unwrap()[h], 3);
+    }
+
+    /// A bridge left dropping (a host that stopped mid-batch) is resynced.
+    #[test]
+    fn a_bridge_left_dropping_is_resynced() {
+        let mut b = Bridge::new(FakeBridge::v2(15, 5), 15);
+        let mut batch = Batch::new();
+        batch.write(0x4, 1);
+        batch.write(0x8, 2);
+        // Send it raw, so nothing resyncs afterwards.
+        let frames: Vec<Vec<bool>> = batch.ops().iter().map(|(f, _)| f.to_bits(15)).collect();
+        b.io.scan_many(&frames).unwrap();
+        assert_eq!(b.read32(0x4).unwrap(), 1);
+        b.write32(0x8, 2).unwrap();
+        assert_eq!(b.read32(0x8).unwrap(), 2);
     }
 }

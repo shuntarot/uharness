@@ -1405,6 +1405,23 @@ pub fn csr_module(plan: &Plan, prefixes: &DirectionPrefixes) -> String {
 /// Too short cuts normal accesses; too long lets the PCIe side time out first.
 const WINDOW_TIMEOUT_US: f64 = 10.0;
 
+/// How long the window waits, in cycles of its clock: `WINDOW_TIMEOUT_US`, or
+/// the longest `timeout` a bundle states. The slaves with a handshake run on
+/// the window clock, so their cycles are the window's.
+pub fn window_timeout(plan: &Plan) -> u32 {
+    let default =
+        window_timeout_cycles(plan.clocks().map(|clocks| clocks.window_output().freq_mhz));
+    let declared = plan
+        .loaded
+        .manifest
+        .bundle
+        .values()
+        .filter_map(|bundle| bundle.timeout)
+        .max()
+        .unwrap_or(0);
+    default.max(declared)
+}
+
 /// `WINDOW_TIMEOUT_US` in cycles of the harness clock.
 ///
 /// The frequency comes from `[clock] freq_mhz` in the manifest. With no clock
@@ -1909,7 +1926,7 @@ fn core_body(
     out.push_str(&format!("    var bus_we: {domain}logic;\n"));
     out.push_str(&format!("    var bus_re: {domain}logic;\n"));
     out.push_str(&format!(
-        "    var bus_rdata: {domain}logic<{WORD_BITS}>;\n    var bus_rvalid: {domain}logic;\n    var bus_wready: {domain}logic;\n    var bus_timeouts: {domain}logic<{WORD_BITS}>;\n    var bus_clear_timeouts: {domain}logic;\n"
+        "    var bus_rdata: {domain}logic<{WORD_BITS}>;\n    var bus_rvalid: {domain}logic;\n    var bus_wready: {domain}logic;\n    var bus_timeouts: {domain}logic<{WORD_BITS}>;\n    var bus_clear_timeouts: {domain}logic;\n    var bus_rd_abort: {domain}logic;\n"
     ));
     // High while the DUT is being reset (`hns::reset_ctl`). Declared here
     // because the parts that drive the DUT's slaves use it before the reset
@@ -1994,8 +2011,7 @@ fn core_body(
     out.push_str("    );\n\n");
 
     // Fixed-shape parts come from the `hns` package; only the wiring is generated.
-    let timeout =
-        window_timeout_cycles(plan.clocks().map(|clocks| clocks.window_output().freq_mhz));
+    let timeout = window_timeout(plan);
     out.push_str(&format!(
         "    inst u_axil: hns::axil #(\n        ADDR_BITS: {addr_bits},\n        TIMEOUT: {timeout},\n    ) (\n"
     ));
@@ -2013,6 +2029,7 @@ fn core_body(
     out.push_str("        i_wready: bus_wready,\n");
     out.push_str("        i_clear: bus_clear_timeouts,\n");
     out.push_str("        o_timeouts: bus_timeouts,\n");
+    out.push_str("        o_rd_abort: bus_rd_abort,\n");
     out.push_str("    );\n\n");
 
     // Wires between the CSR and the DUT.
@@ -2303,6 +2320,7 @@ fn core_body(
         out.push_str(&format!("        i_hre: t_{bundle}_mre,\n"));
         out.push_str(&format!("        o_hrdata: t_{bundle}_mrdata,\n"));
         out.push_str(&format!("        o_hrvalid: t_{bundle}_mrvalid,\n"));
+        out.push_str("        i_rd_abort: bus_rd_abort,\n");
         out.push_str(&format!("        o_hwready: t_{bundle}_mwready,\n"));
         out.push_str("    );\n\n");
     }
@@ -2531,6 +2549,7 @@ fn core_body(
         out.push_str(&format!("        i_re     : t_{bundle}_mre,\n"));
         out.push_str(&format!("        o_rdata  : t_{bundle}_mrdata,\n"));
         out.push_str(&format!("        o_rvalid : t_{bundle}_mrvalid,\n"));
+        out.push_str("        i_rd_abort: bus_rd_abort,\n");
         out.push_str(&format!("        o_wready : t_{bundle}_mwready,\n"));
         out.push_str(&format!("        o_psel   : w_{},\n", dmi.psel));
         out.push_str(&format!("        o_penable: w_{},\n", dmi.penable));
@@ -3478,6 +3497,7 @@ fn core_body(
         out.push_str(&format!("        i_hre: t_{bundle}_mre,\n"));
         out.push_str(&format!("        o_hrdata: t_{bundle}_mrdata,\n"));
         out.push_str(&format!("        o_hrvalid: t_{bundle}_mrvalid,\n"));
+        out.push_str("        i_rd_abort: bus_rd_abort,\n");
         out.push_str(&format!("        o_hwready: t_{bundle}_mwready,\n"));
         out.push_str("    );\n\n");
 
@@ -5736,6 +5756,7 @@ fn emit_corebus_host(
     out.push_str(&format!("        i_hre: t_{bundle}_mre,\n"));
     out.push_str(&format!("        o_hrdata: t_{bundle}_mrdata,\n"));
     out.push_str(&format!("        o_hrvalid: t_{bundle}_mrvalid,\n"));
+    out.push_str("        i_rd_abort: bus_rd_abort,\n");
     out.push_str(&format!("        o_hwready: t_{bundle}_mwready,\n"));
     out.push_str("    );\n");
     // The rest of the master side: one beat, no extra info. A memory command
@@ -5848,7 +5869,9 @@ fn veryl_ident(name: &str) -> String {
 ///   prefix, so separate out-dirs keep several harnesses for one DUT apart.
 /// - `[build]` is copied from the DUT. The top project's `reset_type` also
 ///   applies to its dependencies, so a mismatch emits the DUT SV with another
-///   reset polarity (confirmed on hardware).
+///   reset polarity (confirmed on hardware). The naming rules (clock and reset
+///   prefixes and suffixes, `hashed_mangled_name`, `flatten_array_interface`)
+///   likewise decide the SV names of the dependencies.
 /// - The analysis limits and `[lint.portability]` are copied too: the harness
 ///   project analyses the DUT and everything it depends on again, so it fails
 ///   wherever the DUT needed a larger limit or allowed a dependency something.
@@ -5868,6 +5891,29 @@ pub fn veryl_toml(plan: &Plan, hns: &str, dut_path: &str, extra: &[(String, Stri
     ));
     if build.omit_project_prefix {
         out.push_str("omit_project_prefix = true\n");
+    }
+    // The naming rules too. The SV names of std and of the dependencies come
+    // from the top project, so without them a DUT mixed with SV that its own
+    // build emitted gets a second `__std_fifo` with other port names.
+    for (key, value) in [
+        ("clock_posedge_prefix", &build.clock_posedge_prefix),
+        ("clock_posedge_suffix", &build.clock_posedge_suffix),
+        ("clock_negedge_prefix", &build.clock_negedge_prefix),
+        ("clock_negedge_suffix", &build.clock_negedge_suffix),
+        ("reset_high_prefix", &build.reset_high_prefix),
+        ("reset_high_suffix", &build.reset_high_suffix),
+        ("reset_low_prefix", &build.reset_low_prefix),
+        ("reset_low_suffix", &build.reset_low_suffix),
+    ] {
+        if let Some(value) = value {
+            out.push_str(&format!("{key} = \"{value}\"\n"));
+        }
+    }
+    if build.hashed_mangled_name {
+        out.push_str("hashed_mangled_name = true\n");
+    }
+    if build.flatten_array_interface {
+        out.push_str("flatten_array_interface = true\n");
     }
     // Only what differs from Veryl's default, so a plain DUT gets a plain file.
     let default: veryl_metadata::Build =

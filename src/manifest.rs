@@ -722,6 +722,14 @@ pub struct Bundle {
     /// trigger on its first beat (`hio trace start --now`), on no condition.
     #[serde(default)]
     pub trigger: Option<Vec<String>>,
+
+    /// How long the window waits for this slave to answer, in cycles of its
+    /// clock (a slave with a handshake only). The window waits 10 us by
+    /// default and then ends the access with an error. A slave that answers
+    /// later on purpose, such as a bus that times out on its own and answers
+    /// with an error, needs more: set it above the slave's own timeout.
+    #[serde(default)]
+    pub timeout: Option<u32>,
 }
 
 /// What the records of a `trace` are.

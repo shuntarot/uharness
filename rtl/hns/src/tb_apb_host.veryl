@@ -39,6 +39,7 @@ module test_apb_host {
         i_re     : re     ,
         o_rdata  : rdata  ,
         o_rvalid : rvalid ,
+        i_rd_abort: 1'b0,
         o_wready : wready ,
         o_psel   : psel   ,
         o_penable: penable,

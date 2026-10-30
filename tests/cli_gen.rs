@@ -217,6 +217,31 @@ fn the_output_keeps_the_analysis_settings_of_the_dut() {
     assert_eq!(metadata.build.evaluate_size_limit, 16777216);
 }
 
+/// The naming rules are copied too: the top project decides the SV names of
+/// std and of every dependency, so SV that the DUT's own build emitted only
+/// matches the harness build when they agree.
+#[test]
+fn the_output_keeps_the_naming_rules_of_the_dut() {
+    let veryl_toml = "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\nreset_low_suffix = \"_n\"\nclock_posedge_prefix = \"p_\"\nhashed_mangled_name = true\nflatten_array_interface = true\n\n[dependencies]\nhns = { path = \"HNS\" }\n"
+        .replace("HNS", &format!("{}/rtl/hns", env!("CARGO_MANIFEST_DIR")));
+    let dir = fixture(&veryl_toml, HARNESS_TOML);
+
+    let output = run_gen(&dir, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let metadata = veryl_metadata::Metadata::load(dir.path().join("hns/Veryl.toml")).unwrap();
+    assert_eq!(metadata.build.reset_low_suffix.as_deref(), Some("_n"));
+    assert_eq!(metadata.build.clock_posedge_prefix.as_deref(), Some("p_"));
+    assert_eq!(metadata.build.reset_high_suffix, None);
+    assert!(metadata.build.hashed_mangled_name);
+    assert!(metadata.build.flatten_array_interface);
+}
+
 /// A different out-dir gives a different module name. This lets one DUT keep
 /// harnesses for several boards side by side.
 #[test]
@@ -3152,6 +3177,89 @@ fn the_window_timeout_comes_from_the_clock() {
             "{mhz} MHz should give TIMEOUT: {cycles} (10 us):\n{top}"
         );
     }
+}
+
+/// A slave that answers later than the default states how long the window
+/// waits, in cycles of its clock, and the window waits for the longest. The
+/// host masters hear when the window gives a read up, so a late answer is not
+/// taken for the next read.
+#[test]
+fn a_bundle_timeout_lengthens_the_window_wait() {
+    let gen_top = |harness: &str| {
+        let dir = axi_slave_fixture(harness, 12, "slave");
+        let output = run_gen(&dir, &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let top = fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap();
+        top.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    let top = gen_top(&format!("{AXI_SLAVE_HARNESS_TOML}timeout = 8192\n"));
+    assert!(top.contains("TIMEOUT:8192,"), "{top}");
+    assert!(top.contains("o_rd_abort:bus_rd_abort,"), "{top}");
+    assert!(top.contains("i_rd_abort:bus_rd_abort,"), "{top}");
+    // Shorter than the default (10 us at 200 MHz): the default stays.
+    let top = gen_top(&format!("{AXI_SLAVE_HARNESS_TOML}timeout = 100\n"));
+    assert!(top.contains("TIMEOUT:2000,"), "{top}");
+
+    // Only a slave with a handshake waits.
+    let dir = fixture(
+        &veryl_toml(),
+        "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n\
+         [bundle.csr]\ncontract = \"fixed_latency\"\nlatency = 1\nbacking = \"reg\"\ntimeout = 100\n",
+    );
+    let output = run_gen(&dir, &["--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{value}");
+    assert_eq!(
+        value["error"]["code"], "harness::terminator::key_not_applicable",
+        "{value}"
+    );
+}
+
+/// Over PCIe, a wait past the shortest completion timeout (50 us) is warned
+/// about, not refused.
+#[test]
+fn a_timeout_past_the_pcie_completion_timeout_is_warned_about() {
+    let warnings = |timeout: u32| {
+        let dir = axi_slave_fixture(
+            &format!("{AXI_SLAVE_HARNESS_TOML}timeout = {timeout}\n\n[pcie]\nbar_bytes = 8192\n"),
+            12,
+            "slave",
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+            .args([
+                "gen",
+                "--target",
+                "xilinx/vcu118",
+                "--transport",
+                "pcie",
+                "--json",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(0), "{value}");
+        // Left out when there are none.
+        value["warnings"].as_array().cloned().unwrap_or_default()
+    };
+    // 8192 cycles at 200 MHz: 41 us.
+    assert!(warnings(8192).is_empty());
+    // 20000 cycles: 100 us.
+    let items = warnings(20000);
+    let item = items
+        .iter()
+        .find(|w| w["id"] == "window_timeout_over_pcie_cto")
+        .unwrap_or_else(|| panic!("{items:?}"));
+    let what = item["what"].as_str().unwrap();
+    assert!(what.contains("[bundle.csr]"), "{what}");
+    assert!(what.contains("lspci"), "{what}");
 }
 
 /// The host can read the timeout count. `SLVERR` does not reach the host over
