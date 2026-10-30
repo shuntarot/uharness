@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
-use hns_host::{Batch, Bridge, Ftdi, Mpsse, ProbeConfig, Reads};
+use hns_host::{Batch, Bridge, Bus, Ftdi, Mpsse, ProbeConfig, Reads};
 use hns_regs::{Access, RegisterMap};
 
 #[derive(Parser)]
@@ -931,131 +931,25 @@ fn main() {
     }
 }
 
-/// The probes `--serial` names. A serial equal to the value wins, so a full
-/// serial still picks one probe when it is also a part of another's.
-fn by_serial(found: Vec<hns_host::ftdi::Found>, part: &str) -> Vec<hns_host::ftdi::Found> {
-    if found.iter().any(|f| f.serial.as_deref() == Some(part)) {
-        return found
-            .into_iter()
-            .filter(|f| f.serial.as_deref() == Some(part))
-            .collect();
-    }
-    found
-        .into_iter()
-        .filter(|f| f.serial.as_deref().is_some_and(|s| s.contains(part)))
-        .collect()
-}
-
 /// Builds a `ProbeConfig` from what is plugged in.
 ///
 /// It does not guess. A value it cannot fill stops it with a message that says
 /// what to pass. Filled values are checked later (IR capture pattern, magic).
 fn resolve_probe(cli: &Cli) -> Result<ProbeConfig, String> {
-    // Values only the target description has (level shifter, usable TCK).
-    // The command line wins, so a value can be overridden while debugging.
-    let from_target = load_target(cli)?;
-
-    let vid = cli.vid.map(|v| v as u16).or(from_target.vid);
-    let pid = cli.pid.map(|v| v as u16).or(from_target.pid);
-    let found = hns_host::ftdi::candidates(vid, pid).map_err(|e| e.to_string())?;
-    let found: Vec<_> = found
-        .into_iter()
-        .filter(
-            |f| match cli.product.as_deref().or(from_target.product.as_deref()) {
-                Some(p) => f.product.as_deref() == Some(p),
-                None => true,
-            },
-        )
-        .collect();
-    let found = match &cli.serial {
-        Some(s) => {
-            let named = by_serial(found.clone(), s);
-            if named.is_empty() && !found.is_empty() {
-                let list: Vec<String> = found.iter().map(|f| format!("  {f}")).collect();
-                return Err(format!(
-                    "no probe's serial contains {s:?}. These are plugged in:\n{}\n\
-                     Pass one of their serials, or a part of it, with --serial.",
-                    list.join("\n")
-                ));
-            }
-            named
-        }
-        None => found,
+    let query = hns_host::probe::Query {
+        vid: cli.vid.map(|v| v as u16),
+        pid: cli.pid.map(|v| v as u16),
+        product: cli.product.clone(),
+        serial: cli.serial.clone(),
+        interface: cli.interface,
+        layout_init: cli.layout_init,
+        tck_hz: cli
+            .tck_hz
+            .or_else(|| cli.tck_mhz.map(|mhz| (mhz * 1e6) as u32)),
+        ir_length: cli.ir_length,
+        user1_ir: cli.user1_ir,
     };
-
-    let one = match found.len() {
-        0 => {
-            return Err("no FTDI probe with an MPSSE channel is plugged in.\n\
-                 hio looked for the MPSSE product ids under vendor 0x0403. If your probe \
-                 uses another id, pass --vid/--pid. `lsusb` shows them."
-                .to_string());
-        }
-        1 => found[0].clone(),
-        _ => {
-            let list: Vec<String> = found.iter().map(|f| format!("  {f}")).collect();
-            return Err(format!(
-                "{} probes match, so hio cannot choose:\n{}\n\
-                 Pick one with --serial (a part of it is enough when only one has it), \
-                 or with --product.",
-                found.len(),
-                list.join("\n")
-            ));
-        }
-    };
-
-    // The level shifter is board wiring and USB cannot see it. Do not drive
-    // GPIO on a guess: use the known value only for Digilent, and otherwise
-    // touch only the four JTAG pins.
-    let layout_init = cli
-        .layout_init
-        .or(from_target.layout_init)
-        .unwrap_or_else(|| {
-            let digilent = one
-                .product
-                .as_deref()
-                .is_some_and(|p| p.contains("Digilent"));
-            if digilent {
-                hns_host::mpsse::LAYOUT_DIGILENT
-            } else {
-                hns_host::mpsse::LAYOUT_PLAIN
-            }
-        });
-
-    // Use `host_tck_mhz`, not `max_tck_mhz`. The latter is the device limit
-    // for the XDC constraint, not what the cable can carry (Arty claims 30 MHz,
-    // but 20 MHz is the measured limit).
-    let asked = cli
-        .tck_hz
-        .or_else(|| cli.tck_mhz.map(|mhz| (mhz * 1e6) as u32));
-    let tck_hz = match asked {
-        Some(hz) => hz,
-        None => from_target
-            .host_tck_mhz
-            .map(|mhz| (mhz * 1e6) as u32)
-            .unwrap_or(DEFAULT_TCK_HZ),
-    };
-
-    Ok(ProbeConfig {
-        vid: one.vid,
-        pid: one.pid,
-        interface: cli.interface.or(from_target.interface).unwrap_or(0),
-        serial: one.serial.clone(),
-        product: one.product.clone(),
-        layout_init,
-        max_tck_hz: tck_hz,
-        ir_length: cli
-            .ir_length
-            .or(from_target.ir_length)
-            .unwrap_or(DEFAULT_IR_LENGTH),
-        user1_ir: cli
-            .user1_ir
-            .or(from_target.user1_ir)
-            .unwrap_or(DEFAULT_USER1_IR),
-        chain: hns_host::mpsse::Chain::new(
-            &from_target.chain_tdo_side,
-            &from_target.chain_tdi_side,
-        ),
-    })
+    Ok(hns_host::probe::resolve(&query, &load_target(cli)?)?)
 }
 
 /// Upper bound on what `bench` sweeps without `--size`. It measures time per
@@ -1102,13 +996,6 @@ const SHOW_BAD: usize = 32;
 /// Entry count above which `memtest` prints progress.
 const PROGRESS_ABOVE: usize = 1 << 16;
 
-/// A TCK the cable is known to carry. Start slow.
-const DEFAULT_TCK_HZ: u32 = 3_000_000;
-/// IR length on 7-series. Checked against the IR capture pattern.
-const DEFAULT_IR_LENGTH: u8 = 6;
-/// USER1 on 7-series. Checked by whether the magic comes back.
-const DEFAULT_USER1_IR: u32 = 2;
-
 /// The `[jtag]` table of the target description. Empty (all `None`) when no
 /// target is given.
 fn load_target(cli: &Cli) -> Result<hns_targets::Jtag, String> {
@@ -1154,7 +1041,7 @@ fn run_script(cli: &Cli, file: &str) -> Result<(), String> {
     let mut bus = open_bus(cli, &map_path, &map)?;
 
     if !cli.no_verify {
-        check_identity(&mut bus, &map)?;
+        bus.check_identity(&map)?;
     }
 
     for (n, line, step) in steps {
@@ -2055,12 +1942,7 @@ fn program(
     // fails with `interface is busy`.
     match after_config_map(cli, "configuration finished") {
         Some(map) => {
-            // After configuration, reset the TAP, then select the USER slot again.
-            let mut cmds = Vec::new();
-            hns_host::mpsse::push_tap_reset(&mut cmds);
-            m.send(&cmds).map_err(|e| e.to_string())?;
-            m.scan_ir(cfg.user1_ir, cfg.ir_length)
-                .map_err(|e| e.to_string())?;
+            hns_host::program::select_window(&mut m, &cfg)?;
             set_update_gap(cli, &map, &mut m);
             let mut bus = Bus::Jtag(Bridge::new(m, map.addr_bits() as u32));
             if ps7 {
@@ -2082,32 +1964,35 @@ fn configure(
     allow_any_device: bool,
     erase_wait: std::time::Duration,
 ) -> Result<(Mpsse<Ftdi>, ProbeConfig), String> {
-    let (ir, chunks) = config_plan(target, bit, allow_any_device)?;
+    let plan = config_plan(target, bit, allow_any_device)?;
     let cfg = resolve_probe(cli)?;
-    let mut m = Mpsse::attach(Ftdi::open(&cfg).map_err(|e| e.to_string())?, &cfg)
-        .map_err(|e| e.to_string())?;
-    send_config(&mut m, &ir, cfg.ir_length, bit, &chunks, erase_wait)?;
+    let m = send_planned(&cfg, &plan, bit, erase_wait)?;
     Ok((m, cfg))
 }
 
-/// Sends the bitstream through a probe already set up.
-fn send_config(
-    m: &mut Mpsse<Ftdi>,
-    ir: &hns_host::config::ConfigIr,
-    ir_length: u8,
+/// Opens the probe and sends a bitstream already checked. Answers the probe,
+/// still open.
+fn send_planned(
+    cfg: &ProbeConfig,
+    plan: &hns_host::program::Plan,
     bit: &hns_host::bitstream::Bitstream,
-    chunks: &[hns_host::config::Chunk],
     erase_wait: std::time::Duration,
-) -> Result<(), String> {
-    let start = std::time::Instant::now();
-    hns_host::config::program(m, ir, ir_length, &bit.data, chunks, erase_wait)
+) -> Result<Mpsse<Ftdi>, String> {
+    let mut m = Mpsse::attach(Ftdi::open(cfg).map_err(|e| e.to_string())?, cfg)
         .map_err(|e| e.to_string())?;
+    let start = std::time::Instant::now();
+    hns_host::program::send(&mut m, plan, cfg.ir_length, bit, erase_wait)?;
+    sent(bit, start);
+    Ok(m)
+}
+
+/// Reports how long sending the bitstream took.
+fn sent(bit: &hns_host::bitstream::Bitstream, start: std::time::Instant) {
     println!(
         "sent {} bytes in {:.2} s",
         bit.data.len(),
         start.elapsed().as_secs_f64()
     );
-    Ok(())
 }
 
 /// Checks the bitstream's device against the target, and works out the IR
@@ -2116,63 +2001,12 @@ fn config_plan(
     target: Option<&hns_targets::Target>,
     bit: &hns_host::bitstream::Bitstream,
     allow_any_device: bool,
-) -> Result<(hns_host::config::ConfigIr, Vec<hns_host::config::Chunk>), String> {
-    // Check the device before writing. Without a target there is nothing to
-    // compare with, so do not go on silently.
-    match (target, allow_any_device) {
-        (Some(t), _) => {
-            let part = &t.head.device.part;
-            if !hns_host::bitstream::part_matches(&bit.part, part) {
-                let e = hns_host::bitstream::Error::WrongDevice {
-                    bitstream: bit.part.clone(),
-                    target: part.clone(),
-                };
-                if !allow_any_device {
-                    return Err(e.to_string());
-                }
-                eprintln!("warning: {e}");
-            }
-        }
-        (None, true) => eprintln!("warning: no target given, so the device is not checked"),
-        (None, false) => {
-            return Err(
-                "no target was given, so hio cannot check the bitstream's device.\n\
-                 Pass --target (or --target-file) naming the board this .bit was built for. \
-                 --allow-any-device skips the check."
-                    .to_string(),
-            );
-        }
+) -> Result<hns_host::program::Plan, String> {
+    let plan = hns_host::program::plan(target, bit, allow_any_device)?;
+    if let Some(warning) = &plan.warning {
+        eprintln!("warning: {warning}");
     }
-
-    let jtag = target.map(hns_targets::jtag).unwrap_or_default();
-    let ir = match (jtag.jprogram_ir, jtag.jstart_ir, jtag.bypass_ir) {
-        (Some(jprogram), Some(jstart), Some(bypass)) => hns_host::config::ConfigIr {
-            jprogram,
-            jstart,
-            bypass,
-            ready: jtag.ready.map(|c| hns_host::config::Check {
-                ir: c.ir,
-                expect: c.expect,
-                mask: c.mask,
-            }),
-            done: jtag.done.map(|c| hns_host::config::Check {
-                ir: c.ir,
-                expect: c.expect,
-                mask: c.mask,
-            }),
-        },
-        _ => {
-            return Err(
-                "the target does not say which IR values select JTAG configuration.\n\
-                 `jprogram_ir`, `jstart_ir` and `bypass_ir` are needed. They differ by \
-                 device family. Find them in the device's BSDL file, under \
-                 data/parts/xilinx/<family>/public/bsdl/ in Vivado."
-                    .to_string(),
-            );
-        }
-    };
-    let chunks = split(bit, &jtag)?;
-    Ok((ir, chunks))
+    Ok(plan)
 }
 
 /// `id`, given a moment to come back after the PS was set up.
@@ -2228,56 +2062,6 @@ fn after_config_map(cli: &Cli, what: &str) -> Option<RegisterMap> {
     }
 }
 
-/// Decides which part of the `.bit` goes to which `CFG_IN`.
-///
-/// One SLR gets everything in one go. With several, the `.bit` says where
-/// each part starts and ends, and the target says which `CFG_IN` reaches
-/// each SLR, in file order.
-fn split(
-    bit: &hns_host::bitstream::Bitstream,
-    jtag: &hns_targets::Jtag,
-) -> Result<Vec<hns_host::config::Chunk>, String> {
-    let pieces = bit.slr_pieces().map_err(|e| e.to_string())?;
-    let slrs = pieces.iter().map(|p| p.slr + 1).max().unwrap_or(1);
-    if slrs == 1 {
-        if jtag.slr_cfg_in_ir.len() > 1 {
-            return Err(format!(
-                "the target names {} SLRs, but the bitstream holds one.\n\
-                 It was probably built for another device.",
-                jtag.slr_cfg_in_ir.len()
-            ));
-        }
-        let cfg_in = jtag
-            .cfg_in_ir
-            .or(jtag.slr_cfg_in_ir.first().copied())
-            .ok_or("the target does not say which IR value selects CFG_IN.".to_string())?;
-        return Ok(vec![hns_host::config::Chunk {
-            at: 0,
-            bytes: bit.data.len(),
-            cfg_in,
-            sync: false,
-        }]);
-    }
-    if jtag.slr_cfg_in_ir.len() != slrs {
-        return Err(format!(
-            "the bitstream holds {slrs} sub-bitstreams (one per SLR), but the target names \
-             {} `slr_cfg_in_ir` values.\n\
-             List the CFG_IN of each SLR in the order its sub-bitstream appears in the .bit \
-             (the master SLR first). The BSDL file has one CFG_IN per SLR.",
-            jtag.slr_cfg_in_ir.len()
-        ));
-    }
-    Ok(pieces
-        .iter()
-        .map(|p| hns_host::config::Chunk {
-            at: p.at,
-            bytes: p.bytes,
-            cfg_in: jtag.slr_cfg_in_ir[p.slr],
-            sync: p.tail,
-        })
-        .collect())
-}
-
 /// Replays an SVF as it is.
 ///
 /// The configuration steps come from the file, not from the target
@@ -2331,11 +2115,7 @@ fn play_svf(cli: &Cli, file: &PathBuf) -> Result<(), String> {
     // Check that the harness answers.
     match after_config_map(cli, "the SVF replayed without complaint") {
         Some(map) => {
-            let mut cmds = Vec::new();
-            hns_host::mpsse::push_tap_reset(&mut cmds);
-            m.send(&cmds).map_err(|e| e.to_string())?;
-            m.scan_ir(cfg.user1_ir, cfg.ir_length)
-                .map_err(|e| e.to_string())?;
+            hns_host::program::select_window(&mut m, &cfg)?;
             set_update_gap(cli, &map, &mut m);
             let mut bus = Bus::Jtag(Bridge::new(m, map.addr_bits() as u32));
             if ps7 {
@@ -2754,7 +2534,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
     // defaults, and a wrong one silently reaches something else. It costs
     // one round trip.
     if !cli.no_verify && !matches!(cmd, Cmd::Id) {
-        check_identity(&mut bus, &map)?;
+        bus.check_identity(&map)?;
     }
 
     match cmd {
@@ -3013,14 +2793,14 @@ fn serve(cli: &Cli, bus: &mut Bus, map: &RegisterMap, listen: &str) -> Result<()
         max_ops: hns2::MAX_OPS,
         program_files: program_files(bus, resolve_target(cli)?.as_ref()),
     };
-    // Saved while the card answers, to be written back after programming.
-    let saved = match &*bus {
-        Bus::Pcie(bar) => hns_host::reprogram::read_config(
-            std::path::Path::new(hns_host::pcie::SYSFS),
-            &bar.info().bdf,
-        )
-        .ok()
-        .filter(|c| hns_host::reprogram::answering(c, bar.info().bar0_start)),
+    // The config space is saved while the card answers, to be written back
+    // after programming.
+    let card = match &*bus {
+        Bus::Pcie(bar) => {
+            let mut card = hns_host::program::Card::new(&bar.info().bdf);
+            let _ = card.save();
+            Some(card)
+        }
         _ => None,
     };
     let listener = std::net::TcpListener::bind(listen)
@@ -3038,7 +2818,7 @@ fn serve(cli: &Cli, bus: &mut Bus, map: &RegisterMap, listen: &str) -> Result<()
         bus,
         map: map.clone(),
         info,
-        saved,
+        card,
     };
     hns2::serve(listener, &mut window, |line| println!("hio: {line}")).map_err(|e| e.to_string())
 }
@@ -3062,8 +2842,8 @@ struct BoardWindow<'a> {
     /// The map of the design on the board. Programming replaces it.
     map: RegisterMap,
     info: hns_host::hns2::Info,
-    /// The card's config space from when it last answered at its address.
-    saved: Option<Vec<u8>>,
+    /// The PCIe card, with its config space from when it last answered.
+    card: Option<hns_host::program::Card>,
 }
 
 impl hns_host::hns2::Window for BoardWindow<'_> {
@@ -3072,7 +2852,7 @@ impl hns_host::hns2::Window for BoardWindow<'_> {
     }
 
     fn run(&mut self, batch: &Batch) -> Result<Reads, String> {
-        self.bus.run(batch)
+        Ok(self.bus.run(batch)?)
     }
 
     fn program(
@@ -3118,7 +2898,7 @@ impl BoardWindow<'_> {
             )?,
             Bus::Net(_) => unreachable!("`hio serve` opens a board, not a server"),
         }
-        check_identity_settled(self.bus, &next)?;
+        self.bus.check_identity_settled(&next)?;
         self.map = next;
         self.info.map_hash = Some(self.map.map_hash);
         Ok(self.info.clone())
@@ -3174,24 +2954,22 @@ impl BoardWindow<'_> {
             }
             None => None,
         };
-        let (ir, chunks) = config_plan(target, bit, false)?;
+        let plan = config_plan(target, bit, false)?;
         let cfg = resolve_probe(self.cli)?;
-        let Bus::Jtag(bridge) = &mut *self.bus else {
-            unreachable!("called for a JTAG window")
-        };
 
         // From here the board no longer runs the map the server had.
         self.info.map_hash = None;
-        let m = bridge.io_mut();
-        // The gap is for window commands; configuration runs without it.
-        m.set_update_gap(0);
-        let mut cmds = Vec::new();
-        hns_host::mpsse::push_tap_reset(&mut cmds);
-        m.send(&cmds).map_err(|e| e.to_string())?;
-        send_config(m, &ir, cfg.ir_length, bit, &chunks, erase_wait)?;
+        let start = std::time::Instant::now();
+        self.bus
+            .program_jtag(&plan, cfg.ir_length, bit, erase_wait)?;
+        sent(bit, start);
 
         // The DAP is on the same chain: pad the scans for it for a while.
         if let Some((init, chain, ap)) = &ps7 {
+            let Bus::Jtag(bridge) = &mut *self.bus else {
+                unreachable!("called for a JTAG window")
+            };
+            let m = bridge.io_mut();
             let fpga = m.chain();
             m.set_chain(*chain);
             let done = (|| {
@@ -3207,14 +2985,7 @@ impl BoardWindow<'_> {
             done?;
         }
 
-        // After configuration, reset the TAP, then select the USER slot again.
-        let mut cmds = Vec::new();
-        hns_host::mpsse::push_tap_reset(&mut cmds);
-        m.send(&cmds).map_err(|e| e.to_string())?;
-        m.scan_ir(cfg.user1_ir, cfg.ir_length)
-            .map_err(|e| e.to_string())?;
-        set_update_gap(self.cli, next, m);
-        bridge.set_addr_bits(next.addr_bits() as u32);
+        self.bus.reselect(&cfg, next, self.cli.update_gap)?;
         Ok(())
     }
 
@@ -3230,89 +3001,17 @@ impl BoardWindow<'_> {
         bit: &hns_host::bitstream::Bitstream,
         erase_wait: std::time::Duration,
     ) -> Result<(), String> {
-        use hns_host::reprogram::{self, Shape};
-
-        let Bus::Pcie(bar) = &*self.bus else {
-            unreachable!("called for a PCIe window")
-        };
-        let bdf = bar.info().bdf.clone();
-        let Some(pcie) = &next.pcie else {
-            return Err(
-                "the regs.json sent has no `pcie` section: that design has no PCIe \
-                 endpoint, and the machine would lose the card.\n\
-                 Generate it with `--transport pcie`."
-                    .to_string(),
-            );
-        };
-
-        let root = std::path::Path::new(hns_host::pcie::SYSFS);
-        let card = hns_host::pcie::info_at(root, &bdf).map_err(|e| e.to_string())?;
-        let changed = reprogram::changes(
-            &Shape::of_card(&card),
-            &Shape {
-                vendor: pcie.vendor_id as u16,
-                device: pcie.device_id as u16,
-                class: pcie.class_code,
-                bar_bytes: u64::from(pcie.bar_bytes),
-                intx: next
-                    .registers
-                    .iter()
-                    .any(|r| r.role.as_deref() == Some("irq_level")),
-            },
-        );
-        if !changed.is_empty() {
-            return Err(format!(
-                "the new design looks different from the bus ({}). Nothing was \
-                 programmed.\n\
-                 The machine has to enumerate the card again, which a running server \
-                 cannot do. On the board's machine: stop `hio serve`, run `hio program`, \
-                 then as root remove the card and rescan the bus (reboot instead if the \
-                 BAR grew past the bridge window), and start `hio serve` again.",
-                changed.join(", ")
-            ));
-        }
-        let config = reprogram::read_config(root, &bdf)
-            .map_err(|e| format!("cannot read the config space of {bdf}: {e}"))?;
-        if reprogram::answering(&config, card.bar0_start) {
-            self.saved = Some(config);
-        }
-        let Some(saved) = self.saved.clone() else {
-            return Err(format!(
-                "{bdf} does not answer at its address now, and this server saved no \
-                 config space from when it did. Nothing was programmed.\n\
-                 Make the card answer by hand (as root, remove it and rescan the bus), \
-                 then start `hio serve` again."
-            ));
-        };
+        // Everything that can refuse runs first, so a refusal leaves the
+        // board and the server's map as they were.
+        let plan = config_plan(target, bit, false)?;
+        let cfg = resolve_probe(self.cli)?;
+        let card = self.card.as_mut().expect("a PCIe window keeps its card");
+        card.prepare(next)?;
 
         // From here the board no longer runs the map the server had.
         self.info.map_hash = None;
-        let (m, _) = configure(self.cli, target, bit, false, erase_wait)?;
-        drop(m);
-        reprogram::wait_for_card(
-            root,
-            &bdf,
-            card.vendor,
-            card.device,
-            std::time::Duration::from_secs(10),
-        )?;
-        reprogram::write_config(root, &bdf, &reprogram::restore_plan(&saved))
-            .map_err(|e| format!("cannot write the config space of {bdf} back: {e}"))
-    }
-}
-
-/// `check_identity`, given a moment for the harness to come out of reset
-/// after programming.
-fn check_identity_settled(bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
-    let started = std::time::Instant::now();
-    loop {
-        match check_identity(bus, map) {
-            Ok(()) => return Ok(()),
-            Err(_) if started.elapsed() < std::time::Duration::from_secs(2) => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Err(e) => return Err(e),
-        }
+        drop(send_planned(&cfg, &plan, bit, erase_wait)?);
+        Ok(card.restore()?)
     }
 }
 
@@ -3389,11 +3088,14 @@ fn plain_file_name(name: &str) -> bool {
 fn set_update_gap<C: hns_host::mpsse::Chan>(cli: &Cli, map: &RegisterMap, m: &mut Mpsse<C>) {
     let gap = cli
         .update_gap
-        .unwrap_or_else(|| match (map.window_clock_mhz, map.window_cycles) {
-            (Some(mhz), Some(cycles)) => hns_host::mpsse::update_gap(m.tck(), mhz, cycles),
-            _ => 0,
-        });
+        .unwrap_or_else(|| hns_host::bus::default_update_gap(m.tck(), map));
     m.set_update_gap(gap);
+}
+
+/// The card's BDF. Separate from opening the window because `check` looks at
+/// the card (decode, bus mastering, IOMMU) before it opens the window.
+fn find_bdf(cli: &Cli, pcie: &hns_regs::Pcie) -> Result<String, String> {
+    Ok(hns_host::bus::pcie_bdf(cli.bdf.as_deref(), pcie)?)
 }
 
 /// Opens the window over the chosen transport. JTAG is the default: a PCIe
@@ -3420,59 +3122,11 @@ fn open_bus(cli: &Cli, map_path: &str, map: &RegisterMap) -> Result<Bus, String>
             check_server(cli, &link, map, hns_host::hns2::ADDR_FILE)?;
             Ok(Bus::Net(link))
         }
-        "jtag" => {
-            let cfg = resolve_probe(cli)?;
-            let mut io = Mpsse::open(Ftdi::open(&cfg).map_err(|e| e.to_string())?, &cfg)
-                .map_err(|e| e.to_string())?;
-            set_update_gap(cli, map, &mut io);
-            Ok(Bus::Jtag(Bridge::new(io, map.addr_bits() as u32)))
-        }
-        "pcie" => Ok(Bus::Pcie(open_bar(cli, map)?)),
+        "jtag" => Ok(Bus::jtag(&resolve_probe(cli)?, map, cli.update_gap)?),
+        "pcie" => Ok(Bus::pcie(cli.bdf.as_deref(), map)?),
         other => Err(format!(
             "`--transport {other}` is not a transport this tool has; use `jtag`, `pcie` or `sim`."
         )),
-    }
-}
-
-/// Finds exactly one PCIe card and opens its BAR.
-///
-/// The ID alone is not enough: the default ID is borrowed from an example and
-/// may clash with another card. The BAR size is compared too, and the magic
-/// is read later (`check_identity`).
-fn open_bar(cli: &Cli, map: &RegisterMap) -> Result<hns_host::pcie::Bar, String> {
-    let Some(pcie) = &map.pcie else {
-        return Err(format!(
-            "{} has no `pcie` section, so the design has no PCIe endpoint.\n\
-             Generate with `--transport pcie` and re-synthesize, or drop `--transport pcie` \
-             here.",
-            "regs.json"
-        ));
-    };
-    let bdf = find_bdf(cli, pcie)?;
-    let bar = hns_host::pcie::Bar::open(&bdf).map_err(|e| e.to_string())?;
-    bar.expect_bytes(pcie.bar_bytes as u64)
-        .map_err(|e| e.to_string())?;
-    Ok(bar)
-}
-
-/// The card's BDF. Separate from `open_bar` because `check` looks at the card
-/// (decode, bus mastering, IOMMU) before it opens the window.
-fn find_bdf(cli: &Cli, pcie: &hns_regs::Pcie) -> Result<String, String> {
-    match &cli.bdf {
-        Some(bdf) => hns_host::pcie::named_at(
-            std::path::Path::new(hns_host::pcie::SYSFS),
-            bdf,
-            pcie.vendor_id as u16,
-            pcie.device_id as u16,
-        )
-        .map_err(|e| e.to_string()),
-        None => Ok(hns_host::pcie::find_at(
-            std::path::Path::new(hns_host::pcie::SYSFS),
-            pcie.vendor_id as u16,
-            pcie.device_id as u16,
-        )
-        .map_err(|e| e.to_string())?
-        .bdf),
     }
 }
 
@@ -3740,7 +3394,11 @@ fn check(cli: &Cli, map_path: &str, map: &RegisterMap) -> Result<(), String> {
         }
     }
     if let Some(bus) = &mut bus {
-        match read_identity(bus, map).and_then(|(m, h)| check_identity_values(m, h, map)) {
+        match bus
+            .identity(map)
+            .and_then(|(m, h)| hns_host::bus::check_identity(m, h, map))
+            .map_err(String::from)
+        {
             Err(why) => c.ng_err("window", &why),
             Ok(()) => {
                 let timeouts = if map.get("harness_timeout").is_ok() {
@@ -4794,69 +4452,8 @@ fn wide_words(value: u64, words: usize) -> Vec<u32> {
     (0..words).map(|w| (value >> (32 * w)) as u32).collect()
 }
 
-/// The path to the window. A `Batch` only says what to do at which address;
-/// this runs it. The commands above (`load` / `memtest` / `dump`) see only
-/// this enum.
-enum Bus {
-    Jtag(Bridge<Mpsse<Ftdi>>),
-    Pcie(hns_host::pcie::Bar),
-    /// An HNS2 server: `veryl harness sim`, or `hio serve` with a board.
-    Net(hns_host::hns2::Link),
-}
-
-impl Bus {
-    fn run(&mut self, batch: &Batch) -> Result<Reads, String> {
-        match self {
-            Bus::Jtag(bridge) => bridge.run(batch).map_err(|e| e.to_string()),
-            Bus::Pcie(bar) => bar.run(batch).map_err(|e| e.to_string()),
-            Bus::Net(link) => link.run(batch).map_err(|e| e.to_string()),
-        }
-    }
-
-    /// The master this bus is. A moving window has one base register per
-    /// master. With a shared one, a move by one master would make the other
-    /// read a different address.
-    fn master(&self) -> &'static str {
-        match self {
-            Bus::Jtag(_) => "jtag",
-            Bus::Pcie(_) => "pcie",
-            // The simulator drives the AXI4-Lite port JTAG drives on a board.
-            Bus::Net(link) if link.info().master == "pcie" => "pcie",
-            Bus::Net(_) => "jtag",
-        }
-    }
-
-    fn read32(&mut self, addr: u32) -> Result<u32, String> {
-        match self {
-            Bus::Jtag(bridge) => bridge.read32(addr).map_err(|e| e.to_string()),
-            Bus::Pcie(bar) => bar.read32(addr).map_err(|e| e.to_string()),
-            Bus::Net(link) => link.read32(addr).map_err(|e| e.to_string()),
-        }
-    }
-
-    fn read_burst(&mut self, addr: u32, out: &mut [u32]) -> Result<(), String> {
-        match self {
-            Bus::Jtag(bridge) => bridge.read_burst(addr, out).map_err(|e| e.to_string()),
-            Bus::Pcie(bar) => bar.read_burst(addr, out).map_err(|e| e.to_string()),
-            Bus::Net(link) => link.read_burst(addr, out).map_err(|e| e.to_string()),
-        }
-    }
-
-    /// Only PCIe reads in parallel. JTAG is one cable, so more threads only
-    /// wait longer; there, batching (`Batch`) already cuts round trips.
-    fn read_parallel(&mut self, addr: u32, out: &mut [u32], threads: usize) -> Result<(), String> {
-        match self {
-            Bus::Jtag(bridge) => bridge.read_burst(addr, out).map_err(|e| e.to_string()),
-            Bus::Pcie(bar) => bar
-                .read_parallel(addr, out, threads)
-                .map_err(|e| e.to_string()),
-            Bus::Net(link) => link.read_burst(addr, out).map_err(|e| e.to_string()),
-        }
-    }
-}
-
 fn rd(bus: &mut Bus, addr: u32) -> Result<u32, String> {
-    bus.read32(addr)
+    Ok(bus.read32(addr)?)
 }
 
 /// Puts the DUT into reset or takes it out.
@@ -4926,11 +4523,11 @@ fn reset(bus: &mut Bus, map: &RegisterMap, hold: bool, release: bool) -> Result<
 /// The heartbeat UART prints the same values without any transport, so this
 /// is a second, independent check.
 fn id(bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
-    let (magic, hash) = read_identity(bus, map)?;
+    let (magic, hash) = bus.identity(map)?;
     println!("magic    {magic:#010x} (expected {:#010x})", map.magic);
     println!("map hash {hash:#010x} (expected {:#010x})", map.map_hash);
     println!("dut      {}", map.dut);
-    check_identity_values(magic, hash, map)?;
+    hns_host::bus::check_identity(magic, hash, map)?;
     report_timeouts(bus, map)?;
     let what = if matches!(bus, Bus::Net(link) if link.info().kind == "sim") {
         "the simulation"
@@ -4967,51 +4564,6 @@ fn report_timeouts(bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
              After reading it, clear the count with `hio write harness_timeout 1`, so the \
              next one shows as new."
         );
-    }
-    Ok(())
-}
-
-fn read_identity(bus: &mut Bus, map: &RegisterMap) -> Result<(u32, u32), String> {
-    let mut b = Batch::new();
-    let m = b.read(offset_of(map, "harness_magic")?);
-    let h = b.read(offset_of(map, "harness_map_hash")?);
-    let got = bus.run(&b)?;
-    Ok((got[m], got[h]))
-}
-
-fn check_identity(bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
-    let (magic, hash) = read_identity(bus, map)?;
-    check_identity_values(magic, hash, map)
-}
-
-/// Compares the magic and the map hash with the map.
-///
-/// A magic with only some bits wrong means TCK is too fast. TDO must return
-/// within half a cycle, and the board sets that limit, not the chip. The
-/// same bits fail every time, so the same wrong value comes back.
-fn check_identity_values(magic: u32, hash: u32, map: &RegisterMap) -> Result<(), String> {
-    if magic != map.magic {
-        return Err(format!(
-            "the window answered with magic {magic:#010x}, not {:#010x}.\n\
-             The board does not run a veryl-harness design, or the transport does not \
-             reach its window.\n\
-             If the board was just powered on, or runs another design (from flash or an \
-             SD card), run `hio program` first.\n\
-             If every bit is 0 or every bit is 1, suspect the JTAG chain.\n\
-             If only some bits are wrong, --tck-hz is probably too fast for the cable. \
-             Lower it and try again.\n\
-             If the USER slot is the default, --user1-ir may be wrong: the wrong slot \
-             reaches BYPASS, not the window.",
-            map.magic
-        ));
-    }
-    if hash != map.map_hash {
-        return Err(format!(
-            "the bitstream reports map hash {hash:#010x}, but {} says {:#010x}.\n\
-             The board runs a harness built from a different register map. Re-generate \
-             and re-synthesize, or point --regs at the map that was built.",
-            "regs.json", map.map_hash
-        ));
     }
     Ok(())
 }
@@ -5131,86 +4683,6 @@ fn region_list(map: &RegisterMap) -> String {
     }
 }
 
-/// Splits a byte range of a region into moving-window pages.
-///
-/// The window shows only `size_bytes` at a time, so a longer request is split,
-/// and `base` is set again for each part. A fixed window gives one part.
-fn region_pages(
-    region: &hns_regs::Region,
-    at: u64,
-    words: usize,
-) -> Result<Vec<(u64, u32, usize)>, String> {
-    let span = region.size_bytes as u64;
-    let mut out = Vec::new();
-    let mut left = words.max(1);
-    let mut at = at;
-    while left > 0 {
-        let page = at / span;
-        let off = at % span;
-        let here = (((span - off) / 4) as usize).min(left);
-        out.push((page, (region.window_base as u64 + off) as u32, here));
-        at += 4 * here as u64;
-        left -= here;
-    }
-    Ok(out)
-}
-
-/// Sets `base` for a moving window. Without it, the last page is read.
-fn set_page(
-    b: &mut Batch,
-    map: &RegisterMap,
-    region: &hns_regs::Region,
-    page: u64,
-    master: &str,
-) -> Result<(), String> {
-    if !region.is_aperture() {
-        return Ok(());
-    }
-    let at = offset_of(map, &region.base_register(master))?;
-    b.write(at, page as u32);
-    Ok(())
-}
-
-/// Checks that an offset in a region is backed by real memory.
-///
-/// The limit comes from the entry count, not the window size (`size_bytes`).
-/// A region is rounded up to a power of two. Past the entries, a read returns
-/// 0 and bumps `<bundle>_oor`, and that 0 must not look like data.
-fn region_span(region: &hns_regs::Region, at: u64, words: usize) -> Result<u32, String> {
-    let bytes = region.reach_bytes() as usize;
-    if !at.is_multiple_of(4) {
-        return Err(format!(
-            "0x{at:x} is not on a word boundary.\n\
-             A region is read one 32-bit word at a time. Use 0x{:x} for the word it falls in.",
-            at & !3
-        ));
-    }
-    let end = at as usize + 4 * words.max(1);
-    if end > bytes {
-        return Err(format!(
-            "0x{at:x} + {words} word(s) runs past `{}`, which holds {bytes} bytes \
-             ({} entries of {}).\n\
-             Past the end, the memory returns 0 and counts the access in \
-             `{}_oor`, so the value would look like data.",
-            region.name, region.depth, region.entry_bytes, region.name
-        ));
-    }
-    Ok((region.window_base + at as usize) as u32)
-}
-
-/// A batch for a region.
-///
-/// For harness memory, it marks the batch replayable after a loss. Doing a
-/// read or write twice gives the same result there. A DUT slave interface is
-/// not marked, because a read alone may change its state.
-fn region_batch(region: &hns_regs::Region) -> Batch {
-    let mut b = Batch::new();
-    if region.is_idempotent() {
-        b.replayable();
-    }
-    b
-}
-
 /// A batch for one memory. Replayable only for a region.
 ///
 /// An indirect port is not: each write to `mdata` advances the address by
@@ -5309,11 +4781,11 @@ fn read_region(
 ) -> Result<Vec<u32>, String> {
     not_held(bus, map, region)?;
     let master = bus.master();
-    region_span(region, at, words)?;
+    hns_host::region::span(region, at, words)?;
     let mut out = Vec::new();
-    for (page, addr, count) in region_pages(region, at, words)? {
-        let mut b = region_batch(region);
-        set_page(&mut b, map, region, page, master)?;
+    for (page, addr, count) in hns_host::region::pages(region, at, words) {
+        let mut b = hns_host::region::batch(region);
+        hns_host::region::set_page(&mut b, map, region, page, master)?;
         let handles: Vec<_> = (0..count).map(|i| b.read(addr + 4 * i as u32)).collect();
         let got = bus.run(&b)?;
         out.extend(handles.into_iter().map(|h| got[h]));
@@ -5331,11 +4803,11 @@ fn write_region(
 ) -> Result<(), String> {
     not_held(bus, map, region)?;
     let master = bus.master();
-    region_span(region, at, values.len())?;
+    hns_host::region::span(region, at, values.len())?;
     let mut done = 0usize;
-    for (page, addr, count) in region_pages(region, at, values.len())? {
-        let mut b = region_batch(region);
-        set_page(&mut b, map, region, page, master)?;
+    for (page, addr, count) in hns_host::region::pages(region, at, values.len()) {
+        let mut b = hns_host::region::batch(region);
+        hns_host::region::set_page(&mut b, map, region, page, master)?;
         for i in 0..count {
             b.write(addr + 4 * i as u32, values[done + i] as u32);
         }
@@ -5549,7 +5021,7 @@ fn bench_region(
     } else {
         all.min(BENCH_DEFAULT_BYTES)
     }) as usize;
-    let words = region_span(region, at, want.div_ceil(4)).map(|_| want / 4)?;
+    let words = hns_host::region::span(region, at, want.div_ceil(4)).map(|_| want / 4)?;
     if words == 0 {
         return Err(format!(
             "0 words to measure. `{}` holds {bytes} bytes; `--size` has to be at least 4.",
@@ -5592,8 +5064,8 @@ fn bench_region(
 
     // Discard one run, so the first-time USB and driver cost is not measured.
     {
-        let mut b = region_batch(region);
-        set_page(&mut b, map, region, at / region.size_bytes as u64, master)?;
+        let mut b = hns_host::region::batch(region);
+        hns_host::region::set_page(&mut b, map, region, at / region.size_bytes as u64, master)?;
         for i in 0..words.min(16) {
             if both {
                 b.write(base + 4 * i as u32, value(i));
@@ -5608,7 +5080,7 @@ fn bench_region(
     let mut read = std::time::Duration::ZERO;
     for _ in 0..repeat {
         if both {
-            let mut b = region_batch(region);
+            let mut b = hns_host::region::batch(region);
             for i in 0..words {
                 b.write(base + 4 * i as u32, value(i));
             }
@@ -5626,7 +5098,7 @@ fn bench_region(
             read += start.elapsed();
             out
         } else {
-            let mut b = region_batch(region);
+            let mut b = hns_host::region::batch(region);
             let handles: Vec<_> = (0..words).map(|i| b.read(base + 4 * i as u32)).collect();
             let start = std::time::Instant::now();
             let values = bus.run(&b)?;
@@ -6501,7 +5973,7 @@ fn set_mem_page(
     master: &str,
 ) -> Result<(), String> {
     if let MemPort::Region(region) = port {
-        set_page(b, map, region, entry_page(port, e), master)?;
+        hns_host::region::set_page(b, map, region, entry_page(port, e), master)?;
     }
     Ok(())
 }
@@ -7813,7 +7285,7 @@ fn shell(cli: &Cli) -> Result<(), String> {
     let (map_path, map) = find_regs(cli).map_err(help)?;
     let mut bus = open_bus(cli, &map_path, &map).map_err(help)?;
     if !cli.no_verify {
-        check_identity(&mut bus, &map)?;
+        bus.check_identity(&map)?;
     }
     let mut prompt = Prompt::new(Level::Top, false);
 
@@ -8399,7 +7871,8 @@ impl hns_host::dm::Dmi for WindowDmi<'_> {
         for pause in &self.pauses {
             b.write(*pause, u32::from(!runs));
         }
-        self.bus.run(&b).map(|_| ())
+        self.bus.run(&b)?;
+        Ok(())
     }
 
     fn run(&mut self, ops: &[hns_host::dm::Op]) -> Result<Vec<u32>, String> {
@@ -9110,7 +8583,7 @@ fn trace(bus: &mut Bus, map: &RegisterMap, cmd: &TraceCmd) -> Result<(), String>
             let trigger = (rd(bus, hit)? == 1).then_some(rd(bus, hit_at)?);
             let mut seq = n.wrapping_sub(picked.len() as u32);
             for chunk in picked.chunks((1024 / words).max(1)) {
-                let mut b = region_batch(region);
+                let mut b = hns_host::region::batch(region);
                 let handles: Vec<Vec<_>> = chunk
                     .iter()
                     .map(|entry| {
@@ -9228,35 +8701,6 @@ fn size_note(r: &hns_regs::Register, words: &[u32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn probe_with(serial: &str) -> hns_host::ftdi::Found {
-        hns_host::ftdi::Found {
-            vid: 0x0403,
-            pid: 0x6010,
-            product: None,
-            serial: Some(serial.to_string()),
-        }
-    }
-
-    #[test]
-    fn a_part_of_a_serial_picks_the_one_probe_that_has_it() {
-        let serials = |found: Vec<hns_host::ftdi::Found>| -> Vec<String> {
-            found.into_iter().filter_map(|f| f.serial).collect()
-        };
-        let plugged = || {
-            vec![
-                probe_with("210319788107"),
-                probe_with("210319A8F2D1"),
-                probe_with("8107"),
-            ]
-        };
-        assert_eq!(serials(by_serial(plugged(), "8F2D")), ["210319A8F2D1"]);
-        // Two have `2103`, so it does not choose.
-        assert_eq!(by_serial(plugged(), "2103").len(), 2);
-        // `8107` is a whole serial, and a part of another: the whole one wins.
-        assert_eq!(serials(by_serial(plugged(), "8107")), ["8107"]);
-        assert!(by_serial(plugged(), "9999").is_empty());
-    }
     use clap::CommandFactory;
 
     /// Wide values go out lowest word first. Reversed, a descriptor address
@@ -10078,46 +9522,6 @@ mod tests {
         assert_eq!(parse_rate_u32("15000000").unwrap(), 15_000_000);
         // The same spelling as a size counts in powers of two.
         assert_eq!(parse_u64("15M").unwrap(), 15 * 1024 * 1024);
-    }
-
-    /// A read past a region's entries is refused before it is sent.
-    ///
-    /// A region is rounded up to a power of two, so part of it has no memory.
-    /// A read there returns 0 and bumps `oor`, and that 0 must not look like
-    /// data.
-    #[test]
-    fn a_read_past_the_end_of_a_region_is_refused() {
-        // 100 entries x 4 bytes = 400 bytes, in a 512-byte window.
-        let region = hns_regs::Region {
-            kind: Some("memory".to_string()),
-            total_bytes: None,
-            held_in_dut_reset: false,
-            name: "imem".to_string(),
-            window_base: 0x200,
-            size_bytes: 512,
-            entry_bytes: 4,
-            depth: 100,
-        };
-
-        // Inside, it passes, with `window_base` added.
-        assert_eq!(region_span(&region, 0, 1).unwrap(), 0x200);
-        assert_eq!(region_span(&region, 8, 2).unwrap(), 0x208);
-        assert_eq!(region_span(&region, 396, 1).unwrap(), 0x200 + 396);
-
-        // Past the last word.
-        let err = region_span(&region, 396, 2).unwrap_err();
-        assert!(err.contains("runs past"), "{err}");
-        assert!(err.contains("400 bytes"), "{err}");
-        // The error says a 0 would come back.
-        assert!(err.contains("imem_oor"), "{err}");
-
-        // The rounded-up part (400..512) is refused too, though in the window.
-        assert!(region_span(&region, 400, 1).is_err());
-
-        // An unaligned offset.
-        let err = region_span(&region, 6, 1).unwrap_err();
-        assert!(err.contains("word boundary"), "{err}");
-        assert!(err.contains("0x4"), "{err}");
     }
 
     /// An offset past the window is refused before it is sent.

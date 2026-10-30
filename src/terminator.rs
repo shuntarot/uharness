@@ -3629,6 +3629,7 @@ pub fn check_claimed(
     const RESET: &str = "reset";
     const FORMAT: &str = "format";
     const TRIGGER: &str = "trigger";
+    const TIMEOUT: &str = "timeout";
 
     for binding in bindings {
         let name = binding.bundle.as_str();
@@ -3662,12 +3663,12 @@ pub fn check_claimed(
             (
                 apbs.iter().any(|p| p.bundle == name && p.debug_module),
                 "a `dmi`",
-                &[RESET][..],
+                &[RESET, TIMEOUT][..],
             ),
             (
                 apbs.iter().any(|p| p.bundle == name && !p.debug_module),
                 "an APB `slave`",
-                &[][..],
+                &[TIMEOUT][..],
             ),
             (
                 axi_mems
@@ -3686,7 +3687,7 @@ pub fn check_claimed(
             (
                 axi_slaves.iter().any(|p| p.bundle == name),
                 "an AXI4 `slave`",
-                &[APERTURE][..],
+                &[APERTURE, TIMEOUT][..],
             ),
             (
                 irqs.iter().any(|p| p.bundle == name),
@@ -3727,6 +3728,7 @@ pub fn check_claimed(
             (RESET, declared.reset.is_some()),
             (FORMAT, declared.format.is_some()),
             (TRIGGER, declared.trigger.is_some()),
+            (TIMEOUT, declared.timeout.is_some()),
         ] {
             if set && !takes.contains(&key) {
                 return Err(TerminatorError::KeyNotApplicable {
@@ -3734,7 +3736,7 @@ pub fn check_claimed(
                     key,
                     shape,
                     takes: if takes.is_empty() {
-                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`, `reset`, `format`, `trigger`"
+                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`, `reset`, `format`, `trigger`, `timeout`"
                             .to_string()
                     } else {
                         takes

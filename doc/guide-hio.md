@@ -569,3 +569,36 @@ writes with the PS7 IP. When the harness's `dram` is the PS's, `hio program`
 runs it after the bitstream, from the `ps7_init.tcl` beside it. A design
 without a `dram` bundle does not use the PS, and `hio program` leaves it
 alone.
+
+## `hns-host` as a library
+
+`hio` is a thin CLI over the `hns-host` crate, and another Rust program can
+use the same parts. Turn the CLI dependencies off:
+
+```toml
+[dependencies]
+hns-host = { git = "https://github.com/shuntarot/uharness", rev = "<commit>", default-features = false }
+```
+
+| Module | What it gives |
+|---|---|
+| `bus` | `Bus`: open the window over JTAG, PCIe or TCP, run `Batch`es, check the identity |
+| `probe` | find the FTDI probe and fill its `ProbeConfig` from a target description |
+| `region` | reach a `regs.json` region; `Pager` moves a moving window only when the page changes |
+| `program` | send any bitstream over JTAG; reprogram a PCIe card while the machine keeps it |
+
+```rust
+use hns_host::{Batch, Bus};
+
+let map = hns_regs::RegisterMap::from_json(&std::fs::read_to_string("regs.json")?)?;
+let target = hns_targets::load_file("board.toml".as_ref(), &[])?;
+let cfg = hns_host::probe::resolve(&Default::default(), &hns_targets::jtag(&target))?;
+let mut bus = Bus::jtag(&cfg, &map, None)?;
+bus.check_identity(&map)?;
+let mut b = Batch::new();
+let magic = b.read(map.get("harness_magic")?.offset as u32);
+println!("{:#x}", bus.run(&b)?[magic]);
+```
+
+Every error is `hns_host::Error`; its text says what went wrong and what to
+change.

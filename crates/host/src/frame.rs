@@ -1,9 +1,12 @@
 //! Contents of the bus DR. The layout must match `rtl/hns/src/dr.veryl`.
 //!
 //! ```text
-//!   in : [AW+33:34] addr | [33:2] wdata | [1:0] op   (00=nop, 01=read, 10=write)
-//!   out: [AW+33:34] 0    | [33:2] rdata | [1] sticky_err | [0] busy
+//!   in : [AW+33:34] addr | [33:2] wdata | [1:0] op   (00=nop, 01=read, 10=write, 11=resync)
+//!   out: [AW+33:35] 0    | [34] 1 | [33:2] rdata | [1] err | [0] busy
 //! ```
+//!
+//! Bit 34 is 0 from an older bridge, whose `err` is sticky and whose busy only
+//! means "maybe dropped". See `Response::v2`.
 //!
 //! Bits are sent LSB first. TDI enters the JTAG shift register at the MSB and
 //! TDO leaves at the LSB, so the first bit the host sends lands in `[0]`.
@@ -14,6 +17,9 @@ pub enum Op {
     Nop = 0b00,
     Read = 0b01,
     Write = 0b10,
+    /// Ends the dropping that follows a dropped command. Only a bridge that
+    /// sets `Response::v2` knows it.
+    Resync = 0b11,
 }
 
 /// One command sent to the bridge.
@@ -28,6 +34,14 @@ impl Frame {
     pub fn nop() -> Self {
         Frame {
             op: Op::Nop,
+            addr: 0,
+            wdata: 0,
+        }
+    }
+
+    pub fn resync() -> Self {
+        Frame {
+            op: Op::Resync,
             addr: 0,
             wdata: 0,
         }
@@ -75,12 +89,17 @@ impl Frame {
 /// What Capture returns. Note: this is the result of the previous command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Response {
-    /// The previous transaction was still running, so the command just sent was
-    /// dropped.
+    /// The command of this scan is not taken. With `v2`, it is surely not
+    /// taken, and nor is any later one until a resync. Without, the previous
+    /// transaction was still running, and the command may still have been
+    /// taken if it finished during the shift.
     pub busy: bool,
-    /// Sticky: an error response or a dropped command happened at least once.
+    /// With `v2`, the window answered the last command with an error. Without,
+    /// sticky: some command failed since the bridge was reset.
     pub err: bool,
     pub rdata: u32,
+    /// The bridge drops deterministically and reports errors per command.
+    pub v2: bool,
 }
 
 impl Response {
@@ -96,6 +115,7 @@ impl Response {
             busy: bit(0),
             err: bit(1),
             rdata,
+            v2: bit(34),
         }
     }
 }

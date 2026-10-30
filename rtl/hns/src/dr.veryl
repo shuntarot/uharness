@@ -7,12 +7,27 @@
 /// DR layout:
 ///
 /// ```text
-///   in : [AW+33:34] addr | [33:2] wdata | [1:0] op   (00=nop, 01=read, 10=write)
-///   out: [AW+33:34] 0    | [33:2] rdata | [1] sticky_err | [0] busy
+///   in : [AW+33:34] addr | [33:2] wdata | [1:0] op   (00=nop, 01=read, 10=write, 11=resync)
+///   out: [AW+33:35] 0    | [34] 1 | [33:2] rdata | [1] err | [0] busy
 /// ```
+///
+/// Bit 34 tells the host it talks to this bridge: an older one returned 0 there,
+/// kept `err` set until reset, and could take a command that looked dropped.
 ///
 /// Results are pipelined: the result of a command appears at the next Capture
 /// (as in RISC-V DMI). The host can keep sending without waiting for results.
+///
+/// `rdata` and `err` are the result of the last command that ran: `err` is set
+/// when the window answered it with an error, and the next command clears it.
+/// So an access that fails does not stop the bridge.
+///
+/// `busy` at Capture decides the command of the same scan: busy means it is
+/// dropped, not busy means it runs. Nothing changes between Capture and Update,
+/// so what the host sees is what happened, and a dropped command can always be
+/// sent again. Once a command is dropped, every later one is dropped too, and
+/// Capture shows busy, until a resync. Otherwise a batch sent packed could run
+/// out of order: the window frees up while later commands arrive. A NOP does
+/// not resync, because a host pads resends with NOPs.
 pub module dr #(
     /// Window address width. A shorter one makes each transaction faster.
     /// AW=15 gives a DR length of 49 = 8*6+1, the cheapest shape for MPSSE.
@@ -53,9 +68,10 @@ pub module dr #(
 ) {
     const LEN: u32 = AW + 34;
 
-    const OP_NOP  : logic<2> = 2'b00;
-    const OP_READ : logic<2> = 2'b01;
-    const OP_WRITE: logic<2> = 2'b10;
+    const OP_NOP   : logic<2> = 2'b00;
+    const OP_READ  : logic<2> = 2'b01;
+    const OP_WRITE : logic<2> = 2'b10;
+    const OP_RESYNC: logic<2> = 2'b11;
 
     // ── Bus-side state ──────────────────────────────────────────────────
     // Declared before the TCK side: Veryl requires declaration before use.
@@ -82,6 +98,12 @@ pub module dr #(
 
     let busy: 'tck logic = req_tck != ack_tck;
 
+    /// A command was dropped, and nothing has resynced since.
+    var dropping: 'tck logic;
+    /// What Capture showed as busy. Update decides by it, not by `busy` now.
+    var stall_cap: 'tck logic;
+    let stall    : 'tck logic = busy || dropping;
+
     assign o_tdo = sr[0];
 
     // Capture reads bus-side data in TCK. The data only matters while busy is
@@ -93,10 +115,10 @@ pub module dr #(
                 // Load the result of the previous command. Veryl `as` casts
                 // only to fixed types and cannot zero-extend to a width, so
                 // each field is set on its own.
-                sr[0]          = busy;
+                sr[0]          = stall;
                 sr[1]          = err_bus;
                 sr[33:2]       = rdata_bus;
-                sr[LEN - 1:34] = 0;
+                sr[LEN - 1:34] = 1;
             } else if i_sel && i_shift {
                 sr = {i_tdi, sr[LEN - 1:1]};
             }
@@ -104,18 +126,21 @@ pub module dr #(
     }
 
     always_ff (i_tck) {
+        if i_sel && i_capture {
+            stall_cap = stall;
+        }
         if i_sel && i_update {
-            cmd_op   = sr[1:0];
-            cmd_data = sr[33:2];
-            cmd_addr = sr[LEN - 1:34];
-            // A command that arrives while busy is dropped without an error.
-            // sticky_err is not set: it stays set until reset, so a retry
-            // would make the bridge unusable. The host sees `busy` at Capture
-            // and sends again (as in RISC-V DMI). Capture comes before
-            // Update, so the Update of a scan that returned busy=0 is always
-            // accepted.
-            if !busy && sr[1:0] != OP_NOP {
-                req_tck = !req_tck;
+            if sr[1:0] == OP_RESYNC {
+                dropping = 0;
+            } else if sr[1:0] != OP_NOP {
+                if stall_cap {
+                    dropping = 1;
+                } else {
+                    cmd_op   = sr[1:0];
+                    cmd_data = sr[33:2];
+                    cmd_addr = sr[LEN - 1:34];
+                    req_tck  = !req_tck;
+                }
             }
         }
     }
@@ -170,6 +195,7 @@ pub module dr #(
                 case state {
                     State::IDLE: {
                         if start {
+                            err_bus = 0;
                             // cmd_* is safe to read: it holds after Update.
                             if cmd_op == OP_WRITE {
                                 o_awaddr           = 0;

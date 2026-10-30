@@ -1013,8 +1013,38 @@ pub(crate) fn warnings(plan: &plan::Plan) -> Vec<Item> {
             ),
         ));
     }
+    // A window that waits past the shortest completion timeout a root complex
+    // may use (50 us, Range A). The user chose a warning over a refusal: real
+    // chips are used over PCIe with such buses.
+    if plan.pcie_identity().is_some()
+        && let Some(clocks) = plan.clocks()
+    {
+        let mhz = clocks.window_output().freq_mhz;
+        let longest = plan
+            .loaded
+            .manifest
+            .bundle
+            .iter()
+            .filter_map(|(name, bundle)| bundle.timeout.map(|t| (name, t)))
+            .max_by_key(|(_, t)| *t);
+        if let Some((name, cycles)) = longest
+            && f64::from(cycles) / mhz > PCIE_CTO_MIN_US
+        {
+            items.push(Item::owned(
+                "window_timeout_over_pcie_cto",
+                format!(
+                    "[bundle.{name}] timeout = {cycles} cycles is {:.0} us at {mhz} MHz, longer than the shortest PCIe completion timeout ({PCIE_CTO_MIN_US:.0} us). If the slave does not answer, a read over the BAR can end in a completion timeout on the host, which some machines treat as fatal. Check the Completion Timeout Value of the root port (`lspci -vv`, DevCtl2), or lower `timeout` if the slave answers sooner",
+                    f64::from(cycles) / mhz
+                ),
+            ));
+        }
+    }
     items
 }
+
+/// The shortest completion timeout a PCIe root complex may use (Range A), in
+/// microseconds.
+const PCIE_CTO_MIN_US: f64 = 50.0;
 
 fn line(mark: &str, what: &str, value: &str) {
     println!("{mark}  {what:<8} {value}");

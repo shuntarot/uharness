@@ -41,6 +41,7 @@ module test_axi_host {
         i_hre    : hre    ,
         o_hrdata : hrdata ,
         o_hrvalid: hrvalid,
+        i_rd_abort: 1'b0,
         o_hwready: hwready,
     );
 

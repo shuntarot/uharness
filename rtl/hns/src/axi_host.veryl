@@ -19,6 +19,11 @@
 /// accesses are not taken: the window times out on them instead. A response
 /// that arrives when nothing is open is dropped, so it cannot be taken for a
 /// later read.
+///
+/// When the window gives up on a read (`i_rd_abort`, its timeout), the read
+/// is forgotten if it has not started. If it is open, the slave still owes R:
+/// the read stays open until it comes, and then it is dropped, for the same
+/// reason. A read the window sends meanwhile waits and runs next.
 pub module axi_host::<PKG: $std::axi4_prototype> #(
     /// Width of the window's 32-bit word index.
     param ADDR_W: u32 = 8,
@@ -38,6 +43,8 @@ pub module axi_host::<PKG: $std::axi4_prototype> #(
     o_hrdata : output logic<32>    ,
     /// Read data is valid (one cycle). Connect to `i_rvalid` of `hns::axil`.
     o_hrvalid: output logic        ,
+    /// The window gave up on its read. Connect to `o_rd_abort` of `hns::axil`.
+    i_rd_abort: input logic        ,
     /// A write can be accepted. Connect to `i_wready` of `hns::axil`.
     o_hwready: output logic        ,
 ) {
@@ -78,6 +85,12 @@ pub module axi_host::<PKG: $std::axi4_prototype> #(
     var r_word : logic<SEL_W>              ;
     var r_data : logic<32>                 ;
     var r_out  : logic                     ;
+    /// The open read was given up by the window: drop its R.
+    var r_stale: logic                     ;
+    /// A read that came while one was open, and where it points.
+    var r_wait : logic                     ;
+    var rw_addr: logic<PKG::ADDRESS_WIDTH> ;
+    var rw_word: logic<SEL_W>              ;
 
     always_comb {
         axi.awvalid  = w_busy & ~aw_done;
@@ -131,12 +144,18 @@ pub module axi_host::<PKG: $std::axi4_prototype> #(
             r_word  = 0;
             r_data  = 0;
             r_out   = 0;
+            r_stale = 0;
+            r_wait  = 0;
+            rw_addr = 0;
+            rw_word = 0;
         } else {
             r_out = 0;
 
             if i_hold {
-                w_busy = 0;
-                r_busy = 0;
+                w_busy  = 0;
+                r_busy  = 0;
+                r_stale = 0;
+                r_wait  = 0;
             } else {
                 if !w_busy && i_hwe {
                     w_busy  = 1;
@@ -157,19 +176,42 @@ pub module axi_host::<PKG: $std::axi4_prototype> #(
                     }
                 }
 
+                // The window waits for one read at a time, so the one it gave
+                // up on is the waiting one if there is, else the open one.
+                if i_rd_abort {
+                    if r_wait {
+                        r_wait = 0;
+                    } else if r_busy {
+                        r_stale = 1;
+                    }
+                }
                 if !r_busy && i_hre {
                     r_busy  = 1;
                     ar_done = 0;
                     r_addr  = byte_addr;
                     r_word  = word;
+                } else if !r_busy && r_wait && !i_rd_abort {
+                    r_busy  = 1;
+                    ar_done = 0;
+                    r_addr  = rw_addr;
+                    r_word  = rw_word;
+                    r_wait  = 0;
                 } else {
+                    if r_busy && i_hre {
+                        r_wait  = 1;
+                        rw_addr = byte_addr;
+                        rw_word = word;
+                    }
                     if axi.arvalid && axi.arready {
                         ar_done = 1;
                     }
                     if r_busy && axi.rvalid && axi.rready {
-                        r_busy = 0;
-                        r_data = axi.rdata[r_word * 32+:32];
-                        r_out  = 1;
+                        r_busy  = 0;
+                        r_stale = 0;
+                        if !r_stale && !(i_rd_abort && !r_wait) {
+                            r_data = axi.rdata[r_word * 32+:32];
+                            r_out  = 1;
+                        }
                     }
                 }
             }

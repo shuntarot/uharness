@@ -98,6 +98,7 @@ module test_axil {
         // The watchdog is off (`TIMEOUT` defaults to 0), so this stays 0.
         // `tb_axil_timeout` tests the watchdog when it is on.
         o_timeouts: touts ,
+        o_rd_abort: _     ,
     );
 
     initial {

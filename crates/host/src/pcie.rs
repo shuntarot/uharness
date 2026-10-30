@@ -521,7 +521,7 @@ impl Bar {
             match frame.op {
                 crate::frame::Op::Write => self.write32(frame.addr, frame.wdata)?,
                 crate::frame::Op::Read => values.push(self.read32(frame.addr)?),
-                crate::frame::Op::Nop => {}
+                crate::frame::Op::Nop | crate::frame::Op::Resync => {}
             }
         }
         Ok(crate::bridge::Reads::new(values))

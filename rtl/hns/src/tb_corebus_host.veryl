@@ -1,7 +1,8 @@
 /// `hns::corebus_host` against a pzcorebus CSR slave written in plain wires:
 /// each window access is one command, a write is answered (non-posted), a read
 /// that comes during a write waits for it, and nothing reaches the slave while
-/// it is held in reset.
+/// it is held in reset. A read the window gave up on does not answer the
+/// next one.
 #[test(corebus_host_makes_one_command_per_access)]
 module test_corebus_host {
     inst clk: $tb::clock_gen;
@@ -15,6 +16,7 @@ module test_corebus_host {
     var rvalid: logic    ;
     var wready: logic    ;
     var hold  : logic    ;
+    var abort : logic    ;
 
     var mcmd_valid : logic    ;
     var mcmd       : logic<4> ;
@@ -50,16 +52,20 @@ module test_corebus_host {
         i_hre         : re         ,
         o_hrdata      : rdata      ,
         o_hrvalid     : rvalid     ,
+        i_rd_abort    : abort      ,
         o_hwready     : wready     ,
     );
 
     // The slave: 64 words. It takes a command when it has no answer pending,
-    // and answers on the next cycle. It counts what it was given.
-    var mem   : logic<32> [64];
-    var reads : logic<32>     ;
-    var writes: logic<32>     ;
+    // and answers on the next cycle, or 50 cycles later at word 0x30 (slower
+    // than the window waits). It counts what it was given.
+    var mem    : logic<32> [64];
+    var reads  : logic<32>     ;
+    var writes : logic<32>     ;
+    var delay  : logic<8>      ;
+    var rvalids: logic<32>     ;
 
-    assign scmd_accept = !sresp_valid;
+    assign scmd_accept = !sresp_valid && delay == 0;
 
     always_ff (clk, rst) {
         if_reset {
@@ -67,15 +73,29 @@ module test_corebus_host {
             sdata       = 0;
             reads       = 0;
             writes      = 0;
+            delay       = 0;
+            rvalids     = 0;
         } else {
             sresp_valid = 0;
-            if mcmd_valid && scmd_accept {
-                sresp_valid = 1;
+            if rvalid {
+                rvalids = rvalids + 1;
+            }
+            if delay != 0 {
+                delay = delay - 1;
+                if delay == 1 {
+                    sresp_valid = 1;
+                }
+            } else if mcmd_valid && scmd_accept {
                 if mcmd == 4'b1001 {
                     sdata = mem[maddr[7:2]];
                     reads = reads + 1;
                 } else if mcmd == 4'b1100 {
                     writes = writes + 1;
+                }
+                if maddr[7:2] == 6'h30 {
+                    delay = 50;
+                } else {
+                    sresp_valid = 1;
                 }
             }
         }
@@ -116,7 +136,7 @@ module test_corebus_host {
         re   = 1;
         clk.next(1);
         re = 0;
-        for _i in 0..64 {
+        for _i in 0..128 {
             if rvalid {
                 break;
             }
@@ -127,9 +147,10 @@ module test_corebus_host {
     }
 
     initial {
-        we   = 0;
-        re   = 0;
-        hold = 0;
+        we    = 0;
+        re    = 0;
+        hold  = 0;
+        abort = 0;
         rst.assert(4);
         clk.next(4);
 
@@ -166,6 +187,25 @@ module test_corebus_host {
         hold = 0;
         clk.next(8);
         $assert(reads == 3 && writes == 3);
+
+        // A read of the slow word, given up by the window (its timeout) while
+        // the slave still owes the answer. The next read gets its own value,
+        // and only one answer comes out.
+        put(6'h30, 32'h3030_3030);
+        clk.next(60);
+        addr = 6'h30;
+        re   = 1;
+        clk.next(1);
+        re = 0;
+        clk.next(5);
+        abort = 1;
+        clk.next(1);
+        abort = 0;
+        get(6'h04);
+        $display("after the given-up read: got=%h answers=%d", got, rvalids);
+        $assert(got == 32'h1111_0000);
+        clk.next(80);
+        $assert(rvalids == 4);
 
         $finish();
     }

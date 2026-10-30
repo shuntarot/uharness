@@ -57,6 +57,10 @@ pub module axil #(
     /// "just happened" cannot be told from "happened once at start-up". A
     /// timeout during calibration is almost certain, so this matters.
     i_clear   : input  logic          ,
+    /// A read is ended by timeout this cycle. A terminator that may still
+    /// answer it later (a DUT slave behind `corebus_host`) must drop that
+    /// answer: the window is waiting for the next read by then.
+    o_rd_abort: output logic          ,
     /// Number of transactions ended by timeout (saturating counter).
     ///
     /// This keeps a timeout from looking like a plain 0. A host over PCIe
@@ -123,6 +127,7 @@ pub module axil #(
     assign o_wdata = i_wdata;
     assign o_we    = wr_go & wr_ok;
     assign o_re    = rd_go & rd_ok;
+    assign o_rd_abort = rd_kill;
 
     always_ff {
         if_reset {

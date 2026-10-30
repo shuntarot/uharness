@@ -12,6 +12,10 @@
 /// No transfer starts, the one on the bus is dropped, and window accesses are
 /// not taken: the window times out on them instead. Nothing waits for the
 /// slave, so a late answer cannot be taken for a later read.
+///
+/// When the window gives up on a read (`i_rd_abort`, its timeout), a read
+/// that has not started is forgotten, and one on the bus runs to its end but
+/// its data is dropped, for the same reason.
 pub module apb_host #(
     /// Bits of the slave's byte address.
     param ADDR_BITS: u32 = 9,
@@ -31,6 +35,8 @@ pub module apb_host #(
     o_rdata: output logic<32>,
     /// One cycle, when a read is done.
     o_rvalid: output logic,
+    /// The window gave up on its read. Connect to `o_rd_abort` of `hns::axil`.
+    i_rd_abort: input logic,
     /// The bus is free, so a write can be taken.
     o_wready: output logic,
 
@@ -53,11 +59,13 @@ pub module apb_host #(
     // A read that came while the bus was busy.
     var rd_wait: logic           ;
     var rd_addr: logic<ADDR_BITS>;
+    // The read on the bus was given up by the window: drop its data.
+    var stale  : logic           ;
 
     let idle: logic = !o_psel;
     let done: logic = o_psel && o_penable && i_pready && !i_hold;
     // A read starts now: one just asked for, or one that waited.
-    let rd_now: logic = idle && !i_hold && (i_re || rd_wait);
+    let rd_now: logic = idle && !i_hold && (i_re || (rd_wait && !i_rd_abort));
 
     assign o_wready = idle && !rd_wait && !i_re && !i_hold;
 
@@ -65,6 +73,7 @@ pub module apb_host #(
         if_reset {
             rd_wait   = 0;
             rd_addr   = 0;
+            stale     = 0;
             o_psel    = 0;
             o_penable = 0;
             o_pwrite  = 0;
@@ -75,12 +84,22 @@ pub module apb_host #(
             o_slverrs = 0;
         } else {
             o_rvalid = 0;
+            // The window waits for one read at a time, so the one it gave up
+            // on is the waiting one if there is, else the one on the bus.
+            if i_rd_abort {
+                if rd_wait {
+                    rd_wait = 0;
+                } else if o_psel && !o_pwrite {
+                    stale = 1;
+                }
+            }
             if i_re && !idle {
                 rd_wait = 1;
                 rd_addr = i_addr;
             }
             if i_hold {
                 rd_wait   = 0;
+                stale     = 0;
                 o_psel    = 0;
                 o_penable = 0;
             } else if rd_now {
@@ -103,7 +122,8 @@ pub module apb_host #(
                 if i_pslverr && o_slverrs != '1 {
                     o_slverrs += 1;
                 }
-                if !o_pwrite {
+                stale = 0;
+                if !o_pwrite && !stale && !(i_rd_abort && !rd_wait) {
                     o_rdata  = i_prdata;
                     o_rvalid = 1;
                 }

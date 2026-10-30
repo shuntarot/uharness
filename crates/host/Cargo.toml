@@ -15,14 +15,24 @@ hns-targets = {version = "0.1.0", path = "../targets"}
 nusb = "0.2.7"
 # mmap of a BAR (`pcie.rs`), and the raw terminal of `hio cpu boot`.
 libc = "0.2"
-clap   = {version = "4.6", features = ["derive", "env"]}
-clap_complete = "4.6"
-miette = {version = "7.6", features = ["fancy"]}
+# The `hio` CLI only. A program that uses this crate as a library turns
+# them off with `default-features = false`.
+clap   = {version = "4.6", features = ["derive", "env"], optional = true}
+clap_complete = {version = "4.6", optional = true}
+miette = {version = "7.6", features = ["fancy"], optional = true}
 # Rust symbol names at the debug prompt.
-rustc-demangle = "0.1"
+rustc-demangle = {version = "0.1", optional = true}
 # The INFO message of HNS2.
 serde      = {version = "1.0", features = ["derive"]}
 serde_json = "1.0"
+
+[features]
+default = ["cli"]
+cli     = ["dep:clap", "dep:clap_complete", "dep:miette", "dep:rustc-demangle"]
+
+[[bin]]
+name              = "hio"
+required-features = ["cli"]
 
 [dev-dependencies]
 # The `pcie.rs` tests build a fake sysfs to run the BAR path without a board.
