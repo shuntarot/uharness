@@ -499,12 +499,33 @@ fn print_bundles(plan: &crate::plan::Plan) {
                 (None, Some(_)) => "write",
                 (None, None) => "-",
             };
-            format!(
-                " depth={}{} width={} transfer-level {ports}",
-                mem.depth,
-                defaulted(!mem.depth_defaulted),
-                mem.data_width
-            )
+            match mem.aperture.filter(|_| mem.is_host()) {
+                Some(aperture) if mem.axi.is_some() => {
+                    let dut_base = mem
+                        .axi
+                        .as_ref()
+                        .map(|axi| axi.dut_base)
+                        .filter(|base| *base != 0)
+                        .map(|base| format!(" dut_base={base:#x}"))
+                        .unwrap_or_default();
+                    format!(
+                        " aperture={} data={} bytes AXI4 in host memory{dut_base}",
+                        size_str(u64::from(aperture)),
+                        mem.data_width / 8
+                    )
+                }
+                Some(aperture) => format!(
+                    " aperture={} width={} transfer-level {ports} in host memory",
+                    size_str(u64::from(aperture)),
+                    mem.data_width
+                ),
+                None => format!(
+                    " depth={}{} width={} transfer-level {ports}",
+                    mem.depth,
+                    defaulted(!mem.depth_defaulted),
+                    mem.data_width
+                ),
+            }
         } else if let Some(slave) = plan.slaves.iter().find(|s| s.bundle == binding.bundle) {
             format!(
                 " addr={} bits width={}{}",
@@ -847,7 +868,7 @@ fn print_summary(plan: &plan::Plan, emit_regs: Option<&Path>) {
             .or_else(|| {
                 plan.host_mems
                     .iter()
-                    .find(|mem| mem.bundle == binding.bundle)
+                    .find(|mem| mem.bundle == binding.bundle && !mem.is_host())
                     .map(|mem| (u64::from(mem.depth), mem.depth_defaulted, false))
             });
         if let Some((depth, defaulted, dram)) = depth {

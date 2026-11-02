@@ -1,0 +1,20 @@
+[dut]
+module = "dut_top"
+
+[clock.i_clk]
+freq_mhz = 100
+
+[bundle.ctl]
+backing  = "reg"
+ports    = ["i_addr", "i_wdata", "i_start_wr", "i_start_rd", "i_sweep",
+            "o_rdata", "o_busy", "o_reads", "o_writes", "o_resp"]
+
+# The same AXI4 master on host memory, over PCIe: only `backing` changes, and
+# `aperture` says how many bytes of host memory the DUT may reach. The host
+# hands over one huge page (2 MB on most machines) while `hio` runs.
+#
+#   veryl harness gen --config Harness.hostmem.toml --target <board> --transport pcie -o hns/<board>_hostmem
+[bundle.mem]
+backing  = "host_mem"
+aperture = "2M"
+ports    = ["axi"]

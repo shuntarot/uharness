@@ -48,6 +48,7 @@ HNS2 closes it without an answer.
 | `0x02` | `FINISH` | empty |
 | `0x03` | `PROGRAM` | `erase_wait_ms: u32`, `map_len: u32`, `map_len` bytes of regs.json, then the bitstream |
 | `0x04` | `FILE` | `name_len: u32`, `name_len` bytes of the name (UTF-8), then the contents |
+| `0x05` | `HOSTMEM` | `op: u8`, `name_len: u32`, the bundle name (UTF-8), `at: u64`, `len: u32`, then `len` bytes for a write |
 
 An op is 9 bytes: `op: u8`, `addr: u32`, `data: u32`.
 
@@ -91,6 +92,26 @@ for. `hio serve` over JTAG on a Zynq-7000 asks for `ps7_init.tcl` and sets the
 PS up from it after programming, as `hio program` does with the file beside
 the bitstream. A design that uses the PS's memory is refused without it.
 
+`HOSTMEM` reaches the host memory of a `host_mem` bundle, in the memory of
+the server's machine. The name `dma` stands for the DMA gate of a design that
+has one (`dma_base`): its page is where descriptors move data to and from, and
+the server sets the gate to it. `op`:
+
+- 1 attach: the server takes a page, points the bundle at it and switches it
+  on. The answer is `BYTES` with the page size and its bus address, `u64`
+  each.
+- 2 detach: the server switches the bundle off (closes the gate), waits for
+  its last command, and frees the page.
+- 3 read: `len` bytes at offset `at` of the page. The answer is `BYTES` with
+  them.
+- 4 write: the `len` bytes that follow, at offset `at`.
+
+`at` and `len` are 0 for attach and detach. One `HOSTMEM` moves at most 4 MB;
+a client cuts a longer move. The server answers `BYTES`, empty for detach and
+write, or `ERROR`. A page given to a client is taken back, in the same order
+as detach, when that client leaves, however it leaves. A server without host
+memory (a simulation, JTAG) answers `ERROR`.
+
 ### Server to client
 
 | kind | name | body |
@@ -98,6 +119,7 @@ the bitstream. A design that uses the PS's memory is refused without it.
 | `0x80` | `INFO` | a JSON object, UTF-8 |
 | `0x81` | `READS` | `count: u32`, then `count` x `data: u32` |
 | `0x82` | `ERROR` | `op: u32`, `resp: u8`, then a message, UTF-8 |
+| `0x83` | `BYTES` | the bytes, as many as the body holds |
 
 `READS` has one value per read op of the batch, in order. Writes have none.
 
@@ -127,6 +149,16 @@ whether to go on.
 
 A client ignores keys it does not know. `master` matters for windows with a
 movable base: there is one base register per master.
+
+## What a client may not write
+
+Over PCIe, `hio serve` keeps to itself the registers that point the card at
+host memory: `<bundle>_base` and `<bundle>_on` of each `host_mem` bundle, and
+`dma_base` / `dma_size` of the DMA gate. The card writes any physical address
+it is given, so a client that wrote them could write the server machine's
+memory anywhere. A `BATCH` that writes one is answered with `ERROR` (`op`
+`0xffffffff`), and none of its ops run. Reading them is allowed. The server
+switches the bundles off and closes the gate when it starts.
 
 ## One client at a time
 

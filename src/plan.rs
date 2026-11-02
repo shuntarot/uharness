@@ -43,7 +43,8 @@ pub struct Plan {
     /// `bram` / `bram_preload` terminators, sorted by bundle name.
     pub memories: Vec<MemPlan>,
 
-    /// `host_mem` terminators. For now only where a BRAM can stand in.
+    /// Transfer-level memories (`bram` through `hns::hmem`), and every
+    /// `host_mem`.
     pub host_mems: Vec<HostMemPlan>,
 
     /// Addressable slave interfaces of the DUT, sorted by bundle name.
@@ -302,15 +303,37 @@ pub enum PlanError {
     )]
     RegionEntryRagged { bundle: String, entry_width: usize },
 
-    /// Host memory needs a PCIe requester for the DUT, which does not exist yet.
-    #[error("[bundle.{bundle}] asks for real host memory, which is not generated yet")]
+    /// Host memory is reached through a port that can wait.
+    #[error(
+        "[bundle.{bundle}] is `host_mem` but has neither the transfer-level roles nor an AXI4 master"
+    )]
     #[diagnostic(
-        code(harness::plan::host_mem_not_generated),
+        code(harness::plan::host_mem_needs_transfer_roles),
         help(
-            "Reaching host memory needs a PCIe requester for the DUT, which is not built yet. A BRAM in the FPGA takes the same ports:\n\n    [bundle.{bundle}]\n    backing = \"bram\"\n\nKeep the `rd_*` / `wr_*` roles as they are."
+            "Host memory is far away, so the DUT asks for it and waits. Give the bundle an AXI4 master port:\n\n    ports = [\"m_axi\"]\n\nor name the transfer-level roles in `ports`, for example:\n\n    ports = {{ rd_cmd_valid = \"o_cmd_valid\", rd_cmd_ready = \"i_cmd_ready\",\n              rd_cmd_addr = \"o_cmd_addr\", rd_cmd_size = \"o_cmd_size\",\n              rd_valid = \"i_rd_valid\", rd_ready = \"o_rd_ready\",\n              rd_data = \"i_rd_data\", rd_last = \"i_rd_last\", rd_error = \"i_rd_error\" }}"
         )
     )]
-    HostMemNotGenerated { bundle: String },
+    HostMemNeedsTransferRoles { bundle: String },
+
+    /// The DMA engine serves one `host_mem` bundle.
+    #[error("[bundle.{first}] and [bundle.{second}] both reach host memory")]
+    #[diagnostic(
+        code(harness::plan::host_mem_more_than_one),
+        help(
+            "The harness has one PCIe DMA engine, and it serves one `host_mem` bundle for now. Give the DUT one port to host memory, or put the other on `backing = \"bram\"`."
+        )
+    )]
+    HostMemMoreThanOne { first: String, second: String },
+
+    /// The DMA engine would need to be shared, which is not built yet.
+    #[error("[bundle.{host_mem}] reaches host memory, and [bundle.{dram}] has the card's DMA")]
+    #[diagnostic(
+        code(harness::plan::host_mem_with_dram_dma),
+        help(
+            "With `dram` over PCIe, the harness uses its DMA engine for `hio load` / `memtest`. Sharing it with `host_mem` is not built yet. Put [bundle.{host_mem}] on `backing = \"bram\"` (the same ports), or use the `dram` design without `host_mem`."
+        )
+    )]
+    HostMemWithDramDma { host_mem: String, dram: String },
 }
 
 /// Resolves the manifest and the DUT, and runs every check.
@@ -613,9 +636,24 @@ fn generatable(plan: &Plan) -> Result<(), PlanError> {
 
     for binding in &plan.bindings {
         let backing = plan.loaded.manifest.bundle[&binding.bundle].backing;
-        if backing.is_host_mem() {
-            return Err(PlanError::HostMemNotGenerated {
+        if backing.is_host_mem() && !plan.host_mems.iter().any(|h| h.bundle == binding.bundle) {
+            return Err(PlanError::HostMemNeedsTransferRoles {
                 bundle: binding.bundle.clone(),
+            });
+        }
+    }
+    let mut hosts = plan.host_mems.iter().filter(|h| h.is_host());
+    if let Some(first) = hosts.next() {
+        if let Some(second) = hosts.next() {
+            return Err(PlanError::HostMemMoreThanOne {
+                first: first.bundle.clone(),
+                second: second.bundle.clone(),
+            });
+        }
+        if let Some(dram) = &plan.registers.requester {
+            return Err(PlanError::HostMemWithDramDma {
+                host_mem: first.bundle.clone(),
+                dram: dram.clone(),
             });
         }
     }

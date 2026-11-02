@@ -110,7 +110,7 @@ Sizes accept a suffix: `4k`, `256M` (1024-based). `depth`, `aperture`,
 | `bram` | FPGA memory | works |
 | `bram_preload` | FPGA memory the host fills and the DUT only reads | works |
 | `dram` | the board's DRAM | works |
-| `host_mem` | host memory | not yet (needs a PCIe requester for the DUT) |
+| `host_mem` | the host's memory, over PCIe | works; request / response or AXI4, one bundle |
 | `host_irq` | the DUT's interrupt line, sent to the host as INTA (PCIe) | works; one 1-bit output, at most one bundle |
 | `pcie_flr` | the host's Function Level Reset, handed to the DUT (PCIe) | works; one 1-bit input, optionally one 1-bit done output |
 
@@ -143,6 +143,7 @@ Which combinations exist today, by the shapes above:
 | `bram` | | ✅ | | ✅ | | ✅ | |
 | `bram_preload` | | ✅ read only | | | | | |
 | `dram` | | | | ✅ | | ✅ | |
+| `host_mem` | | | | ✅ | | ✅ | |
 | `host_irq` | ✅ | | | | | | |
 | `pcie_flr` | ✅ | | | | | | |
 
@@ -157,11 +158,23 @@ the backings differ only in who holds the memory: with `bram` and
   request / response. A RAM port cannot wait, so it cannot use `dram`.
 - `host_irq` and `pcie_flr` need the PCIe transport: one 1-bit port (plus a
   1-bit done output for `pcie_flr`), at most one bundle each.
-- `host_mem` is accepted by `check` but not generated yet.
+- `host_mem` needs the PCIe transport and `aperture`: the bytes of host memory
+  the DUT may reach, a multiple of 4 KB and at most one huge page (2 MB on most
+  machines). The DUT addresses them from 0. While `hio` holds the page
+  (`hio hostmem attach`), the harness adds its bus address; before that, and
+  past `aperture`, a command ends with an error. A write stores only its
+  strobed bytes, and they must be one run in each 4 KB page: a PCIe write has
+  byte enables only at its two ends, so a write with a gap is refused with an
+  error (a CPU never makes one). It cannot be combined with a `dram` over PCIe
+  yet.
+- `host_mem` on AXI4 takes INCR and WRAP bursts at the bus width, and single
+  narrow transfers. FIXED and narrow bursts are answered with SLVERR and
+  counted in `<bundle>_refused`. `dut_base` moves the memory as it does for
+  `bram` / `dram`.
 
 **On an AXI4 or a request / response port, moving from `bram` to `dram` is one
 word in the manifest** — the DUT does not change (`dram` also needs
-`aperture`).
+`aperture`). The same goes for `host_mem`.
 
 #### ports and roles
 

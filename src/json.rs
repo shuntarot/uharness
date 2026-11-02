@@ -959,8 +959,9 @@ pub fn ok(
                         depth: mem.depth,
                         depth_declared: !mem.depth_defaulted,
                         data_width: mem.data_width,
-                        read: mem.read.is_some(),
-                        write: mem.write.is_some(),
+                        // An AXI4 master both reads and writes.
+                        read: mem.read.is_some() || mem.axi.is_some(),
+                        write: mem.write.is_some() || mem.axi.is_some(),
                     }),
                 slave: plan
                     .slaves

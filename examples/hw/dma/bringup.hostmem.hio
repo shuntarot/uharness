@@ -1,0 +1,72 @@
+# dma on host memory -- sudo hio -p run bringup.hostmem.hio
+# The same DUT and the same copies as bringup.dram.hio, in the host's own
+# memory. `hostmem attach` hands the DUT one huge page for as long as this
+# file runs; the host fills it and reads it back directly.
+
+echo == identity ==
+id
+read hmem_aperture
+
+echo == hand the DUT a page of host memory ==
+hostmem attach hmem
+hostmem load hmem pattern.bin
+
+echo == copy four beats ==
+write i_addr 0 0
+write i_dst 64 0
+write i_size 32
+write i_start 1
+write i_start 0
+# Over PCIe the next read comes right away; give the copy time to finish.
+sleep 10
+# 0, 4, 10
+read o_busy
+read o_beats
+read o_sum
+read o_errors
+# 1 0 2 0 3 0 4 0
+hostmem read hmem 64 8
+
+echo == copy 300 beats: across a page to read, across another to write ==
+# ramp.bin holds the 64-bit values 1 to 300. It is read from byte 8192, which
+# runs past the page at 8192 + 4096, and written to byte 16000, across the
+# page edge at 16384.
+hostmem load hmem ramp.bin --at 8192
+write i_addr 8192 0
+write i_dst 16000 0
+write i_size 2400
+write i_start 1
+write i_start 0
+sleep 10
+# 0, 300 (0x12c), 45150 (0xb05e)
+read o_busy
+read o_beats
+read o_sum
+read o_errors
+# 1 0, then 48 0 49 0 on either side of 16384, then 300 0
+hostmem read hmem 16000 2
+hostmem read hmem 16376 4
+hostmem read hmem 18392 2
+
+echo == past the end: 2 beats inside, 2 refused ==
+# The DUT reaches 2 MB. A read of 32 bytes from 16 bytes before the end
+# returns two good beats and two error beats.
+write i_addr 0x1ffff0 0
+write i_dst 0 0
+write i_size 32
+write i_start 1
+write i_start 0
+sleep 10
+# errors: 2 read beats, and the write of the same 4 beats is fine
+read o_beats
+read o_errors
+
+echo == what the port counted ==
+# 1 (the read past the end), 0, 0 0, 0
+read hmem_oor
+read hmem_failed
+read hmem_rd_code
+read hmem_wr_code
+read hmem_busy
+read dma_rc_cor
+read dma_rc_uncor

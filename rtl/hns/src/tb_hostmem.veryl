@@ -1,0 +1,677 @@
+/// `hns::hostmem` serves the transfer-level port from host memory, through a
+/// model of the borrowed DMA engines.
+///
+/// The model moves bytes between a host memory array and the AXI side of
+/// `hns::hostmem`, one descriptor at a time, as `hns::dma_rd` and
+/// `hns::dma_wr` do. The checks are on that array: what the DUT read must be
+/// what the host holds, and what the DUT wrote must land there, at the right
+/// bytes and nowhere else. Strobes are on, as an AXI4 DUT needs them.
+#[test(hostmem_reaches_host_memory_through_the_engine)]
+module test_hostmem {
+    const DW      : u32     = 64;
+    const APERTURE: bit<64> = 64'h2000; // two pages
+    const BASE    : bit<64> = 64'h1_0000_0000; // bus address of the buffer
+    /// 16 KB of host memory: twice the aperture, so a write past the end shows.
+    const WORDS: u32 = 2048;
+    /// The error code the model reports when told to fail.
+    const CODE: bit<4> = 4'd10;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    inst bus: $std::axi4_if::<$std::axi4_pkg::<64, 32, 4, 1, 1, 1, 1, 1>>;
+
+    var on: logic;
+
+    var rd_cmd_valid: logic    ;
+    var rd_cmd_ready: logic    ;
+    var rd_cmd_addr : logic<64>;
+    var rd_cmd_size : logic<32>;
+    var rd_valid    : logic    ;
+    var rd_ready    : logic    ;
+    var rd_data     : logic<64>;
+    var rd_last     : logic    ;
+    var rd_error    : logic    ;
+
+    var wr_cmd_valid : logic    ;
+    var wr_cmd_ready : logic    ;
+    var wr_cmd_addr  : logic<64>;
+    var wr_cmd_size  : logic<32>;
+    var wr_valid     : logic    ;
+    var wr_ready     : logic    ;
+    var wr_data      : logic<64>;
+    var wr_strb      : logic<8> ;
+    var wr_done      : logic    ;
+    var wr_done_error: logic    ;
+
+    var rd_desc_pcie: logic<64>;
+    var rd_desc_axi : logic<64>;
+    var rd_desc_len : logic<20>;
+    var rd_desc_v   : logic    ;
+    var rd_desc_r   : logic    ;
+    var rd_st_v     : logic    ;
+    var wr_desc_pcie: logic<64>;
+    var wr_desc_axi : logic<64>;
+    var wr_desc_len : logic<20>;
+    var wr_desc_v   : logic    ;
+    var wr_desc_r   : logic    ;
+    var wr_st_v     : logic    ;
+
+    var oor    : logic<32>;
+    var failed : logic<32>;
+    var rd_code: logic<4> ;
+    var wr_code: logic<4> ;
+    var busy   : logic    ;
+
+    // The stimulus drives these; `copy` hands the read beats to the write port
+    // instead, as a DUT that copies does.
+    var copy   : logic    ;
+    var t_valid: logic    ;
+    var t_data : logic<64>;
+    var t_strb : logic<8> ;
+    var fail   : logic    ; // the model reports an error for the next pages
+
+    let st_err: logic<4> = if fail ? CODE : 4'd0;
+
+    assign wr_valid = if copy ? rd_valid : t_valid;
+    assign wr_data  = if copy ? rd_data : t_data;
+    assign wr_strb  = if copy ? 8'hff : t_strb;
+    assign rd_ready = if copy ? wr_ready : 1'b1;
+
+    inst u: hostmem::<$std::axi4_pkg::<64, 32, 4, 1, 1, 1, 1, 1>> #(
+        HAS_STRB: true    ,
+        DW      : DW      ,
+        ADDR_W  : 64      ,
+        SIZE_W  : 32      ,
+        APERTURE: APERTURE,
+    ) (
+        i_clk              : clk          ,
+        i_rst              : rst          ,
+        i_base             : BASE         ,
+        i_on               : on           ,
+        i_rd_cmd_valid     : rd_cmd_valid ,
+        o_rd_cmd_ready     : rd_cmd_ready ,
+        i_rd_cmd_addr      : rd_cmd_addr  ,
+        i_rd_cmd_size      : rd_cmd_size  ,
+        o_rd_valid         : rd_valid     ,
+        i_rd_ready         : rd_ready     ,
+        o_rd_data          : rd_data      ,
+        o_rd_last          : rd_last      ,
+        o_rd_error         : rd_error     ,
+        i_wr_cmd_valid     : wr_cmd_valid ,
+        o_wr_cmd_ready     : wr_cmd_ready ,
+        i_wr_cmd_addr      : wr_cmd_addr  ,
+        i_wr_cmd_size      : wr_cmd_size  ,
+        i_wr_valid         : wr_valid     ,
+        o_wr_ready         : wr_ready     ,
+        i_wr_data          : wr_data      ,
+        i_wr_strb          : wr_strb      ,
+        i_wr_last          : 1'b0         ,
+        o_wr_done_valid    : wr_done      ,
+        o_wr_done_error    : wr_done_error,
+        o_rd_desc_pcie_addr: rd_desc_pcie ,
+        o_rd_desc_axi_addr : rd_desc_axi  ,
+        o_rd_desc_len      : rd_desc_len  ,
+        o_rd_desc_valid    : rd_desc_v    ,
+        i_rd_desc_ready    : rd_desc_r    ,
+        i_rd_status_valid  : rd_st_v      ,
+        i_rd_status_error  : st_err       ,
+        o_wr_desc_pcie_addr: wr_desc_pcie ,
+        o_wr_desc_axi_addr : wr_desc_axi  ,
+        o_wr_desc_len      : wr_desc_len  ,
+        o_wr_desc_valid    : wr_desc_v    ,
+        i_wr_desc_ready    : wr_desc_r    ,
+        i_wr_status_valid  : wr_st_v      ,
+        i_wr_status_error  : st_err       ,
+        s_axi              : bus          ,
+        o_oor              : oor          ,
+        o_failed           : failed       ,
+        o_rd_code          : rd_code      ,
+        o_wr_code          : wr_code      ,
+        o_busy             : busy         ,
+    );
+
+    // ------------------------------------------------------------------
+    // the model of the engines
+    // ------------------------------------------------------------------
+
+    /// What host word `i` holds after reset.
+    function pattern (
+        i: input logic<32>,
+    ) -> logic<64> {
+        return {32'hc0de_0000 | i, i};
+    }
+
+    var host: logic<64> [WORDS];
+    var fill: logic<12>        ;
+
+    /// Byte `b` of a line is part of the transfer `[off, off + len)`.
+    function in_span (
+        b  : input logic<13>,
+        off: input logic<13>,
+        len: input logic<13>,
+    ) -> logic {
+        return b >= off && b <: off + len;
+    }
+
+    // host -> card: one AXI write burst per descriptor
+    var r_phase: logic<3> ;
+    var r_page : logic<64>; // bus address of the page
+    var r_off  : logic<13>;
+    var r_len  : logic<13>;
+    var r_line : logic<8> ;
+    var r_last : logic<8> ;
+
+    assign rd_desc_r = r_phase == 0;
+
+    var r_wdata: logic<256>;
+    var r_wstrb: logic<32> ;
+    always_comb {
+        r_wdata = 0;
+        r_wstrb = 0;
+        for k in 0..4 {
+            r_wdata[k step 64] = host[((r_page - BASE + {r_line, 5'b0} + k * 8) >> 3) & (WORDS - 1)];
+        }
+        for b in 0..32 {
+            r_wstrb[b] = in_span({r_line[6:0], 5'b0} + b, r_off, r_len);
+        }
+    }
+
+    // card -> host: one AXI read burst per descriptor
+    var w_phase: logic<3> ;
+    var w_page : logic<64>;
+    var w_off  : logic<13>;
+    var w_len  : logic<13>;
+    var w_line : logic<8> ;
+
+    assign wr_desc_r = w_phase == 0;
+
+    always_comb {
+        bus.awaddr  = {51'b0, r_off & 13'h1fe0};
+        bus.awlen   = r_last;
+        bus.awid    = 0;
+        bus.awvalid = r_phase == 1;
+        bus.wdata   = r_wdata;
+        bus.wstrb   = r_wstrb;
+        bus.wlast   = r_line == r_last;
+        bus.wvalid  = r_phase == 2;
+        bus.bready  = r_phase == 3;
+        bus.araddr  = {51'b0, w_off & 13'h1fe0};
+        bus.arlen   = ((w_off + w_len - 1) >> 5) - (w_off >> 5);
+        bus.arid    = 0;
+        bus.arvalid = w_phase == 1;
+        bus.rready  = w_phase == 2;
+
+        // Unused by `hns::hostmem`, but every master output needs a driver.
+        bus.awsize   = 3'd5;
+        bus.awburst  = 2'b01;
+        bus.awlock   = 0;
+        bus.awcache  = 0;
+        bus.awprot   = 0;
+        bus.awqos    = 0;
+        bus.awregion = 0;
+        bus.awuser   = 0;
+        bus.wuser    = 0;
+        bus.arsize   = 3'd5;
+        bus.arburst  = 2'b01;
+        bus.arlock   = 0;
+        bus.arcache  = 0;
+        bus.arprot   = 0;
+        bus.arqos    = 0;
+        bus.arregion = 0;
+        bus.aruser   = 0;
+    }
+
+    always_ff (clk, rst) {
+        if_reset {
+            fill    = 0;
+            r_phase = 0;
+            r_page  = 0;
+            r_off   = 0;
+            r_len   = 0;
+            r_line  = 0;
+            r_last  = 0;
+            rd_st_v = 0;
+            w_phase = 0;
+            w_page  = 0;
+            w_off   = 0;
+            w_len   = 0;
+            w_line  = 0;
+            wr_st_v = 0;
+        } else {
+            rd_st_v = 0;
+            wr_st_v = 0;
+
+            // A reset value must be a constant, so the host memory is filled
+            // one word per cycle after the reset instead.
+            if fill <: WORDS {
+                host[fill] = pattern(fill as 32);
+                fill       = fill + 1;
+            }
+
+            case r_phase {
+                0: {
+                    if rd_desc_v {
+                        r_page  = rd_desc_pcie - rd_desc_axi;
+                        r_off   = rd_desc_axi[12:0];
+                        r_len   = rd_desc_len[12:0];
+                        r_line  = 0;
+                        r_last  = (((rd_desc_axi[12:0] + rd_desc_len[12:0] - 1) >> 5) - (rd_desc_axi[12:0] >> 5)) as 8;
+                        r_phase = 1;
+                    }
+                }
+                1: {
+                    if bus.awready {
+                        r_line  = (r_off >> 5) as 8;
+                        r_last  = r_last + (r_off >> 5) as 8;
+                        r_phase = 2;
+                    }
+                }
+                2: {
+                    if bus.wready {
+                        if r_line == r_last {
+                            r_phase = 3;
+                        } else {
+                            r_line = r_line + 1;
+                        }
+                    }
+                }
+                3: {
+                    if bus.bvalid {
+                        rd_st_v = 1;
+                        r_phase = 0;
+                    }
+                }
+                default: {
+                    r_phase = 0;
+                }
+            }
+
+            case w_phase {
+                0: {
+                    if wr_desc_v {
+                        w_page  = wr_desc_pcie - wr_desc_axi;
+                        w_off   = wr_desc_axi[12:0];
+                        w_len   = wr_desc_len[12:0];
+                        w_phase = 1;
+                    }
+                }
+                1: {
+                    if bus.arready {
+                        w_line  = (w_off >> 5) as 8;
+                        w_phase = 2;
+                    }
+                }
+                2: {
+                    if bus.rvalid {
+                        for k in 0..4 {
+                            for b in 0..8 {
+                                if in_span({w_line[6:0], 5'b0} + k * 8 + b, w_off, w_len) {
+                                    host[((w_page - BASE + {w_line, 5'b0} + k * 8) >> 3) & (WORDS - 1)][b step 8] = bus.rdata[(k * 8 + b) step 8];
+                                }
+                            }
+                        }
+                        w_line = w_line + 1;
+                        if bus.rlast {
+                            w_phase = 3;
+                        }
+                    }
+                }
+                3: {
+                    wr_st_v = 1;
+                    w_phase = 0;
+                }
+                default: {
+                    w_phase = 0;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // what the DUT side sees
+    // ------------------------------------------------------------------
+
+    var got     : logic<64> [16];
+    var gerr    : logic<16>     ;
+    var beats   : logic<32>     ;
+    var saw_last: logic         ;
+    var dones   : logic<32>     ;
+    var derrs   : logic<32>     ;
+    var clear   : logic         ;
+
+    always_ff (clk, rst) {
+        if_reset {
+            for i in 0..16 {
+                got[i] = 0;
+            }
+            gerr     = 0;
+            beats    = 0;
+            saw_last = 0;
+            dones    = 0;
+            derrs    = 0;
+        } else {
+            if clear {
+                gerr     = 0;
+                beats    = 0;
+                saw_last = 0;
+            } else if rd_valid && rd_ready {
+                got[beats[3:0]]  = rd_data;
+                gerr[beats[3:0]] = rd_error;
+                beats            = beats + 1;
+                if rd_last {
+                    saw_last = 1;
+                }
+            }
+            if wr_done {
+                dones = dones + 1;
+                if wr_done_error {
+                    derrs = derrs + 1;
+                }
+            }
+        }
+    }
+
+    function read (
+        addr: input logic<64>,
+        size: input logic<32>,
+    ) {
+        clear = 1;
+        clk.next(1);
+        clear        = 0;
+        rd_cmd_addr  = addr;
+        rd_cmd_size  = size;
+        rd_cmd_valid = 1;
+        for _i in 0..64 {
+            if rd_cmd_ready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        rd_cmd_valid = 0;
+        for _i in 0..2000 {
+            if saw_last {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(2);
+    }
+
+    function write_cmd (
+        addr: input logic<64>,
+        size: input logic<32>,
+    ) {
+        wr_cmd_addr  = addr;
+        wr_cmd_size  = size;
+        wr_cmd_valid = 1;
+        for _i in 0..64 {
+            if wr_cmd_ready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        wr_cmd_valid = 0;
+    }
+
+    /// Sends `n` beats; beat `i` is `seed + i`.
+    function send (
+        n   : input logic<32>,
+        seed: input logic<64>,
+    ) {
+        for i in 0..16 {
+            if i == n {
+                break;
+            }
+            t_data  = seed + i;
+            t_valid = 1;
+            for _j in 0..2000 {
+                if wr_ready {
+                    break;
+                }
+                clk.next(1);
+            }
+            clk.next(1);
+        }
+        t_valid = 0;
+    }
+
+    /// Sends one beat with strobes `strb`.
+    function send_one (
+        data: input logic<64>,
+        strb: input logic<8> ,
+    ) {
+        t_data  = data;
+        t_strb  = strb;
+        t_valid = 1;
+        for _j in 0..2000 {
+            if wr_ready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        t_valid = 0;
+        t_strb  = 8'hff;
+    }
+
+    function wait_done (
+        n: input logic<32>,
+    ) {
+        for _i in 0..2000 {
+            if dones == n {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(2);
+    }
+
+    initial {
+        on           = 1;
+        rd_cmd_valid = 0;
+        rd_cmd_addr  = 0;
+        rd_cmd_size  = 0;
+        wr_cmd_valid = 0;
+        wr_cmd_addr  = 0;
+        wr_cmd_size  = 0;
+        copy         = 0;
+        t_valid      = 0;
+        t_data       = 0;
+        t_strb       = 8'hff;
+        fail         = 0;
+        clear        = 0;
+
+        rst.assert(4);
+        clk.next(WORDS + 4);
+
+        // --- 1. four beats from the start of the buffer ---
+        read(0, 32);
+        $display("read: beats=%d got0=%h got3=%h oor=%d", beats, got[0], got[3], oor);
+        $assert(beats == 4);
+        $assert(gerr == 0);
+        $assert(got[0] == pattern(0));
+        $assert(got[3] == pattern(3));
+        $assert(oor == 0);
+
+        // --- 2. across a page: two descriptors, beats in order ---
+        read(4096 - 16, 48);
+        $display("across a page: beats=%d got0=%h got5=%h", beats, got[0], got[5]);
+        $assert(beats == 6);
+        $assert(gerr == 0);
+        $assert(got[0] == pattern(510));
+        $assert(got[2] == pattern(512));
+        $assert(got[5] == pattern(515));
+
+        // --- 3. past the aperture: two beats, then two error beats ---
+        read(8192 - 16, 32);
+        $display("past the end: beats=%d gerr=%h got1=%h oor=%d", beats, gerr, got[1], oor);
+        $assert(beats == 4);
+        $assert(gerr == 16'b1100);
+        $assert(got[1] == pattern(1023));
+        $assert(got[2] == 0);
+        $assert(oor == 1);
+
+        // --- 4. while off, every beat is an error and nothing is requested ---
+        on = 0;
+        read(0, 16);
+        on = 1;
+        $display("off: beats=%d gerr=%h oor=%d", beats, gerr, oor);
+        $assert(beats == 2);
+        $assert(gerr == 16'b11);
+        $assert(oor == 2);
+
+        // --- 5. a page the engine fails: error beats, counted, code kept ---
+        fail = 1;
+        read(64, 16);
+        fail = 0;
+        $display("engine error: beats=%d gerr=%h failed=%d code=%d", beats, gerr, failed, rd_code);
+        $assert(beats == 2);
+        $assert(gerr == 16'b11);
+        $assert(got[0] == 0);
+        $assert(failed == 1);
+        $assert(rd_code == CODE);
+
+        // --- 6. 0 bytes and off a beat boundary end with error beats ---
+        read(0, 0);
+        $assert(beats == 1);
+        $assert(gerr == 16'b1);
+        read(4, 16);
+        $assert(beats == 2);
+        $assert(gerr == 16'b11);
+        $assert(oor == 4);
+
+        // --- 7. a write of three beats lands in host words 8..10. Until the
+        //     beats come, the command is in flight. ---
+        write_cmd(64, 24);
+        $assert(busy == 1);
+        send(3, 64'h5000);
+        wait_done(1);
+        $display("write: dones=%d w8=%h w11=%h", dones, host[8], host[11]);
+        $assert(derrs == 0);
+        $assert(host[8] == 64'h5000);
+        $assert(host[10] == 64'h5002);
+        $assert(host[11] == pattern(11));
+
+        // --- 8. across a page ---
+        write_cmd(4096 - 8, 16);
+        send(2, 64'h6000);
+        wait_done(2);
+        $assert(derrs == 0);
+        $assert(host[511] == 64'h6000);
+        $assert(host[512] == 64'h6001);
+        $assert(host[513] == pattern(513));
+
+        // --- 9. 12 bytes: the last beat is cut, and the bytes after it stay ---
+        write_cmd(128, 12);
+        send(2, 64'h7777_7777_7777_7000);
+        wait_done(3);
+        $display("short write: w16=%h w17=%h", host[16], host[17]);
+        $assert(derrs == 0);
+        $assert(host[16] == 64'h7777_7777_7777_7000);
+        $assert(host[17] == 64'hc0de_0011_7777_7001);
+
+        // --- 10. past the aperture: one beat stored, one taken and dropped ---
+        write_cmd(8192 - 8, 16);
+        send(2, 64'h8000);
+        wait_done(4);
+        $display("write past the end: derrs=%d w1023=%h w1024=%h oor=%d", derrs, host[1023], host[1024], oor);
+        $assert(derrs == 1);
+        $assert(host[1023] == 64'h8000);
+        $assert(host[1024] == pattern(1024));
+        $assert(oor == 5);
+
+        // --- 11. a 0-byte write ends at once, with an error ---
+        write_cmd(0, 0);
+        wait_done(5);
+        $assert(derrs == 2);
+        $assert(oor == 6);
+
+        // --- 12. a copy: the read and the write run at once, the write fed
+        //     only by the read. A design that served one command at a time
+        //     would deadlock here. ---
+        copy = 1;
+        clear = 1;
+        clk.next(1);
+        clear        = 0;
+        rd_cmd_addr  = 4096 - 32;
+        rd_cmd_size  = 64;
+        rd_cmd_valid = 1;
+        wr_cmd_addr  = 4096 + 512;
+        wr_cmd_size  = 64;
+        wr_cmd_valid = 1;
+        // Both walkers are idle, so both commands are taken at this edge.
+        clk.next(1);
+        rd_cmd_valid = 0;
+        wr_cmd_valid = 0;
+        wait_done(6);
+        copy = 0;
+        $display("copy: w576=%h w583=%h derrs=%d", host[576], host[583], derrs);
+        $assert(derrs == 2);
+        $assert(host[576] == pattern(508));
+        $assert(host[583] == pattern(515));
+        $assert(host[584] == pattern(584));
+        // Nothing is left in flight once both commands are done.
+        $assert(busy == 0);
+
+        // --- 13. a one-byte store: only the strobed byte changes ---
+        write_cmd(256, 8);
+        send_one(64'h0000_0000_aa00_0000, 8'b0000_1000);
+        wait_done(7);
+        $display("byte store: w32=%h", host[32]);
+        $assert(derrs == 2);
+        $assert(host[32] == 64'hc0de_0020_aa00_0020);
+
+        // --- 14. one run over two beats: bytes 4 to 9 ---
+        write_cmd(272, 16);
+        send_one(64'h1111_2222_3333_4444, 8'b1111_0000);
+        send_one(64'h5555_6666_7777_8888, 8'b0000_0011);
+        wait_done(8);
+        $display("run: w34=%h w35=%h", host[34], host[35]);
+        $assert(derrs == 2);
+        $assert(host[34] == 64'h1111_2222_0000_0022);
+        $assert(host[35] == 64'hc0de_0023_0000_8888);
+
+        // --- 15. a hole between beats: nothing is written, and it is an
+        //     error counted with the rest ---
+        write_cmd(304, 16);
+        send_one(64'h1, 8'b0000_0001);
+        send_one(64'h1, 8'b0000_0001);
+        wait_done(9);
+        $display("hole: derrs=%d oor=%d w38=%h", derrs, oor, host[38]);
+        $assert(derrs == 3);
+        $assert(oor == 7);
+        $assert(host[38] == pattern(38));
+        $assert(host[39] == pattern(39));
+
+        // --- 16. a hole inside one beat ---
+        write_cmd(320, 8);
+        send_one(64'h1, 8'b1000_0001);
+        wait_done(10);
+        $assert(derrs == 4);
+        $assert(oor == 8);
+        $assert(host[40] == pattern(40));
+
+        // --- 17. no byte strobed: done, nothing written, no error ---
+        write_cmd(336, 8);
+        send_one(64'h1, 8'b0000_0000);
+        wait_done(11);
+        $assert(derrs == 4);
+        $assert(oor == 8);
+        $assert(host[42] == pattern(42));
+
+        // --- 18. across a page: one run on each side ---
+        write_cmd(4096 - 8, 16);
+        send_one(64'haaaa_bbbb_cccc_dddd, 8'b1111_0000);
+        send_one(64'heeee_ffff_1234_5678, 8'b0000_1111);
+        wait_done(12);
+        $display("strobes across a page: w511=%h w512=%h", host[511], host[512]);
+        $assert(derrs == 4);
+        $assert(host[511] == 64'haaaa_bbbb_0000_6000);
+        $assert(host[512] == 64'h0000_0000_1234_5678);
+        $assert(busy == 0);
+    }
+
+}

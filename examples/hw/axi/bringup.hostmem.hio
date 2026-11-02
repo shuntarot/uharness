@@ -1,0 +1,66 @@
+# axi on host memory -- sudo hio -p run bringup.hostmem.hio
+#
+# The same DUT and the same steps as bringup.hio, with the memory in the
+# host. `hostmem attach` hands the DUT one huge page for as long as this file
+# runs; the host reaches it directly, not through the card.
+
+echo == identity ==
+id
+read mem_aperture
+
+echo == hand the DUT a page of host memory ==
+hostmem attach mem
+
+echo == the DUT reads what the host wrote ==
+hostmem write mem 0 0xdeadbeef 0x00c0ffee
+# Byte address 4 -> the second word. o_rdata has to come back 0x00c0ffee.
+write i_addr 4
+write i_start_rd 1
+write i_start_rd 0
+sleep 1
+read o_busy
+read o_rdata
+read o_reads
+
+echo == the host reads what the DUT wrote ==
+# The DUT writes 0x5a5a0001 at byte address 8, and 0x5a5a0002 at the last
+# word of the first 4 KB page.
+write i_addr 8
+write i_wdata 0x5a5a0001
+write i_start_wr 1
+write i_start_wr 0
+write i_addr 4092
+write i_wdata 0x5a5a0002
+write i_start_wr 1
+write i_start_wr 0
+sleep 1
+read o_writes
+hostmem read mem 0 4
+hostmem read mem 4092
+
+echo == nothing was refused ==
+# 0 is OKAY.
+read o_resp
+
+echo == the DUT reads continuously ==
+# o_reads has to keep moving while the sweep runs.
+write i_sweep 1
+read o_reads
+sleep 10
+read o_reads
+write i_sweep 0
+sleep 1
+read o_resp
+
+echo == past the end of host memory ==
+# The DUT reaches 2 MB. A read just past it is answered with SLVERR (2),
+# and the port counts it.
+write i_addr 0x200000
+write i_start_rd 1
+write i_start_rd 0
+sleep 1
+read o_resp
+read mem_oor
+read mem_refused
+read mem_failed
+read mem_busy
