@@ -268,7 +268,7 @@ fn an_impossible_combination_is_rejected_before_anything_is_generated() {
     // a BRAM could stand in; this test leaves `source` out on purpose.
     let dir = fixture_with_dut(
         "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n\
-         [bundle.hmem]\nbacking = \"host_mem\"\n\
+         [bundle.hmem]\nbacking = \"host_mem\"\naperture = \"2M\"\n\
          ports = { rd_cmd_valid = \"o_cmd_valid\", rd_cmd_ready = \"i_cmd_ready\", \
          rd_cmd_addr = \"o_cmd_addr\", rd_cmd_size = \"o_cmd_nbytes\", \
          rd_valid = \"i_rd_valid\", rd_ready = \"o_rd_ready\", \

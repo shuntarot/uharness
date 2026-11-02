@@ -85,8 +85,9 @@ pub enum Error {
     },
     /// The card may not master the bus (bit 2 of the command register is 0).
     /// A descriptor gets no answer and the DMA engine stays busy. No driver
-    /// sets the bit, so a reboot clears it. `COMMAND=0x4:0x4` sets only that
-    /// bit and leaves memory decoding alone.
+    /// sets the bit, so a reboot clears it; `hio` sets it when it hands the
+    /// card host memory. `COMMAND=0x4:0x4` sets only that bit and leaves
+    /// memory decoding alone.
     NoBusMaster {
         bdf: String,
     },
@@ -261,6 +262,42 @@ pub fn bus_master_at(root: &Path, bdf: &str) -> Result<bool, Error> {
         });
     };
     Ok(u16::from_le_bytes([command[0], command[1]]) & COMMAND_BUS_MASTER != 0)
+}
+
+/// Turns bus mastering on, as a driver does when it binds to a card. Answers
+/// whether it was off. Needs root.
+///
+/// No driver binds to the card, so after a reboot the bit is off. It is set
+/// before host memory is handed over, while nothing can have been fired yet:
+/// a descriptor fired while it was off hangs the engine, and setting it then
+/// does not bring the engine back.
+pub fn enable_bus_master(bdf: &str) -> Result<bool, Error> {
+    enable_bus_master_at(Path::new(crate::pcie::SYSFS), bdf)
+}
+
+/// Turn it on under the given root. Tests pass a fake tree.
+pub fn enable_bus_master_at(root: &Path, bdf: &str) -> Result<bool, Error> {
+    use std::os::unix::fs::FileExt;
+    if bus_master_at(root, bdf)? {
+        return Ok(false);
+    }
+    let path = root.join(bdf).join("config");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(io(&path))?;
+    let mut command = [0u8; 2];
+    file.read_exact_at(&mut command, 4).map_err(io(&path))?;
+    let command = u16::from_le_bytes(command) | COMMAND_BUS_MASTER;
+    file.write_all_at(&command.to_le_bytes(), 4)
+        .map_err(io(&path))?;
+    if !bus_master_at(root, bdf)? {
+        return Err(Error::NoBusMaster {
+            bdf: bdf.to_string(),
+        });
+    }
+    Ok(true)
 }
 
 /// The card-side condition before a transfer. Refuses with the fix when the
@@ -670,6 +707,17 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("stay busy"), "{err}");
+    }
+
+    #[test]
+    fn bus_mastering_is_turned_on_and_the_rest_is_kept() {
+        let bdf = "0000:04:00.0";
+        let root = fake_config(bdf, 0x0002);
+        assert!(enable_bus_master_at(root.path(), bdf).unwrap());
+        let raw = std::fs::read(root.path().join(bdf).join("config")).unwrap();
+        assert_eq!(u16::from_le_bytes([raw[4], raw[5]]), 0x0006);
+        // Already on: nothing to do.
+        assert!(!enable_bus_master_at(root.path(), bdf).unwrap());
     }
 
     /// `/proc/meminfo` as read on a test host.

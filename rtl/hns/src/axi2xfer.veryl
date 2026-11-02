@@ -1,0 +1,357 @@
+/// An AXI4 slave in front of the transfer-level port, so an AXI4 DUT (a CPU,
+/// for example) runs on a memory that only has the transfer level, such as
+/// `hns::hostmem`.
+///
+/// The beat of the transfer level is the AXI data width. A burst becomes one
+/// command from its first beat, rounded down to a beat boundary:
+///
+/// - INCR passes as one command.
+/// - WRAP becomes two commands: from the start to the end of the wrap block,
+///   then from the start of the block up to the start. A cache line fill with
+///   the critical word first uses it.
+/// - A narrow transfer (`size` below the bus width) passes only alone
+///   (`len` = 0). A read returns its whole beat, and a write carries its
+///   strobes, as AXI lays both out by address.
+/// - FIXED, a narrow burst, and a malformed WRAP are refused here: a read
+///   returns `len + 1` beats of 0 with SLVERR, a write takes its beats, drops
+///   them, and answers SLVERR. `o_refused` counts them.
+///
+/// An error beat of the memory becomes SLVERR on that beat; a write that ends
+/// with `wr_done_error` is answered SLVERR.
+///
+/// Reading and writing run independently, one burst at a time each. AXI4
+/// allows a slave to do this, and a CPU waits for one miss at a time anyway.
+pub module axi2xfer::<PKG: $std::axi4_prototype> #(
+    param ADDR_W: u32 = 64, // width of the command address
+    param SIZE_W: u32 = 32, // width of the command length
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// DUT side.
+    s_axi: modport $std::axi4_if::<PKG>::slave,
+
+    // read command (here -> memory)
+    o_rd_cmd_valid: output logic        ,
+    i_rd_cmd_ready: input  logic        ,
+    o_rd_cmd_addr : output logic<ADDR_W>,
+    o_rd_cmd_size : output logic<SIZE_W>,
+
+    // read data (memory -> here)
+    i_rd_valid: input  logic                           ,
+    o_rd_ready: output logic                           ,
+    i_rd_data : input  logic<PKG::DATA_WIDTH_BYTES * 8>,
+    i_rd_last : input  logic                           ,
+    i_rd_error: input  logic                           ,
+
+    // write command (here -> memory)
+    o_wr_cmd_valid: output logic        ,
+    i_wr_cmd_ready: input  logic        ,
+    o_wr_cmd_addr : output logic<ADDR_W>,
+    o_wr_cmd_size : output logic<SIZE_W>,
+
+    // write data (here -> memory), and the completion that ends the transfer
+    o_wr_valid     : output logic                           ,
+    i_wr_ready     : input  logic                           ,
+    o_wr_data      : output logic<PKG::DATA_WIDTH_BYTES * 8>,
+    o_wr_strb      : output logic<PKG::DATA_WIDTH_BYTES>    ,
+    o_wr_last      : output logic                           ,
+    i_wr_done_valid: input  logic                           ,
+    i_wr_done_error: input  logic                           ,
+
+    /// Bursts refused here (FIXED, narrow bursts, malformed WRAP). Saturating.
+    o_refused: output logic<32>,
+) {
+    const BYTES: u32 = PKG::DATA_WIDTH_BYTES;
+    const SHIFT: u32 = $clog2(BYTES);
+    const AW   : u32 = PKG::ADDRESS_WIDTH;
+
+    /// Whether a burst can be served: INCR at any size alone or at the bus
+    /// width, WRAP at the bus width over 2, 4, 8 or 16 aligned beats.
+    function served (
+        addr : input logic<AW>,
+        len  : input logic<8> ,
+        size : input logic<3> ,
+        burst: input logic<2> ,
+    ) -> logic {
+        var full: logic;
+        full = size == SHIFT;
+        if size >: SHIFT {
+            return 0;
+        }
+        if burst == 2'b01 {
+            return full || len == 0;
+        }
+        if burst == 2'b10 {
+            return full && (addr & (BYTES - 1)) == 0 && (len == 1 || len == 3 || len == 7 || len == 15);
+        }
+        return 0;
+    }
+
+    /// The first command of a burst: its address and its bytes. The second
+    /// (WRAP only) is from the start of the block for the bytes before `addr`.
+    function first_size (
+        addr : input logic<AW>,
+        len  : input logic<8> ,
+        burst: input logic<2> ,
+    ) -> logic<SIZE_W> {
+        var total: logic<SIZE_W>;
+        var start: logic<AW>    ;
+        total = ((len as SIZE_W) + 1) << SHIFT;
+        if burst == 2'b10 {
+            start = addr & ~((total as AW) - 1);
+            return (start + (total as AW) - addr) as SIZE_W;
+        }
+        return total;
+    }
+
+    function wrap_start (
+        addr: input logic<AW>,
+        len : input logic<8> ,
+    ) -> logic<AW> {
+        var total: logic<AW>;
+        total = ((len as AW) + 1) << SHIFT;
+        return addr & ~(total - 1);
+    }
+
+    // ------------------------------------------------------------------
+    // reads
+    // ------------------------------------------------------------------
+
+    enum RState: logic<3> {
+        IDLE,
+        CMD,
+        DATA,
+        BAD,
+    }
+
+    var r_state: RState        ;
+    var r_id   : PKG::id_t     ;
+    var r_addr : logic<AW>     ; // the first command
+    var r_size : logic<SIZE_W> ;
+    var r_addr2: logic<AW>     ; // the second command, if `r_two`
+    var r_size2: logic<SIZE_W> ;
+    var r_two  : logic         ; // a second command follows this one
+    var r_left : logic<8>      ; // beats still to answer (BAD)
+
+    let ar_ok: logic = served(s_axi.araddr, s_axi.arlen, s_axi.arsize, s_axi.arburst);
+
+    always_comb {
+        s_axi.arready = r_state == RState::IDLE;
+
+        o_rd_cmd_valid = r_state == RState::CMD;
+        o_rd_cmd_addr  = r_addr as ADDR_W;
+        o_rd_cmd_size  = r_size;
+
+        s_axi.rid   = r_id;
+        s_axi.ruser = 0;
+        if r_state == RState::DATA {
+            s_axi.rvalid = i_rd_valid;
+            s_axi.rdata  = if i_rd_error ? 0 : i_rd_data;
+            s_axi.rresp  = if i_rd_error ? 2'b10 : 2'b00;
+            s_axi.rlast  = i_rd_last && !r_two;
+        } else {
+            s_axi.rvalid = r_state == RState::BAD;
+            s_axi.rdata  = 0;
+            s_axi.rresp  = 2'b10;
+            s_axi.rlast  = r_left == 0;
+        }
+        o_rd_ready = r_state == RState::DATA && s_axi.rready;
+    }
+
+    always_ff {
+        if_reset {
+            r_state = RState::IDLE;
+            r_id    = 0;
+            r_addr  = 0;
+            r_size  = 0;
+            r_addr2 = 0;
+            r_size2 = 0;
+            r_two   = 0;
+            r_left  = 0;
+        } else {
+            case r_state {
+                RState::IDLE: {
+                    if s_axi.arvalid {
+                        r_id    = s_axi.arid;
+                        r_addr  = s_axi.araddr & ~((BYTES - 1) as AW);
+                        r_size  = first_size(s_axi.araddr, s_axi.arlen, s_axi.arburst);
+                        r_addr2 = wrap_start(s_axi.araddr, s_axi.arlen);
+                        r_size2 = (s_axi.araddr - wrap_start(s_axi.araddr, s_axi.arlen)) as SIZE_W;
+                        r_two   = s_axi.arburst == 2'b10 && s_axi.araddr != wrap_start(s_axi.araddr, s_axi.arlen);
+                        r_left  = s_axi.arlen;
+                        r_state = if ar_ok ? RState::CMD : RState::BAD;
+                    }
+                }
+                RState::CMD: {
+                    if i_rd_cmd_ready {
+                        r_state = RState::DATA;
+                    }
+                }
+                RState::DATA: {
+                    if i_rd_valid && s_axi.rready && i_rd_last {
+                        if r_two {
+                            r_addr  = r_addr2;
+                            r_size  = r_size2;
+                            r_two   = 0;
+                            r_state = RState::CMD;
+                        } else {
+                            r_state = RState::IDLE;
+                        }
+                    }
+                }
+                RState::BAD: {
+                    if s_axi.rready {
+                        if r_left == 0 {
+                            r_state = RState::IDLE;
+                        } else {
+                            r_left = r_left - 1;
+                        }
+                    }
+                }
+                default: {
+                    r_state = RState::IDLE;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // writes
+    // ------------------------------------------------------------------
+
+    enum WState: logic<3> {
+        IDLE,
+        CMD,
+        DATA,
+        WAIT,
+        BAD,
+        RESP,
+    }
+
+    var w_state: WState        ;
+    var w_id   : PKG::id_t     ;
+    var w_addr : logic<AW>     ;
+    var w_size : logic<SIZE_W> ;
+    var w_addr2: logic<AW>     ;
+    var w_size2: logic<SIZE_W> ;
+    var w_two  : logic         ;
+    var w_beats: logic<SIZE_W> ; // beats of this command still to pass
+    var w_done : logic         ; // this command is done
+    var w_err  : logic         ;
+
+    let aw_ok: logic = served(s_axi.awaddr, s_axi.awlen, s_axi.awsize, s_axi.awburst);
+
+    always_comb {
+        s_axi.awready = w_state == WState::IDLE;
+
+        o_wr_cmd_valid = w_state == WState::CMD;
+        o_wr_cmd_addr  = w_addr as ADDR_W;
+        o_wr_cmd_size  = w_size;
+
+        o_wr_valid  = w_state == WState::DATA && s_axi.wvalid;
+        o_wr_data   = s_axi.wdata;
+        o_wr_strb   = s_axi.wstrb;
+        o_wr_last   = w_beats == 1;
+        s_axi.wready = (w_state == WState::DATA && i_wr_ready) || w_state == WState::BAD;
+
+        s_axi.bvalid = w_state == WState::RESP;
+        s_axi.bid    = w_id;
+        s_axi.bresp  = if w_err ? 2'b10 : 2'b00;
+        s_axi.buser  = 0;
+    }
+
+    always_ff {
+        if_reset {
+            w_state = WState::IDLE;
+            w_id    = 0;
+            w_addr  = 0;
+            w_size  = 0;
+            w_addr2 = 0;
+            w_size2 = 0;
+            w_two   = 0;
+            w_beats = 0;
+            w_done  = 0;
+            w_err   = 0;
+        } else {
+            if i_wr_done_valid {
+                w_done = 1;
+                if i_wr_done_error {
+                    w_err = 1;
+                }
+            }
+            case w_state {
+                WState::IDLE: {
+                    if s_axi.awvalid {
+                        w_id    = s_axi.awid;
+                        w_addr  = s_axi.awaddr & ~((BYTES - 1) as AW);
+                        w_size  = first_size(s_axi.awaddr, s_axi.awlen, s_axi.awburst);
+                        w_addr2 = wrap_start(s_axi.awaddr, s_axi.awlen);
+                        w_size2 = (s_axi.awaddr - wrap_start(s_axi.awaddr, s_axi.awlen)) as SIZE_W;
+                        w_two   = s_axi.awburst == 2'b10 && s_axi.awaddr != wrap_start(s_axi.awaddr, s_axi.awlen);
+                        w_beats = (first_size(s_axi.awaddr, s_axi.awlen, s_axi.awburst) + (BYTES - 1)) >> SHIFT;
+                        w_err   = !aw_ok;
+                        w_state = if aw_ok ? WState::CMD : WState::BAD;
+                    }
+                }
+                WState::CMD: {
+                    if i_wr_cmd_ready {
+                        w_done  = 0;
+                        w_state = WState::DATA;
+                    }
+                }
+                WState::DATA: {
+                    if s_axi.wvalid && i_wr_ready {
+                        w_beats = w_beats - 1;
+                        if w_beats == 1 {
+                            w_state = WState::WAIT;
+                        }
+                    }
+                }
+                WState::WAIT: {
+                    if w_done {
+                        if w_two {
+                            w_addr  = w_addr2;
+                            w_size  = w_size2;
+                            w_beats = w_size2 >> SHIFT;
+                            w_two   = 0;
+                            w_state = WState::CMD;
+                        } else {
+                            w_state = WState::RESP;
+                        }
+                    }
+                }
+                WState::BAD: {
+                    if s_axi.wvalid && s_axi.wlast {
+                        w_state = WState::RESP;
+                    }
+                }
+                WState::RESP: {
+                    if s_axi.bready {
+                        w_state = WState::IDLE;
+                    }
+                }
+                default: {
+                    w_state = WState::IDLE;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // the count
+    // ------------------------------------------------------------------
+
+    var refused: logic<32>;
+    let ref_add: logic<2> = {1'b0, r_state == RState::IDLE && s_axi.arvalid && !ar_ok} + {1'b0, w_state == WState::IDLE && s_axi.awvalid && !aw_ok};
+
+    always_ff {
+        if_reset {
+            refused = 0;
+        } else {
+            refused = if refused >: 32'hffff_ffff - ref_add ? 32'hffff_ffff : refused + ref_add;
+        }
+    }
+
+    assign o_refused = refused;
+}

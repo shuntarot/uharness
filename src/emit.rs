@@ -961,14 +961,15 @@ fn dma_registers(map: &crate::regmap::RegisterMap) -> Vec<&crate::regmap::Regist
         .collect()
 }
 
+/// What the DMA engine reports, whoever issues its descriptors.
+const DMA_ENGINE_WIRES: [(&str, usize); 2] = [("dma_mps_used", 3), ("dma_mrrs_used", 3)];
+
 /// The wires between the gate and the DMA engine. The widths match the ports
 /// of `hns::dma_gate` one to one.
 ///
 /// There is one set of descriptor fields, and a handshake and status per
 /// direction. Only one transfer runs at a time, so the fields are shared.
-const DMA_DESC_WIRES: [(&str, usize); 14] = [
-    ("dma_mps_used", 3),
-    ("dma_mrrs_used", 3),
+const DMA_DESC_WIRES: [(&str, usize); 12] = [
     ("dma_desc_pcie_addr", 64),
     ("dma_desc_axi_addr", 64),
     ("dma_desc_len", 20),
@@ -2447,6 +2448,51 @@ fn core_body(
         for (port, width) in wires {
             out.push_str(&format!("    var w_{port}: {domain}logic<{width}>;\n"));
         }
+        if hmem.is_host() {
+            // Real host memory: the registers of `hns::hostmem`.
+            for (role, width) in [
+                ("host_base", 64),
+                ("host_on", 1),
+                ("oor", WORD_BITS),
+                ("host_failed", WORD_BITS),
+                ("host_rd_code", 4),
+                ("host_wr_code", 4),
+                ("host_busy", 1),
+            ] {
+                out.push_str(&format!(
+                    "    var t_{bundle}_{role}: {domain}{};\n",
+                    logic(width)
+                ));
+            }
+            // An AXI4 port: the DUT's interface, the output of the reset
+            // fence, and the transfer level `hns::axi2xfer` makes of it.
+            if let Some(axi) = &hmem.axi {
+                out.push_str(&format!(
+                    "    var t_{bundle}_refused: {domain}logic<{WORD_BITS}>;\n"
+                ));
+                out.push_str(&format!(
+                    "    inst axi_{bundle}: {domain}$std::axi4_if::<{}>;\n",
+                    axi.pkg
+                ));
+                out.push_str(&format!(
+                    "    inst faxi_{bundle}: {domain}$std::axi4_if::<{}>;\n",
+                    axi.pkg
+                ));
+                if axi.dut_base != 0 {
+                    out.push_str(&format!(
+                        "    inst raxi_{bundle}: {domain}$std::axi4_if::<{}>;\n",
+                        axi.pkg
+                    ));
+                }
+                for (name, width) in host_mem_xfer_wires(hmem) {
+                    out.push_str(&format!(
+                        "    var hx_{bundle}_{name}: {domain}{};\n",
+                        logic(width)
+                    ));
+                }
+            }
+            continue;
+        }
         out.push_str(&format!(
             "    var t_{bundle}_maddr: {domain}logic<{}>;\n",
             hmem.host_addr_width()
@@ -3032,26 +3078,26 @@ fn core_body(
             "    // DUT reset from the host (dut_reset). The harness itself is not reset.\n",
         );
     }
-    for axi_mem in &plan.axi_mems {
-        let bundle = &axi_mem.bundle;
+    let fenced = fenced_masters(plan);
+    for (bundle, _) in &fenced {
         out.push_str(&format!("    var fence_closed_{bundle}: {domain}logic;\n"));
         out.push_str(&format!("    var fence_idle_{bundle}: {domain}logic;\n"));
     }
-    let closed = if plan.axi_mems.is_empty() {
+    let closed = if fenced.is_empty() {
         "1".to_string()
     } else {
-        plan.axi_mems
+        fenced
             .iter()
-            .map(|m| format!("fence_closed_{}", m.bundle))
+            .map(|(bundle, _)| format!("fence_closed_{bundle}"))
             .collect::<Vec<_>>()
             .join(" & ")
     };
-    let idle = if plan.axi_mems.is_empty() {
+    let idle = if fenced.is_empty() {
         "1".to_string()
     } else {
-        plan.axi_mems
+        fenced
             .iter()
-            .map(|m| format!("fence_idle_{}", m.bundle))
+            .map(|(bundle, _)| format!("fence_idle_{bundle}"))
             .collect::<Vec<_>>()
             .join(" & ")
     };
@@ -3075,11 +3121,9 @@ fn core_body(
     out.push_str(&format!(
         "    assign t_{DUT_RESET_STATE} = dut_rst_req;\n\n"
     ));
-    for axi_mem in &plan.axi_mems {
-        let bundle = &axi_mem.bundle;
+    for (bundle, pkg) in &fenced {
         out.push_str(&format!(
-            "    inst u_fence_{bundle}: hns::axi_fence::<{}> (\n",
-            axi_mem.pkg
+            "    inst u_fence_{bundle}: hns::axi_fence::<{pkg}> (\n"
         ));
         out.push_str(&format!("        i_clk   : {clk},\n"));
         out.push_str(&format!("        i_rst   : {rst},\n"));
@@ -3114,10 +3158,18 @@ fn core_body(
         ));
     }
 
-    // The card-issued DMA. The gate is always present. The DMA engine exists
-    // only in a PCIe design, so `hns_sim` has the gate alone.
+    // The card-issued DMA. The gate is there with `dram` (the host issues
+    // descriptors); with `host_mem` the DUT issues them through
+    // `hns::hostmem`. The DMA engine exists only in a PCIe design, so
+    // `hns_sim` has the gate alone.
     let dma = dma_registers(map);
+    let gate = dma.iter().any(|r| r.role == Some(DMA_GO));
     if !dma.is_empty() {
+        for (name, width) in DMA_ENGINE_WIRES {
+            out.push_str(&format!("    var {name}: {domain}{};\n", logic(width)));
+        }
+    }
+    if gate {
         for (name, width) in DMA_DESC_WIRES {
             out.push_str(&format!("    var {name}: {domain}{};\n", logic(width)));
         }
@@ -3161,6 +3213,17 @@ fn core_body(
         }
         out.push_str("    );\n\n");
 
+        if !second_master {
+            out.push_str("    // No requester here: hns_sim has no PCIe to issue on.\n");
+            out.push_str("    assign dma_wr_ready = 0;\n");
+            out.push_str("    assign dma_rd_ready = 0;\n");
+            out.push_str("    assign dma_wr_status_valid = 0;\n");
+            out.push_str("    assign dma_wr_status_error = 0;\n");
+            out.push_str("    assign dma_rd_status_valid = 0;\n");
+            out.push_str("    assign dma_rd_status_error = 0;\n\n");
+        }
+    }
+    if !dma.is_empty() {
         // The host sees the values the DMA engine uses (`o_mps` of
         // `hns::dma_wr`), not the negotiated link values. Otherwise the host
         // cannot tell whether `dma_mps_limit` took effect.
@@ -3176,15 +3239,8 @@ fn core_body(
         // A top with no DMA engine (`hns_sim`): tie the inputs so that nothing
         // is ever accepted.
         if !second_master {
-            out.push_str("    // No requester here: hns_sim has no PCIe to issue on.\n");
             out.push_str("    assign dma_mps_used = 0;\n");
             out.push_str("    assign dma_mrrs_used = 0;\n");
-            out.push_str("    assign dma_wr_ready = 0;\n");
-            out.push_str("    assign dma_rd_ready = 0;\n");
-            out.push_str("    assign dma_wr_status_valid = 0;\n");
-            out.push_str("    assign dma_wr_status_error = 0;\n");
-            out.push_str("    assign dma_rd_status_valid = 0;\n");
-            out.push_str("    assign dma_rd_status_error = 0;\n");
             out.push_str("    assign t_dma_rq_drops = 0;\n");
             out.push_str("    assign t_dma_rq_gaps = 0;\n");
             out.push_str("    assign t_dma_rc_cor = 0;\n");
@@ -3588,7 +3644,10 @@ fn core_body(
     // default, but can add wait states without a new synthesis. The stand-in
     // is fast and regular, so without it the DUT is never tested against a
     // slow partner on the board.
-    for hmem in &plan.host_mems {
+    for hmem in plan.host_mems.iter().filter(|h| h.is_host()) {
+        host_mem_instance(out, plan, hmem, second_master, &d);
+    }
+    for hmem in plan.host_mems.iter().filter(|h| !h.is_host()) {
         let bundle = &hmem.bundle;
         let dut_side = |port: Option<&String>, width: usize, input: bool| -> String {
             match port {
@@ -4291,6 +4350,553 @@ fn ps7_instance(
     out.push_str("        );\n    }\n\n");
 }
 
+/// The wires one direction of the DMA engine takes its descriptors on.
+struct DescWires<'a> {
+    pcie_addr: &'a str,
+    axi_addr: &'a str,
+    len: &'a str,
+    tag: &'a str,
+    valid: &'a str,
+    ready: &'a str,
+    status_error: &'a str,
+    status_valid: &'a str,
+}
+
+/// The `hns::dma_gate` wires: one set of descriptor fields for both
+/// directions, because only one transfer runs at a time.
+const GATE_WR: DescWires<'static> = DescWires {
+    pcie_addr: "dma_desc_pcie_addr",
+    axi_addr: "dma_desc_axi_addr",
+    len: "dma_desc_len",
+    tag: "dma_desc_tag",
+    valid: "dma_wr_valid",
+    ready: "dma_wr_ready",
+    status_error: "dma_wr_status_error",
+    status_valid: "dma_wr_status_valid",
+};
+const GATE_RD: DescWires<'static> = DescWires {
+    valid: "dma_rd_valid",
+    ready: "dma_rd_ready",
+    status_error: "dma_rd_status_error",
+    status_valid: "dma_rd_status_valid",
+    ..GATE_WR
+};
+
+fn desc_ports(out: &mut String, wires: &DescWires<'_>) {
+    for (port, wire) in [
+        ("i_desc_pcie_addr", wires.pcie_addr),
+        ("i_desc_axi_addr", wires.axi_addr),
+        ("i_desc_len", wires.len),
+        ("i_desc_tag", wires.tag),
+        ("i_desc_valid", wires.valid),
+        ("o_desc_ready", wires.ready),
+        ("o_status_tag", "_"),
+        ("o_status_error", wires.status_error),
+        ("o_status_valid", wires.status_valid),
+    ] {
+        out.push_str(&format!("        {port}: {wire},\n"));
+    }
+}
+
+/// The borrowed DMA engines (`hns::dma_wr` / `hns::dma_rd`) and their path to
+/// the hard block: the RQ crossing and buffer, and the RC crossing.
+///
+/// `axi` is the interface their AXI master drives (`dpkg`, 256 bits). The
+/// write engine reads it and the read engine writes it, so the two form one
+/// master.
+fn dma_engine(
+    out: &mut String,
+    plan: &Plan,
+    domain: &str,
+    axi: &str,
+    dpkg: &str,
+    wr: &DescWires<'_>,
+    rd: &DescWires<'_>,
+) {
+    let host = plan.board().clocks.window.clone();
+    // Wires between the DMA engine and the hard block. They are declared
+    // first; `veryl check` rejects a name used before its declaration.
+    for (signal, width) in RQ_STREAM {
+        out.push_str(&format!(
+            "    var h_rq_{signal}: {domain}{};\n",
+            logic(width)
+        ));
+    }
+    // Wires between the crossing output and the TLP buffer stage (hard
+    // block clock side).
+    for (signal, width) in RQ_STREAM {
+        out.push_str(&format!(
+            "    var p_rq_{signal}: '{PCIE_DOMAIN} {};\n",
+            logic(width)
+        ));
+    }
+    out.push('\n');
+
+    // Two RQ streams leave, and the write engine merges them into one. The
+    // borrowed code works this way, so no stream arbiter is needed.
+    for (signal, width) in RQ_STREAM {
+        out.push_str(&format!(
+            "    var j_rq_{signal}: {domain}{};\n",
+            logic(width)
+        ));
+    }
+    for (signal, width) in RC_STREAM {
+        out.push_str(&format!(
+            "    var h_rc_{signal}: {domain}{};\n",
+            logic(width)
+        ));
+    }
+    out.push('\n');
+
+    // Read and write connect to one interface separately. AXI4 channels
+    // are independent, so with `read_master` and `write_master` the two
+    // DMA engines form one master, with one arbiter and one converter.
+    out.push_str(&format!("    inst u_dma_wr: hns::dma_wr::<{dpkg}> (\n"));
+    out.push_str(&format!("        i_clk: clk_{host},\n"));
+    out.push_str(&format!("        i_rst: rst_{host},\n"));
+    desc_ports(out, wr);
+    out.push_str(&format!("        m_axi: {axi},\n"));
+    for (signal, _width) in RQ_STREAM {
+        let d = if signal == "tready" { "i" } else { "o" };
+        out.push_str(&format!("        {d}_rq_{signal}: h_rq_{signal},\n"));
+    }
+    for (signal, _width) in RQ_STREAM {
+        let d = if signal == "tready" { "o" } else { "i" };
+        out.push_str(&format!("        {d}_join_{signal}: j_rq_{signal},\n"));
+    }
+    out.push_str("        i_max_payload: pcie_max_payload,\n");
+    out.push_str("        i_limit: t_dma_mps_limit,\n");
+    out.push_str("        o_mps: dma_mps_used,\n");
+    // `hns::dma_gate` tracks busy.
+    out.push_str("        o_busy: _,\n");
+    out.push_str("    );\n\n");
+
+    out.push_str(&format!("    inst u_dma_rd: hns::dma_rd::<{dpkg}> (\n"));
+    out.push_str(&format!("        i_clk: clk_{host},\n"));
+    out.push_str(&format!("        i_rst: rst_{host},\n"));
+    desc_ports(out, rd);
+    out.push_str(&format!("        m_axi: {axi},\n"));
+    for (signal, _width) in RQ_STREAM {
+        let d = if signal == "tready" { "i" } else { "o" };
+        out.push_str(&format!("        {d}_rq_{signal}: j_rq_{signal},\n"));
+    }
+    for (signal, _width) in RC_STREAM {
+        let d = if signal == "tready" { "o" } else { "i" };
+        out.push_str(&format!("        {d}_rc_{signal}: h_rc_{signal},\n"));
+    }
+    out.push_str("        i_max_read_req: pcie_max_read_req,\n");
+    out.push_str("        i_limit: t_dma_mrrs_limit,\n");
+    out.push_str("        o_mrrs: dma_mrrs_used,\n");
+    // Completions dropped by the borrowed code. The host compares the
+    // counts before and after a transfer.
+    out.push_str("        o_cor_count: t_dma_rc_cor,\n");
+    out.push_str("        o_uncor_count: t_dma_rc_uncor,\n");
+    out.push_str("        o_busy: _,\n");
+    out.push_str("    );\n\n");
+
+    // This is the only crossing. The DMA engine is on the harness side, so
+    // only the TLP stream goes to the hard block (`hns::tlp_cdc`).
+    // The depth must hold a whole TLP. With 8 entries (256 bytes), a TLP
+    // with a 256-byte payload (9 beats with the header) did not fit, and
+    // transfers got 12% slower even with half as many TLPs (measured).
+    // PCIe allows 4096-byte payloads, but that needs BRAM; the depth is
+    // sized for two 512-byte TLPs, the payload negotiated today.
+    out.push_str(
+        "    inst u_rq_cdc: hns::tlp_cdc #(\n        DEPTH : 64,\n        USER_W: 60,\n    ) (\n",
+    );
+    out.push_str(&format!("        is_clk: clk_{host},\n"));
+    out.push_str(&format!("        is_rst: rst_{host},\n"));
+    for (signal, _width) in RQ_STREAM {
+        let d = if signal == "tready" { "os" } else { "is" };
+        out.push_str(&format!("        {d}_{signal}: h_rq_{signal},\n"));
+    }
+    out.push_str("        id_clk: pcie_user_clk,\n");
+    out.push_str("        id_rst: pcie_user_rst,\n");
+    for (signal, _width) in RQ_STREAM {
+        let d = if signal == "tready" { "id" } else { "od" };
+        out.push_str(&format!("        {d}_{signal}: p_rq_{signal},\n"));
+    }
+    out.push_str("    );\n\n");
+
+    // Buffer each whole TLP before sending it. On RQ, a `tvalid` drop in
+    // the middle of a TLP makes the hard block nullify it (PG213). The DMA
+    // engine streams while it reads DRAM, so a gap in R would leave a gap
+    // in the TLP (`hns::tlp_hold`).
+    out.push_str(
+        "    inst u_rq_hold: hns::tlp_hold #(\n        DEPTH : 64,\n        USER_W: 60,\n    ) (\n",
+    );
+    out.push_str("        i_clk: pcie_user_clk,\n");
+    out.push_str("        i_rst: pcie_user_rst,\n");
+    for (signal, _width) in RQ_STREAM {
+        let d = if signal == "tready" { "o" } else { "i" };
+        out.push_str(&format!("        {d}_{signal}: p_rq_{signal},\n"));
+    }
+    for (signal, _width) in RQ_STREAM {
+        let d = if signal == "tready" { "i" } else { "o" };
+        out.push_str(&format!("        {d}_{signal}: rq_{signal},\n"));
+    }
+    out.push_str("        o_gaps_gray: pcie_rq_gaps_gray,\n");
+    out.push_str("    );\n\n");
+
+    // Completions must always be taken, or the hard block stalls. So this
+    // must be a FIFO, not a handshake. The depth holds a whole TLP, as
+    // for RQ.
+    out.push_str(
+        "    inst u_rc_cdc: hns::tlp_cdc #(\n        DEPTH : 64,\n        USER_W: 75,\n    ) (\n",
+    );
+    out.push_str("        is_clk: pcie_user_clk,\n");
+    out.push_str("        is_rst: pcie_user_rst,\n");
+    for (signal, _width) in RC_STREAM {
+        let d = if signal == "tready" { "os" } else { "is" };
+        out.push_str(&format!("        {d}_{signal}: rc_{signal},\n"));
+    }
+    out.push_str(&format!("        id_clk: clk_{host},\n"));
+    out.push_str(&format!("        id_rst: rst_{host},\n"));
+    for (signal, _width) in RC_STREAM {
+        let d = if signal == "tready" { "id" } else { "od" };
+        out.push_str(&format!("        {d}_{signal}: h_rc_{signal},\n"));
+    }
+    out.push_str("    );\n\n");
+}
+
+/// The AXI address width between the DMA engine and `hns::hostmem`. Only the
+/// offset in a 4 KB page is used; a little more keeps the engine's own
+/// arithmetic away from the top bit.
+const HOST_MEM_AXI_ADDR: u32 = 16;
+
+/// The AXI ID width between the DMA engine and `hns::hostmem`, which answers
+/// with the ID it was given.
+const HOST_MEM_AXI_ID: u32 = 8;
+
+/// The AXI4 masters of the DUT that get a reset fence, with their types: the
+/// memories on AXI4, and `host_mem` on AXI4.
+fn fenced_masters(plan: &Plan) -> Vec<(&str, &str)> {
+    plan.axi_mems
+        .iter()
+        .map(|m| (m.bundle.as_str(), m.pkg.as_str()))
+        .chain(plan.host_mems.iter().filter_map(|h| {
+            h.axi
+                .as_ref()
+                .map(|axi| (h.bundle.as_str(), axi.pkg.as_str()))
+        }))
+        .collect()
+}
+
+/// The transfer level between `hns::axi2xfer` and `hns::hostmem`: the ports
+/// of `hns::hostmem` on the DUT side, without their `i_` / `o_`.
+fn host_mem_xfer_wires(hmem: &crate::terminator::HostMemPlan) -> Vec<(&'static str, usize)> {
+    vec![
+        ("rd_cmd_valid", 1),
+        ("rd_cmd_ready", 1),
+        ("rd_cmd_addr", hmem.cmd_addr_width),
+        ("rd_cmd_size", hmem.cmd_size_width),
+        ("rd_valid", 1),
+        ("rd_ready", 1),
+        ("rd_data", hmem.data_width),
+        ("rd_last", 1),
+        ("rd_error", 1),
+        ("wr_cmd_valid", 1),
+        ("wr_cmd_ready", 1),
+        ("wr_cmd_addr", hmem.cmd_addr_width),
+        ("wr_cmd_size", hmem.cmd_size_width),
+        ("wr_valid", 1),
+        ("wr_ready", 1),
+        ("wr_data", hmem.data_width),
+        ("wr_strb", hmem.data_width / 8),
+        ("wr_last", 1),
+        ("wr_done_valid", 1),
+        ("wr_done_error", 1),
+        ("oor", WORD_BITS),
+        ("range_oor", WORD_BITS),
+    ]
+}
+
+/// Whether `hns::hostmem` takes this transfer-level signal as an input, so
+/// `hns::axi2xfer` drives it.
+fn hostmem_takes(name: &str) -> bool {
+    matches!(
+        name,
+        "rd_cmd_valid"
+            | "rd_cmd_addr"
+            | "rd_cmd_size"
+            | "rd_ready"
+            | "wr_cmd_valid"
+            | "wr_cmd_addr"
+            | "wr_cmd_size"
+            | "wr_valid"
+            | "wr_data"
+            | "wr_strb"
+            | "wr_last"
+    )
+}
+
+/// Real host memory behind a transfer-level port: `hns::hostmem`, and on the
+/// PCIe top the DMA engine that reaches the host.
+///
+/// `hns_sim` has no PCIe, so `_on` is tied to 0 there: every command ends with
+/// an error at once, and nothing waits for an engine that is not there.
+fn host_mem_instance(
+    out: &mut String,
+    plan: &Plan,
+    hmem: &crate::terminator::HostMemPlan,
+    second_master: bool,
+    d: &Domain<'_>,
+) {
+    let (clk, rst, domain) = (d.clk, d.rst, d.tag);
+    let bundle = &hmem.bundle;
+    let aperture = hmem
+        .aperture
+        .expect("`resolve_host_mem` requires an aperture for host memory");
+    let dpkg = format!(
+        "$std::axi4_pkg::<{HOST_MEM_AXI_ADDR}, {DMA_BUS_BYTES}, {HOST_MEM_AXI_ID}, 1, 1, 1, 1, 1>"
+    );
+
+    out.push_str(&format!(
+        "    inst haxi_{bundle}: {domain}$std::axi4_if::<{dpkg}>;\n"
+    ));
+    for dir in ["rd", "wr"] {
+        for (name, width) in [
+            ("pcie_addr", 64),
+            ("axi_addr", 64),
+            ("len", 20),
+            ("valid", 1),
+            ("ready", 1),
+            ("status_valid", 1),
+            ("status_error", 4),
+        ] {
+            out.push_str(&format!(
+                "    var hm_{bundle}_{dir}_{name}: {domain}{};\n",
+                logic(width)
+            ));
+        }
+    }
+    out.push('\n');
+
+    // An AXI4 port becomes the transfer level first. The fence in front of
+    // it is made with the DUT reset.
+    if let Some(axi) = &hmem.axi {
+        let pkg = &axi.pkg;
+        let from = if axi.dut_base != 0 {
+            out.push_str(&format!(
+                "    inst u_range_{bundle}: hns::axi_range::<\n        {pkg},\n        {pkg},\n    > #(\n"
+            ));
+            out.push_str(&format!("        BASE: 64'h{:x},\n", axi.dut_base));
+            out.push_str(&format!("        SPAN: 64'h{aperture:x},\n"));
+            out.push_str("    ) (\n");
+            out.push_str(&format!("        i_clk: {clk},\n"));
+            out.push_str(&format!("        i_rst: {rst},\n"));
+            out.push_str(&format!("        o_oor: hx_{bundle}_range_oor,\n"));
+            out.push_str(&format!("        s_axi: faxi_{bundle},\n"));
+            out.push_str(&format!("        m_axi: raxi_{bundle},\n"));
+            out.push_str("    );\n\n");
+            format!("raxi_{bundle}")
+        } else {
+            out.push_str(&format!("    assign hx_{bundle}_range_oor = 0;\n"));
+            format!("faxi_{bundle}")
+        };
+        out.push_str(&format!(
+            "    inst u_axi2xfer_{bundle}: hns::axi2xfer::<{pkg}> #(\n"
+        ));
+        out.push_str(&format!("        ADDR_W: {},\n", hmem.cmd_addr_width));
+        out.push_str(&format!("        SIZE_W: {},\n", hmem.cmd_size_width));
+        out.push_str("    ) (\n");
+        out.push_str(&format!("        i_clk: {clk},\n"));
+        out.push_str(&format!("        i_rst: {rst},\n"));
+        out.push_str(&format!("        s_axi: {from},\n"));
+        for (name, _) in host_mem_xfer_wires(hmem) {
+            if name.ends_with("oor") {
+                continue;
+            }
+            // The other side of `hns::hostmem`'s ports.
+            let dir = if hostmem_takes(name) { "o" } else { "i" };
+            out.push_str(&format!("        {dir}_{name}: hx_{bundle}_{name},\n"));
+        }
+        out.push_str(&format!("        o_refused: t_{bundle}_refused,\n"));
+        out.push_str("    );\n\n");
+        // Both count what the DUT asked of memory it cannot reach.
+        out.push_str(&format!(
+            "    var hx_{bundle}_oor_sum: {domain}logic<{}>;\n",
+            WORD_BITS + 1
+        ));
+        out.push_str(&format!(
+            "    assign hx_{bundle}_oor_sum = {{1'b0, hx_{bundle}_oor}} + {{1'b0, hx_{bundle}_range_oor}};\n"
+        ));
+        out.push_str(&format!(
+            "    assign t_{bundle}_oor = if hx_{bundle}_oor_sum[{WORD_BITS}] ? '1 : hx_{bundle}_oor_sum[{}:0];\n\n",
+            WORD_BITS - 1
+        ));
+    }
+
+    let dut_side = |name: &str, port: Option<&String>, width: usize, input: bool| -> String {
+        if hmem.axi.is_some() {
+            return format!("hx_{bundle}_{}", &name[2..]);
+        }
+        match port {
+            Some(name) => format!("w_{name}"),
+            None if input => format!("{width}'b0"),
+            None => "_".to_string(),
+        }
+    };
+    let read = hmem.read.as_ref();
+    let write = hmem.write.as_ref();
+    let strb = hmem.axi.is_some() || write.is_some_and(|w| w.strb.is_some());
+
+    out.push_str(&format!(
+        "    inst u_hostmem_{bundle}: hns::hostmem::<{dpkg}> #(\n"
+    ));
+    out.push_str(&format!("        HAS_STRB: {strb},\n"));
+    out.push_str(&format!("        DW: {},\n", hmem.data_width));
+    out.push_str(&format!("        ADDR_W: {},\n", hmem.cmd_addr_width));
+    out.push_str(&format!("        SIZE_W: {},\n", hmem.cmd_size_width));
+    out.push_str(&format!("        APERTURE: 64'h{aperture:x},\n"));
+    out.push_str("    ) (\n");
+    out.push_str(&format!("        i_clk: {clk},\n"));
+    out.push_str(&format!("        i_rst: {rst},\n"));
+    out.push_str(&format!("        i_base: t_{bundle}_host_base,\n"));
+    if second_master {
+        out.push_str(&format!("        i_on: t_{bundle}_host_on,\n"));
+    } else {
+        out.push_str("        // No PCIe here: every command ends with an error.\n");
+        out.push_str("        i_on: 1'b0,\n");
+    }
+    for (port, chosen, width, input) in [
+        ("i_rd_cmd_valid", read.map(|r| &r.cmd_valid), 1, true),
+        ("o_rd_cmd_ready", read.map(|r| &r.cmd_ready), 1, false),
+        (
+            "i_rd_cmd_addr",
+            read.map(|r| &r.cmd_addr),
+            hmem.cmd_addr_width,
+            true,
+        ),
+        (
+            "i_rd_cmd_size",
+            read.map(|r| &r.cmd_size),
+            hmem.cmd_size_width,
+            true,
+        ),
+        ("o_rd_valid", read.map(|r| &r.valid), 1, false),
+        ("i_rd_ready", read.map(|r| &r.ready), 1, true),
+        ("o_rd_data", read.map(|r| &r.data), hmem.data_width, false),
+        ("o_rd_last", read.map(|r| &r.last), 1, false),
+        ("o_rd_error", read.map(|r| &r.error), 1, false),
+        ("i_wr_cmd_valid", write.map(|w| &w.cmd_valid), 1, true),
+        ("o_wr_cmd_ready", write.map(|w| &w.cmd_ready), 1, false),
+        (
+            "i_wr_cmd_addr",
+            write.map(|w| &w.cmd_addr),
+            hmem.cmd_addr_width,
+            true,
+        ),
+        (
+            "i_wr_cmd_size",
+            write.map(|w| &w.cmd_size),
+            hmem.cmd_size_width,
+            true,
+        ),
+        ("i_wr_valid", write.map(|w| &w.valid), 1, true),
+        ("o_wr_ready", write.map(|w| &w.ready), 1, false),
+        ("i_wr_data", write.map(|w| &w.data), hmem.data_width, true),
+        (
+            "i_wr_strb",
+            write.and_then(|w| w.strb.as_ref()),
+            hmem.data_width / 8,
+            true,
+        ),
+        ("i_wr_last", write.map(|w| &w.last), 1, true),
+        ("o_wr_done_valid", write.map(|w| &w.done_valid), 1, false),
+        ("o_wr_done_error", write.map(|w| &w.done_error), 1, false),
+    ] {
+        out.push_str(&format!(
+            "        {port}: {},\n",
+            dut_side(port, chosen, width, input)
+        ));
+    }
+    for dir in ["rd", "wr"] {
+        for (port, name) in [
+            ("o_{dir}_desc_pcie_addr", "pcie_addr"),
+            ("o_{dir}_desc_axi_addr", "axi_addr"),
+            ("o_{dir}_desc_len", "len"),
+            ("o_{dir}_desc_valid", "valid"),
+            ("i_{dir}_desc_ready", "ready"),
+            ("i_{dir}_status_valid", "status_valid"),
+            ("i_{dir}_status_error", "status_error"),
+        ] {
+            out.push_str(&format!(
+                "        {}: hm_{bundle}_{dir}_{name},\n",
+                port.replace("{dir}", dir)
+            ));
+        }
+    }
+    out.push_str(&format!("        s_axi: haxi_{bundle},\n"));
+    if hmem.axi.is_some() {
+        out.push_str(&format!("        o_oor: hx_{bundle}_oor,\n"));
+    } else {
+        out.push_str(&format!("        o_oor: t_{bundle}_oor,\n"));
+    }
+    out.push_str(&format!("        o_failed: t_{bundle}_host_failed,\n"));
+    out.push_str(&format!("        o_rd_code: t_{bundle}_host_rd_code,\n"));
+    out.push_str(&format!("        o_wr_code: t_{bundle}_host_wr_code,\n"));
+    out.push_str(&format!("        o_busy: t_{bundle}_host_busy,\n"));
+    out.push_str("    );\n\n");
+
+    if second_master {
+        let names: Vec<String> = ["rd", "wr"]
+            .iter()
+            .flat_map(|dir| {
+                [
+                    "pcie_addr",
+                    "axi_addr",
+                    "len",
+                    "valid",
+                    "ready",
+                    "status_error",
+                    "status_valid",
+                ]
+                .map(|name| format!("hm_{bundle}_{dir}_{name}"))
+            })
+            .collect();
+        let wires = |at: usize| DescWires {
+            pcie_addr: &names[at],
+            axi_addr: &names[at + 1],
+            len: &names[at + 2],
+            tag: "'0",
+            valid: &names[at + 3],
+            ready: &names[at + 4],
+            status_error: &names[at + 5],
+            status_valid: &names[at + 6],
+        };
+        dma_engine(
+            out,
+            plan,
+            domain,
+            &format!("haxi_{bundle}"),
+            &dpkg,
+            &wires(7),
+            &wires(0),
+        );
+    } else {
+        // Nothing takes a descriptor or drives the AXI side.
+        out.push_str("    always_comb {\n");
+        for dir in ["rd", "wr"] {
+            for name in ["ready", "status_valid", "status_error"] {
+                out.push_str(&format!("        hm_{bundle}_{dir}_{name} = 0;\n"));
+            }
+        }
+        for field in AXI4_MASTER_FIELDS {
+            out.push_str(&format!("        haxi_{bundle}.{field} = 0;\n"));
+        }
+        out.push_str("    }\n\n");
+    }
+}
+
+/// What a master drives on `$std::axi4_if`.
+const AXI4_MASTER_FIELDS: [&str; 31] = [
+    "awid", "awaddr", "awlen", "awsize", "awburst", "awlock", "awcache", "awprot", "awqos",
+    "awregion", "awuser", "awvalid", "wdata", "wstrb", "wlast", "wuser", "wvalid", "bready",
+    "arid", "araddr", "arlen", "arsize", "arburst", "arlock", "arcache", "arprot", "arqos",
+    "arregion", "aruser", "arvalid", "rready",
+];
+
 /// Places the Vivado MIG and connects AXI4 to it through a CDC.
 ///
 /// The ports were measured. `s_axi_*` are flat ports with no `region` and no
@@ -4374,7 +4980,10 @@ fn mig_instance(
     // The card-issued DMA path. It is arbitrated at the controller width. The
     // DMA engine master is fixed at 256 bits and cannot join the arbiter of
     // the DUT and the window (DUT bus width). The DUT path does not change.
-    let into_cdc = if has_pcie(plan) && !dma_registers(&plan.registers).is_empty() {
+    let gate = dma_registers(&plan.registers)
+        .iter()
+        .any(|r| r.role == Some(DMA_GO));
+    let into_cdc = if has_pcie(plan) && gate {
         let dpkg = format!("$std::axi4_pkg::<{aw}, {DMA_BUS_BYTES}, {idw}, 1, 1, 1, 1, 1>");
         out.push_str(&format!(
             "    inst qaxi_{bundle}: {domain}$std::axi4_if::<{dpkg}>;\n"
@@ -4401,173 +5010,15 @@ fn mig_instance(
         out.push_str(&format!(
             "    inst paxi_{bundle}: {domain}$std::axi4_if::<{cpkg}>;\n"
         ));
-        // Wires between the DMA engine and the hard block. They are declared
-        // first; `veryl check` rejects a name used before its declaration.
-        for (signal, width) in RQ_STREAM {
-            out.push_str(&format!(
-                "    var h_rq_{signal}: {domain}{};\n",
-                logic(width)
-            ));
-        }
-        // Wires between the crossing output and the TLP buffer stage (hard
-        // block clock side).
-        for (signal, width) in RQ_STREAM {
-            out.push_str(&format!(
-                "    var p_rq_{signal}: '{PCIE_DOMAIN} {};\n",
-                logic(width)
-            ));
-        }
-        out.push('\n');
-
-        // Two RQ streams leave, and the write engine merges them into one. The
-        // borrowed code works this way, so no stream arbiter is needed.
-        for (signal, width) in RQ_STREAM {
-            out.push_str(&format!(
-                "    var j_rq_{signal}: {domain}{};\n",
-                logic(width)
-            ));
-        }
-        for (signal, width) in RC_STREAM {
-            out.push_str(&format!(
-                "    var h_rc_{signal}: {domain}{};\n",
-                logic(width)
-            ));
-        }
-        out.push('\n');
-
-        // Read and write connect to one interface separately. AXI4 channels
-        // are independent, so with `read_master` and `write_master` the two
-        // DMA engines form one master, with one arbiter and one converter.
-        out.push_str(&format!("    inst u_dma_wr: hns::dma_wr::<{dpkg}> (\n"));
-        out.push_str(&format!("        i_clk: clk_{host},\n"));
-        out.push_str(&format!("        i_rst: rst_{host},\n"));
-        for (port, wire) in [
-            ("i_desc_pcie_addr", "dma_desc_pcie_addr"),
-            ("i_desc_axi_addr", "dma_desc_axi_addr"),
-            ("i_desc_len", "dma_desc_len"),
-            ("i_desc_tag", "dma_desc_tag"),
-            ("i_desc_valid", "dma_wr_valid"),
-            ("o_desc_ready", "dma_wr_ready"),
-            ("o_status_tag", "_"),
-            ("o_status_error", "dma_wr_status_error"),
-            ("o_status_valid", "dma_wr_status_valid"),
-        ] {
-            out.push_str(&format!("        {port}: {wire},\n"));
-        }
-        out.push_str(&format!("        m_axi: qaxi_{bundle},\n"));
-        for (signal, _width) in RQ_STREAM {
-            let d = if signal == "tready" { "i" } else { "o" };
-            out.push_str(&format!("        {d}_rq_{signal}: h_rq_{signal},\n"));
-        }
-        for (signal, _width) in RQ_STREAM {
-            let d = if signal == "tready" { "o" } else { "i" };
-            out.push_str(&format!("        {d}_join_{signal}: j_rq_{signal},\n"));
-        }
-        out.push_str("        i_max_payload: pcie_max_payload,\n");
-        out.push_str("        i_limit: t_dma_mps_limit,\n");
-        out.push_str("        o_mps: dma_mps_used,\n");
-        // `hns::dma_gate` tracks busy.
-        out.push_str("        o_busy: _,\n");
-        out.push_str("    );\n\n");
-
-        out.push_str(&format!("    inst u_dma_rd: hns::dma_rd::<{dpkg}> (\n"));
-        out.push_str(&format!("        i_clk: clk_{host},\n"));
-        out.push_str(&format!("        i_rst: rst_{host},\n"));
-        for (port, wire) in [
-            ("i_desc_pcie_addr", "dma_desc_pcie_addr"),
-            ("i_desc_axi_addr", "dma_desc_axi_addr"),
-            ("i_desc_len", "dma_desc_len"),
-            ("i_desc_tag", "dma_desc_tag"),
-            ("i_desc_valid", "dma_rd_valid"),
-            ("o_desc_ready", "dma_rd_ready"),
-            ("o_status_tag", "_"),
-            ("o_status_error", "dma_rd_status_error"),
-            ("o_status_valid", "dma_rd_status_valid"),
-        ] {
-            out.push_str(&format!("        {port}: {wire},\n"));
-        }
-        out.push_str(&format!("        m_axi: qaxi_{bundle},\n"));
-        for (signal, _width) in RQ_STREAM {
-            let d = if signal == "tready" { "i" } else { "o" };
-            out.push_str(&format!("        {d}_rq_{signal}: j_rq_{signal},\n"));
-        }
-        for (signal, _width) in RC_STREAM {
-            let d = if signal == "tready" { "o" } else { "i" };
-            out.push_str(&format!("        {d}_rc_{signal}: h_rc_{signal},\n"));
-        }
-        out.push_str("        i_max_read_req: pcie_max_read_req,\n");
-        out.push_str("        i_limit: t_dma_mrrs_limit,\n");
-        out.push_str("        o_mrrs: dma_mrrs_used,\n");
-        // Completions dropped by the borrowed code. The host compares the
-        // counts before and after a transfer.
-        out.push_str("        o_cor_count: t_dma_rc_cor,\n");
-        out.push_str("        o_uncor_count: t_dma_rc_uncor,\n");
-        out.push_str("        o_busy: _,\n");
-        out.push_str("    );\n\n");
-
-        // This is the only crossing. The DMA engine is on the harness side, so
-        // only the TLP stream goes to the hard block (`hns::tlp_cdc`).
-        // The depth must hold a whole TLP. With 8 entries (256 bytes), a TLP
-        // with a 256-byte payload (9 beats with the header) did not fit, and
-        // transfers got 12% slower even with half as many TLPs (measured).
-        // PCIe allows 4096-byte payloads, but that needs BRAM; the depth is
-        // sized for two 512-byte TLPs, the payload negotiated today.
-        out.push_str(
-            "    inst u_rq_cdc: hns::tlp_cdc #(\n        DEPTH : 64,\n        USER_W: 60,\n    ) (\n",
+        dma_engine(
+            out,
+            plan,
+            domain,
+            &format!("qaxi_{bundle}"),
+            &dpkg,
+            &GATE_WR,
+            &GATE_RD,
         );
-        out.push_str(&format!("        is_clk: clk_{host},\n"));
-        out.push_str(&format!("        is_rst: rst_{host},\n"));
-        for (signal, _width) in RQ_STREAM {
-            let d = if signal == "tready" { "os" } else { "is" };
-            out.push_str(&format!("        {d}_{signal}: h_rq_{signal},\n"));
-        }
-        out.push_str("        id_clk: pcie_user_clk,\n");
-        out.push_str("        id_rst: pcie_user_rst,\n");
-        for (signal, _width) in RQ_STREAM {
-            let d = if signal == "tready" { "id" } else { "od" };
-            out.push_str(&format!("        {d}_{signal}: p_rq_{signal},\n"));
-        }
-        out.push_str("    );\n\n");
-
-        // Buffer each whole TLP before sending it. On RQ, a `tvalid` drop in
-        // the middle of a TLP makes the hard block nullify it (PG213). The DMA
-        // engine streams while it reads DRAM, so a gap in R would leave a gap
-        // in the TLP (`hns::tlp_hold`).
-        out.push_str(
-            "    inst u_rq_hold: hns::tlp_hold #(\n        DEPTH : 64,\n        USER_W: 60,\n    ) (\n",
-        );
-        out.push_str("        i_clk: pcie_user_clk,\n");
-        out.push_str("        i_rst: pcie_user_rst,\n");
-        for (signal, _width) in RQ_STREAM {
-            let d = if signal == "tready" { "o" } else { "i" };
-            out.push_str(&format!("        {d}_{signal}: p_rq_{signal},\n"));
-        }
-        for (signal, _width) in RQ_STREAM {
-            let d = if signal == "tready" { "i" } else { "o" };
-            out.push_str(&format!("        {d}_{signal}: rq_{signal},\n"));
-        }
-        out.push_str("        o_gaps_gray: pcie_rq_gaps_gray,\n");
-        out.push_str("    );\n\n");
-
-        // Completions must always be taken, or the hard block stalls. So this
-        // must be a FIFO, not a handshake. The depth holds a whole TLP, as
-        // for RQ.
-        out.push_str(
-            "    inst u_rc_cdc: hns::tlp_cdc #(\n        DEPTH : 64,\n        USER_W: 75,\n    ) (\n",
-        );
-        out.push_str("        is_clk: pcie_user_clk,\n");
-        out.push_str("        is_rst: pcie_user_rst,\n");
-        for (signal, _width) in RC_STREAM {
-            let d = if signal == "tready" { "os" } else { "is" };
-            out.push_str(&format!("        {d}_{signal}: rc_{signal},\n"));
-        }
-        out.push_str(&format!("        id_clk: clk_{host},\n"));
-        out.push_str(&format!("        id_rst: rst_{host},\n"));
-        for (signal, _width) in RC_STREAM {
-            let d = if signal == "tready" { "id" } else { "od" };
-            out.push_str(&format!("        {d}_{signal}: h_rc_{signal},\n"));
-        }
-        out.push_str("    );\n\n");
 
         // The DUT and the window are m0, the DMA engine m1. The order has no
         // meaning, but it is fixed so that diffs of the output stay readable.
@@ -5679,6 +6130,13 @@ fn connection(
         };
         return format!("{prefix}_{}", axi_mem.bundle);
     }
+    if let Some(hmem) = plan
+        .host_mems
+        .iter()
+        .find(|h| h.axi.as_ref().is_some_and(|axi| axi.port == port.name))
+    {
+        return format!("axi_{}", hmem.bundle);
+    }
     if let Some(axi) = plan.axi_slaves.iter().find(|axi| axi.port == port.name) {
         let prefix = if axi.corebus.is_some() { "cb" } else { "axi" };
         return format!("{prefix}_{}", axi.bundle);
@@ -6246,6 +6704,17 @@ pub fn sync_instances(plan: &Plan) -> Vec<(String, String, f64)> {
         // RQ TLPs dropped by the hard block (Gray coded), to the window clock.
         out.push(std_sync("u_rqdrop_sync".to_string(), 1000.0 / host_mhz));
         out.push(std_sync("u_rqgap_sync".to_string(), 1000.0 / host_mhz));
+        // The payload and read request sizes, to the window clock, by two
+        // flops in the wrapper. Left unbounded, the crossing is timed as if
+        // the clocks were related: on a board where it crosses an SLR, it
+        // failed by 2.2 ns.
+        for reg in ["mps_reg_1", "mrrs_reg_1"] {
+            out.push((
+                format!("u_pcie/{reg}"),
+                format!("*u_pcie/{reg}_reg*"),
+                1000.0 / host_mhz,
+            ));
+        }
         // The reset merge in `hns::tlp_cdc` (`MERGE_RESET`). The other side's
         // reset reaches the synchronizer's asynchronous clear, so that path is
         // bounded too. It ends on both sides, so the faster period is used.
@@ -7274,6 +7743,42 @@ fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
                 "AXI4 transfers the DUT made outside the memory (below `dut_base` or past the end); they were answered with DECERR".to_string(),
             )
         }
+        Some("oor")
+            if plan
+                .host_mems
+                .iter()
+                .any(|mem| mem.is_host() && Some(mem.bundle.as_str()) == register.bundle.as_deref()) =>
+        {
+            let axi = plan
+                .host_mems
+                .iter()
+                .any(|mem| mem.axi.is_some() && Some(mem.bundle.as_str()) == register.bundle.as_deref());
+            notes.push(if axi {
+                format!(
+                    "AXI4 transfers the DUT made outside host memory (below `dut_base`, past `{bundle}_aperture`, or while `{bundle}_on` was 0), and writes not stored for a gap in their strobes; they were answered with an error"
+                )
+            } else {
+                format!(
+                    "commands the DUT made past `{bundle}_aperture`, off a beat boundary, of 0 bytes, or while `{bundle}_on` was 0, and writes not stored for a gap in their strobes; their reads ended with error beats and their writes with `wr_done_error`"
+                )
+            })
+        }
+        Some("host_base") => notes.push(
+            "bus address of the host buffer; the DUT's address 0 is here. `hio hostmem attach` writes it".to_string(),
+        ),
+        Some("host_on") => notes.push(format!(
+            "1 lets the DUT reach host memory. A command takes `{bundle}_base` when it starts, so a change never splits one"
+        )),
+        Some("host_aperture") => notes.push("bytes of host memory the DUT may reach".to_string()),
+        Some("host_failed") => notes.push(
+            "4 KB pages the card could not move; their beats were errors. Saturates instead of wrapping".to_string(),
+        ),
+        Some("host_rd_code") | Some("host_wr_code") => notes.push(
+            "the last error code of the card's DMA engine for reads (`rd`) or writes (`wr`); 0 if none".to_string(),
+        ),
+        Some("host_busy") => notes.push(format!(
+            "1 while a command is being served. It runs to its end even after `{bundle}_on` goes to 0"
+        )),
         // Not a fixed-latency memory: do not talk about cycles holding an
         // address. A transfer-level port counts per command.
         Some("oor") if !plan
@@ -7296,6 +7801,16 @@ fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
             } else {
                 "cycles the DUT held an address at or above the depth (the port has no read enable, so an access cannot be told from an idle cycle); those reads return 0 and their writes are dropped. The address is never folded back into range".to_string()
             });
+        }
+        Some("refused")
+            if plan
+                .host_mems
+                .iter()
+                .any(|mem| Some(mem.bundle.as_str()) == register.bundle.as_deref()) =>
+        {
+            notes.push(
+                "AXI4 bursts the DUT made that host memory does not serve (FIXED, a narrow burst, a malformed WRAP). They were answered with SLVERR, and their writes were dropped".to_string(),
+            )
         }
         Some("refused") => notes.push(
             "pzcorebus commands the DUT made that are not a read or a write (broadcast, atomic, message). They were not run: their data was dropped, and a non-posted one was answered with an error".to_string(),

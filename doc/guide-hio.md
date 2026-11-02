@@ -59,7 +59,7 @@ enough (`--serial 8107`).
 | `trace …` | a `trace` ring: `start`, `stop`, `status`, `dump`; see [`hio trace`](#hio-trace-the-last-instructions) |
 | `dump` | read every register |
 | `reset` | reset the DUT only; `--hold` / `--release` keep it in reset |
-| `bench` | how fast the window is; `<region> --both` measures writes too |
+| `bench` | how fast the window is; `<region> --both` measures writes too; `--suite` measures everything; see [`hio bench`](#hio-bench-how-fast) |
 | `check` | whether the board and this machine are ready, and what to fix |
 | `dma-fire` | the card moves one descriptor itself, either way (PCIe + `dram`); `--pcie-addr` aims it at another card's BAR |
 | `run <file>` | a file of commands, holding the link open (`-` for standard input) |
@@ -176,9 +176,15 @@ hio --regs regs.json --connect localhost:5555 id
 - `HIO_CONNECT=localhost:5555` does the same as `--connect`.
 - One client at a time; another is refused until the first is done.
 - There is no password. Keep the default `127.0.0.1` and use `ssh -L`.
-- `--connect` reaches only the window, with one exception below. `erase`,
-  `probe`, `sysmon`, `dap`, `program <file>.svf` and the card's DMA (`--dma`,
-  `dma-fire`) run on the server's machine.
+- `--connect` reaches only the window, with three exceptions: `program`
+  (below), [`hostmem`](#hio-hostmem-host-memory-for-the-dut), and the card's
+  DMA for `load` and `memtest` over PCIe: the server holds the page, and the
+  data crosses the connection once. `erase`, `probe`, `sysmon`, `dap`,
+  `program <file>.svf` and `dma-fire` run on the server's machine.
+- Over PCIe, the registers that point the card at host memory
+  (`<bundle>_base`, `<bundle>_on`, `dma_base`, `dma_size`) belong to the
+  server. A batch that writes one is refused: the card would write any
+  physical address it is given, the kernel's memory included.
 - A simulation is served the same way: `veryl harness sim --addr`.
 
 The server also programs the board, so you can change the design without
@@ -292,6 +298,60 @@ needs what `check` reports (root, huge pages, and the IOMMU passing this
 card's addresses through); without it the window is used instead, and the output
 says which it was. Only the memory the card is wired to (the `dram` bundle) goes
 this way. `--pio` and `--dma` force one or the other, for telling them apart.
+Through `hio serve` over PCIe, the page is in the server's machine, so the
+client needs no root.
+
+## `hio bench`: how fast
+
+```bash
+hio bench --suite --json perf.jsonl
+```
+
+`--suite` measures what this design and this transport can do, one after
+another, and prints a table: a round trip of the window, batched reads, writes
+and reads of each memory region, the card's DMA both ways at a few descriptor
+sizes (PCIe with `dram`), and through `hio serve` the copies to and from the
+server's host memory. **What is in the memories is lost.** `--json` also adds
+the results to a file as one line, with the board, the transport and the `hio`
+version, so runs can be compared later.
+
+How fast the DUT itself reaches host memory depends on the DUT, so it is not
+part of the suite. `examples/hw/axi/bench.hostmem.hio` shows how to measure it.
+
+## `hio hostmem`: host memory for the DUT
+
+A `host_mem` bundle reaches this machine's memory over PCIe. `hostmem attach`
+gives it one huge page and says where it is; the DUT then addresses it from 0
+(from `dut_base` on AXI4 with one). Offsets in `hostmem` are bytes in the page.
+
+```
+# in a procedure file, run with: sudo hio -p run copy.hio
+hostmem attach hmem
+hostmem load hmem pattern.bin            # --at <offset>
+hostmem write hmem 0x100 1 2             # offset, words
+write i_start 1
+sleep 10
+hostmem read hmem 64 8                   # offset, words
+hostmem save hmem out.bin --at 0 --len 4096
+```
+
+**The page lives only while the procedure file or the prompt runs**, so
+`hostmem` works there and not as a command of its own. When it ends, however it
+ends, the bundle is switched off (`<bundle>_on`), its last command is allowed
+to finish (`<bundle>_busy`), and only then is the page freed. `hostmem detach`
+does the same earlier. It needs what `check` reports for the card's DMA: root,
+a free huge page, and the IOMMU passing this card's addresses through. Bus
+mastering, which a reboot turns off, is turned on by `attach`.
+
+Through `hio serve` over PCIe, `hostmem` works over `--connect` as well. The
+page is then in the server's machine, and the server takes it back the same
+way when the client leaves.
+
+What the DUT could not get is counted: `<bundle>_oor` for commands outside the
+aperture (or while switched off) and writes with a gap in their strobes,
+`<bundle>_failed` for pages the card could not move, with the last code in
+`<bundle>_rd_code` / `_wr_code`, and on AXI4 `<bundle>_refused` for bursts it
+does not serve (FIXED, narrow bursts).
 
 ## `hio cpu boot` and `cpu console`: run firmware
 

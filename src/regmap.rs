@@ -1041,7 +1041,11 @@ pub fn build(
         .find(|m| m.backing == crate::manifest::Backing::Dram)
         .filter(|_| pcie.is_some())
         .map(|m| m.bundle.clone());
-    if requester.is_some() {
+    // The DMA engine itself is also there for `host_mem`, which reaches host
+    // memory through it. Its gate (`dma_base` .. `dma_blocked`) is not: the
+    // DUT issues those descriptors, not the host.
+    let engine = pcie.is_some() && (requester.is_some() || host_mems.iter().any(|h| h.is_host()));
+    if engine {
         let mut place = |name: &str, width: usize, access: Access, role: &'static str| {
             let words = width.div_ceil(WORD_BITS).max(1);
             registers.push(Register {
@@ -1058,27 +1062,30 @@ pub fn build(
             });
             offset += words * (WORD_BITS / 8);
         };
-        // The allowed window. The host writes it once, with one page from
-        // pagemap. `hns::dma_gate` does not issue a descriptor outside it: on a
-        // machine with the IOMMU in pass-through, nothing else would stop it.
-        place("base", 64, Access::ReadWrite, "dma_base");
-        place("size", 32, Access::ReadWrite, "dma_size");
-        // One descriptor.
-        place("pcie_addr", 64, Access::ReadWrite, "dma_pcie_addr");
-        place("axi_addr", 64, Access::ReadWrite, "dma_axi_addr");
-        place("len", 20, Access::ReadWrite, "dma_len");
-        // The direction. 0: the card writes host memory (a read for the host).
-        // 1: the card reads it (a write for the host). The window check is the
-        // same for both.
-        place("dir", 1, Access::ReadWrite, "dma_dir");
-        // A write becomes a pulse. No value is kept.
-        place("go", 1, Access::ReadWrite, DMA_GO);
-        // Separate "not issued" from "issued and failed".
-        place("busy", 1, Access::ReadOnly, "dma_busy");
-        place("error", 4, Access::ReadOnly, "dma_error");
-        place("done", 16, Access::ReadOnly, "dma_done");
-        place("oor", 16, Access::ReadOnly, "dma_oor");
-        place("blocked", 16, Access::ReadOnly, "dma_blocked");
+        if requester.is_some() {
+            // The allowed window. The host writes it once, with one page from
+            // pagemap. `hns::dma_gate` does not issue a descriptor outside it:
+            // on a machine with the IOMMU in pass-through, nothing else would
+            // stop it.
+            place("base", 64, Access::ReadWrite, "dma_base");
+            place("size", 32, Access::ReadWrite, "dma_size");
+            // One descriptor.
+            place("pcie_addr", 64, Access::ReadWrite, "dma_pcie_addr");
+            place("axi_addr", 64, Access::ReadWrite, "dma_axi_addr");
+            place("len", 20, Access::ReadWrite, "dma_len");
+            // The direction. 0: the card writes host memory (a read for the
+            // host). 1: the card reads it (a write for the host). The window
+            // check is the same for both.
+            place("dir", 1, Access::ReadWrite, "dma_dir");
+            // A write becomes a pulse. No value is kept.
+            place("go", 1, Access::ReadWrite, DMA_GO);
+            // Separate "not issued" from "issued and failed".
+            place("busy", 1, Access::ReadOnly, "dma_busy");
+            place("error", 4, Access::ReadOnly, "dma_error");
+            place("done", 16, Access::ReadOnly, "dma_done");
+            place("oor", 16, Access::ReadOnly, "dma_oor");
+            place("blocked", 16, Access::ReadOnly, "dma_blocked");
+        }
         // The max payload size the link negotiated (encoded; 0 is 128 bytes).
         // It sets the speed, so the host can see it.
         place("mps", 3, Access::ReadOnly, "dma_mps");
@@ -1112,7 +1119,7 @@ pub fn build(
 
     // The `host_mem` stand-in. It has the same indirect port as a memory, so
     // the host accesses it like a `bram`, and `hio load` works unchanged.
-    for hmem in host_mems {
+    for hmem in host_mems.iter().filter(|h| !h.is_host()) {
         let bundle = hmem.bundle.clone();
         let mut place = |name: String, width: usize, access: Access, role, value| {
             let words = width.div_ceil(WORD_BITS).max(1);
@@ -1180,6 +1187,48 @@ pub fn build(
             "jitter",
             None,
         ));
+    }
+
+    // Real host memory. The host hands over one buffer and says where it is;
+    // until then, every command the DUT makes ends with an error.
+    for hmem in host_mems.iter().filter(|h| h.is_host()) {
+        let bundle = hmem.bundle.clone();
+        let mut place = |name: &str, width: usize, access: Access, role, value| {
+            let words = width.div_ceil(WORD_BITS).max(1);
+            registers.push(Register {
+                name: format!("{bundle}_{name}"),
+                kind: Kind::Terminator,
+                offset,
+                words,
+                width,
+                access,
+                bundle: Some(bundle.clone()),
+                value,
+                self_clearing: None,
+                role: Some(role),
+            });
+            offset += words * (WORD_BITS / 8);
+        };
+        place("base", 64, Access::ReadWrite, "host_base", None);
+        place("on", 1, Access::ReadWrite, "host_on", None);
+        place(
+            "aperture",
+            WORD_BITS,
+            Access::ReadOnly,
+            "host_aperture",
+            hmem.aperture,
+        );
+        place("oor", WORD_BITS, Access::ReadOnly, "oor", None);
+        place("failed", WORD_BITS, Access::ReadOnly, "host_failed", None);
+        place("rd_code", 4, Access::ReadOnly, "host_rd_code", None);
+        place("wr_code", 4, Access::ReadOnly, "host_wr_code", None);
+        // A command that started before `_on` went to 0 still runs to its
+        // end, so the host waits for this before it frees the buffer.
+        place("busy", 1, Access::ReadOnly, "host_busy", None);
+        // An AXI4 port: `hns::axi2xfer` counts the bursts it cannot serve.
+        if hmem.axi.is_some() {
+            place("refused", WORD_BITS, Access::ReadOnly, "refused", None);
+        }
     }
 
     // TLP counts, on PCIe only. They show whether a request reached the

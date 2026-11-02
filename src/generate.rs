@@ -727,14 +727,11 @@ fn commit(pending: Vec<Pending>) -> Result<Vec<Written>, GenError> {
         .collect()
 }
 
-/// What to run next to get a bitstream, and what is not generated yet.
+/// What to run next to get a bitstream.
 fn print_next_steps(out: &Path) {
     println!("next:");
     println!("  make -C {}", out.join("syn").display());
     println!("      # veryl build -> IP generation -> synthesis -> bitstream");
-    println!();
-    println!("NOT GENERATED YET:");
-    println!("  - host_mem terminators");
     println!();
     println!("The harness uses its own BSCANE2 bridge, which Vivado cannot see, so the");
     println!("window is reached with `hio` rather than hw_server. `make program`");

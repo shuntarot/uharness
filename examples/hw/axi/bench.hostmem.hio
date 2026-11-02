@@ -1,0 +1,25 @@
+# How fast the DUT reads host memory -- sudo hio -p run bench.hostmem.hio
+#
+# `hio bench --suite` measures what the host does. This measures what the DUT
+# does, with the design from Harness.hostmem.toml: the sweep reads host memory
+# one word after another, and `o_reads` counts the reads. Take the two counts
+# printed below:
+#
+#     time per read = 1 s / (second count - first count)
+#
+# `sleep` is in milliseconds. The reads around it add microseconds, so the
+# answer is good to well under 1%. Through `hio serve`, run it with
+# `hio --connect <server> run bench.hostmem.hio`.
+
+hostmem attach mem
+write i_sweep 1
+read o_reads
+sleep 1000
+read o_reads
+write i_sweep 0
+sleep 1
+
+echo == nothing was refused ==
+# 0 is OKAY.
+read o_resp
+read mem_failed

@@ -535,8 +535,8 @@ module hns_pcie_wrap #(
     // Max payload size, brought over the same way. Two flops per bit: the host
     // sets it once at enumeration, and the requester samples it only while it is
     // idle, so no descriptor sees it change (hns::dma_wr).
-    (* shreg_extract = "no" *) reg [2:0] mps_reg_1 = 3'b000;
-    (* shreg_extract = "no" *) reg [2:0] mps_reg_2 = 3'b000;
+    (* ASYNC_REG = "TRUE", shreg_extract = "no" *) reg [2:0] mps_reg_1 = 3'b000;
+    (* ASYNC_REG = "TRUE", shreg_extract = "no" *) reg [2:0] mps_reg_2 = 3'b000;
     always @(posedge i_clk) begin
         mps_reg_1 <= cfg_max_payload;
         mps_reg_2 <= mps_reg_1;
@@ -544,8 +544,8 @@ module hns_pcie_wrap #(
     assign o_max_payload = mps_reg_2;
 
     // Max read request size, the same way and for the same reason.
-    (* shreg_extract = "no" *) reg [2:0] mrrs_reg_1 = 3'b000;
-    (* shreg_extract = "no" *) reg [2:0] mrrs_reg_2 = 3'b000;
+    (* ASYNC_REG = "TRUE", shreg_extract = "no" *) reg [2:0] mrrs_reg_1 = 3'b000;
+    (* ASYNC_REG = "TRUE", shreg_extract = "no" *) reg [2:0] mrrs_reg_2 = 3'b000;
     always @(posedge i_clk) begin
         mrrs_reg_1 <= cfg_max_read_req;
         mrrs_reg_2 <= mrrs_reg_1;

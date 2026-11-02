@@ -28,9 +28,11 @@ pub const BATCH: u8 = 0x01;
 pub const FINISH: u8 = 0x02;
 pub const PROGRAM: u8 = 0x03;
 pub const FILE: u8 = 0x04;
+pub const HOSTMEM: u8 = 0x05;
 pub const INFO: u8 = 0x80;
 pub const READS: u8 = 0x81;
 pub const ERROR: u8 = 0x82;
+pub const BYTES: u8 = 0x83;
 
 pub const OP_READ: u8 = 1;
 pub const OP_WRITE: u8 = 2;
@@ -49,6 +51,12 @@ pub const MAX_OPS: u32 = 1 << 20;
 
 /// The largest `PROGRAM` a server takes. A VU9P bitstream is 80 MB.
 pub const MAX_PROGRAM: usize = 512 << 20;
+
+/// The most bytes one `HOSTMEM` moves. A client cuts a longer move.
+pub const MAX_HOSTMEM: u32 = 4 << 20;
+
+/// The longest bundle name a `HOSTMEM` may carry.
+const MAX_NAME: usize = 4096;
 
 /// What a server says about itself after the greeting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +297,104 @@ pub fn decode_program(body: &[u8]) -> Result<Program<'_>, String> {
     })
 }
 
+/// What a `HOSTMEM` asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostmemOp {
+    /// Hand the bundle a page. The answer is the page size and its bus
+    /// address, 8 bytes each.
+    Attach,
+    /// Switch the bundle off and free its page.
+    Detach,
+    /// Read `len` bytes at `at`.
+    Read,
+    /// Write the bytes that follow at `at`.
+    Write,
+}
+
+impl HostmemOp {
+    fn code(self) -> u8 {
+        match self {
+            HostmemOp::Attach => 1,
+            HostmemOp::Detach => 2,
+            HostmemOp::Read => 3,
+            HostmemOp::Write => 4,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<HostmemOp> {
+        Some(match code {
+            1 => HostmemOp::Attach,
+            2 => HostmemOp::Detach,
+            3 => HostmemOp::Read,
+            4 => HostmemOp::Write,
+            _ => return None,
+        })
+    }
+}
+
+/// A `HOSTMEM`: one step on the host memory of a `host_mem` bundle.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Hostmem<'a> {
+    pub op: HostmemOp,
+    pub bundle: &'a str,
+    /// Byte offset in the page. 0 for attach and detach.
+    pub at: u64,
+    /// Bytes to read. For a write, the length of `data`.
+    pub len: u32,
+    /// The bytes to write. Empty for the other ops.
+    pub data: &'a [u8],
+}
+
+/// The body of `HOSTMEM`: op, name, offset, length, then the bytes of a write.
+pub fn encode_hostmem(op: HostmemOp, bundle: &str, at: u64, len: u32, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17 + bundle.len() + data.len());
+    out.push(op.code());
+    out.extend_from_slice(&(bundle.len() as u32).to_le_bytes());
+    out.extend_from_slice(bundle.as_bytes());
+    out.extend_from_slice(&at.to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+pub fn decode_hostmem(body: &[u8]) -> Result<Hostmem<'_>, String> {
+    let (Some(&code), Some(name_len)) = (body.first(), body.get(1..5)) else {
+        return Err("a HOSTMEM shorter than its header".to_string());
+    };
+    let op =
+        HostmemOp::from_code(code).ok_or_else(|| format!("HOSTMEM op {code} is not 1 to 4"))?;
+    let name_len = u32::from_le_bytes(name_len.try_into().unwrap()) as usize;
+    let rest = 5 + name_len;
+    let (Some(name), Some(at), Some(len)) = (
+        body.get(5..rest),
+        body.get(rest..rest + 8),
+        body.get(rest + 8..rest + 12),
+    ) else {
+        return Err("a HOSTMEM shorter than its header".to_string());
+    };
+    let bundle = std::str::from_utf8(name).map_err(|_| "a HOSTMEM whose name is not UTF-8")?;
+    let len = u32::from_le_bytes(len.try_into().unwrap());
+    let data = &body[rest + 12..];
+    let want = if op == HostmemOp::Write {
+        len as usize
+    } else {
+        0
+    };
+    if data.len() != want {
+        return Err(format!(
+            "a HOSTMEM that carries {} bytes where {want} belong",
+            data.len()
+        ));
+    }
+    Ok(Hostmem {
+        op,
+        bundle,
+        at: u64::from_le_bytes(at.try_into().unwrap()),
+        len,
+        data,
+    })
+}
+
 /// The body of `READS`.
 pub fn encode_reads(values: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + values.len() * 4);
@@ -343,7 +449,7 @@ fn decode_error(body: &[u8]) -> Result<(u32, u8, String), String> {
 /// The largest message a client accepts: `READS` for a full batch, or an
 /// `INFO` or `ERROR`, which are far smaller.
 fn max_reply(max_ops: u32) -> usize {
-    4 + 4 * max_ops as usize + 64 * 1024
+    (4 + 4 * max_ops as usize).max(MAX_HOSTMEM as usize) + 64 * 1024
 }
 
 pub struct Link {
@@ -474,6 +580,85 @@ impl Link {
         }
     }
 
+    /// Hands a `host_mem` bundle a page in the memory of the server's
+    /// machine. Answers the page size and its bus address.
+    pub fn hostmem_attach(&mut self, bundle: &str) -> Result<(u64, u64), Error> {
+        let answer = self.hostmem(HostmemOp::Attach, bundle, 0, 0, &[])?;
+        let (Some(size), Some(addr)) = (answer.get(..8), answer.get(8..16)) else {
+            return Err(Error::Protocol(format!(
+                "{} bytes as an answer to attach, not 16",
+                answer.len()
+            )));
+        };
+        Ok((
+            u64::from_le_bytes(size.try_into().unwrap()),
+            u64::from_le_bytes(addr.try_into().unwrap()),
+        ))
+    }
+
+    /// Switches the bundle off and has the server free its page.
+    pub fn hostmem_detach(&mut self, bundle: &str) -> Result<(), Error> {
+        self.hostmem(HostmemOp::Detach, bundle, 0, 0, &[])
+            .map(|_| ())
+    }
+
+    /// Reads `len` bytes of the bundle's page at `at`.
+    pub fn hostmem_read(&mut self, bundle: &str, at: u64, len: usize) -> Result<Vec<u8>, Error> {
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            let part = (len - out.len()).min(MAX_HOSTMEM as usize);
+            let got = self.hostmem(
+                HostmemOp::Read,
+                bundle,
+                at + out.len() as u64,
+                part as u32,
+                &[],
+            )?;
+            if got.len() != part {
+                return Err(Error::Protocol(format!(
+                    "{} bytes for a read of {part}",
+                    got.len()
+                )));
+            }
+            out.extend_from_slice(&got);
+        }
+        Ok(out)
+    }
+
+    /// Writes `data` into the bundle's page at `at`.
+    pub fn hostmem_write(&mut self, bundle: &str, at: u64, data: &[u8]) -> Result<(), Error> {
+        for (i, part) in data.chunks(MAX_HOSTMEM as usize).enumerate() {
+            let offset = at + (i * MAX_HOSTMEM as usize) as u64;
+            self.hostmem(HostmemOp::Write, bundle, offset, part.len() as u32, part)?;
+        }
+        Ok(())
+    }
+
+    fn hostmem(
+        &mut self,
+        op: HostmemOp,
+        bundle: &str,
+        at: u64,
+        len: u32,
+        data: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        send_message(
+            &mut self.stream,
+            HOSTMEM,
+            &encode_hostmem(op, bundle, at, len, data),
+        )?;
+        match read_message(&mut self.stream, max_reply(self.info.max_ops))? {
+            (BYTES, body) => Ok(body),
+            (ERROR, body) => {
+                let (_, _, message) = decode_error(&body).map_err(Error::Protocol)?;
+                Err(Error::Failed(message))
+            }
+            (kind, _) => Err(Error::Protocol(format!(
+                "message {kind:#04x} as an answer to HOSTMEM, not BYTES or ERROR"
+            ))),
+        }
+    }
+
     /// Ends the simulation, as Ctrl-C on `veryl harness sim` would.
     pub fn finish(mut self) -> Result<(), Error> {
         send_message(&mut self.stream, FINISH, &[])?;
@@ -529,6 +714,17 @@ pub trait Window {
     fn program(&mut self, _request: &Program) -> Result<Info, String> {
         Err("this server does not program the board".to_string())
     }
+
+    /// Runs one step on host memory. Answers the bytes of `BYTES`.
+    fn hostmem(&mut self, _request: &Hostmem) -> Result<Vec<u8>, String> {
+        Err("this server holds no host memory".to_string())
+    }
+
+    /// The client left, however it went. Host memory it was given is taken
+    /// back here.
+    fn left(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A window that only runs batches, through a closure.
@@ -577,6 +773,9 @@ pub fn serve(
             Ok(()) => format!("{peer} left"),
             Err(e) => format!("{peer} dropped: {e}"),
         });
+        if let Err(e) = window.left() {
+            log(&e);
+        }
         busy.store(false, Ordering::Release);
     }
     Ok(())
@@ -608,6 +807,7 @@ fn serve_one(
     loop {
         let max_of = |kind| match kind {
             PROGRAM => MAX_PROGRAM,
+            HOSTMEM => 17 + MAX_NAME + MAX_HOSTMEM as usize,
             _ => 5 + 9 * max_ops as usize,
         };
         let (kind, body) = match read_message_by_kind(stream, max_of) {
@@ -662,6 +862,22 @@ fn serve_one(
                     log("programming failed");
                     send_message(stream, ERROR, &encode_error(NO_OP, 0, &message))?
                 }
+            }
+            continue;
+        }
+        if kind == HOSTMEM {
+            let done = decode_hostmem(&body).and_then(|request| {
+                if request.len > MAX_HOSTMEM {
+                    return Err(format!(
+                        "a HOSTMEM moves at most {MAX_HOSTMEM} bytes; this one asks for {}",
+                        request.len
+                    ));
+                }
+                window.hostmem(&request)
+            });
+            match done {
+                Ok(bytes) => send_message(stream, BYTES, &bytes)?,
+                Err(message) => send_message(stream, ERROR, &encode_error(NO_OP, 0, &message))?,
             }
             continue;
         }
@@ -1066,6 +1282,116 @@ mod tests {
             *seen.lock().unwrap(),
             vec![Some(b"first".to_vec()), None, None]
         );
+    }
+
+    #[test]
+    fn a_hostmem_request_carries_the_op_the_name_and_the_bytes() {
+        let body = encode_hostmem(HostmemOp::Write, "mem", 0x10, 2, &[7, 8]);
+        assert_eq!(
+            decode_hostmem(&body).unwrap(),
+            Hostmem {
+                op: HostmemOp::Write,
+                bundle: "mem",
+                at: 0x10,
+                len: 2,
+                data: &[7, 8],
+            }
+        );
+        // A write that carries fewer bytes than its length, a read that
+        // carries any, and an op that does not exist.
+        assert!(decode_hostmem(&body[..body.len() - 1]).is_err());
+        assert!(decode_hostmem(&encode_hostmem(HostmemOp::Read, "mem", 0, 2, &[1])).is_err());
+        let mut bad = encode_hostmem(HostmemOp::Read, "mem", 0, 2, &[]);
+        bad[0] = 9;
+        assert!(decode_hostmem(&bad).is_err());
+    }
+
+    /// A board with one `host_mem` bundle, `mem`, whose page is 64 bytes.
+    struct Host {
+        page: Option<Vec<u8>>,
+        /// How many times a client left with the page still given out.
+        taken_back: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Window for Host {
+        fn info(&self) -> Info {
+            info()
+        }
+
+        fn run(&mut self, _batch: &Batch) -> Result<Reads, String> {
+            Ok(Reads::new(Vec::new()))
+        }
+
+        fn hostmem(&mut self, request: &Hostmem) -> Result<Vec<u8>, String> {
+            if request.bundle != "mem" {
+                return Err(format!("`{}` is not a host_mem bundle", request.bundle));
+            }
+            let at = request.at as usize;
+            match request.op {
+                HostmemOp::Attach => {
+                    self.page = Some(vec![0; 64]);
+                    let mut answer = 64u64.to_le_bytes().to_vec();
+                    answer.extend_from_slice(&0x2_6040_0000u64.to_le_bytes());
+                    Ok(answer)
+                }
+                HostmemOp::Detach => {
+                    self.page = None;
+                    Ok(Vec::new())
+                }
+                HostmemOp::Read => {
+                    let page = self.page.as_ref().ok_or("no page")?;
+                    Ok(page[at..at + request.len as usize].to_vec())
+                }
+                HostmemOp::Write => {
+                    let page = self.page.as_mut().ok_or("no page")?;
+                    page[at..at + request.data.len()].copy_from_slice(request.data);
+                    Ok(Vec::new())
+                }
+            }
+        }
+
+        fn left(&mut self) -> Result<(), String> {
+            if self.page.take().is_some() {
+                self.taken_back
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_client_reaches_host_memory_through_the_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let taken_back = std::sync::Arc::default();
+        let mut host = Host {
+            page: None,
+            taken_back: std::sync::Arc::clone(&taken_back),
+        };
+        std::thread::spawn(move || serve(listener, &mut host, |_| {}).unwrap());
+        let mut link = Link::connect(&addr).unwrap();
+        assert_eq!(link.hostmem_attach("mem").unwrap(), (64, 0x2_6040_0000));
+        link.hostmem_write("mem", 4, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(link.hostmem_read("mem", 2, 4).unwrap(), [0, 0, 1, 2]);
+        // An error leaves the connection usable.
+        let err = link.hostmem_attach("other").unwrap_err();
+        assert!(err.to_string().contains("`other`"), "{err}");
+        link.hostmem_detach("mem").unwrap();
+        assert!(link.hostmem_read("mem", 0, 4).is_err());
+        // A client that leaves without detaching has its page taken back.
+        link.hostmem_attach("mem").unwrap();
+        drop(link);
+        let mut link = Link::connect(&addr).unwrap();
+        assert!(link.hostmem_read("mem", 0, 4).is_err());
+        assert_eq!(taken_back.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_server_without_host_memory_says_so() {
+        let mut link = Link::connect(&start()).unwrap();
+        let err = link.hostmem_attach("mem").unwrap_err();
+        assert!(err.to_string().contains("holds no host memory"), "{err}");
+        assert_eq!(link.read32(0x0).unwrap(), 0);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
-use hns_host::{Batch, Bridge, Bus, Ftdi, Mpsse, ProbeConfig, Reads};
+use hns_host::{Batch, Bridge, Bus, Ftdi, Mpsse, ProbeConfig, ReadHandle, Reads};
 use hns_regs::{Access, RegisterMap};
 
 #[derive(Parser)]
@@ -338,6 +338,17 @@ enum Cmd {
         /// posted and already fast.
         #[arg(long, value_name = "N", default_value_t = 1)]
         threads: usize,
+        /// Measure all this design and transport can do. Destroys the memories.
+        ///
+        /// The window (one read per batch, batched reads), each memory region
+        /// (writes and reads, and 4 threads over PCIe), the card's DMA in both
+        /// directions at several descriptor sizes, and through `hio serve`
+        /// the copies to and from the server's host memory.
+        #[arg(long, conflicts_with_all = ["bundle", "both", "base", "size", "threads"])]
+        suite: bool,
+        /// Also add the suite to FILE as one line of JSON, to keep as a record.
+        #[arg(long, value_name = "FILE", requires = "suite")]
+        json: Option<PathBuf>,
     },
 
     /// Load a file into a memory bundle, one entry at a time.
@@ -484,6 +495,12 @@ enum Cmd {
     #[command(subcommand)]
     Trace(TraceCmd),
 
+    /// Hand host memory to a `host_mem` bundle (PCIe).
+    ///
+    /// It works in a procedure file or at the prompt, which hold the page.
+    #[command(subcommand)]
+    Hostmem(HostmemCmd),
+
     /// Serve the window to `hio --connect` on other machines.
     ///
     /// Opens the window as any command does (JTAG, or PCIe with `-p`) and keeps it
@@ -620,6 +637,60 @@ enum TraceCmd {
         /// Only the newest N records.
         #[arg(long, value_name = "N")]
         last: Option<usize>,
+    },
+}
+
+/// `hio hostmem`: the host memory a `host_mem` bundle reaches.
+///
+/// The page is held only while a procedure file (`hio run`) or the prompt
+/// runs, so these work there and not as one command.
+#[derive(Subcommand)]
+enum HostmemCmd {
+    /// Get one huge page and hand it to the bundle.
+    ///
+    /// Writes its bus address to `<bundle>_base` and switches `<bundle>_on`
+    /// on. The page starts as zeros. When the procedure or the prompt ends,
+    /// the bundle is switched off before the page is freed.
+    Attach { bundle: String },
+    /// Switch the bundle off and free its page.
+    Detach { bundle: String },
+    /// Copy a file into the page.
+    Load {
+        bundle: String,
+        file: PathBuf,
+        /// Byte offset in the page: the DUT address where the file starts.
+        #[arg(long, value_name = "BYTES", default_value_t = 0, value_parser = parse_u64)]
+        at: u64,
+    },
+    /// Print 32-bit words of the page.
+    Read {
+        bundle: String,
+        /// Byte offset in the page.
+        #[arg(value_parser = parse_u64)]
+        at: u64,
+        /// How many words (default 1).
+        words: Option<usize>,
+    },
+    /// Write 32-bit words into the page.
+    Write {
+        bundle: String,
+        /// Byte offset in the page.
+        #[arg(value_parser = parse_u64)]
+        at: u64,
+        /// Words to write, lowest first. Decimal, or 0x-prefixed hex.
+        #[arg(required = true, value_parser = parse_u64)]
+        values: Vec<u64>,
+    },
+    /// Write bytes of the page to a file.
+    Save {
+        bundle: String,
+        file: PathBuf,
+        /// Byte offset in the page.
+        #[arg(long, value_name = "BYTES", default_value_t = 0, value_parser = parse_u64)]
+        at: u64,
+        /// How many bytes.
+        #[arg(long, value_name = "BYTES", value_parser = parse_u64)]
+        len: u64,
     },
 }
 
@@ -1044,10 +1115,19 @@ fn run_script(cli: &Cli, file: &str) -> Result<(), String> {
         bus.check_identity(&map)?;
     }
 
+    let mut pages = HostPages::default();
+    let mut ran = Ok(());
     for (n, line, step) in steps {
-        run_step(cli, &mut bus, &map, step).map_err(|e| format!("line {n}: {line}\n{e}"))?;
+        ran = run_step(cli, &mut bus, &map, step, Some(&mut pages))
+            .map_err(|e| format!("line {n}: {line}\n{e}"));
+        if ran.is_err() {
+            break;
+        }
     }
-    Ok(())
+    // Even after a failed line: a page must never be freed while the DUT can
+    // still reach it.
+    let closed = pages.close(&mut bus, &map);
+    ran.and(closed)
 }
 
 /// One line of a script.
@@ -1124,7 +1204,13 @@ fn parse_step(line: &str) -> Result<Step, String> {
     }
 }
 
-fn run_step(cli: &Cli, bus: &mut Bus, map: &RegisterMap, step: Step) -> Result<(), String> {
+fn run_step(
+    cli: &Cli,
+    bus: &mut Bus,
+    map: &RegisterMap,
+    step: Step,
+    pages: Option<&mut HostPages>,
+) -> Result<(), String> {
     let cmd = match step {
         Step::Echo(text) => {
             println!("{text}");
@@ -1159,6 +1245,17 @@ fn run_step(cli: &Cli, bus: &mut Bus, map: &RegisterMap, step: Step) -> Result<(
         Cmd::Check => unreachable!("refused by parse_step"),
         Cmd::Drain { bundle, max } => drain(bus, map, &bundle, max),
         Cmd::Trace(cmd) => trace(bus, map, &cmd),
+        Cmd::Hostmem(cmd) => match pages {
+            Some(pages) => hostmem(cli, bus, map, pages, &cmd),
+            None => Err(
+                "`hostmem` works at the top prompt and in a procedure file, not here.".to_string(),
+            ),
+        },
+        Cmd::Bench {
+            suite: true,
+            ref json,
+            ..
+        } => bench_suite(bus, map, cli, json.as_deref()),
         Cmd::Bench {
             reads,
             repeat,
@@ -1167,6 +1264,7 @@ fn run_step(cli: &Cli, bus: &mut Bus, map: &RegisterMap, step: Step) -> Result<(
             base,
             size,
             threads,
+            ..
         } => bench(
             bus,
             map,
@@ -2429,17 +2527,27 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
     if matches!(cmd, Cmd::Targets) {
         return targets();
     }
+    if matches!(cmd, Cmd::Hostmem(_)) {
+        return Err(
+            "`hostmem` holds the page only while a procedure file or the prompt runs; as one \
+             command it would free it at once.\n\
+             Put the steps in a file for `hio run`, or type them at the prompt (`hio -p`)."
+                .to_string(),
+        );
+    }
     if cli.connect.is_some() {
         refuse_over_connect(&cmd)?;
     }
     // The card moves data only over PCIe. Allowing `--dma` over JTAG would
-    // test PCIe while the user thinks they test JTAG.
+    // test PCIe while the user thinks they test JTAG. A server says how it
+    // reaches the window only once connected, so `route` checks that case.
     let forced = match &cmd {
         Cmd::Memtest { dma: true, .. } => Some("memtest"),
         Cmd::Load { dma: true, .. } => Some("load"),
         _ => None,
     };
     if let Some(command) = forced
+        && cli.connect.is_none()
         && cli.transport_name() != "pcie"
     {
         return Err(not_over_pcie(cli.transport_name(), command));
@@ -2546,6 +2654,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
         | Cmd::Erase
         | Cmd::Run { .. }
         | Cmd::Check
+        | Cmd::Hostmem(_)
         | Cmd::Completions { .. } => {
             unreachable!("handled above")
         }
@@ -2580,6 +2689,11 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
             &mut bus, &map, &cli, bundle, file, at, base, verify, pio, dma,
         ),
         Cmd::Bench {
+            suite: true,
+            ref json,
+            ..
+        } => bench_suite(&mut bus, &map, &cli, json.as_deref()),
+        Cmd::Bench {
             reads,
             repeat,
             bundle,
@@ -2587,6 +2701,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
             base,
             size,
             threads,
+            ..
         } => bench(
             &mut bus,
             &map,
@@ -2754,18 +2869,13 @@ fn refuse_over_connect(cmd: &Cmd) -> Result<(), String> {
              Run it on the machine the board is on."
         ));
     }
-    let dma = match cmd {
-        Cmd::Memtest { dma: true, .. } => Some("memtest --dma"),
-        Cmd::Load { dma: true, .. } => Some("load --dma"),
-        Cmd::DmaFire { .. } => Some("dma-fire"),
-        _ => None,
-    };
-    if let Some(name) = dma {
-        return Err(format!(
-            "`{name}` has the card move data in the memory of the machine it is in, and \
-             `--connect` reaches only the window.\n\
-             Run it on the machine the board is on, or use `--pio`."
-        ));
+    if matches!(cmd, Cmd::DmaFire { .. }) {
+        return Err(
+            "`dma-fire` brings the card's DMA up on the machine it is in, and `--connect` \
+             reaches only the window.\n\
+             Run it on the machine the board is on."
+                .to_string(),
+        );
     }
     if matches!(cmd, Cmd::Serve { .. }) {
         return Err("`serve` opens the window on this machine; drop `--connect`.".to_string());
@@ -2813,12 +2923,16 @@ fn serve(cli: &Cli, bus: &mut Bus, map: &RegisterMap, listen: &str) -> Result<()
     if !local.ip().is_loopback() {
         eprintln!("warning: {local} is reachable from other machines, and HNS2 has no password");
     }
+    if !cli.no_verify {
+        close_steering(bus, map)?;
+    }
     let mut window = BoardWindow {
         cli,
         bus,
         map: map.clone(),
         info,
         card,
+        pages: HostPages::default(),
     };
     hns2::serve(listener, &mut window, |line| println!("hio: {line}")).map_err(|e| e.to_string())
 }
@@ -2844,6 +2958,8 @@ struct BoardWindow<'a> {
     info: hns_host::hns2::Info,
     /// The PCIe card, with its config space from when it last answered.
     card: Option<hns_host::program::Card>,
+    /// Host memory handed out to the client being served.
+    pages: HostPages,
 }
 
 impl hns_host::hns2::Window for BoardWindow<'_> {
@@ -2852,6 +2968,7 @@ impl hns_host::hns2::Window for BoardWindow<'_> {
     }
 
     fn run(&mut self, batch: &Batch) -> Result<Reads, String> {
+        refuse_steering(&self.map, batch)?;
         Ok(self.bus.run(batch)?)
     }
 
@@ -2861,6 +2978,107 @@ impl hns_host::hns2::Window for BoardWindow<'_> {
     ) -> Result<hns_host::hns2::Info, String> {
         self.reprogram(request)
     }
+
+    fn hostmem(&mut self, request: &hns_host::hns2::Hostmem) -> Result<Vec<u8>, String> {
+        use hns_host::hns2::HostmemOp;
+        let (bundle, at) = (request.bundle, request.at);
+        match request.op {
+            HostmemOp::Attach => {
+                let (size, addr) = self.pages.attach(self.cli, self.bus, &self.map, bundle)?;
+                let mut answer = size.to_le_bytes().to_vec();
+                answer.extend_from_slice(&addr.to_le_bytes());
+                Ok(answer)
+            }
+            HostmemOp::Detach => self
+                .pages
+                .release(self.bus, &self.map, bundle)
+                .map(|()| Vec::new()),
+            HostmemOp::Read => {
+                self.pages
+                    .read(self.bus, &self.map, bundle, at, u64::from(request.len))
+            }
+            HostmemOp::Write => self
+                .pages
+                .write(self.bus, &self.map, bundle, at, request.data)
+                .map(|()| Vec::new()),
+        }
+    }
+
+    fn left(&mut self) -> Result<(), String> {
+        self.pages.close(self.bus, &self.map)
+    }
+}
+
+/// The registers that steer where the card reaches in host memory: the base
+/// and the switch of each `host_mem` bundle, and the window of the DMA gate.
+/// Answers each word's address and the register's name.
+fn steering(map: &RegisterMap) -> Vec<(u32, &str)> {
+    map.registers
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.role.as_deref(),
+                Some("host_base" | "host_on" | "dma_base" | "dma_size")
+            )
+        })
+        .flat_map(|r| (0..r.words).map(move |w| ((r.offset + 4 * w) as u32, r.name.as_str())))
+        .collect()
+}
+
+/// Refuses a batch from a `hio serve` client that writes a steering register.
+///
+/// The IOMMU passes the card's addresses through, so whoever writes these
+/// points the card at any physical address, the kernel's memory included.
+/// Only the server writes them, with a page it holds. A refused batch runs
+/// none of its ops.
+fn refuse_steering(map: &RegisterMap, batch: &Batch) -> Result<(), String> {
+    let guarded = steering(map);
+    if guarded.is_empty() {
+        return Ok(());
+    }
+    for (frame, _) in batch.ops() {
+        if !matches!(frame.op, hns_host::frame::Op::Write) {
+            continue;
+        }
+        let Some((_, name)) = guarded.iter().find(|(addr, _)| *addr == frame.addr) else {
+            continue;
+        };
+        let reg = map.get(name).ok();
+        return Err(
+            match (
+                reg.and_then(|r| r.role.as_deref()),
+                reg.and_then(|r| r.bundle.as_deref()),
+            ) {
+                (Some("host_base" | "host_on"), Some(bundle)) => format!(
+                    "`{name}` points the card at host memory, so through `hio serve` only the \
+                 server writes it. Nothing in this batch ran.\n\
+                 Have the server hand the bundle a page: `hostmem attach {bundle}`."
+                ),
+                _ => format!(
+                    "`{name}` sets where the card may reach in host memory, so through `hio serve` \
+                 only the server writes it. Nothing in this batch ran.\n\
+                 Have the server hand the gate a page: `hostmem attach dma`, or `--dma` on \
+                 `load` and `memtest`."
+                ),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Switches every `host_mem` bundle off and closes the DMA gate. `hio serve`
+/// does this when it starts: a base left by an earlier run points at a page
+/// that run has freed.
+fn close_steering(bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
+    let mut b = Batch::new();
+    for r in &map.registers {
+        match r.role.as_deref() {
+            Some("host_on") | Some("dma_size") => write_wide(&mut b, map, &r.name, 0)?,
+            _ => {}
+        }
+    }
+    bus.run(&b)?;
+    Ok(())
 }
 
 impl BoardWindow<'_> {
@@ -2887,6 +3105,9 @@ impl BoardWindow<'_> {
         let bit = hns_host::bitstream::parse(request.bitstream).map_err(|e| e.to_string())?;
         let target = resolve_target(self.cli)?;
         let erase_wait = std::time::Duration::from_millis(u64::from(request.erase_wait_ms));
+        // The new design starts with its bundles off; the pages of the old one
+        // go first, in the same order as when a client leaves.
+        self.pages.close(self.bus, &self.map)?;
         match &*self.bus {
             Bus::Pcie(_) => self.reprogram_pcie(&next, target.as_ref(), &bit, erase_wait)?,
             Bus::Jtag(_) => self.reprogram_jtag(
@@ -3208,7 +3429,16 @@ fn check(cli: &Cli, map_path: &str, map: &RegisterMap) -> Result<(), String> {
     c.ok("map", format!("{map_path} (hash {:#010x})", map.map_hash));
 
     let pcie_run = cli.transport_name() == "pcie";
-    let requester = pcie_run && map.get("dma_base").is_ok();
+    // The card's DMA engine, driven by the host (`dma_*`, with `dram`) or by
+    // the DUT (`host_mem`). Both need the same from this machine.
+    let gate = map.get("dma_base").is_ok();
+    let apertures: Vec<(String, u64)> = map
+        .registers
+        .iter()
+        .filter(|r| r.role.as_deref() == Some("host_aperture"))
+        .filter_map(|r| Some((r.bundle.clone()?, r.value?)))
+        .collect();
+    let requester = pcie_run && (gate || !apertures.is_empty());
     // Whether to open the window. Do not open it when it is known to fail,
     // or a second error hides the first.
     let mut window = true;
@@ -3317,11 +3547,12 @@ fn check(cli: &Cli, map_path: &str, map: &RegisterMap) -> Result<(), String> {
         if requester {
             match dma::bus_master(&found) {
                 Ok(true) => c.ok("master", "on"),
+                // Off after a reboot. `hio -p` turns it on when it hands the
+                // card host memory, so this is not a failure.
                 Ok(false) => {
-                    c.ng(
+                    c.ok(
                         "master",
-                        "off",
-                        &format!("sudo setpci -s {found} COMMAND=0x4:0x4"),
+                        "off; hio turns it on when it hands the card host memory",
                     );
                     handover = false;
                 }
@@ -3348,7 +3579,28 @@ fn check(cli: &Cli, map_path: &str, map: &RegisterMap) -> Result<(), String> {
                     handover = false;
                 }
             }
+            let too_small = |pages: &dma::Hugepages| {
+                apertures
+                    .iter()
+                    .find(|(_, bytes)| *bytes > pages.size_bytes)
+                    .cloned()
+            };
             match dma::hugepages() {
+                Ok(pages) if let Some((bundle, bytes)) = too_small(&pages) => {
+                    c.ng(
+                        "pages",
+                        format!(
+                            "{} each, and `{bundle}` reaches {}",
+                            size_str(pages.size_bytes),
+                            size_str(bytes)
+                        ),
+                        &format!(
+                            "make `aperture` at most {} in Harness.toml and generate again",
+                            size_str(pages.size_bytes)
+                        ),
+                    );
+                    handover = false;
+                }
                 Ok(pages) if pages.free > 0 => c.ok(
                     "pages",
                     format!(
@@ -3436,7 +3688,7 @@ fn check(cli: &Cli, map_path: &str, map: &RegisterMap) -> Result<(), String> {
                 {
                     c.ok("dut", "held in reset (hio reset --release)");
                 }
-                if let (true, Some(found)) = (requester, &bdf) {
+                if let (true, true, Some(found)) = (requester, gate, &bdf) {
                     match require_idle(bus, map, found) {
                         Ok(()) => c.ok("engine", "idle"),
                         Err(why) => c.ng_err("engine", &why),
@@ -3448,7 +3700,7 @@ fn check(cli: &Cli, map_path: &str, map: &RegisterMap) -> Result<(), String> {
         if !calib.is_empty() {
             c.skip("memory", "needs the window");
         }
-        if requester {
+        if requester && gate {
             c.skip("engine", "needs the window");
         }
     }
@@ -3978,6 +4230,408 @@ fn require_requester(map: &RegisterMap) -> Result<(), String> {
     )
 }
 
+/// The pages handed to `host_mem` bundles, held for a procedure file or the
+/// prompt.
+///
+/// The card writes host memory with the IOMMU passing its addresses through,
+/// so nothing but the order here keeps it off a freed page: a bundle is
+/// switched off, and its last command allowed to finish, before its page goes.
+///
+/// Through `hio serve`, the page is in the server's memory and the server
+/// holds it; only the bundle name is kept here, to give it back.
+#[derive(Default)]
+struct HostPages {
+    held: Vec<(String, hns_host::dma::Buffer)>,
+    /// Pages the server holds: the name and the page size.
+    remote: Vec<(String, u64)>,
+}
+
+/// The name under which `hostmem` hands a page to the DMA gate instead of a
+/// `host_mem` bundle: the prefix of the gate's registers.
+const GATE: &str = "dma";
+
+/// What a page is handed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Holder {
+    /// A `host_mem` bundle, which reaches this many bytes.
+    Bundle(u64),
+    /// The DMA gate: the host fires descriptors into the page.
+    Gate,
+}
+
+/// What `name` hands a page to.
+fn holder(map: &RegisterMap, name: &str) -> Result<Holder, String> {
+    if name == GATE
+        && map
+            .registers
+            .iter()
+            .any(|r| r.role.as_deref() == Some("dma_base"))
+    {
+        return Ok(Holder::Gate);
+    }
+    host_aperture(map, name).map(Holder::Bundle)
+}
+
+/// How long `close` waits for a command that started before `_on` went to 0.
+/// One 4 KB page takes microseconds; a DUT that stopped taking beats never
+/// finishes.
+const HOST_MEM_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
+impl HostPages {
+    fn page(&mut self, bundle: &str) -> Result<&mut hns_host::dma::Buffer, String> {
+        self.held
+            .iter_mut()
+            .find(|(name, _)| name == bundle)
+            .map(|(_, page)| page)
+            .ok_or_else(|| no_page(bundle))
+    }
+
+    fn has(&self, bundle: &str) -> bool {
+        self.held.iter().any(|(name, _)| name == bundle)
+            || self.remote.iter().any(|(name, _)| name == bundle)
+    }
+
+    /// The size of a page the server holds.
+    fn served(&self, bundle: &str) -> Result<u64, String> {
+        self.remote
+            .iter()
+            .find(|(name, _)| name == bundle)
+            .map(|(_, size)| *size)
+            .ok_or_else(|| no_page(bundle))
+    }
+
+    /// Switches one bundle off, waits for it, and frees its page.
+    fn release(&mut self, bus: &mut Bus, map: &RegisterMap, bundle: &str) -> Result<(), String> {
+        if let Bus::Net(link) = bus {
+            let at = self
+                .remote
+                .iter()
+                .position(|(name, _)| name == bundle)
+                .ok_or_else(|| format!("`{bundle}` has no host memory to give back."))?;
+            link.hostmem_detach(bundle).map_err(|e| e.to_string())?;
+            self.remote.remove(at);
+            return Ok(());
+        }
+        let at = self
+            .held
+            .iter()
+            .position(|(name, _)| name == bundle)
+            .ok_or_else(|| format!("`{bundle}` has no host memory to give back."))?;
+        // Closed first, then wait for what was already taken.
+        let (off, busy) = match holder(map, bundle)? {
+            Holder::Gate => ("dma_size".to_string(), "dma_busy".to_string()),
+            Holder::Bundle(_) => (format!("{bundle}_on"), format!("{bundle}_busy")),
+        };
+        let mut b = Batch::new();
+        write_wide(&mut b, map, &off, 0)?;
+        bus.run(&b)?;
+        let start = std::time::Instant::now();
+        while read_reg(bus, map, &busy)?[0] != 0 {
+            if start.elapsed() > HOST_MEM_SETTLE {
+                // Keep the page: the command may still write it. It goes when
+                // hio exits, which is the best left to do.
+                return Err(format!(
+                    "`{bundle}` is switched off, but a command it took earlier has not \
+                     finished, so its page is kept until hio exits.\n\
+                     The DUT probably stopped taking or giving beats. Reset it \
+                     (`hio reset`) before hio exits."
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.held.remove(at);
+        Ok(())
+    }
+
+    /// Gives every page back. Called however the procedure or the prompt
+    /// ended.
+    fn close(&mut self, bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
+        let bundles: Vec<String> = self
+            .held
+            .iter()
+            .map(|(name, _)| name.clone())
+            .chain(self.remote.iter().map(|(name, _)| name.clone()))
+            .collect();
+        let mut first = Ok(());
+        for bundle in bundles {
+            let done = self.release(bus, map, &bundle);
+            if first.is_ok() {
+                first = done;
+            }
+        }
+        first
+    }
+
+    /// Hands `bundle` a page and switches it on. Answers the page size and
+    /// its bus address.
+    fn attach(
+        &mut self,
+        cli: &Cli,
+        bus: &mut Bus,
+        map: &RegisterMap,
+        bundle: &str,
+    ) -> Result<(u64, u64), String> {
+        let to = holder(map, bundle)?;
+        if self.has(bundle) {
+            return Err(format!("`{bundle}` already has host memory."));
+        }
+        let pcie = match bus {
+            Bus::Pcie(_) => {
+                let Some(pcie) = &map.pcie else {
+                    return Err("regs.json has no `pcie` section, so there is no card.".to_string());
+                };
+                pcie
+            }
+            Bus::Jtag(_) => return Err(not_over_pcie("jtag", "run")),
+            Bus::Net(link) => {
+                let (size, addr) = link.hostmem_attach(bundle).map_err(|e| e.to_string())?;
+                self.remote.push((bundle.to_string(), size));
+                return Ok((size, addr));
+            }
+        };
+        let bdf = find_bdf(cli, pcie)?;
+        let_card_master(&bdf)?;
+        let page = hns_host::dma::Buffer::huge(&bdf).map_err(|e| e.to_string())?;
+        let aperture = match to {
+            Holder::Bundle(aperture) => aperture,
+            Holder::Gate => {
+                // The gate refuses a descriptor outside the page, so nothing
+                // is checked against a size here.
+                let mut b = Batch::new();
+                write_wide(&mut b, map, "dma_base", page.bus_addr())?;
+                write_wide(&mut b, map, "dma_size", page.len() as u64)?;
+                bus.run(&b)?;
+                let answer = (page.len() as u64, page.bus_addr());
+                self.held.push((bundle.to_string(), page));
+                return Ok(answer);
+            }
+        };
+        if (page.len() as u64) < aperture {
+            return Err(format!(
+                "a huge page here is {}, and `{bundle}` reaches {}.\n\
+                 Make `aperture` at most {} in Harness.toml and generate again, or give \
+                 the machine larger huge pages.",
+                size_str(page.len() as u64),
+                size_str(aperture),
+                size_str(page.len() as u64)
+            ));
+        }
+        // Off first: a run that died may have left the bundle on.
+        let mut b = Batch::new();
+        write_wide(&mut b, map, &format!("{bundle}_on"), 0)?;
+        write_wide(&mut b, map, &format!("{bundle}_base"), page.bus_addr())?;
+        write_wide(&mut b, map, &format!("{bundle}_on"), 1)?;
+        bus.run(&b)?;
+        let answer = (page.len() as u64, page.bus_addr());
+        self.held.push((bundle.to_string(), page));
+        Ok(answer)
+    }
+
+    /// Reads `len` bytes of the bundle's page at `at`.
+    fn read(
+        &mut self,
+        bus: &mut Bus,
+        map: &RegisterMap,
+        bundle: &str,
+        at: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, String> {
+        let span = host_span(bundle, self.reach(bus, map, bundle)?, at, len)?;
+        if let Bus::Net(link) = bus {
+            return link
+                .hostmem_read(bundle, at, span.len())
+                .map_err(|e| e.to_string());
+        }
+        // The card wrote the page; what it wrote must be seen here.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        Ok(self.page(bundle)?.as_slice()[span].to_vec())
+    }
+
+    /// The bytes of the page that `hostmem` may reach: the aperture of a
+    /// bundle, or the whole page of the gate.
+    fn reach(&mut self, bus: &Bus, map: &RegisterMap, bundle: &str) -> Result<u64, String> {
+        match holder(map, bundle)? {
+            Holder::Bundle(aperture) => {
+                if matches!(bus, Bus::Net(_)) {
+                    self.served(bundle)?;
+                }
+                Ok(aperture)
+            }
+            Holder::Gate if matches!(bus, Bus::Net(_)) => self.served(bundle),
+            Holder::Gate => Ok(self.page(bundle)?.len() as u64),
+        }
+    }
+
+    /// Writes `bytes` into the bundle's page at `at`.
+    fn write(
+        &mut self,
+        bus: &mut Bus,
+        map: &RegisterMap,
+        bundle: &str,
+        at: u64,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let span = host_span(
+            bundle,
+            self.reach(bus, map, bundle)?,
+            at,
+            bytes.len() as u64,
+        )?;
+        if let Bus::Net(link) = bus {
+            return link
+                .hostmem_write(bundle, at, bytes)
+                .map_err(|e| e.to_string());
+        }
+        self.page(bundle)?.as_mut_slice()[span].copy_from_slice(bytes);
+        // Before the card is told to read the page.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+fn no_page(bundle: &str) -> String {
+    format!("`{bundle}` has no host memory yet. Give it a page first: `hostmem attach {bundle}`")
+}
+
+/// Turns bus mastering on before the card is given host memory. Nothing turns
+/// it on otherwise, and a reboot turns it off.
+fn let_card_master(bdf: &str) -> Result<(), String> {
+    if hns_host::dma::enable_bus_master(bdf).map_err(|e| e.to_string())? {
+        println!("{bdf}: bus mastering turned on");
+    }
+    Ok(())
+}
+
+/// The bytes a `host_mem` bundle may reach, from its `_aperture` register.
+fn host_aperture(map: &RegisterMap, bundle: &str) -> Result<u64, String> {
+    let found = map
+        .get(&format!("{bundle}_aperture"))
+        .ok()
+        .filter(|r| r.role.as_deref() == Some("host_aperture"))
+        .and_then(|r| r.value);
+    if let Some(bytes) = found {
+        return Ok(bytes);
+    }
+    let hosts: Vec<String> = map
+        .registers
+        .iter()
+        .filter(|r| r.role.as_deref() == Some("host_aperture"))
+        .filter_map(|r| r.bundle.clone())
+        .map(|b| format!("`{b}`"))
+        .collect();
+    Err(if hosts.is_empty() {
+        format!("`{bundle}` is not a `host_mem` bundle, and this design has none.")
+    } else {
+        format!(
+            "`{bundle}` is not a `host_mem` bundle. This design has {}.",
+            hosts.join(", ")
+        )
+    })
+}
+
+/// Checks that `[at, at + len)` is inside what the DUT may reach.
+fn host_span(
+    bundle: &str,
+    aperture: u64,
+    at: u64,
+    len: u64,
+) -> Result<std::ops::Range<usize>, String> {
+    match at.checked_add(len) {
+        Some(end) if end <= aperture => Ok(at as usize..end as usize),
+        _ => Err(format!(
+            "{len} bytes at {at:#x} do not fit in `{bundle}`, which reaches {} ({aperture:#x} bytes).",
+            size_str(aperture)
+        )),
+    }
+}
+
+/// `hostmem read` and `hostmem write` move whole 32-bit words.
+fn on_a_word(at: u64) -> Result<(), String> {
+    if !at.is_multiple_of(4) {
+        return Err(format!("{at:#x} is not on a word: give a multiple of 4."));
+    }
+    Ok(())
+}
+
+/// `hostmem`: hands host memory to a `host_mem` bundle and reaches into it.
+fn hostmem(
+    cli: &Cli,
+    bus: &mut Bus,
+    map: &RegisterMap,
+    pages: &mut HostPages,
+    cmd: &HostmemCmd,
+) -> Result<(), String> {
+    match cmd {
+        HostmemCmd::Attach { bundle } => {
+            let to = holder(map, bundle)?;
+            let (size, addr) = pages.attach(cli, bus, map, bundle)?;
+            match to {
+                Holder::Bundle(aperture) => println!(
+                    "{bundle}: {} of host memory at bus address {addr:#x}; the DUT reaches \
+                     the first {}",
+                    size_str(size),
+                    size_str(aperture)
+                ),
+                Holder::Gate => println!(
+                    "{bundle}: {} of host memory at bus address {addr:#x}; the gate passes \
+                     descriptors into it",
+                    size_str(size)
+                ),
+            }
+            Ok(())
+        }
+        HostmemCmd::Detach { bundle } => pages.release(bus, map, bundle),
+        HostmemCmd::Load { bundle, file, at } => {
+            let bytes = std::fs::read(file).map_err(|e| read_error(file, e))?;
+            pages.write(bus, map, bundle, *at, &bytes)?;
+            println!("{bundle}: {} bytes at {at:#x}", bytes.len());
+            Ok(())
+        }
+        HostmemCmd::Read { bundle, at, words } => {
+            on_a_word(*at)?;
+            let count = words.unwrap_or(1);
+            let data = pages.read(bus, map, bundle, *at, 4 * count as u64)?;
+            let words: Vec<u32> = data
+                .chunks(4)
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect();
+            // The same layout as `read` of a region.
+            if count == 1 {
+                println!("{}", show(&words));
+            } else {
+                for (i, line) in words.chunks(4).enumerate() {
+                    let cells: Vec<String> =
+                        line.iter().map(|word| format!("{word:08x}")).collect();
+                    println!("{:#06x}  {}", *at as usize + 16 * i, cells.join(" "));
+                }
+            }
+            Ok(())
+        }
+        HostmemCmd::Write { bundle, at, values } => {
+            on_a_word(*at)?;
+            let mut bytes = Vec::with_capacity(4 * values.len());
+            for &value in values {
+                let word = u32::try_from(value)
+                    .map_err(|_| format!("{value:#x} does not fit in a 32-bit word."))?;
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            pages.write(bus, map, bundle, *at, &bytes)
+        }
+        HostmemCmd::Save {
+            bundle,
+            file,
+            at,
+            len,
+        } => {
+            let data = pages.read(bus, map, bundle, *at, *len)?;
+            std::fs::write(file, &data)
+                .map_err(|e| format!("cannot write {}: {e}", file.display()))?;
+            println!("{bundle}: {len} bytes from {at:#x} to {}", file.display());
+            Ok(())
+        }
+    }
+}
+
 /// Move the data through the window, or have the card move it.
 ///
 /// The size decides. `--pio` / `--dma` only override that choice, so the user
@@ -4079,6 +4733,23 @@ fn route(
     }
 }
 
+/// Gives the mover's page back once a command is done with it, however it
+/// went.
+fn close_mover(
+    mover: Option<Mover>,
+    bus: &mut Bus,
+    map: &RegisterMap,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    match mover {
+        Some(mover) => {
+            let closed = mover.close(bus, map);
+            result.and(closed)
+        }
+        None => result,
+    }
+}
+
 /// Opens the chosen route. If the card cannot be set up on this machine, it
 /// falls back to the window, unless the card was forced.
 fn open_route(
@@ -4127,7 +4798,7 @@ const POISON: u8 = 0xa5;
 /// The page and its size are written once. After that, each descriptor
 /// rewrites only four registers.
 struct Mover {
-    buffer: hns_host::dma::Buffer,
+    page: MoverPage,
     /// Bytes per descriptor: the smaller of the length field limit and the
     /// page size, rounded down to 4KB (the borrowed engine splits TLPs at 4KB).
     chunk: usize,
@@ -4137,6 +4808,42 @@ struct Mover {
     blocked: u32,
     /// Silent-loss counts when opened. The difference is reported at the end.
     losses: Option<Losses>,
+    /// Time spent starting descriptors and waiting for them: the register
+    /// traffic, and the card's transfer where no copy hides it.
+    /// `bench --suite` reports it beside the total.
+    fired: std::time::Duration,
+    /// The descriptor still running. The page has two halves, so the next
+    /// copy can use the other one meanwhile.
+    pending: Option<Fired>,
+}
+
+/// The page the card moves data through.
+enum MoverPage {
+    /// In this process.
+    Local(hns_host::dma::Buffer),
+    /// In the memory of the `hio serve` machine, which also set the gate.
+    /// Data goes to and from it through `scratch`.
+    Served {
+        len: usize,
+        bus_addr: u64,
+        scratch: Vec<u8>,
+    },
+}
+
+impl MoverPage {
+    fn len(&self) -> usize {
+        match self {
+            MoverPage::Local(buffer) => buffer.len(),
+            MoverPage::Served { len, .. } => *len,
+        }
+    }
+
+    fn bus_addr(&self) -> u64 {
+        match self {
+            MoverPage::Local(buffer) => buffer.bus_addr(),
+            MoverPage::Served { bus_addr, .. } => *bus_addr,
+        }
+    }
 }
 
 impl Mover {
@@ -4148,36 +4855,61 @@ impl Mover {
                     .to_string(),
             );
         };
-        let bdf = find_bdf(cli, pcie)?;
-        let buffer = hns_host::dma::Buffer::huge(&bdf).map_err(|e| e.to_string())?;
-        require_idle(bus, map, &bdf)?;
+        let page = match bus {
+            // The server takes the page and sets the gate: a client may not.
+            Bus::Net(link) => {
+                let (len, bus_addr) = link.hostmem_attach(GATE).map_err(|e| e.to_string())?;
+                MoverPage::Served {
+                    len: len as usize,
+                    bus_addr,
+                    scratch: vec![0; len as usize],
+                }
+            }
+            _ => {
+                let bdf = find_bdf(cli, pcie)?;
+                let_card_master(&bdf)?;
+                let buffer = hns_host::dma::Buffer::huge(&bdf).map_err(|e| e.to_string())?;
+                require_idle(bus, map, &bdf)?;
+                // Set the page once; the gate refuses a descriptor outside it.
+                let mut b = Batch::new();
+                write_wide(&mut b, map, "dma_base", buffer.bus_addr())?;
+                write_wide(&mut b, map, "dma_size", buffer.len() as u64)?;
+                bus.run(&b)?;
+                MoverPage::Local(buffer)
+            }
+        };
+        if matches!(page, MoverPage::Served { .. }) {
+            require_idle(bus, map, "<the card>")?;
+        }
 
-        // Set the page once; the gate refuses a descriptor outside it. Reset
-        // the limits too, so a value left by `dma-fire --mps` is not used.
+        // Reset the limits, so a value left by `dma-fire --mps` is not used.
         let mut b = Batch::new();
         write_wide(&mut b, map, "dma_mps_limit", 0)?;
         write_wide(&mut b, map, "dma_mrrs_limit", 0)?;
-        write_wide(&mut b, map, "dma_base", buffer.bus_addr())?;
-        write_wide(&mut b, map, "dma_size", buffer.len() as u64)?;
         bus.run(&b)?;
         let counters = dma_counters(bus, map)?;
         let losses = Losses::read(bus, map)?;
 
         let len_bits = map.get("dma_len").map(|r| r.width).unwrap_or(20);
         let most = ((1u64 << len_bits) - 1) as usize;
-        let chunk = most.min(buffer.len()) & !0xfff;
+        // Half the page, so one half can be copied while the card moves the
+        // other.
+        let chunk = most.min(page.len() / 2) & !0xfff;
         Ok(Mover {
-            buffer,
+            page,
             chunk,
             refused: counters.out_of_range,
             blocked: counters.while_busy,
             losses,
+            fired: std::time::Duration::ZERO,
+            pending: None,
         })
     }
 
     /// Reports what was silently lost since opening. It reports even when the
     /// data matched: then the loss only hit a range that was not tested.
-    fn report_losses(&self, bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
+    fn report_losses(&mut self, bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
+        self.drain(bus, map)?;
         let (Some(before), Some(now)) = (self.losses, Losses::read(bus, map)?) else {
             return Ok(());
         };
@@ -4188,22 +4920,93 @@ impl Mover {
     }
 
     /// Moves `len` bytes from memory offset `at` to the host and returns them.
+    ///
+    /// `next` is the range the caller will fetch after this one. The card
+    /// starts on it into the other half of the page while this one is copied
+    /// out, so the copy and the card's transfer overlap.
     fn fetch(
         &mut self,
         bus: &mut Bus,
         map: &RegisterMap,
         at: u64,
         len: usize,
+        next: Option<u64>,
     ) -> Result<&[u8], String> {
-        // Poison first. Data left by the last `send` would look like a good
-        // read even if nothing arrived, and in a write-then-read test it is
-        // exactly the expected value.
-        self.buffer.as_mut_slice()[..len].fill(POISON);
-        self.fire(bus, map, at, len, false)?;
-        Ok(&self.buffer.as_slice()[..len])
+        let started = match self.pending {
+            Some(p) if !p.to_card && p.at == at && p.len == len => p,
+            _ => {
+                self.drain(bus, map)?;
+                self.poison(bus, 0, len)?;
+                self.start(bus, map, at, len, false, 0)?
+            }
+        };
+        self.pending = None;
+        let half = started.half;
+        match next {
+            Some(next) => {
+                let other = 1 - half;
+                self.poison(bus, other, len)?;
+                self.wait(bus, map, started)?;
+                self.pending = Some(self.start(bus, map, next, len, false, other)?);
+            }
+            None => self.wait(bus, map, started)?,
+        }
+        let from = half * self.chunk;
+        match (&mut self.page, bus) {
+            (MoverPage::Served { scratch, .. }, Bus::Net(link)) => {
+                let got = link
+                    .hostmem_read(GATE, from as u64, len)
+                    .map_err(|e| e.to_string())?;
+                scratch[..len].copy_from_slice(&got);
+                Ok(&scratch[..len])
+            }
+            (MoverPage::Local(buffer), _) => Ok(&buffer.as_slice()[from..from + len]),
+            (MoverPage::Served { .. }, _) => unreachable!("a served page comes over `--connect`"),
+        }
+    }
+
+    /// Fills half of the page with the poison. Data left by an earlier
+    /// descriptor would look like a good read even if nothing arrived, and in
+    /// a write-then-read test it is exactly the expected value.
+    fn poison(&mut self, bus: &mut Bus, half: usize, len: usize) -> Result<(), String> {
+        let from = half * self.chunk;
+        match (&mut self.page, bus) {
+            (MoverPage::Served { scratch, .. }, Bus::Net(link)) => {
+                scratch[..len].fill(POISON);
+                link.hostmem_write(GATE, from as u64, &scratch[..len])
+                    .map_err(|e| e.to_string())
+            }
+            (MoverPage::Local(buffer), _) => {
+                buffer.as_mut_slice()[from..from + len].fill(POISON);
+                Ok(())
+            }
+            (MoverPage::Served { .. }, _) => unreachable!("a served page comes over `--connect`"),
+        }
+    }
+
+    /// Gives the page back and closes the gate, so the card cannot be fired
+    /// at a page that is freed.
+    fn close(mut self, bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
+        let drained = self.drain(bus, map);
+        let closed = match (self.page, bus) {
+            (MoverPage::Served { .. }, Bus::Net(link)) => {
+                link.hostmem_detach(GATE).map_err(|e| e.to_string())
+            }
+            (_, bus) => {
+                let mut b = Batch::new();
+                write_wide(&mut b, map, "dma_size", 0)?;
+                bus.run(&b)?;
+                Ok(())
+            }
+        };
+        drained.and(closed)
     }
 
     /// Moves the `len` bytes that `fill` writes to memory offset `at`.
+    ///
+    /// It returns once the card has started. `fill` writes the half of the
+    /// page the card is not reading, so it overlaps the previous descriptor.
+    /// `drain` waits for the last one.
     fn send(
         &mut self,
         bus: &mut Bus,
@@ -4212,60 +5015,136 @@ impl Mover {
         len: usize,
         fill: impl FnOnce(&mut [u8]),
     ) -> Result<(), String> {
-        fill(&mut self.buffer.as_mut_slice()[..len]);
-        self.fire(bus, map, at, len, true)
+        let half = match self.pending {
+            Some(p) if p.to_card => 1 - p.half,
+            _ => {
+                self.drain(bus, map)?;
+                0
+            }
+        };
+        let from = half * self.chunk;
+        match (&mut self.page, &mut *bus) {
+            (MoverPage::Served { scratch, .. }, Bus::Net(link)) => {
+                fill(&mut scratch[..len]);
+                link.hostmem_write(GATE, from as u64, &scratch[..len])
+                    .map_err(|e| e.to_string())?;
+            }
+            (MoverPage::Local(buffer), _) => fill(&mut buffer.as_mut_slice()[from..from + len]),
+            (MoverPage::Served { .. }, _) => unreachable!("a served page comes over `--connect`"),
+        }
+        self.drain(bus, map)?;
+        self.pending = Some(self.start(bus, map, at, len, true, half)?);
+        Ok(())
     }
 
-    /// Fires one descriptor and waits until it finishes.
-    fn fire(
+    /// Waits for the descriptor still running, if any.
+    fn drain(&mut self, bus: &mut Bus, map: &RegisterMap) -> Result<(), String> {
+        match self.pending.take() {
+            Some(p) => self.wait(bus, map, p),
+            None => Ok(()),
+        }
+    }
+
+    /// Fires one descriptor on half of the page and returns without waiting.
+    fn start(
         &mut self,
         bus: &mut Bus,
         map: &RegisterMap,
         at: u64,
         len: usize,
         to_card: bool,
-    ) -> Result<(), String> {
+        half: usize,
+    ) -> Result<Fired, String> {
         use std::sync::atomic::{Ordering, fence};
 
-        let (dir, way) = if to_card { (1, "to") } else { (0, "from") };
+        let started = std::time::Instant::now();
         // The page writes must be visible before `go`. They are plain memory
         // and `go` is volatile MMIO, so nothing else orders them.
         fence(Ordering::SeqCst);
         let mut b = Batch::new();
         // Write the direction every time; reads and writes share the page.
-        write_wide(&mut b, map, "dma_dir", dir)?;
-        write_wide(&mut b, map, "dma_pcie_addr", self.buffer.bus_addr())?;
+        write_wide(&mut b, map, "dma_dir", u64::from(to_card))?;
+        write_wide(
+            &mut b,
+            map,
+            "dma_pcie_addr",
+            self.page.bus_addr() + (half * self.chunk) as u64,
+        )?;
         write_wide(&mut b, map, "dma_axi_addr", at)?;
         write_wide(&mut b, map, "dma_len", len as u64)?;
         write_wide(&mut b, map, "dma_go", 1)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        bus.run(&b)?;
+        let ran = bus.run(&b);
+        self.fired += started.elapsed();
+        ran?;
+        Ok(Fired {
+            at,
+            len,
+            to_card,
+            half,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+        })
+    }
+
+    /// Waits until a descriptor finishes and checks how it went.
+    fn wait(&mut self, bus: &mut Bus, map: &RegisterMap, fired: Fired) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let waited = self.wait_once(bus, map, fired);
+        self.fired += started.elapsed();
+        waited
+    }
+
+    fn wait_once(&mut self, bus: &mut Bus, map: &RegisterMap, fired: Fired) -> Result<(), String> {
+        use std::sync::atomic::{Ordering, fence};
+
+        let Fired {
+            at, len, to_card, ..
+        } = fired;
+        let way = if to_card { "to" } else { "from" };
+        // Over `--connect` each batch costs a TCP round trip, so each poll
+        // also reads the gate's status. A batch runs in order, so when `busy`
+        // reads 0 the status read after it is the one after this descriptor.
+        // Locally a batch is one MMIO read after another and saves nothing,
+        // so a poll reads only `busy`.
+        let together = matches!(bus, Bus::Net(_));
+        let mut poll = Batch::new();
+        let busy = poll.read(offset_of(map, "dma_busy")?);
+        let status = together
+            .then(|| GateStatus::queue(&mut poll, map))
+            .transpose()?;
         // PCIe ordering: the read of `busy` cannot pass earlier MemWr. Once
         // `busy` reads 0, the writes to the host have landed.
-        loop {
-            if rd(bus, offset_of(map, "dma_busy")?)? == 0 {
-                break;
+        let reads = loop {
+            let reads = bus.run(&poll)?;
+            if reads[busy] == 0 {
+                break reads;
             }
-            if std::time::Instant::now() > deadline {
+            if std::time::Instant::now() > fired.deadline {
                 return Err(format!(
                     "the engine did not finish moving {len} bytes {way} 0x{at:x} within 5 \
                      seconds.\nCheck that the memory answers (`hio read` the region) and \
                      that the link is up."
                 ));
             }
-        }
+        };
         fence(Ordering::SeqCst);
+        let after = match status {
+            Some(queued) => queued.take(&reads),
+            None => {
+                let mut b = Batch::new();
+                let queued = GateStatus::queue(&mut b, map)?;
+                queued.take(&bus.run(&b)?)
+            }
+        };
 
         // "Not sent" is not "not arrived". `hns::dma_gate` counts refusals;
         // without this check they would only show as a full mismatch.
-        let after = dma_counters(bus, map)?;
         if after.out_of_range != self.refused {
             self.refused = after.out_of_range;
             return Err(format!(
                 "the gate refused a descriptor: 0x{at:x} + {len} bytes against a page of {} \
                  bytes at 0x{:x}.",
-                self.buffer.len(),
-                self.buffer.bus_addr()
+                self.page.len(),
+                self.page.bus_addr()
             ));
         }
         if after.while_busy != self.blocked {
@@ -4289,6 +5168,17 @@ impl Mover {
         }
         Ok(())
     }
+}
+
+/// A descriptor the card was given and not yet seen to finish.
+#[derive(Clone, Copy)]
+struct Fired {
+    at: u64,
+    len: usize,
+    to_card: bool,
+    /// Which half of the page it uses.
+    half: usize,
+    deadline: std::time::Instant,
 }
 
 /// Names an error code from the borrowed DMA engine.
@@ -4346,13 +5236,13 @@ fn require_idle(bus: &mut Bus, map: &RegisterMap, bdf: &str) -> Result<(), Strin
         "the engine is still busy with an earlier descriptor that never finished ({done} \
          finished before it), so it will not take another.\n\
          This happens when the card fired without bus mastering. Turning bus mastering on \
-         later does not clear it. Reprogram the card. The rescan turns decoding, bus \
-         mastering and the IOMMU setting back to their defaults, so finish with `check`:\n\n\
+         later does not clear it. Reprogram the card. The rescan turns decoding and the \
+         IOMMU setting back to their defaults, so finish with `check` (hio turns bus \
+         mastering on itself):\n\n\
          \x20   echo 1 | sudo tee /sys/bus/pci/devices/{bdf}/remove\n\
          \x20   sudo \"$(command -v hio)\" program\n\
          \x20   echo 1 | sudo tee /sys/bus/pci/rescan\n\
          \x20   echo 1 | sudo tee /sys/bus/pci/devices/{bdf}/enable\n\
-         \x20   sudo setpci -s {bdf} COMMAND=0x4:0x4\n\
          \x20   sudo \"$(command -v hio)\" -p check"
     ))
 }
@@ -4425,12 +5315,53 @@ struct DmaCounters {
 }
 
 fn dma_counters(bus: &mut Bus, map: &RegisterMap) -> Result<DmaCounters, String> {
+    let mut b = Batch::new();
+    let done = b.read(offset_of(map, "dma_done")?);
+    let status = GateStatus::queue(&mut b, map)?;
+    let reads = bus.run(&b)?;
+    let GateStatus {
+        out_of_range,
+        while_busy,
+        error,
+    } = status.take(&reads);
     Ok(DmaCounters {
-        done: rd(bus, offset_of(map, "dma_done")?)?,
-        out_of_range: rd(bus, offset_of(map, "dma_oor")?)?,
-        while_busy: rd(bus, offset_of(map, "dma_blocked")?)?,
-        error: rd(bus, offset_of(map, "dma_error")?)?,
+        done: reads[done],
+        out_of_range,
+        while_busy,
+        error,
     })
+}
+
+/// What a descriptor needs checked after it: the counters without `done`.
+struct GateStatus {
+    out_of_range: u32,
+    while_busy: u32,
+    error: u32,
+}
+
+/// The reads of a `GateStatus`, queued in a batch.
+#[derive(Clone, Copy)]
+struct QueuedStatus([ReadHandle; 3]);
+
+impl GateStatus {
+    fn queue(b: &mut Batch, map: &RegisterMap) -> Result<QueuedStatus, String> {
+        Ok(QueuedStatus([
+            b.read(offset_of(map, "dma_oor")?),
+            b.read(offset_of(map, "dma_blocked")?),
+            b.read(offset_of(map, "dma_error")?),
+        ]))
+    }
+}
+
+impl QueuedStatus {
+    fn take(self, reads: &Reads) -> GateStatus {
+        let [oor, blocked, error] = self.0;
+        GateStatus {
+            out_of_range: reads[oor],
+            while_busy: reads[blocked],
+            error: reads[error],
+        }
+    }
 }
 
 /// Queues a write to a register wider than 32 bits: lowest word first, as
@@ -4952,6 +5883,19 @@ fn bench(
             threads,
         );
     }
+    let total = read_magic(bus, map, reads, repeat)?;
+    rate("read", reads * repeat, total);
+    Ok(())
+}
+
+/// Reads `harness_magic` in `repeat` batches of `reads`, and answers the time
+/// the batches took. The value is known, so corruption shows too.
+fn read_magic(
+    bus: &mut Bus,
+    map: &RegisterMap,
+    reads: usize,
+    repeat: usize,
+) -> Result<std::time::Duration, String> {
     let at = offset_of(map, "harness_magic")?;
     let want = map.magic;
 
@@ -4966,7 +5910,6 @@ fn bench(
     }
 
     let mut total = std::time::Duration::ZERO;
-    let mut done = 0usize;
     for _ in 0..repeat {
         let mut b = Batch::new();
         b.replayable();
@@ -4985,11 +5928,8 @@ fn bench(
                 ));
             }
         }
-        done += reads;
     }
-
-    rate("read", done, total);
-    Ok(())
+    Ok(total)
 }
 
 /// Writes a region and reads it back. Writes and reads are reported apart:
@@ -5006,7 +5946,36 @@ fn bench_region(
     threads: usize,
 ) -> Result<(), String> {
     not_held(bus, map, region)?;
-    let master = bus.master();
+    let words = bench_words(region, at, size)?;
+    if both {
+        println!(
+            "writing {words} words into `{}` at 0x{at:x} -- what was there is lost",
+            region.name
+        );
+    } else {
+        // A read-only run cannot check the data. Say so, or the rate looks
+        // verified.
+        println!(
+            "reading {words} words of `{}` at 0x{at:x}; the contents are not checked \
+             (`--both` writes a known pattern and checks it)",
+            region.name
+        );
+    }
+    // Print the thread count next to the rate, so a saved log does not mix
+    // it up with a single-thread rate.
+    if threads > 1 {
+        println!("  with {threads} threads");
+    }
+    let (wrote, read) = sweep_region(bus, map, region, repeat, at, words, both, threads)?;
+    if both {
+        rate("write", words * repeat, wrote);
+    }
+    rate("read", words * repeat, read);
+    Ok(())
+}
+
+/// How many words `bench` sweeps from `at`: `size`, or a capped default.
+fn bench_words(region: &hns_regs::Region, at: u64, size: Option<u64>) -> Result<usize, String> {
     // Count only the entries. Past them a read returns 0 and bumps `oor`,
     // which says nothing about the transport.
     let bytes = region.depth as usize * region.entry_bytes;
@@ -5028,25 +5997,6 @@ fn bench_region(
             region.name
         ));
     }
-    if both {
-        println!(
-            "writing {words} words into `{}` at 0x{at:x} -- what was there is lost",
-            region.name
-        );
-    } else {
-        // A read-only run cannot check the data. Say so, or the rate looks
-        // verified.
-        println!(
-            "reading {words} words of `{}` at 0x{at:x}; the contents are not checked \
-             (`--both` writes a known pattern and checks it)",
-            region.name
-        );
-    }
-    // Print the thread count next to the rate, so a saved log does not mix
-    // it up with a single-thread rate.
-    if threads > 1 {
-        println!("  with {threads} threads");
-    }
     // Do not cross a page of a moving window. The base writes would be
     // measured too. A range inside one page is fine.
     if region.is_aperture()
@@ -5059,6 +6009,23 @@ fn bench_region(
             region.name, region.size_bytes
         ));
     }
+    Ok(words)
+}
+
+/// Sweeps `words` words of a region `repeat` times, and answers the time the
+/// writes and the reads took. With `both`, what was written is checked.
+#[allow(clippy::too_many_arguments)]
+fn sweep_region(
+    bus: &mut Bus,
+    map: &RegisterMap,
+    region: &hns_regs::Region,
+    repeat: usize,
+    at: u64,
+    words: usize,
+    both: bool,
+    threads: usize,
+) -> Result<(std::time::Duration, std::time::Duration), String> {
+    let master = bus.master();
     let base = (region.window_base + (at as usize % region.size_bytes)) as u32;
     let value = |i: usize| 0xbe11_0000u32 | i as u32;
 
@@ -5135,11 +6102,446 @@ fn bench_region(
         }
     }
 
-    if both {
-        rate("write", words * repeat, wrote);
+    Ok((wrote, read))
+}
+
+/// How many one-read batches `bench --suite` times.
+const SUITE_ROUND_TRIPS: usize = 200;
+/// How much of the card's memory the DMA part walks, at most.
+const SUITE_DMA_SPAN: u64 = 64 << 20;
+/// Descriptors per size, at most. Small ones measure the cost per
+/// descriptor, and a thousand is plenty for that.
+const SUITE_DMA_MAX_REPS: u64 = 1024;
+/// Bytes moved each way to and from the server's host memory.
+const SUITE_HOSTMEM_TOTAL: usize = 32 << 20;
+
+/// One measurement of `bench --suite`: `count` operations moving `bytes`.
+#[derive(Debug, serde::Serialize)]
+struct Measured {
+    what: String,
+    count: u64,
+    bytes: u64,
+    secs: f64,
+    /// The part of `secs` spent starting descriptors and waiting for them.
+    /// The rest is copies the card did not overlap: into the page here, or
+    /// to and from the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    card_secs: Option<f64>,
+}
+
+impl Measured {
+    fn new(what: impl Into<String>, count: usize, bytes: usize, took: std::time::Duration) -> Self {
+        Measured {
+            what: what.into(),
+            count: count as u64,
+            bytes: bytes as u64,
+            secs: took.as_secs_f64(),
+            card_secs: None,
+        }
     }
-    rate("read", words * repeat, read);
+
+    fn line(&self) -> String {
+        let each = self.secs / self.count as f64 * 1e6;
+        let mut line = format!(
+            "{:<44} {each:>10.2} us each {:>10} MB/s",
+            self.what,
+            mb_per_s(self.bytes, self.secs)
+        );
+        if let Some(card) = self.card_secs {
+            line += &format!("  (waiting on the card: {:.0}%)", card / self.secs * 100.0);
+        }
+        line
+    }
+}
+
+/// A rate with three significant digits or more: JTAG moves well under
+/// 1 MB/s, and `0.0` would say nothing.
+fn mb_per_s(bytes: u64, secs: f64) -> String {
+    let mbs = bytes as f64 / secs / 1e6;
+    match mbs {
+        m if m < 1.0 => format!("{m:.3}"),
+        m if m < 100.0 => format!("{m:.2}"),
+        m => format!("{m:.1}"),
+    }
+}
+
+/// What `bench --suite --json` adds to its file: the measurements, and what
+/// they were taken on.
+#[derive(Debug, serde::Serialize)]
+struct SuiteRecord {
+    hio: String,
+    /// Seconds since 1970, when the suite finished.
+    unix: u64,
+    /// The machine this `hio` ran on. Through `hio serve`, the board is on
+    /// the server's.
+    host: Option<String>,
+    cpu: Option<String>,
+    transport: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tck_hz: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link: Option<String>,
+    dut: String,
+    target: Option<String>,
+    map_hash: u32,
+    results: Vec<Measured>,
+    /// What was not measured, and why.
+    skipped: Vec<String>,
+}
+
+/// The measurements so far. Each is printed as it is taken, so a slow
+/// transport shows progress.
+#[derive(Default)]
+struct Suite {
+    results: Vec<Measured>,
+    skipped: Vec<String>,
+}
+
+impl Suite {
+    fn add(&mut self, m: Measured) {
+        println!("{}", m.line());
+        self.results.push(m);
+    }
+
+    fn skip(&mut self, why: String) {
+        println!("skipped: {why}");
+        self.skipped.push(why);
+    }
+}
+
+/// Measures everything this design and this transport can do, one after
+/// another (`bench --suite`).
+fn bench_suite(
+    bus: &mut Bus,
+    map: &RegisterMap,
+    cli: &Cli,
+    json: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let first_line = |path: &str, key: Option<&str>| -> Option<String> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let line = match key {
+            Some(key) => {
+                text.lines()
+                    .find(|l| l.starts_with(key))?
+                    .split_once(':')?
+                    .1
+            }
+            None => text.lines().next()?,
+        };
+        Some(line.trim().to_string())
+    };
+    let transport = match &*bus {
+        Bus::Jtag(_) => "jtag".to_string(),
+        Bus::Pcie(_) => "pcie".to_string(),
+        Bus::Net(link) if link.info().kind == "sim" => "serve, sim".to_string(),
+        Bus::Net(link) => format!("serve, {}", link.info().master),
+    };
+    // The real TCK, which the divisor rounds down from the one asked for.
+    let tck_hz = match bus {
+        Bus::Jtag(_) => resolve_probe(cli)
+            .ok()
+            .map(|cfg| hns_host::mpsse::tck_hz(hns_host::mpsse::tck_divisor(cfg.max_tck_hz))),
+        _ => None,
+    };
+    let link = match (&*bus, &map.pcie) {
+        (Bus::Pcie(_), Some(pcie)) => find_bdf(cli, pcie).ok().and_then(|bdf| {
+            let at = format!("/sys/bus/pci/devices/{bdf}");
+            let speed = first_line(&format!("{at}/current_link_speed"), None)?;
+            let width = first_line(&format!("{at}/current_link_width"), None)?;
+            Some(format!("{speed} x{width}"))
+        }),
+        _ => None,
+    };
+    let mut record = SuiteRecord {
+        hio: env!("HNS_VERSION").to_string(),
+        unix: 0,
+        host: first_line("/proc/sys/kernel/hostname", None),
+        cpu: first_line("/proc/cpuinfo", Some("model name")),
+        transport,
+        tck_hz,
+        link,
+        dut: map.dut.clone(),
+        target: map.target.clone(),
+        map_hash: map.map_hash,
+        results: Vec::new(),
+        skipped: Vec::new(),
+    };
+    println!(
+        "hio {} on {}, over {}{}{}",
+        record.hio,
+        record.host.as_deref().unwrap_or("this machine"),
+        record.transport,
+        record
+            .tck_hz
+            .map(|hz| format!(" at {:.3} MHz TCK", hz as f64 / 1e6))
+            .unwrap_or_default(),
+        record
+            .link
+            .as_deref()
+            .map(|l| format!(" ({l})"))
+            .unwrap_or_default(),
+    );
+    println!(
+        "{} on {}, map {:#010x}; what is in the memories is lost",
+        record.dut,
+        record.target.as_deref().unwrap_or("a board"),
+        record.map_hash
+    );
+
+    let mut suite = Suite::default();
+    let took = read_magic(bus, map, 1, SUITE_ROUND_TRIPS)?;
+    suite.add(Measured::new(
+        "window: one read per batch",
+        SUITE_ROUND_TRIPS,
+        SUITE_ROUND_TRIPS * 4,
+        took,
+    ));
+    let took = read_magic(bus, map, 1000, 10)?;
+    suite.add(Measured::new(
+        "window: reads, 1000 per batch",
+        10_000,
+        40_000,
+        took,
+    ));
+
+    for region in map
+        .regions
+        .iter()
+        .filter(|r| r.kind.as_deref() == Some("memory"))
+    {
+        not_held(bus, map, region)?;
+        let words = bench_words(region, 0, None)?;
+        let n = words * 10;
+        let (wrote, read) = sweep_region(bus, map, region, 10, 0, words, true, 1)?;
+        suite.add(Measured::new(
+            format!("{}: window writes", region.name),
+            n,
+            n * 4,
+            wrote,
+        ));
+        suite.add(Measured::new(
+            format!("{}: window reads", region.name),
+            n,
+            n * 4,
+            read,
+        ));
+        // Only a BAR reads in parallel; through a server the reads go one
+        // batch at a time.
+        if matches!(bus, Bus::Pcie(_)) {
+            let (_, read) = sweep_region(bus, map, region, 10, 0, words, true, 4)?;
+            suite.add(Measured::new(
+                format!("{}: window reads, 4 threads", region.name),
+                n,
+                n * 4,
+                read,
+            ));
+        }
+    }
+
+    suite_dma(bus, map, cli, &mut suite)?;
+    suite_hostmem(bus, map, cli, &mut suite)?;
+
+    let Some(path) = json else {
+        return Ok(());
+    };
+    record.unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    record.results = suite.results;
+    record.skipped = suite.skipped;
+    let line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| writeln!(f, "{line}"))
+        .map_err(|e| format!("cannot add the record to {}: {e}", path.display()))?;
+    println!("added to {}", path.display());
     Ok(())
+}
+
+/// The card's DMA engine, both ways, at a few descriptor sizes.
+fn suite_dma(bus: &mut Bus, map: &RegisterMap, cli: &Cli, suite: &mut Suite) -> Result<(), String> {
+    if map.get("dma_base").is_err() {
+        suite.skip("card DMA: the design has no `dma_*` registers".to_string());
+        return Ok(());
+    }
+    if bus.master() != "pcie" {
+        suite.skip("card DMA: the window is not reached over PCIe".to_string());
+        return Ok(());
+    }
+    let Some(bundle) = map.pcie.as_ref().and_then(|p| p.requester.clone()) else {
+        suite.skip(
+            "card DMA: regs.json does not say which memory the card reaches; generate it again"
+                .to_string(),
+        );
+        return Ok(());
+    };
+    let region = map
+        .region(&bundle)
+        .ok_or_else(|| format!("the card reaches `{bundle}`, but it is not a region."))?;
+    let mut mover = Mover::new(bus, map, cli)?;
+    let result = suite_dma_sizes(bus, map, &mut mover, region, suite);
+    close_mover(Some(mover), bus, map, result)
+}
+
+fn suite_dma_sizes(
+    bus: &mut Bus,
+    map: &RegisterMap,
+    mover: &mut Mover,
+    region: &hns_regs::Region,
+    suite: &mut Suite,
+) -> Result<(), String> {
+    let memory = region
+        .total_bytes
+        .unwrap_or(region.depth * region.entry_bytes as u64);
+    let span = memory.min(SUITE_DMA_SPAN);
+    let mut sizes = vec![4096, 64 * 1024, mover.chunk];
+    sizes.retain(|&size| size <= mover.chunk && size as u64 <= span);
+    sizes.dedup();
+    for (seed, size) in sizes.into_iter().enumerate() {
+        let reps = (span / size as u64).clamp(1, SUITE_DMA_MAX_REPS) as usize;
+        let pattern = suite_pattern(size, seed as u64 + 1);
+        // The first 8 bytes say which descriptor it was, so one landing at
+        // the wrong address shows.
+        let tag = |i: usize| (i as u64).to_le_bytes();
+
+        let fired = mover.fired;
+        let start = std::time::Instant::now();
+        for i in 0..reps {
+            mover.send(bus, map, (i * size) as u64, size, |page| {
+                page.copy_from_slice(&pattern);
+                page[..8].copy_from_slice(&tag(i));
+            })?;
+        }
+        mover.drain(bus, map)?;
+        let mut m = Measured::new(
+            format!("card DMA to the card, {} each", size_str(size as u64)),
+            reps,
+            reps * size,
+            start.elapsed(),
+        );
+        m.card_secs = Some((mover.fired - fired).as_secs_f64());
+        suite.add(m);
+
+        let fired = mover.fired;
+        let mut took = std::time::Duration::ZERO;
+        for i in 0..reps {
+            let start = std::time::Instant::now();
+            let next = (i + 1 < reps).then_some(((i + 1) * size) as u64);
+            let got = mover.fetch(bus, map, (i * size) as u64, size, next)?;
+            took += start.elapsed();
+            if got[..8] != tag(i) || got[8..] != pattern[8..] {
+                return Err(format!(
+                    "{} at 0x{:x} did not read back as written, so its rate means nothing.\n\
+                     `memtest {} --dma` checks this alone.",
+                    size_str(size as u64),
+                    i * size,
+                    region.name
+                ));
+            }
+        }
+        let mut m = Measured::new(
+            format!("card DMA to the host, {} each", size_str(size as u64)),
+            reps,
+            reps * size,
+            took,
+        );
+        m.card_secs = Some((mover.fired - fired).as_secs_f64());
+        suite.add(m);
+    }
+    mover.report_losses(bus, map)
+}
+
+/// Copies to and from the server's host memory, through `hio serve`. Here a
+/// page is plain memory, and a copy says nothing about the board.
+fn suite_hostmem(
+    bus: &mut Bus,
+    map: &RegisterMap,
+    cli: &Cli,
+    suite: &mut Suite,
+) -> Result<(), String> {
+    let mut names: Vec<String> = map
+        .registers
+        .iter()
+        .filter(|r| r.role.as_deref() == Some("host_aperture"))
+        .filter_map(|r| r.bundle.clone())
+        .collect();
+    if map.get("dma_base").is_ok() {
+        names.push(GATE.to_string());
+    }
+    if names.is_empty() {
+        return Ok(());
+    }
+    if !matches!(bus, Bus::Net(_)) || bus.master() != "pcie" {
+        suite.skip(
+            "host memory: measured only through `hio serve` over PCIe (a page here is plain \
+             memory)"
+                .to_string(),
+        );
+        return Ok(());
+    }
+    let mut pages = HostPages::default();
+    let result = (|| -> Result<(), String> {
+        for (seed, name) in names.iter().enumerate() {
+            let (size, _) = pages.attach(cli, bus, map, name)?;
+            let len = pages.reach(bus, map, name)?.min(size) as usize;
+            let reps = (SUITE_HOSTMEM_TOTAL / len).clamp(1, 1000);
+            let data = suite_pattern(len, 100 + seed as u64);
+
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                pages.write(bus, map, name, 0, &data)?;
+            }
+            suite.add(Measured::new(
+                format!(
+                    "host memory `{name}`: writes, {} each",
+                    size_str(len as u64)
+                ),
+                reps,
+                reps * len,
+                start.elapsed(),
+            ));
+
+            let start = std::time::Instant::now();
+            let mut got = Vec::new();
+            for _ in 0..reps {
+                got = pages.read(bus, map, name, 0, len as u64)?;
+            }
+            suite.add(Measured::new(
+                format!("host memory `{name}`: reads, {} each", size_str(len as u64)),
+                reps,
+                reps * len,
+                start.elapsed(),
+            ));
+            if got != data {
+                return Err(format!(
+                    "the server's page for `{name}` did not read back as written, so the \
+                     rates mean nothing."
+                ));
+            }
+            pages.release(bus, map, name)?;
+        }
+        Ok(())
+    })();
+    let closed = pages.close(bus, map);
+    result.and(closed)
+}
+
+/// `len` bytes that do not repeat, from `seed` (xorshift).
+fn suite_pattern(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out.truncate(len);
+    out
 }
 
 /// Finds the register of a bundle with the given `role`.
@@ -5288,264 +6690,278 @@ fn memtest(
         map, master, "memtest", bundle, &port, want, DMA_ABOVE, asked,
     )?;
     let mut mover = open_route(bus, map, cli, chosen)?;
-    let per_descriptor = mover.as_ref().map(|m| m.chunk / entry_bytes);
+    let result = (|| -> Result<(), String> {
+        let per_descriptor = mover.as_ref().map(|m| m.chunk / entry_bytes);
 
-    let mut writing = Progress::new(to - from, "writing");
-    if let (Some(mover), Some(per)) = (&mut mover, per_descriptor) {
-        for a in (from..to).step_by(per) {
-            let b_end = (a + per).min(to);
-            let at = a as u64 * entry_bytes as u64;
-            mover.send(bus, map, at, (b_end - a) * entry_bytes, |page| {
+        let mut writing = Progress::new(to - from, "writing");
+        if let (Some(mover), Some(per)) = (&mut mover, per_descriptor) {
+            for a in (from..to).step_by(per) {
+                let b_end = (a + per).min(to);
+                let at = a as u64 * entry_bytes as u64;
+                mover.send(bus, map, at, (b_end - a) * entry_bytes, |page| {
+                    for e in a..b_end {
+                        for w in 0..words_per_entry {
+                            let byte = (e - a) * entry_bytes + w * 4;
+                            page[byte..byte + 4]
+                                .copy_from_slice(&pattern(seed, e, w).to_le_bytes());
+                        }
+                    }
+                })?;
+                writing.at(b_end - from, "");
+            }
+            mover.drain(bus, map)?;
+        } else {
+            // Entries can be batched. Split at moving-window pages: the window
+            // shows one page at a time.
+            for (a, b_end) in entry_groups(&port, from, to) {
+                let mut b = mem_batch(&port);
+                set_mem_page(&mut b, map, &port, a, master)?;
+                if let MemPort::Indirect { maddr, .. } = &port {
+                    b.write(maddr.offset as u32, a as u32);
+                }
                 for e in a..b_end {
                     for w in 0..words_per_entry {
-                        let byte = (e - a) * entry_bytes + w * 4;
-                        page[byte..byte + 4].copy_from_slice(&pattern(seed, e, w).to_le_bytes());
+                        b.write(word_at(&port, e, w), pattern(seed, e, w));
                     }
                 }
-            })?;
-            writing.at(b_end - from, "");
-        }
-    } else {
-        // Entries can be batched. Split at moving-window pages: the window
-        // shows one page at a time.
-        for (a, b_end) in entry_groups(&port, from, to) {
-            let mut b = mem_batch(&port);
-            set_mem_page(&mut b, map, &port, a, master)?;
-            if let MemPort::Indirect { maddr, .. } = &port {
-                b.write(maddr.offset as u32, a as u32);
+                bus.run(&b)?;
+                writing.at(b_end - from, "");
             }
-            for e in a..b_end {
-                for w in 0..words_per_entry {
-                    b.write(word_at(&port, e, w), pattern(seed, e, w));
-                }
-            }
-            bus.run(&b)?;
-            writing.at(b_end - from, "");
         }
-    }
-    let wrote_secs = writing.elapsed();
+        let wrote_secs = writing.elapsed();
 
-    // Read back. A region is grouped by page, like the writes. One round trip
-    // per entry would make a full test (2GB = 540 million entries) far too
-    // slow. An indirect port cannot be grouped: each entry needs `maddr` set.
-    let groups: Vec<(usize, usize)> = if let Some(per) = per_descriptor {
-        (from..to)
-            .step_by(per)
-            .map(|a| (a, (a + per).min(to)))
-            .collect()
-    } else if indirect {
-        (from..to).map(|e| (e, e + 1)).collect()
-    } else {
-        entry_groups(&port, from, to)
-    };
-
-    // Parallel reads need PCIe and contiguous addresses. An indirect port
-    // needs `maddr` set per entry, so it cannot run in parallel.
-    let threads = threads.unwrap_or(if master == "pcie" { MEMTEST_THREADS } else { 1 });
-    let spread =
-        mover.is_none() && threads > 1 && !indirect && port.entry_bytes() == words_per_entry * 4;
-    // Always name the route in the result line. Otherwise a saved time does
-    // not say what was measured.
-    let window = if spread {
-        format!("through the window, {threads} threads")
-    } else if threads > 1 && !indirect {
-        // No region is non-contiguous today. If one appears, say why it is slow.
-        format!("through the window, one at a time: the entries of `{bundle}` are not contiguous")
-    } else if threads > 1 && indirect {
-        format!(
-            "through the window, one at a time: `{bundle}` is an indirect port, so each \
-             entry needs its own address write"
-        )
-    } else {
-        "through the window".to_string()
-    };
-
-    let mut bad = 0usize;
-    let mut shown = 0usize;
-    // Suspect address bits: set when a value from another address comes back.
-    let mut suspect = 0u64;
-    // Ranges that still hold the poison. This matters only with the DMA
-    // engine: the memory was not wrong, the card never wrote these bytes here.
-    let poison = u32::from_le_bytes([POISON; 4]);
-    let mut undelivered = 0usize;
-    let mut unwritten: Vec<(u64, u64)> = Vec::new();
-    let mut reading = Progress::new(to - from, "reading back");
-    for (a, b_end) in groups {
-        let got: Vec<u32> = if let Some(mover) = &mut mover {
-            let bytes = (b_end - a) * entry_bytes;
-            let landed = mover.fetch(bus, map, a as u64 * entry_bytes as u64, bytes)?;
-            let (words, _) = landed.as_chunks::<4>();
-            words.iter().copied().map(u32::from_le_bytes).collect()
-        } else if spread {
-            // Set the page and confirm it before the parallel reads. The base
-            // write is posted, and a read from another core may pass it and
-            // read the wrong page. Reading one word back proves the device
-            // has handled the write (PCIe ordering). Only then start threads.
-            let mut b = mem_batch(&port);
-            set_mem_page(&mut b, map, &port, a, master)?;
-            bus.run(&b)?;
-            let at = word_at(&port, a, 0);
-            bus.read32(at)?;
-
-            let mut out = vec![0u32; (b_end - a) * words_per_entry];
-            bus.read_parallel(at, &mut out, threads)?;
-            out
+        // Read back. A region is grouped by page, like the writes. One round trip
+        // per entry would make a full test (2GB = 540 million entries) far too
+        // slow. An indirect port cannot be grouped: each entry needs `maddr` set.
+        let groups: Vec<(usize, usize)> = if let Some(per) = per_descriptor {
+            (from..to)
+                .step_by(per)
+                .map(|a| (a, (a + per).min(to)))
+                .collect()
+        } else if indirect {
+            (from..to).map(|e| (e, e + 1)).collect()
         } else {
-            let mut b = mem_batch(&port);
-            set_mem_page(&mut b, map, &port, a, master)?;
-            if let MemPort::Indirect { maddr, .. } = &port {
-                b.write(maddr.offset as u32, a as u32);
-            }
-            let mut hs = Vec::with_capacity((b_end - a) * words_per_entry);
-            for e in a..b_end {
-                for w in 0..words_per_entry {
-                    hs.push(b.read(word_at(&port, e, w)));
-                }
-            }
-            let values = bus.run(&b)?;
-            hs.into_iter().map(|h| values[h]).collect()
+            entry_groups(&port, from, to)
         };
-        for (i, &found) in got.iter().enumerate() {
-            let e = a + i / words_per_entry;
-            let w = i % words_per_entry;
-            let want = pattern(seed, e, w);
-            if found == want {
-                continue;
-            }
-            bad += 1;
-            let at = e as u64 * entry_bytes as u64 + w as u64 * 4;
-            if mover.is_some() && found == poison {
-                undelivered += 1;
-                match unwritten.last_mut() {
-                    Some((_, end)) if *end == at => *end = at + 4,
-                    _ => unwritten.push((at, at + 4)),
-                }
-                continue;
-            }
-            // There may be many bad words (a whole address range can be
-            // dead). Print the first few addresses and count the rest.
-            if shown < SHOW_BAD {
-                shown += 1;
-                match alias_of(seed, e, w, found, depth, words_per_entry) {
-                    Some((oe, ow, bit)) => {
-                        suspect |= 1u64 << bit;
-                        let other = oe as u64 * entry_bytes as u64 + ow as u64 * 4;
-                        println!(
-                            "0x{at:x}: read {found:#010x}, wrote {want:#010x}; \
-                             that value belongs to 0x{other:x} (address bit {bit})"
-                        );
-                    }
-                    None => println!("0x{at:x}: read {found:#010x}, wrote {want:#010x}"),
-                }
-            }
-        }
-        reading.at(
-            b_end - from,
-            &if bad > 0 {
-                format!(", {bad} bad so far")
-            } else {
-                String::new()
-            },
-        );
-    }
 
-    let words = (to - from) * words_per_entry;
-    let took = reading.elapsed();
-    // Always print the rate when the DMA engine moved the data. It is what
-    // compares with the window (702 s for 2GB), and a fast run falls under
-    // the 10 s threshold below.
-    let bytes = (to - from) * entry_bytes;
-    let rate = |secs: f64| bytes as f64 / secs / 1e6;
-    let how = if mover.is_some() {
-        format!(
-            "by the card: wrote {:.0} MB/s, read back {:.0} MB/s",
-            rate(wrote_secs),
-            rate(took)
-        )
-    } else {
-        window
-    };
-    if let Some(mover) = &mover {
-        mover.report_losses(bus, map)?;
-    }
-    let total = wrote_secs + took;
-    let secs = if total >= 10.0 {
-        format!(", {total:.0} s")
-    } else {
-        String::new()
-    };
-    if bad == 0 {
-        println!(
-            "{} entries, {words} words: all read back as written ({how}{secs})",
-            to - from
-        );
-        Ok(())
-    } else {
-        // Give details only on failure. The TLP sizes help when the DMA
-        // engine path is in doubt.
-        match &mover {
-            Some(mover) => println!(
-                "moved by the card, {} bytes per descriptor: wrote {:.0} MB/s in {}-byte read \
-                 requests, read back {:.0} MB/s in {}-byte TLPs{secs}",
-                mover.chunk,
-                rate(wrote_secs),
-                tlp_bytes(bus, map, "dma_mrrs")?,
-                rate(took),
-                tlp_bytes(bus, map, "dma_mps")?
-            ),
-            None => println!("read back {how}{secs}"),
-        }
-        let wrong = bad - undelivered;
-        if shown < wrong {
-            println!("... and {} more", wrong - shown);
-        }
-        if !unwritten.is_empty() {
-            let listed: Vec<String> = unwritten
-                .iter()
-                .take(SHOW_BAD)
-                .map(|(a, b)| format!("0x{a:x}..0x{b:x} ({} bytes)", b - a))
-                .collect();
-            println!(
-                "never written back by the card: {}{}",
-                listed.join(", "),
-                if unwritten.len() > SHOW_BAD {
-                    format!(", and {} more", unwritten.len() - SHOW_BAD)
+        // Parallel reads need PCIe and contiguous addresses. An indirect port
+        // needs `maddr` set per entry, so it cannot run in parallel.
+        let threads = threads.unwrap_or(if master == "pcie" { MEMTEST_THREADS } else { 1 });
+        let spread = mover.is_none()
+            && threads > 1
+            && !indirect
+            && port.entry_bytes() == words_per_entry * 4;
+        // Always name the route in the result line. Otherwise a saved time does
+        // not say what was measured.
+        let window = if spread {
+            format!("through the window, {threads} threads")
+        } else if threads > 1 && !indirect {
+            // No region is non-contiguous today. If one appears, say why it is slow.
+            format!(
+                "through the window, one at a time: the entries of `{bundle}` are not contiguous"
+            )
+        } else if threads > 1 && indirect {
+            format!(
+                "through the window, one at a time: `{bundle}` is an indirect port, so each \
+             entry needs its own address write"
+            )
+        } else {
+            "through the window".to_string()
+        };
+
+        let mut bad = 0usize;
+        let mut shown = 0usize;
+        // Suspect address bits: set when a value from another address comes back.
+        let mut suspect = 0u64;
+        // Ranges that still hold the poison. This matters only with the DMA
+        // engine: the memory was not wrong, the card never wrote these bytes here.
+        let poison = u32::from_le_bytes([POISON; 4]);
+        let mut undelivered = 0usize;
+        let mut unwritten: Vec<(u64, u64)> = Vec::new();
+        let mut reading = Progress::new(to - from, "reading back");
+        for (g, &(a, b_end)) in groups.iter().enumerate() {
+            let got: Vec<u32> = if let Some(mover) = &mut mover {
+                let bytes = (b_end - a) * entry_bytes;
+                // Only a group of the same size can follow on the other half.
+                let next = groups
+                    .get(g + 1)
+                    .filter(|&&(na, nb)| nb - na == b_end - a)
+                    .map(|&(na, _)| na as u64 * entry_bytes as u64);
+                let landed = mover.fetch(bus, map, a as u64 * entry_bytes as u64, bytes, next)?;
+                let (words, _) = landed.as_chunks::<4>();
+                words.iter().copied().map(u32::from_le_bytes).collect()
+            } else if spread {
+                // Set the page and confirm it before the parallel reads. The base
+                // write is posted, and a read from another core may pass it and
+                // read the wrong page. Reading one word back proves the device
+                // has handled the write (PCIe ordering). Only then start threads.
+                let mut b = mem_batch(&port);
+                set_mem_page(&mut b, map, &port, a, master)?;
+                bus.run(&b)?;
+                let at = word_at(&port, a, 0);
+                bus.read32(at)?;
+
+                let mut out = vec![0u32; (b_end - a) * words_per_entry];
+                bus.read_parallel(at, &mut out, threads)?;
+                out
+            } else {
+                let mut b = mem_batch(&port);
+                set_mem_page(&mut b, map, &port, a, master)?;
+                if let MemPort::Indirect { maddr, .. } = &port {
+                    b.write(maddr.offset as u32, a as u32);
+                }
+                let mut hs = Vec::with_capacity((b_end - a) * words_per_entry);
+                for e in a..b_end {
+                    for w in 0..words_per_entry {
+                        hs.push(b.read(word_at(&port, e, w)));
+                    }
+                }
+                let values = bus.run(&b)?;
+                hs.into_iter().map(|h| values[h]).collect()
+            };
+            for (i, &found) in got.iter().enumerate() {
+                let e = a + i / words_per_entry;
+                let w = i % words_per_entry;
+                let want = pattern(seed, e, w);
+                if found == want {
+                    continue;
+                }
+                bad += 1;
+                let at = e as u64 * entry_bytes as u64 + w as u64 * 4;
+                if mover.is_some() && found == poison {
+                    undelivered += 1;
+                    match unwritten.last_mut() {
+                        Some((_, end)) if *end == at => *end = at + 4,
+                        _ => unwritten.push((at, at + 4)),
+                    }
+                    continue;
+                }
+                // There may be many bad words (a whole address range can be
+                // dead). Print the first few addresses and count the rest.
+                if shown < SHOW_BAD {
+                    shown += 1;
+                    match alias_of(seed, e, w, found, depth, words_per_entry) {
+                        Some((oe, ow, bit)) => {
+                            suspect |= 1u64 << bit;
+                            let other = oe as u64 * entry_bytes as u64 + ow as u64 * 4;
+                            println!(
+                                "0x{at:x}: read {found:#010x}, wrote {want:#010x}; \
+                             that value belongs to 0x{other:x} (address bit {bit})"
+                            );
+                        }
+                        None => println!("0x{at:x}: read {found:#010x}, wrote {want:#010x}"),
+                    }
+                }
+            }
+            reading.at(
+                b_end - from,
+                &if bad > 0 {
+                    format!(", {bad} bad so far")
                 } else {
                     String::new()
-                }
+                },
             );
         }
-        // If words only failed to arrive, do not blame the memory. The poison
-        // is still there, so the path from the card to this machine failed.
-        if wrong == 0 {
-            return Err(format!(
-                "{bad} of {words} words never came back: the card did not write them into \
+
+        let words = (to - from) * words_per_entry;
+        let took = reading.elapsed();
+        // Always print the rate when the DMA engine moved the data. It is what
+        // compares with the window (702 s for 2GB), and a fast run falls under
+        // the 10 s threshold below.
+        let bytes = (to - from) * entry_bytes;
+        let rate = |secs: f64| bytes as f64 / secs / 1e6;
+        let how = if mover.is_some() {
+            format!(
+                "by the card: wrote {:.0} MB/s, read back {:.0} MB/s",
+                rate(wrote_secs),
+                rate(took)
+            )
+        } else {
+            window
+        };
+        if let Some(mover) = &mut mover {
+            mover.report_losses(bus, map)?;
+        }
+        let total = wrote_secs + took;
+        let secs = if total >= 10.0 {
+            format!(", {total:.0} s")
+        } else {
+            String::new()
+        };
+        if bad == 0 {
+            println!(
+                "{} entries, {words} words: all read back as written ({how}{secs})",
+                to - from
+            );
+            Ok(())
+        } else {
+            // Give details only on failure. The TLP sizes help when the DMA
+            // engine path is in doubt.
+            match &mover {
+                Some(mover) => println!(
+                    "moved by the card, {} bytes per descriptor: wrote {:.0} MB/s in {}-byte read \
+                 requests, read back {:.0} MB/s in {}-byte TLPs{secs}",
+                    mover.chunk,
+                    rate(wrote_secs),
+                    tlp_bytes(bus, map, "dma_mrrs")?,
+                    rate(took),
+                    tlp_bytes(bus, map, "dma_mps")?
+                ),
+                None => println!("read back {how}{secs}"),
+            }
+            let wrong = bad - undelivered;
+            if shown < wrong {
+                println!("... and {} more", wrong - shown);
+            }
+            if !unwritten.is_empty() {
+                let listed: Vec<String> = unwritten
+                    .iter()
+                    .take(SHOW_BAD)
+                    .map(|(a, b)| format!("0x{a:x}..0x{b:x} ({} bytes)", b - a))
+                    .collect();
+                println!(
+                    "never written back by the card: {}{}",
+                    listed.join(", "),
+                    if unwritten.len() > SHOW_BAD {
+                        format!(", and {} more", unwritten.len() - SHOW_BAD)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            // If words only failed to arrive, do not blame the memory. The poison
+            // is still there, so the path from the card to this machine failed.
+            if wrong == 0 {
+                return Err(format!(
+                    "{bad} of {words} words never came back: the card did not write them into \
                  this machine.\n\
                  The problem is the path from the card to this machine, not the memory. \
                  Run the same range with --pio to check the memory itself."
-            ));
-        }
-        if suspect != 0 {
-            let bits: Vec<String> = (0..64)
-                .filter(|i| suspect & (1u64 << i) != 0)
-                .map(|i| i.to_string())
-                .collect();
-            println!(
-                "address bits that came back holding another word: {}",
-                bits.join(", ")
-            );
-        }
-        Err(format!(
-            "{wrong} of {words} words came back wrong{}.\n\
+                ));
+            }
+            if suspect != 0 {
+                let bits: Vec<String> = (0..64)
+                    .filter(|i| suspect & (1u64 << i) != 0)
+                    .map(|i| i.to_string())
+                    .collect();
+                println!(
+                    "address bits that came back holding another word: {}",
+                    bits.join(", ")
+                );
+            }
+            Err(format!(
+                "{wrong} of {words} words came back wrong{}.\n\
              Each address gets its own pattern. A value from another address points at \
              the address wiring, not the storage.",
-            if undelivered > 0 {
-                format!(", and {undelivered} more never came back from the card")
-            } else {
-                String::new()
-            }
-        ))
-    }
+                if undelivered > 0 {
+                    format!(", and {undelivered} more never came back from the card")
+                } else {
+                    String::new()
+                }
+            ))
+        }
+    })();
+    close_mover(mover, bus, map, result)
 }
 
 /// Finds which address a read value belongs to, trying only addresses one bit
@@ -5717,64 +7133,69 @@ fn load(
         asked,
     )?;
     let mut mover = open_route(bus, map, cli, chosen)?;
-
-    let mut total = 0usize;
-    // Time only the transfer. With `time hio load`, process start and `sudo`
-    // dominate: a measured 54ms for 1KB was almost all fixed cost.
-    let started = std::time::Instant::now();
-    for p in &pieces {
-        match &mut mover {
-            Some(mover) => send_piece(bus, map, mover, &port, p)?,
-            None => write_entries(bus, map, &port, p)?,
-        }
-        total += p.bytes.len();
-        // Print the address too, so a wrong `--base` shows.
-        match p.addr {
-            Some(a) => println!(
-                "  {a:#012x} -> entry {:>6} .. {:<6}  {} bytes",
-                p.entry,
-                p.entry + p.bytes.len().div_ceil(entry_bytes),
-                p.bytes.len()
-            ),
-            None => println!(
-                "  entry {:>6} .. {:<6}  {} bytes",
-                p.entry,
-                p.entry + p.bytes.len().div_ceil(entry_bytes),
-                p.bytes.len()
-            ),
-        }
-    }
-    let took = started.elapsed().as_secs_f64();
-    // Route and rate on one line. For the window, also the time per word,
-    // which compares with `bench`'s time per write.
-    let mbps = total as f64 / took / 1e6;
-    let how = if mover.is_some() {
-        format!("by the card, {mbps:.0} MB/s")
-    } else {
-        format!(
-            "through the window, {:.2} us per word, {mbps:.1} MB/s",
-            took / (total / 4).max(1) as f64 * 1e6
-        )
-    };
-    println!("loaded {total} bytes into {bundle} ({how})");
-
-    // Report losses before verifying, so they show before a verify failure.
-    if let Some(mover) = &mover {
-        mover.report_losses(bus, map)?;
-    }
-    if verify {
+    let result = (|| -> Result<(), String> {
+        let mut total = 0usize;
+        // Time only the transfer. With `time hio load`, process start and `sudo`
+        // dominate: a measured 54ms for 1KB was almost all fixed cost.
+        let started = std::time::Instant::now();
         for p in &pieces {
             match &mut mover {
-                Some(mover) => check_piece(bus, map, mover, &port, p)?,
-                None => check_entries(bus, map, &port, p)?,
+                Some(mover) => send_piece(bus, map, mover, &port, p)?,
+                None => write_entries(bus, map, &port, p)?,
+            }
+            total += p.bytes.len();
+            // Print the address too, so a wrong `--base` shows.
+            match p.addr {
+                Some(a) => println!(
+                    "  {a:#012x} -> entry {:>6} .. {:<6}  {} bytes",
+                    p.entry,
+                    p.entry + p.bytes.len().div_ceil(entry_bytes),
+                    p.bytes.len()
+                ),
+                None => println!(
+                    "  entry {:>6} .. {:<6}  {} bytes",
+                    p.entry,
+                    p.entry + p.bytes.len().div_ceil(entry_bytes),
+                    p.bytes.len()
+                ),
             }
         }
-        if let Some(mover) = &mover {
+        if let Some(mover) = &mut mover {
+            mover.drain(bus, map)?;
+        }
+        let took = started.elapsed().as_secs_f64();
+        // Route and rate on one line. For the window, also the time per word,
+        // which compares with `bench`'s time per write.
+        let mbps = total as f64 / took / 1e6;
+        let how = if mover.is_some() {
+            format!("by the card, {mbps:.0} MB/s")
+        } else {
+            format!(
+                "through the window, {:.2} us per word, {mbps:.1} MB/s",
+                took / (total / 4).max(1) as f64 * 1e6
+            )
+        };
+        println!("loaded {total} bytes into {bundle} ({how})");
+
+        // Report losses before verifying, so they show before a verify failure.
+        if let Some(mover) = &mut mover {
             mover.report_losses(bus, map)?;
         }
-        println!("verified: what is in the memory is what was in the file");
-    }
-    Ok(())
+        if verify {
+            for p in &pieces {
+                match &mut mover {
+                    Some(mover) => check_piece(bus, map, mover, &port, p)?,
+                    None => check_entries(bus, map, &port, p)?,
+                }
+            }
+            if let Some(mover) = &mut mover {
+                mover.report_losses(bus, map)?;
+            }
+            println!("verified: what is in the memory is what was in the file");
+        }
+        Ok(())
+    })();
+    close_mover(mover, bus, map, result)
 }
 
 /// The size of a piece, rounded up to whole entries. The last entry is padded
@@ -5831,10 +7252,16 @@ fn check_piece(
     let entry_bytes = port.entry_bytes();
     let first = (p.entry * entry_bytes) as u64;
     let mut want = Vec::new();
-    for (off, len) in piece_chunks(port, p, mover.chunk) {
+    let chunks = piece_chunks(port, p, mover.chunk);
+    for (k, &(off, len)) in chunks.iter().enumerate() {
         want.resize(len, 0);
         piece_bytes(p, off, len, &mut want);
-        let got = mover.fetch(bus, map, first + off as u64, len)?;
+        // Only a part of the same size can follow on the other half.
+        let next = chunks
+            .get(k + 1)
+            .filter(|&&(_, l)| l == len)
+            .map(|&(o, _)| first + o as u64);
+        let got = mover.fetch(bus, map, first + off as u64, len, next)?;
         let Some(word) = (0..len / 4).find(|w| got[w * 4..w * 4 + 4] != want[w * 4..w * 4 + 4])
         else {
             continue;
@@ -7111,6 +8538,9 @@ struct Prompt {
     edit: LineEdit,
     /// Inside `cpu boot` / `cpu console`, where Ctrl-A c is the way out.
     in_console: bool,
+    /// Host memory handed to `host_mem` bundles. The top prompt only: the
+    /// console has no single place to give it back.
+    pages: Option<HostPages>,
 }
 
 /// What a line at the prompt asks for.
@@ -7132,6 +8562,7 @@ impl Prompt {
             level,
             edit: LineEdit::default(),
             in_console,
+            pages: (!in_console).then(HostPages::default),
         }
     }
 
@@ -7168,7 +8599,7 @@ impl Prompt {
             }
             PromptAction::Hio(step) => {
                 let reset = matches!(step, Step::Window(Cmd::Reset { .. }));
-                run_step(cli, bus, map, step)?;
+                run_step(cli, bus, map, step, self.pages.as_mut())?;
                 if reset {
                     return Ok(Ran::Resumed);
                 }
@@ -7288,7 +8719,23 @@ fn shell(cli: &Cli) -> Result<(), String> {
         bus.check_identity(&map)?;
     }
     let mut prompt = Prompt::new(Level::Top, false);
+    let ran = prompt_lines(cli, &mut bus, &map, &mut prompt);
+    // However the prompt ended: a page must never be freed while the DUT can
+    // still reach it.
+    let closed = match prompt.pages.as_mut() {
+        Some(pages) => pages.close(&mut bus, &map),
+        None => Ok(()),
+    };
+    ran.and(closed)
+}
 
+/// The lines of the top prompt, from a pipe or the terminal.
+fn prompt_lines(
+    cli: &Cli,
+    bus: &mut Bus,
+    map: &RegisterMap,
+    prompt: &mut Prompt,
+) -> Result<(), String> {
     // SAFETY: a plain query on fd 0.
     if unsafe { libc::isatty(0) } == 0 {
         use std::io::BufRead;
@@ -7296,7 +8743,7 @@ fn shell(cli: &Cli) -> Result<(), String> {
             let line = line.map_err(|e| format!("cannot read standard input: {e}"))?;
             let text = line.split('#').next().unwrap_or("").trim();
             let ran = prompt
-                .run(text, cli, &mut bus, &map, None)
+                .run(text, cli, bus, map, None)
                 .map_err(|e| format!("line {}: {line}\n{e}", i + 1))?;
             if ran == Ran::Quit {
                 break;
@@ -7313,14 +8760,14 @@ fn shell(cli: &Cli) -> Result<(), String> {
     );
     let raw = RawTerminal::enter();
     let mut out = std::io::stdout();
-    let mut watch = HaltWatch::new(&mut bus, &map, false);
+    let mut watch = HaltWatch::new(bus, map, false);
     to_terminal(&raw, &mut out, prompt.text().as_bytes())?;
     loop {
         let keys = raw.keys();
         if keys.is_empty() {
-            if watch.poll(&mut bus) {
+            if watch.poll(bus) {
                 raw.pause();
-                let stop = stop_line(&mut bus, &map, None).unwrap_or_else(|e| e);
+                let stop = stop_line(bus, map, None).unwrap_or_else(|e| e);
                 raw.resume();
                 let text = format!("\n{stop}\n{}{}", prompt.text(), prompt.edit.line);
                 to_terminal(&raw, &mut out, text.as_bytes())?;
@@ -7339,9 +8786,9 @@ fn shell(cli: &Cli) -> Result<(), String> {
             to_terminal(&raw, &mut out, &echo)?;
             if let Some(line) = line {
                 raw.pause();
-                let ran = prompt.run(&line, cli, &mut bus, &map, None);
+                let ran = prompt.run(&line, cli, bus, map, None);
                 match &ran {
-                    Ok(Ran::Halted) => watch.sync(&mut bus),
+                    Ok(Ran::Halted) => watch.sync(bus),
                     Ok(Ran::Resumed) => watch.running(),
                     _ => {}
                 }
@@ -9095,6 +10542,78 @@ mod tests {
         .unwrap()
     }
 
+    /// A map with a `host_mem` bundle `mem` and the DMA gate.
+    fn steering_map() -> RegisterMap {
+        let reg = |name: &str, offset: usize, words: usize, role: &str, bundle: &str| {
+            let tail = if bundle.is_empty() {
+                String::new()
+            } else {
+                format!(r#","bundle":"{bundle}""#)
+            };
+            format!(
+                r#"{{"name":"{name}","kind":"terminator","offset":{offset},"words":{words},
+                    "width":{},"access":"rw","role":"{role}"{tail}}}"#,
+                32 * words
+            )
+        };
+        let regs = [
+            reg("mem_base", 0x10, 2, "host_base", "mem"),
+            reg("mem_on", 0x18, 1, "host_on", "mem"),
+            reg("dma_base", 0x20, 2, "dma_base", ""),
+            reg("dma_size", 0x28, 1, "dma_size", ""),
+            reg("dma_len", 0x2c, 1, "dma_len", ""),
+        ];
+        RegisterMap::from_json(&format!(
+            r#"{{"marker":"m","format_version":{},"generator":"g","dut":"d","word_bits":32,
+                "size_bytes":4096,"magic":1,"map_hash":2,"registers":[{}]}}"#,
+            hns_regs::FORMAT_VERSION,
+            regs.join(",")
+        ))
+        .unwrap()
+    }
+
+    /// `hostmem dma` hands the page to the DMA gate, where the design has one;
+    /// any other name is a `host_mem` bundle.
+    #[test]
+    fn the_gate_takes_a_page_under_its_register_prefix() {
+        let map = steering_map();
+        assert_eq!(holder(&map, GATE), Ok(Holder::Gate));
+        let err = holder(&map, "mem").unwrap_err();
+        assert!(err.contains("not a `host_mem` bundle"), "{err}");
+        let without_gate = region_map(&[]);
+        let err = holder(&without_gate, GATE).unwrap_err();
+        assert!(err.contains("`dma`"), "{err}");
+    }
+
+    /// Through `hio serve`, a client may read the registers that point the
+    /// card at host memory, but not write them.
+    #[test]
+    fn a_served_client_does_not_steer_the_card() {
+        let map = steering_map();
+        let batch = |addr: u32, write: bool| {
+            let mut b = Batch::new();
+            b.write(0x2c, 64);
+            if write {
+                b.write(addr, 1);
+            } else {
+                b.read(addr);
+            }
+            b
+        };
+        for addr in [0x10, 0x14, 0x18] {
+            let err = refuse_steering(&map, &batch(addr, true)).unwrap_err();
+            assert!(err.contains("hostmem attach mem"), "{addr:#x}: {err}");
+            assert!(err.contains("Nothing in this batch ran"), "{err}");
+            refuse_steering(&map, &batch(addr, false)).unwrap();
+        }
+        for addr in [0x20, 0x24, 0x28] {
+            let err = refuse_steering(&map, &batch(addr, true)).unwrap_err();
+            assert!(err.contains("`dma_"), "{addr:#x}: {err}");
+        }
+        // The descriptor stays the client's: the gate keeps it in the window.
+        refuse_steering(&map, &batch(0x2c, true)).unwrap();
+    }
+
     /// `hio cpu` finds the Debug Module by the region kind, not by its name,
     /// and asks when there is more than one.
     #[test]
@@ -9405,6 +10924,34 @@ mod tests {
         assert!(parse_step("reset --hold --release").is_err());
     }
 
+    /// `hostmem` holds its page across lines, so it belongs in a script.
+    #[test]
+    fn a_script_hands_host_memory_to_the_dut() {
+        for line in [
+            "hostmem attach hmem",
+            "hostmem load hmem pattern.bin --at 0x2000",
+            "hostmem read hmem 64 8",
+            "hostmem write hmem 0x40 1 0xdead_beef",
+            "hostmem save hmem out.bin --at 0 --len 4096",
+            "hostmem detach hmem",
+        ] {
+            assert!(
+                matches!(parse_step(line), Ok(Step::Window(Cmd::Hostmem(_)))),
+                "{line}"
+            );
+        }
+    }
+
+    /// The host side stops at the aperture too, so `load` cannot fill bytes
+    /// the DUT will never be allowed to reach.
+    #[test]
+    fn host_memory_is_reached_only_inside_the_aperture() {
+        assert_eq!(host_span("hmem", 0x1000, 0xff0, 16), Ok(0xff0..0x1000));
+        let err = host_span("hmem", 0x1000, 0xff0, 17).unwrap_err();
+        assert!(err.contains("do not fit in `hmem`"), "{err}");
+        assert!(host_span("hmem", 0x1000, u64::MAX, 2).is_err());
+    }
+
     /// The same code means different things per direction. On the read side
     /// 10 is a completion UR (the IOMMU refused); on the write side it is an
     /// AXI write SLVERR. Mixing them up blames the memory for a host setting.
@@ -9634,6 +11181,19 @@ mod tests {
         // The same for `load`.
         let err = run_cli(Cli::parse_from(["hio", "load", "mem", "a.bin", "--dma"])).unwrap_err();
         assert!(err.contains("-p load"), "{err}");
+
+        // A server over PCIe moves data with the card, so `--connect` is
+        // not refused here. It stops later, at the missing map.
+        let err = run_cli(Cli::parse_from([
+            "hio",
+            "--connect",
+            "127.0.0.1:1",
+            "memtest",
+            "mem",
+            "--dma",
+        ]))
+        .unwrap_err();
+        assert!(!err.contains("over PCIe"), "{err}");
     }
 
     /// The `memtest` thread default (4 over PCIe) is an `Option`, so it does
@@ -9664,6 +11224,59 @@ mod tests {
         // One thread is the default, so it passes (and stops at the missing map).
         let err = run_cli(Cli::parse_from(["hio", "bench", "mem", "--threads", "1"])).unwrap_err();
         assert!(!err.contains("only does anything over PCIe"), "{err}");
+    }
+
+    /// The suite picks what to measure itself, so the options that name a
+    /// region or a range do not go with it.
+    #[test]
+    fn the_suite_takes_no_region() {
+        for args in [
+            vec!["hio", "bench", "--suite", "mem"],
+            vec!["hio", "bench", "--suite", "--both"],
+            vec!["hio", "bench", "--suite", "--threads", "4"],
+            vec!["hio", "bench", "--json", "perf.jsonl"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
+        let cli = Cli::parse_from(["hio", "bench", "--suite", "--json", "perf.jsonl"]);
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Bench {
+                suite: true,
+                json: Some(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_suite_rate_keeps_its_digits() {
+        assert_eq!(mb_per_s(40_000, 0.1), "0.400");
+        assert_eq!(mb_per_s(8_500_000, 1.0), "8.50");
+        assert_eq!(mb_per_s(1_521_700_000, 1.0), "1521.7");
+    }
+
+    /// Each DMA descriptor of the suite carries a pattern that does not
+    /// repeat, so data from another descriptor or another size shows.
+    #[test]
+    fn the_suite_pattern_does_not_repeat() {
+        let a = suite_pattern(4096, 1);
+        assert_eq!(a.len(), 4096);
+        assert_eq!(a, suite_pattern(4096, 1));
+        assert_ne!(a, suite_pattern(4096, 2));
+        let words: std::collections::HashSet<&[u8]> = a.chunks(8).collect();
+        assert_eq!(words.len(), 512);
+        // Not a multiple of 8.
+        assert_eq!(suite_pattern(13, 1).len(), 13);
+    }
+
+    /// A record leaves out what was not measured instead of writing null.
+    #[test]
+    fn a_suite_record_leaves_out_what_does_not_apply() {
+        let m = Measured::new("w", 2, 8, std::time::Duration::from_millis(1));
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains("card_secs"), "{json}");
+        assert!(json.contains(r#""count":2"#), "{json}");
     }
 
     /// `-p` means `--transport pcie`.
@@ -9764,7 +11377,7 @@ mod tests {
                 "x.bit",
             ],
             vec!["hio", "--connect", "h:1", "probe"],
-            vec!["hio", "--connect", "h:1", "load", "mem", "x.elf", "--dma"],
+            vec!["hio", "--connect", "h:1", "dma-fire", "mem"],
             vec!["hio", "--connect", "h:1", "serve"],
         ] {
             let err = run_cli(Cli::parse_from(&args)).unwrap_err();

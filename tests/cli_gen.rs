@@ -426,9 +426,10 @@ fn the_csr_decodes_the_offsets_the_register_map_publishes() {
     assert!(csr.contains(&format!("{hash:08x}")), "{csr}");
 }
 
-/// A backing with no terminator is an error, not silently dropped.
+/// `host_mem` is reached only through the transfer-level port. A stream shape
+/// is an error, not silently dropped.
 #[test]
-fn gen_refuses_host_mem_until_it_is_built() {
+fn gen_refuses_host_mem_without_the_transfer_roles() {
     let dir = fifo_fixture(
         "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.run]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"i_run\"]\n\n[bundle.tx]\ncontract = \"valid_ready\"\nbacking = \"host_mem\"\nports = { valid = \"o_valid\", ready = \"i_ready\", data = \"o_data\" }\n",
     );
@@ -445,11 +446,11 @@ fn gen_refuses_host_mem_until_it_is_built() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         value["error"]["code"],
-        "harness::plan::host_mem_not_generated"
+        "harness::plan::host_mem_needs_transfer_roles"
     );
-    // The help offers a BRAM in its place.
+    // The help shows the roles to name.
     let help = value["error"]["help"].as_str().unwrap();
-    assert!(help.contains("bram"), "{help}");
+    assert!(help.contains("rd_cmd_valid"), "{help}");
 
     // `check --target` refuses it for the same reason, so `check` does not
     // pass what `gen` then refuses.
@@ -462,21 +463,353 @@ fn gen_refuses_host_mem_until_it_is_built() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         value["error"]["code"],
-        "harness::plan::host_mem_not_generated"
+        "harness::plan::host_mem_needs_transfer_roles"
     );
+}
 
-    // Without a target this is not about generation, so it passes.
+/// A DUT with a transfer-level read and write port, for `host_mem`. It has
+/// a byte strobe only when the bundle names one.
+fn host_mem_fixture(bundle: &str) -> tempfile::TempDir {
+    let dir = dram_fixture();
+    let mut source = String::from(
+        r#"
+module dut_top (
+    i_clk     : input  clock    ,
+    i_rst     : input  reset    ,
+    o_rc_valid: output logic    ,
+    i_rc_ready: input  logic    ,
+    o_rc_addr : output logic<64>,
+    o_rc_size : output logic<32>,
+    i_r_valid : input  logic    ,
+    o_r_ready : output logic    ,
+    i_r_data  : input  logic<64>,
+    i_r_last  : input  logic    ,
+    i_r_error : input  logic    ,
+    o_wc_valid: output logic    ,
+    i_wc_ready: input  logic    ,
+    o_wc_addr : output logic<64>,
+    o_wc_size : output logic<32>,
+    o_w_valid : output logic    ,
+    i_w_ready : input  logic    ,
+    o_w_data  : output logic<64>,
+    o_w_strb  : output logic<8> ,
+    o_w_last  : output logic    ,
+    i_w_done  : input  logic    ,
+    i_w_error : input  logic    ,
+) {
+    assign o_rc_valid = 0;
+    assign o_rc_addr  = 0;
+    assign o_rc_size  = 0;
+    assign o_r_ready  = 1;
+    assign o_wc_valid = 0;
+    assign o_wc_addr  = 0;
+    assign o_wc_size  = 0;
+    assign o_w_valid  = 0;
+    assign o_w_data   = 0;
+    assign o_w_strb   = 0;
+    assign o_w_last   = 0;
+}
+"#,
+    );
+    if !bundle.contains("o_w_strb") {
+        source = source
+            .replace("    o_w_strb  : output logic<8> ,\n", "")
+            .replace("    assign o_w_strb   = 0;\n", "");
+    }
+    fs::write(dir.path().join("src").join("fixture.veryl"), source).unwrap();
+    fs::write(
+        dir.path().join("Harness.toml"),
+        format!("{HOST_MEM_HEAD}{bundle}"),
+    )
+    .unwrap();
+    dir
+}
+
+const HOST_MEM_HEAD: &str = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 100\n\n[bundle.mem]\nbacking = \"host_mem\"\n";
+
+const HOST_MEM_PORTS: &str = "ports = { rd_cmd_valid = \"o_rc_valid\", rd_cmd_ready = \"i_rc_ready\", rd_cmd_addr = \"o_rc_addr\", rd_cmd_size = \"o_rc_size\", rd_valid = \"i_r_valid\", rd_ready = \"o_r_ready\", rd_data = \"i_r_data\", rd_last = \"i_r_last\", rd_error = \"i_r_error\", wr_cmd_valid = \"o_wc_valid\", wr_cmd_ready = \"i_wc_ready\", wr_cmd_addr = \"o_wc_addr\", wr_cmd_size = \"o_wc_size\", wr_valid = \"o_w_valid\", wr_ready = \"i_w_ready\", wr_data = \"o_w_data\", wr_last = \"o_w_last\", wr_done_valid = \"i_w_done\", wr_done_error = \"i_w_error\" }\n";
+
+fn gen_host_mem(dir: &tempfile::TempDir) -> (Option<i32>, serde_json::Value) {
     let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
-        .args(["check", "--json"])
+        .args([
+            "gen",
+            "--target",
+            "xilinx/vcu118",
+            "--transport",
+            "pcie",
+            "--json",
+        ])
         .current_dir(dir.path())
         .output()
         .unwrap();
-    assert_eq!(
+    (
         output.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
+        serde_json::from_slice(&output.stdout).unwrap(),
+    )
+}
+
+/// `host_mem` puts `hns::hostmem` behind the port, and the PCIe DMA engine
+/// behind that. The host's registers are the buffer address and the switch;
+/// the gate of `dram`'s DMA is not there, because the DUT issues the
+/// descriptors. `hns_sim` has no PCIe, so it keeps the port switched off.
+#[test]
+fn host_mem_reaches_host_memory_through_the_dma_engine() {
+    let dir = host_mem_fixture(&format!("aperture = \"2M\"\n{HOST_MEM_PORTS}"));
+    let (code, value) = gen_host_mem(&dir);
+    assert_eq!(code, Some(0), "{value}");
+
+    let squash = |text: String| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+    let top = squash(fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap());
+    for want in [
+        "instu_hostmem_mem:hns::hostmem::<$std::axi4_pkg::<",
+        "APERTURE:64'h200000,",
+        "i_base:t_mem_host_base,",
+        "i_on:t_mem_host_on,",
+        "i_rd_cmd_valid:w_o_rc_valid,",
+        "o_wr_done_error:w_i_w_error,",
+        "instu_dma_wr:hns::dma_wr::<",
+        "i_desc_valid:hm_mem_wr_valid,",
+        "i_desc_valid:hm_mem_rd_valid,",
+        "m_axi:haxi_mem,",
+    ] {
+        assert!(top.contains(want), "{want} missing:\n{top}");
+    }
+    assert!(!top.contains("hns::dma_gate"), "{top}");
+    assert!(!top.contains("hns::hmem"), "{top}");
+
+    let sim = squash(fs::read_to_string(dir.path().join("hns/src/sim.veryl")).unwrap());
+    assert!(sim.contains("i_on:1'b0,"), "{sim}");
+    assert!(!sim.contains("hns::dma_wr"), "{sim}");
+
+    let regs: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("hns/regs.json")).unwrap())
+            .unwrap();
+    let names: Vec<&str> = regs["registers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    for want in [
+        "mem_base",
+        "mem_on",
+        "mem_aperture",
+        "mem_oor",
+        "mem_failed",
+        "dma_mps_limit",
+        "dma_rc_cor",
+    ] {
+        assert!(names.contains(&want), "{want} missing: {names:?}");
+    }
+    for unwanted in ["dma_go", "dma_base", "mem_maddr"] {
+        assert!(!names.contains(&unwanted), "{unwanted} placed: {names:?}");
+    }
+    let aperture = regs["registers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "mem_aperture")
+        .unwrap();
+    assert_eq!(aperture["value"], 0x20_0000);
+}
+
+/// A byte strobe on the transfer level reaches `hns::hostmem`, which stores
+/// only the strobed bytes.
+#[test]
+fn host_mem_carries_a_byte_strobe() {
+    let dir = host_mem_fixture(&format!(
+        "aperture = \"2M\"\n{}",
+        HOST_MEM_PORTS.replace("wr_last", "wr_strb = \"o_w_strb\", wr_last")
+    ));
+    let (code, value) = gen_host_mem(&dir);
+    assert_eq!(code, Some(0), "{value}");
+    let top: String = fs::read_to_string(dir.path().join("hns/src/top.veryl"))
+        .unwrap()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(top.contains("HAS_STRB:true,"), "{top}");
+    assert!(top.contains("i_wr_strb:w_o_w_strb,"), "{top}");
+}
+
+/// A DUT whose memory port is an AXI4 master, on `host_mem`. It depends on
+/// the `hns` in this tree, so the harness checks against the parts here.
+fn host_mem_axi_fixture(extra: &str) -> tempfile::TempDir {
+    let dir = dram_fixture();
+    fs::write(
+        dir.path().join("Veryl.toml"),
+        format!(
+            "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n\n[dependencies]\nhns = {{ path = \"{}/rtl/hns\" }}\n",
+            env!("CARGO_MANIFEST_DIR")
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src").join("fixture.veryl"),
+        r#"
+module dut_top (
+    i_clk: input clock,
+    i_rst: input reset,
+    mem  : modport $std::axi4_if::<$std::axi4_pkg::<28, 4, 8, 1, 1, 1, 1, 1>>::master,
+) {
+    always_comb {
+        mem.awvalid  = 0;
+        mem.awaddr   = 0;
+        mem.awsize   = 3'd2;
+        mem.awburst  = 2'b01;
+        mem.awcache  = 0;
+        mem.awprot   = 0;
+        mem.awid     = 0;
+        mem.awlen    = 0;
+        mem.awlock   = 0;
+        mem.awqos    = 0;
+        mem.awregion = 0;
+        mem.awuser   = 0;
+        mem.wvalid   = 0;
+        mem.wlast    = 0;
+        mem.wdata    = 0;
+        mem.wstrb    = 0;
+        mem.wuser    = 0;
+        mem.bready   = 1;
+        mem.arvalid  = 0;
+        mem.araddr   = 0;
+        mem.arsize   = 3'd2;
+        mem.arburst  = 2'b01;
+        mem.arcache  = 0;
+        mem.arprot   = 0;
+        mem.arid     = 0;
+        mem.arlen    = 0;
+        mem.arlock   = 0;
+        mem.arqos    = 0;
+        mem.arregion = 0;
+        mem.aruser   = 0;
+        mem.rready   = 1;
+    }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("Harness.toml"),
+        format!("{HOST_MEM_HEAD}aperture = \"2M\"\nports = [\"mem\"]\n{extra}"),
+    )
+    .unwrap();
+    dir
+}
+
+/// An AXI4 master reaches host memory through `hns::axi2xfer`, behind the
+/// reset fence. The memory is the same `hns::hostmem`, so the registers are
+/// the same, plus the count of bursts it cannot serve. Both tops check.
+#[test]
+fn host_mem_takes_an_axi4_master() {
+    let dir = host_mem_axi_fixture("");
+    let (code, value) = gen_host_mem(&dir);
+    assert_eq!(code, Some(0), "{value}");
+    if let Err(why) = common::veryl_check(&dir.path().join("hns")) {
+        panic!("the AXI4 host_mem harness does not check:\n{why}");
+    }
+
+    let squash = |text: String| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+    let top = squash(fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap());
+    for want in [
+        "mem:axi_mem,",
+        "instu_fence_mem:hns::axi_fence::<",
+        "s_axi:axi_mem,",
+        "instu_axi2xfer_mem:hns::axi2xfer::<",
+        "s_axi:faxi_mem,",
+        "o_refused:t_mem_refused,",
+        "HAS_STRB:true,",
+        "i_rd_cmd_valid:hx_mem_rd_cmd_valid,",
+        "i_wr_strb:hx_mem_wr_strb,",
+        "fence_closed_mem",
+    ] {
+        assert!(top.contains(want), "{want} missing:\n{top}");
+    }
+    assert!(!top.contains("hns::axi_range"), "{top}");
+    assert!(!top.contains("hns::axi_mem"), "{top}");
+
+    let regs: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("hns/regs.json")).unwrap())
+            .unwrap();
+    let names: Vec<&str> = regs["registers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    for want in [
+        "mem_base",
+        "mem_on",
+        "mem_aperture",
+        "mem_oor",
+        "mem_refused",
+    ] {
+        assert!(names.contains(&want), "{want} missing: {names:?}");
+    }
+}
+
+/// With `dut_base`, `hns::axi_range` takes the base off first and answers
+/// what is outside with DECERR. Its count joins the port's.
+#[test]
+fn host_mem_on_axi4_starts_at_its_dut_base() {
+    let dir = host_mem_axi_fixture("dut_base = 0x800_0000\n");
+    let (code, value) = gen_host_mem(&dir);
+    assert_eq!(code, Some(0), "{value}");
+    if let Err(why) = common::veryl_check(&dir.path().join("hns")) {
+        panic!("the AXI4 host_mem harness does not check:\n{why}");
+    }
+    let top: String = fs::read_to_string(dir.path().join("hns/src/top.veryl"))
+        .unwrap()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    for want in [
+        "instu_range_mem:hns::axi_range::<",
+        "BASE:64'h8000000,",
+        "SPAN:64'h200000,",
+        "o_oor:hx_mem_range_oor,",
+        "s_axi:raxi_mem,",
+    ] {
+        assert!(top.contains(want), "{want} missing:\n{top}");
+    }
+
+    // Past the 28-bit address of the port: the DUT could not reach the end.
+    let dir = host_mem_axi_fixture("dut_base = 0xfff_f000\n");
+    let (code, value) = gen_host_mem(&dir);
+    assert_eq!(code, Some(1), "{value}");
+    assert_eq!(
+        value["error"]["code"],
+        "harness::terminator::dut_base_past_address"
     );
+}
+
+/// What `host_mem` cannot serve is refused at generation, with the fix.
+#[test]
+fn host_mem_refuses_what_it_cannot_serve() {
+    for (bundle, code, help) in [
+        (
+            HOST_MEM_PORTS.to_string(),
+            "harness::terminator::host_mem_needs_aperture",
+            "aperture = \"2M\"",
+        ),
+        (
+            format!("aperture = 1000\n{HOST_MEM_PORTS}"),
+            "harness::terminator::host_mem_aperture_not_pages",
+            "aperture = 4096",
+        ),
+        (
+            format!("aperture = 4096\ndut_base = 0x1000\n{HOST_MEM_PORTS}"),
+            "harness::terminator::key_not_applicable",
+            "`aperture`",
+        ),
+    ] {
+        let dir = host_mem_fixture(&bundle);
+        let (code_got, value) = gen_host_mem(&dir);
+        assert_eq!(code_got, Some(1), "{value}");
+        assert_eq!(value["error"]["code"], code, "{value}");
+        let text = value["error"]["help"].as_str().unwrap();
+        assert!(text.contains(help), "{text}");
+    }
 }
 
 /// A DUT with an output stream (for host_poll_fifo tests).
@@ -3120,6 +3453,8 @@ module dut_top (
     let xdc = fs::read_to_string(dir.path().join("hns").join("syn").join("harness.xdc")).unwrap();
     assert!(xdc.contains("*u_rqdrop_sync/*rg_reg*"), "{xdc}");
     assert!(xdc.contains("*u_rqgap_sync/*rg_reg*"), "{xdc}");
+    assert!(xdc.contains("*u_pcie/mps_reg_1_reg*"), "{xdc}");
+    assert!(xdc.contains("*u_pcie/mrrs_reg_1_reg*"), "{xdc}");
     assert!(
         xdc.contains("*u_rq_cdc/u_fifo/u_reset_sync/*rg_reg*"),
         "{xdc}"

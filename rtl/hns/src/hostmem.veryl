@@ -1,0 +1,708 @@
+/// Host memory behind the transfer-level port, reached by the borrowed PCIe
+/// DMA engines (`hns::dma_rd` / `hns::dma_wr`).
+///
+/// The host gives the card one buffer and writes its bus address to `i_base`.
+/// The DUT addresses that buffer from 0, as it does a `bram` or a `dram`, so
+/// the same DUT runs on any of the three. Nothing outside `APERTURE` bytes is
+/// requested, and nothing at all while `i_on` is 0.
+///
+/// ```
+///   rd_cmd_* --> read walker --desc--> dma_rd --AXI write--> read page --> rd_*
+///   wr_cmd_* --> write walker --desc--> dma_wr <--AXI read-- write page <-- wr_*
+/// ```
+///
+/// A command is cut at the 4 KB pages of the host address, and one page moves
+/// at a time per direction through a 4 KB buffer on the card. The buffer offset
+/// is the page offset, so no beat is ever split across the cut. The engine
+/// splits a page further into TLPs (max payload, max read request size).
+///
+/// Reading and writing walk independently, for the same reason as in
+/// `hns::hmem`: a DUT that copies cannot finish a read whose beats it can only
+/// drain into a write.
+///
+/// The contract of the port is the one `hns::hmem` keeps:
+///
+/// - A read always hands back `ceil(size / beat)` beats, at least one, and
+///   `o_rd_last` marks the last. A beat that is not read comes with
+///   `o_rd_error` set and data 0: past the aperture, while off, the whole
+///   command when the address is off a beat boundary, and every beat of a page
+///   the engine reported an error for. A read of 0 bytes is one error beat.
+/// - A write always takes every beat it was promised. It stores exactly `size`
+///   bytes, not whole beats: the bytes after them in host memory may belong to
+///   someone else. `o_wr_done_error` comes with `o_wr_done_valid` when any
+///   byte was not stored.
+///
+/// With `HAS_STRB`, only the strobed bytes are stored. A write TLP has byte
+/// enables only at its two ends, so the stored bytes of one page must be one
+/// run. A page with a hole in it is not written at all: the write ends with
+/// `o_wr_done_error`, and `o_oor` counts it. A CPU never writes such a hole.
+pub module hostmem::<PKG: $std::axi4_prototype> #(
+    param HAS_STRB: bbool   = false     , // whether `i_wr_strb` is used
+    param DW      : u32     = 64        , // beat width; divides the AXI width
+    param ADDR_W  : u32     = 64        , // width of the command address
+    param SIZE_W  : u32     = 32        , // width of the command length
+    param APERTURE: bit<64> = 64'h20_0000, // bytes the DUT may reach; a multiple of 4 KB
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// The bus address of the host buffer, and whether it is there. Both are
+    /// taken when a command starts, so a change never splits one command.
+    i_base: input logic<64>,
+    i_on  : input logic    ,
+
+    // read command (DUT -> here)
+    i_rd_cmd_valid: input  logic        ,
+    o_rd_cmd_ready: output logic        ,
+    i_rd_cmd_addr : input  logic<ADDR_W>,
+    i_rd_cmd_size : input  logic<SIZE_W>,
+
+    // read data (here -> DUT)
+    o_rd_valid: output logic    ,
+    i_rd_ready: input  logic    ,
+    o_rd_data : output logic<DW>,
+    o_rd_last : output logic    ,
+    o_rd_error: output logic    ,
+
+    // write command (DUT -> here)
+    i_wr_cmd_valid: input  logic        ,
+    o_wr_cmd_ready: output logic        ,
+    i_wr_cmd_addr : input  logic<ADDR_W>,
+    i_wr_cmd_size : input  logic<SIZE_W>,
+
+    // write data (DUT -> here), and the completion that ends the transfer
+    i_wr_valid     : input  logic    ,
+    o_wr_ready     : output logic    ,
+    i_wr_data      : input  logic<DW>,
+    /// Bytes to write. Ignored when `HAS_STRB` is false.
+    i_wr_strb      : input  logic<DW / 8>,
+    i_wr_last      : input  logic    ,
+    o_wr_done_valid: output logic    ,
+    o_wr_done_error: output logic    ,
+
+    /// Descriptors for `hns::dma_rd` (host to card). `o_rd_desc_axi_addr` is
+    /// the offset in the read page.
+    o_rd_desc_pcie_addr: output logic<64>,
+    o_rd_desc_axi_addr : output logic<64>,
+    o_rd_desc_len      : output logic<20>,
+    o_rd_desc_valid    : output logic    ,
+    i_rd_desc_ready    : input  logic    ,
+    i_rd_status_valid  : input  logic    ,
+    i_rd_status_error  : input  logic<4> ,
+
+    /// Descriptors for `hns::dma_wr` (card to host).
+    o_wr_desc_pcie_addr: output logic<64>,
+    o_wr_desc_axi_addr : output logic<64>,
+    o_wr_desc_len      : output logic<20>,
+    o_wr_desc_valid    : output logic    ,
+    i_wr_desc_ready    : input  logic    ,
+    i_wr_status_valid  : input  logic    ,
+    i_wr_status_error  : input  logic<4> ,
+
+    /// The AXI master of the engines. Its write channels fill the read page;
+    /// its read channels drain the write page.
+    s_axi: modport $std::axi4_if::<PKG>::slave,
+
+    /// Commands that could not be served as asked (outside, off, off a beat
+    /// boundary, 0 bytes), and pages not written for a hole in the strobes.
+    /// Saturating.
+    o_oor: output logic<32>,
+    /// Pages the engine reported an error for. Saturating.
+    o_failed: output logic<32>,
+    /// The last error code of each engine, as the borrowed code numbers it.
+    /// The two engines number their errors differently.
+    o_rd_code: output logic<4>,
+    o_wr_code: output logic<4>,
+    /// A command is being served. Switching off does not stop one that has
+    /// started (it took `i_base` when it did), so the host waits for this to
+    /// drop before it frees the buffer.
+    o_busy: output logic,
+) {
+    const BYTES : u32 = DW / 8;
+    const SHIFT : u32 = $clog2(BYTES);
+    const LINE  : u32 = PKG::DATA_WIDTH_BYTES;
+    const LANES : u32 = LINE / BYTES;
+    const LANE_W: u32 = $clog2(LANES);
+    const PAGE  : u32 = 4096;
+    const LINES : u32 = PAGE / LINE;
+    const LINE_W: u32 = $clog2(LINES);
+    const BEAT_W: u32 = $clog2(PAGE / BYTES);
+    const AXI_SH: u32 = $clog2(LINE);
+
+    /// Bytes a command may reach from `addr`: 0 when nothing can be served.
+    function room (
+        addr : input logic<64>,
+        on   : input logic    ,
+        align: input logic    ,
+    ) -> logic<64> {
+        return if on && align && addr <: APERTURE ? APERTURE - addr : 0;
+    }
+
+    /// The bytes of `want` that fit before the next page boundary of `addr`.
+    function page_part (
+        addr: input logic<64>,
+        want: input logic<64>,
+    ) -> logic<13> {
+        var left: logic<13>;
+        left = 13'd4096 - {1'b0, addr[11:0]};
+        return if want <: {51'b0, left} ? want[12:0] : left;
+    }
+
+    // ------------------------------------------------------------------
+    // read walker
+    // ------------------------------------------------------------------
+
+    enum RState: logic<3> {
+        IDLE,
+        ISSUE,
+        WAIT,
+        STREAM,
+        TAIL,
+    }
+
+    var r_state: RState   ;
+    var r_base : logic<64>;
+    var r_addr : logic<64>; // DUT address of the next page
+    var r_good : logic<64>; // bytes still to fetch
+    var r_left : logic<SIZE_W>; // beats still to hand back, error beats too
+    var r_chunk: logic<13>; // bytes of the page being moved
+    var r_beat : logic<BEAT_W>; // next beat in the read page
+    var r_beats: logic<13>; // beats of this page still to hand back
+    var r_err  : logic    ; // the engine failed this page
+
+    // The beats go out through a queue, as in `hns::hmem`: the page is read a
+    // cycle ahead, and the DUT takes beats when it likes.
+    const BURST: u32 = 8;
+    var pend    : logic    ;
+    var plast   : logic    ;
+    var perr    : logic    ;
+    var rd_level: logic<$clog2(BURST) + 1>;
+    var rd_out  : logic<DW + 2>;
+    var rpage   : logic<DW>;
+
+    let rd_room: logic = (rd_level + (if pend ? 1 : 0)) <: BURST;
+    let r_move : logic = rd_room && ((r_state == RState::STREAM && r_beats != 0) || (r_state == RState::TAIL && r_left != 0));
+
+    let rc_align: logic          = (i_rd_cmd_addr & (BYTES - 1)) == 0;
+    let rc_beats: logic<SIZE_W>  = (i_rd_cmd_size + (BYTES - 1)) >> SHIFT;
+    let rc_want : logic<64>      = (rc_beats as 64) << SHIFT;
+    let rc_room : logic<64>      = room(i_rd_cmd_addr as 64, i_on, rc_align);
+    let rc_good : logic<64>      = if rc_want <: rc_room ? rc_want : rc_room;
+    let rc_short: logic          = rc_good != rc_want || rc_beats == 0;
+
+    assign o_rd_cmd_ready      = r_state == RState::IDLE;
+    assign o_rd_desc_pcie_addr = r_base + r_addr;
+    assign o_rd_desc_axi_addr  = {52'b0, r_addr[11:0]};
+    assign o_rd_desc_len       = {7'b0, r_chunk};
+    assign o_rd_desc_valid     = r_state == RState::ISSUE;
+
+    // ------------------------------------------------------------------
+    // write walker
+    // ------------------------------------------------------------------
+
+    enum WState: logic<3> {
+        IDLE,
+        FILL,
+        ISSUE,
+        WAIT,
+        DRAIN,
+    }
+
+    var w_state: WState   ;
+    var w_base : logic<64>;
+    var w_addr : logic<64>;
+    var w_good : logic<64>; // bytes still to store
+    var w_left : logic<SIZE_W>; // beats still to take, stored or not
+    var w_chunk: logic<13>;
+    var w_beat : logic<BEAT_W>;
+    var w_beats: logic<13>; // beats of this page still to take
+    var w_err  : logic    ;
+    var wdone  : logic    ;
+    var wderr  : logic    ;
+
+    // The bytes of the page being filled that are stored: the strobed bytes
+    // inside the command. They go out as one descriptor, so they must be one
+    // run. Without strobes they are the whole chunk.
+    var s_seen: logic    ; // a byte is stored
+    var s_hole: logic    ; // the stored bytes are not one run
+    var s_lo  : logic<13>; // page offset of the first stored byte
+    var s_hi  : logic<13>; // page offset after the last stored byte
+    var w_skip: logic    ; // this page sends nothing: no byte, or a hole
+
+    var b_off  : logic<13>    ; // page offset of the beat taken
+    var b_strb : logic<BYTES> ; // its bytes that are stored
+    var b_found: logic        ;
+    var b_first: logic<13>    ;
+    var b_last : logic<13>    ;
+    var b_run  : logic        ;
+    var n_seen : logic        ;
+    var n_hole : logic        ;
+    var n_lo   : logic<13>    ;
+    var n_hi   : logic<13>    ;
+
+    let wc_align: logic         = (i_wr_cmd_addr & (BYTES - 1)) == 0;
+    let wc_beats: logic<SIZE_W> = (i_wr_cmd_size + (BYTES - 1)) >> SHIFT;
+    let wc_size : logic<64>     = i_wr_cmd_size as 64;
+    let wc_room : logic<64>     = room(i_wr_cmd_addr as 64, i_on, wc_align);
+    let wc_good : logic<64>     = if wc_size <: wc_room ? wc_size : wc_room;
+    let wc_short: logic         = wc_good != wc_size || wc_beats == 0;
+
+    let w_take: logic = i_wr_valid && ((w_state == WState::FILL && w_beats != 0) || (w_state == WState::DRAIN && w_left != 0));
+    let w_fill: logic = w_take && w_state == WState::FILL;
+    let w_end : logic = w_fill && w_beats == 1;
+    let w_fail: logic = if w_skip ? s_hole : i_wr_status_error != 0;
+
+    always_comb {
+        b_off = (w_beat as 13) << SHIFT;
+        for i in 0..BYTES {
+            b_strb[i] = (if HAS_STRB ? i_wr_strb[i] : 1'b1) && b_off + i <: (w_addr[11:0] as 13) + w_chunk;
+        }
+        b_found = 0;
+        b_first = 0;
+        b_last  = 0;
+        for i in 0..BYTES {
+            if b_strb[i] {
+                if !b_found {
+                    b_first = b_off + i;
+                }
+                b_found = 1;
+                b_last  = b_off + i;
+            }
+        }
+        b_run = 1;
+        for i in 0..BYTES {
+            if !b_strb[i] && b_off + i >: b_first && b_off + i <: b_last {
+                b_run = 0;
+            }
+        }
+
+        n_seen = s_seen;
+        n_hole = s_hole;
+        n_lo   = s_lo;
+        n_hi   = s_hi;
+        if w_fill && b_found {
+            if !b_run || (s_seen && b_first != s_hi) {
+                n_hole = 1;
+            }
+            if !s_seen {
+                n_lo = b_first;
+            }
+            n_hi   = b_last + 1;
+            n_seen = 1;
+        }
+    }
+
+    assign o_wr_cmd_ready      = w_state == WState::IDLE;
+    assign o_wr_ready          = (w_state == WState::FILL && w_beats != 0) || (w_state == WState::DRAIN && w_left != 0);
+    assign o_wr_desc_pcie_addr = w_base + {w_addr[63:12], 12'b0} + (s_lo as 64);
+    assign o_wr_desc_axi_addr  = s_lo as 64;
+    assign o_wr_desc_len       = (s_hi - s_lo) as 20;
+    assign o_wr_desc_valid     = w_state == WState::ISSUE;
+    assign o_wr_done_valid     = wdone;
+    assign o_wr_done_error     = wderr;
+
+    // ------------------------------------------------------------------
+    // counters
+    // ------------------------------------------------------------------
+
+    // Both walkers can count in one cycle, so each counter adds both at once.
+    // Two separate increments in one `always_ff` would lose one.
+    var oor     : logic<32>;
+    var failed  : logic<32>;
+    var rd_code : logic<4> ;
+    var wr_code : logic<4> ;
+    let w_status: logic    = w_state == WState::WAIT && !w_skip && i_wr_status_valid;
+    let oor_add : logic<2> = {1'b0, r_state == RState::IDLE && i_rd_cmd_valid && rc_short} + {1'b0, w_state == WState::IDLE && i_wr_cmd_valid && wc_short} + {1'b0, w_end && n_hole};
+    let fail_add: logic<2> = {1'b0, r_state == RState::WAIT && i_rd_status_valid && i_rd_status_error != 0} + {1'b0, w_status && i_wr_status_error != 0};
+
+    always_ff {
+        if_reset {
+            oor     = 0;
+            failed  = 0;
+            rd_code = 0;
+            wr_code = 0;
+        } else {
+            oor    = if oor >: 32'hffff_ffff - oor_add ? 32'hffff_ffff : oor + oor_add;
+            failed = if failed >: 32'hffff_ffff - fail_add ? 32'hffff_ffff : failed + fail_add;
+            if r_state == RState::WAIT && i_rd_status_valid && i_rd_status_error != 0 {
+                rd_code = i_rd_status_error;
+            }
+            if w_status && i_wr_status_error != 0 {
+                wr_code = i_wr_status_error;
+            }
+        }
+    }
+
+    assign o_oor     = oor;
+    assign o_failed  = failed;
+    assign o_rd_code = rd_code;
+    assign o_wr_code = wr_code;
+    assign o_busy    = r_state != RState::IDLE || w_state != WState::IDLE;
+
+    // ------------------------------------------------------------------
+    // the walkers
+    // ------------------------------------------------------------------
+
+    always_ff {
+        if_reset {
+            r_state = RState::IDLE;
+            r_base  = 0;
+            r_addr  = 0;
+            r_good  = 0;
+            r_left  = 0;
+            r_chunk = 0;
+            r_beat  = 0;
+            r_beats = 0;
+            r_err   = 0;
+            pend    = 0;
+            plast   = 0;
+            perr    = 0;
+        } else {
+            pend = 0;
+            if r_move {
+                pend   = 1;
+                plast  = r_left == 1;
+                perr   = r_state == RState::TAIL || r_err;
+                r_left = r_left - 1;
+                if r_state == RState::STREAM {
+                    r_beats = r_beats - 1;
+                    r_beat  = r_beat + 1;
+                }
+            }
+            case r_state {
+                RState::IDLE: {
+                    if i_rd_cmd_valid {
+                        r_base = i_base;
+                        r_addr = i_rd_cmd_addr as 64;
+                        r_good = rc_good;
+                        // A read of 0 bytes still ends with one beat, an
+                        // error one.
+                        r_left  = if rc_beats == 0 ? 1 : rc_beats;
+                        r_state = if rc_good != 0 ? RState::ISSUE : RState::TAIL;
+                        if rc_good != 0 {
+                            r_chunk = page_part(i_rd_cmd_addr as 64, rc_good);
+                        }
+                    }
+                }
+                RState::ISSUE: {
+                    if i_rd_desc_ready {
+                        r_state = RState::WAIT;
+                    }
+                }
+                RState::WAIT: {
+                    if i_rd_status_valid {
+                        r_err   = i_rd_status_error != 0;
+                        r_beat  = r_addr[11:SHIFT];
+                        r_beats = (r_chunk + (BYTES - 1)) >> SHIFT;
+                        r_state = RState::STREAM;
+                    }
+                }
+                RState::STREAM: {
+                    if r_beats == 0 && !pend {
+                        r_addr = r_addr + {51'b0, r_chunk};
+                        r_good = r_good - {51'b0, r_chunk};
+                        if r_good != {51'b0, r_chunk} {
+                            r_chunk = page_part(r_addr + {51'b0, r_chunk}, r_good - {51'b0, r_chunk});
+                            r_state = RState::ISSUE;
+                        } else {
+                            r_state = if r_left != 0 ? RState::TAIL : RState::IDLE;
+                        }
+                    }
+                }
+                RState::TAIL: {
+                    if r_left == 0 && !pend {
+                        r_state = RState::IDLE;
+                    }
+                }
+                default: {
+                    r_state = RState::IDLE;
+                }
+            }
+        }
+    }
+
+    always_ff {
+        if_reset {
+            w_state = WState::IDLE;
+            w_base  = 0;
+            w_addr  = 0;
+            w_good  = 0;
+            w_left  = 0;
+            w_chunk = 0;
+            w_beat  = 0;
+            w_beats = 0;
+            w_err   = 0;
+            wdone   = 0;
+            wderr   = 0;
+            s_seen  = 0;
+            s_hole  = 0;
+            s_lo    = 0;
+            s_hi    = 0;
+            w_skip  = 0;
+        } else {
+            wdone  = 0;
+            wderr  = 0;
+            s_seen = n_seen;
+            s_hole = n_hole;
+            s_lo   = n_lo;
+            s_hi   = n_hi;
+            if w_take {
+                w_left = w_left - 1;
+                if w_state == WState::FILL {
+                    w_beats = w_beats - 1;
+                    w_beat  = w_beat + 1;
+                }
+            }
+            case w_state {
+                WState::IDLE: {
+                    if i_wr_cmd_valid {
+                        w_base = i_base;
+                        w_addr = i_wr_cmd_addr as 64;
+                        w_good = wc_good;
+                        w_left = wc_beats;
+                        w_err  = wc_short;
+                        if wc_beats == 0 {
+                            // Nothing to take, but the write side can still
+                            // say so.
+                            wdone = 1;
+                            wderr = 1;
+                        } else if wc_good != 0 {
+                            w_chunk = page_part(i_wr_cmd_addr as 64, wc_good);
+                            w_beat  = i_wr_cmd_addr[11:SHIFT];
+                            w_beats = (page_part(i_wr_cmd_addr as 64, wc_good) + (BYTES - 1)) >> SHIFT;
+                            s_seen  = 0;
+                            s_hole  = 0;
+                            w_state = WState::FILL;
+                        } else {
+                            w_state = WState::DRAIN;
+                        }
+                    }
+                }
+                WState::FILL: {
+                    if w_end {
+                        w_skip  = !n_seen || n_hole;
+                        w_state = if !n_seen || n_hole ? WState::WAIT : WState::ISSUE;
+                    }
+                }
+                WState::ISSUE: {
+                    if i_wr_desc_ready {
+                        w_state = WState::WAIT;
+                    }
+                }
+                WState::WAIT: {
+                    if i_wr_status_valid || w_skip {
+                        if w_fail {
+                            w_err = 1;
+                        }
+                        w_skip = 0;
+                        w_addr = w_addr + {51'b0, w_chunk};
+                        w_good = w_good - {51'b0, w_chunk};
+                        if w_good != {51'b0, w_chunk} {
+                            w_chunk = page_part(w_addr + {51'b0, w_chunk}, w_good - {51'b0, w_chunk});
+                            w_beat  = 0;
+                            w_beats = (page_part(w_addr + {51'b0, w_chunk}, w_good - {51'b0, w_chunk}) + (BYTES - 1)) >> SHIFT;
+                            s_seen  = 0;
+                            s_hole  = 0;
+                            w_state = WState::FILL;
+                        } else if w_left != 0 {
+                            w_state = WState::DRAIN;
+                        } else {
+                            wdone   = 1;
+                            wderr   = w_err || w_fail;
+                            w_state = WState::IDLE;
+                        }
+                    }
+                }
+                WState::DRAIN: {
+                    if w_left == 0 || (w_take && w_left == 1) {
+                        wdone   = 1;
+                        wderr   = w_err;
+                        w_state = WState::IDLE;
+                    }
+                }
+                default: {
+                    w_state = WState::IDLE;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // the read queue
+    // ------------------------------------------------------------------
+
+    // An error beat carries 0, never what the page happened to hold.
+    let rbeat: logic<DW> = if perr ? 0 : rpage;
+
+    inst rdq: fifo #(
+        WIDTH: DW + 2,
+        DEPTH: BURST ,
+    ) (
+        i_clk                           ,
+        i_rst                           ,
+        i_push : pend                   ,
+        i_data : {perr, plast, rbeat}   ,
+        o_ready: _                      ,
+        i_pop  : o_rd_valid & i_rd_ready,
+        o_data : rd_out                 ,
+        o_level: rd_level               ,
+        o_drops: _                      ,
+    );
+
+    assign o_rd_valid = rd_level != 0;
+    assign o_rd_data  = rd_out[DW - 1:0];
+    assign o_rd_last  = rd_out[DW];
+    assign o_rd_error = rd_out[DW + 1];
+
+    // ------------------------------------------------------------------
+    // the AXI slave: writes fill the read page, reads drain the write page
+    // ------------------------------------------------------------------
+
+    var aw_busy: logic        ;
+    var aw_line: logic<LINE_W>;
+    var aw_id  : logic<PKG::ID_LENGTH>;
+
+    var ar_busy: logic        ;
+    var ar_line: logic<LINE_W>;
+    var ar_left: logic<8>     ;
+    var ar_id  : logic<PKG::ID_LENGTH>;
+
+    always_comb {
+        s_axi.awready = !aw_busy && !s_axi.bvalid;
+        s_axi.wready  = aw_busy;
+        s_axi.arready = !ar_busy;
+    }
+
+    always_ff {
+        if_reset {
+            aw_busy      = 0;
+            aw_line      = 0;
+            aw_id        = 0;
+            s_axi.bvalid = 0;
+            s_axi.bid    = 0;
+            s_axi.bresp  = 0;
+            ar_busy      = 0;
+            ar_line      = 0;
+            ar_left      = 0;
+            ar_id        = 0;
+            s_axi.rvalid = 0;
+            s_axi.rid    = 0;
+            s_axi.rresp  = 0;
+            s_axi.rlast  = 0;
+        } else {
+            if s_axi.bvalid && s_axi.bready {
+                s_axi.bvalid = 0;
+            }
+            if !aw_busy && !s_axi.bvalid && s_axi.awvalid {
+                aw_busy = 1;
+                aw_line = s_axi.awaddr[LINE_W + AXI_SH - 1:AXI_SH];
+                aw_id   = s_axi.awid;
+            }
+            if aw_busy && s_axi.wvalid {
+                aw_line = aw_line + 1;
+                if s_axi.wlast {
+                    aw_busy      = 0;
+                    s_axi.bvalid = 1;
+                    s_axi.bid    = aw_id;
+                    s_axi.bresp  = 2'b00;
+                }
+            }
+
+            // One beat every two cycles, as in `hns::axi_mem`: the line is
+            // read in the cycle after its address is set, and held until
+            // taken.
+            if s_axi.rvalid && s_axi.rready {
+                s_axi.rvalid = 0;
+                if ar_left != 0 {
+                    ar_line = ar_line + 1;
+                    ar_left = ar_left - 1;
+                } else {
+                    ar_busy = 0;
+                }
+            } else if ar_busy && !s_axi.rvalid {
+                s_axi.rvalid = 1;
+                s_axi.rid    = ar_id;
+                s_axi.rresp  = 2'b00;
+                s_axi.rlast  = ar_left == 0;
+            }
+            if !ar_busy && s_axi.arvalid {
+                ar_busy = 1;
+                ar_line = s_axi.araddr[LINE_W + AXI_SH - 1:AXI_SH];
+                ar_left = s_axi.arlen;
+                ar_id   = s_axi.arid;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // the two pages
+    // ------------------------------------------------------------------
+
+    // Read page. Port B takes the engine's AXI writes with their strobes;
+    // port A hands the DUT one beat-wide slice of a line.
+    inst u_rpage: mem #(
+        WIDTH    : DW    ,
+        SLICES   : LANES ,
+        DEPTH    : LINES ,
+        LATENCY  : 1     ,
+        ADDR_W   : BEAT_W,
+        SHIFT    : LANE_W,
+        STRB_W   : 1     ,
+        HAS_STRB : false ,
+        HSTRB_W  : LINE  ,
+        HAS_HSTRB: true  ,
+    ) (
+        i_clk                                  ,
+        i_rst                                  ,
+        i_addr  : r_beat                       ,
+        o_rdata : rpage                        ,
+        i_wdata : '0                           ,
+        i_wstrb : '0                           ,
+        i_we    : 1'b0                         ,
+        i_en    : 1'b1                         ,
+        o_oor   : _                            ,
+        i_haddr : aw_line                      ,
+        i_hwdata: s_axi.wdata                  ,
+        i_hwstrb: s_axi.wstrb                  ,
+        i_hwe   : aw_busy && s_axi.wvalid      ,
+        o_hrdata: _                            ,
+    );
+
+    // Write page. Port A takes the DUT's beats, one lane of a line at a time;
+    // port B is read by the engine.
+    var lane_strb: logic<LINE>;
+    always_comb {
+        lane_strb = 0;
+        for i in 0..LANES {
+            if (w_beat & (LANES - 1)) == i {
+                lane_strb[i step BYTES] = '1;
+            }
+        }
+    }
+
+    inst u_wpage: mem #(
+        WIDTH    : DW    ,
+        SLICES   : LANES ,
+        DEPTH    : LINES ,
+        LATENCY  : 1     ,
+        ADDR_W   : BEAT_W,
+        SHIFT    : LANE_W,
+        STRB_W   : LINE  ,
+        HAS_STRB : true  ,
+    ) (
+        i_clk                                    ,
+        i_rst                                    ,
+        i_addr  : w_beat                         ,
+        o_rdata : _                              ,
+        i_wdata : {i_wr_data repeat LANES}       ,
+        i_wstrb : lane_strb                      ,
+        i_we    : w_take && w_state == WState::FILL,
+        i_en    : 1'b1                           ,
+        o_oor   : _                              ,
+        i_haddr : ar_line                        ,
+        i_hwdata: '0                             ,
+        i_hwstrb: '0                             ,
+        i_hwe   : 1'b0                           ,
+        o_hrdata: s_axi.rdata                    ,
+    );
+}

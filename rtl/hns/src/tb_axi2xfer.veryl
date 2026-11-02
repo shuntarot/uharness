@@ -1,0 +1,374 @@
+/// `hns::axi2xfer` serves AXI4 bursts from a transfer-level memory
+/// (`hns::hmem`): INCR and WRAP both ways, narrow single transfers, and
+/// refusals for what it cannot serve.
+#[test(axi2xfer_serves_bursts_from_the_transfer_level)]
+module test_axi2xfer {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    inst bus: $std::axi4_if::<$std::axi4_pkg::<32, 8, 4, 1, 1, 1, 1, 1>>;
+
+    var rd_cmd_valid: logic    ;
+    var rd_cmd_ready: logic    ;
+    var rd_cmd_addr : logic<32>;
+    var rd_cmd_size : logic<32>;
+    var rd_valid    : logic    ;
+    var rd_ready    : logic    ;
+    var rd_data     : logic<64>;
+    var rd_last     : logic    ;
+    var rd_error    : logic    ;
+
+    var wr_cmd_valid : logic    ;
+    var wr_cmd_ready : logic    ;
+    var wr_cmd_addr  : logic<32>;
+    var wr_cmd_size  : logic<32>;
+    var wr_valid     : logic    ;
+    var wr_ready     : logic    ;
+    var wr_data      : logic<64>;
+    var wr_strb      : logic<8> ;
+    var wr_last      : logic    ;
+    var wr_done      : logic    ;
+    var wr_done_error: logic    ;
+
+    var refused: logic<32>;
+
+    var haddr : logic<9> ;
+    var hwdata: logic<64>;
+    var hwe   : logic    ;
+
+    inst u: axi2xfer::<$std::axi4_pkg::<32, 8, 4, 1, 1, 1, 1, 1>> #(
+        ADDR_W: 32,
+        SIZE_W: 32,
+    ) (
+        i_clk          : clk          ,
+        i_rst          : rst          ,
+        s_axi          : bus          ,
+        o_rd_cmd_valid : rd_cmd_valid ,
+        i_rd_cmd_ready : rd_cmd_ready ,
+        o_rd_cmd_addr  : rd_cmd_addr  ,
+        o_rd_cmd_size  : rd_cmd_size  ,
+        i_rd_valid     : rd_valid     ,
+        o_rd_ready     : rd_ready     ,
+        i_rd_data      : rd_data      ,
+        i_rd_last      : rd_last      ,
+        i_rd_error     : rd_error     ,
+        o_wr_cmd_valid : wr_cmd_valid ,
+        i_wr_cmd_ready : wr_cmd_ready ,
+        o_wr_cmd_addr  : wr_cmd_addr  ,
+        o_wr_cmd_size  : wr_cmd_size  ,
+        o_wr_valid     : wr_valid     ,
+        i_wr_ready     : wr_ready     ,
+        o_wr_data      : wr_data      ,
+        o_wr_strb      : wr_strb      ,
+        o_wr_last      : wr_last      ,
+        i_wr_done_valid: wr_done      ,
+        i_wr_done_error: wr_done_error,
+        o_refused      : refused      ,
+    );
+
+    // 4 KB of memory: 512 beats of 8 bytes.
+    inst m: hmem #(
+        HAS_STRB: true,
+        DW      : 64  ,
+        DEPTH   : 512 ,
+        ADDR_W  : 32  ,
+        SIZE_W  : 32  ,
+    ) (
+        i_clk          : clk          ,
+        i_rst          : rst          ,
+        i_rd_cmd_valid : rd_cmd_valid ,
+        o_rd_cmd_ready : rd_cmd_ready ,
+        i_rd_cmd_addr  : rd_cmd_addr  ,
+        i_rd_cmd_size  : rd_cmd_size  ,
+        o_rd_valid     : rd_valid     ,
+        i_rd_ready     : rd_ready     ,
+        o_rd_data      : rd_data      ,
+        o_rd_last      : rd_last      ,
+        o_rd_error     : rd_error     ,
+        i_wr_cmd_valid : wr_cmd_valid ,
+        o_wr_cmd_ready : wr_cmd_ready ,
+        i_wr_cmd_addr  : wr_cmd_addr  ,
+        i_wr_cmd_size  : wr_cmd_size  ,
+        i_wr_valid     : wr_valid     ,
+        o_wr_ready     : wr_ready     ,
+        i_wr_data      : wr_data      ,
+        i_wr_strb      : wr_strb      ,
+        i_wr_last      : wr_last      ,
+        o_wr_done_valid: wr_done      ,
+        o_wr_done_error: wr_done_error,
+        i_haddr        : haddr        ,
+        i_hwdata       : hwdata       ,
+        i_hwe          : hwe          ,
+        o_hrdata       : _            ,
+        o_oor          : _            ,
+        o_widened      : _            ,
+    );
+
+    /// What beat `i` holds after the preload.
+    function pattern (
+        i: input logic<32>,
+    ) -> logic<64> {
+        return {32'hbeef_0000 | i, i};
+    }
+
+    // ------------------------------------------------------------------
+    // what the master sees
+    // ------------------------------------------------------------------
+
+    var got    : logic<64> [16];
+    var gerr   : logic<16>     ;
+    var beats  : logic<32>     ;
+    var lastat : logic<32>     ;
+    var done   : logic         ;
+    var bcount : logic<32>     ;
+    var berrs  : logic<32>     ;
+    var clear  : logic         ;
+
+    always_ff (clk, rst) {
+        if_reset {
+            for i in 0..16 {
+                got[i] = 0;
+            }
+            gerr   = 0;
+            beats  = 0;
+            lastat = 0;
+            done   = 0;
+            bcount = 0;
+            berrs  = 0;
+        } else {
+            if clear {
+                gerr  = 0;
+                beats = 0;
+                done  = 0;
+            } else if bus.rvalid && bus.rready {
+                got[beats[3:0]]  = bus.rdata;
+                gerr[beats[3:0]] = bus.rresp != 2'b00;
+                beats            = beats + 1;
+                if bus.rlast {
+                    done   = 1;
+                    lastat = beats;
+                }
+            }
+            if bus.bvalid && bus.bready {
+                bcount = bcount + 1;
+                if bus.bresp != 2'b00 {
+                    berrs = berrs + 1;
+                }
+            }
+        }
+    }
+
+    /// One read burst; waits for its last beat.
+    function rd (
+        addr : input logic<32>,
+        len  : input logic<8> ,
+        size : input logic<3> ,
+        burst: input logic<2> ,
+    ) {
+        clear = 1;
+        clk.next(1);
+        clear       = 0;
+        bus.araddr  = addr;
+        bus.arlen   = len;
+        bus.arsize  = size;
+        bus.arburst = burst;
+        bus.arvalid = 1;
+        for _i in 0..64 {
+            if bus.arready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        bus.arvalid = 0;
+        for _i in 0..2000 {
+            if done {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(2);
+    }
+
+    /// One write burst of `len + 1` beats, beat `i` being `seed + i`; waits
+    /// for its response.
+    function wr (
+        addr : input logic<32>,
+        len  : input logic<8> ,
+        size : input logic<3> ,
+        burst: input logic<2> ,
+        seed : input logic<64>,
+        strb : input logic<8> ,
+    ) {
+        var b_was: logic<32>;
+        b_was       = bcount;
+        bus.awaddr  = addr;
+        bus.awlen   = len;
+        bus.awsize  = size;
+        bus.awburst = burst;
+        bus.awvalid = 1;
+        for _i in 0..64 {
+            if bus.awready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        bus.awvalid = 0;
+        for i in 0..16 {
+            if i >: len {
+                break;
+            }
+            bus.wdata  = seed + i;
+            bus.wstrb  = strb;
+            bus.wlast  = i == len;
+            bus.wvalid = 1;
+            for _j in 0..2000 {
+                if bus.wready {
+                    break;
+                }
+                clk.next(1);
+            }
+            clk.next(1);
+        }
+        bus.wvalid = 0;
+        for _i in 0..2000 {
+            if bcount != b_was {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(2);
+    }
+
+    // The other master signals. Nothing here reads them, but they must not be
+    // left undriven.
+    always_comb {
+        bus.awid     = 1;
+        bus.awcache  = 0;
+        bus.awprot   = 0;
+        bus.awlock   = 0;
+        bus.awqos    = 0;
+        bus.awregion = 0;
+        bus.awuser   = 0;
+        bus.wuser    = 0;
+        bus.arid     = 2;
+        bus.arcache  = 0;
+        bus.arprot   = 0;
+        bus.arlock   = 0;
+        bus.arqos    = 0;
+        bus.arregion = 0;
+        bus.aruser   = 0;
+    }
+
+    initial {
+        bus.awvalid = 0;
+        bus.awaddr  = 0;
+        bus.awlen   = 0;
+        bus.awsize  = 3'd3;
+        bus.awburst = 2'b01;
+        bus.wvalid  = 0;
+        bus.wdata   = 0;
+        bus.wstrb   = 0;
+        bus.wlast   = 0;
+        bus.arvalid = 0;
+        bus.araddr  = 0;
+        bus.arlen   = 0;
+        bus.arsize  = 3'd3;
+        bus.arburst = 2'b01;
+        bus.bready  = 1;
+        bus.rready  = 1;
+        clear       = 0;
+        haddr       = 0;
+        hwdata      = 0;
+        hwe         = 0;
+
+        rst.assert(4);
+        clk.next(4);
+
+        // Preload beats 0 to 15 through the back door.
+        for i in 0..16 {
+            haddr  = i;
+            hwdata = pattern(i);
+            hwe    = 1;
+            clk.next(1);
+        }
+        hwe = 0;
+        clk.next(2);
+
+        // --- 1. INCR read of four beats ---
+        rd(32'h20, 3, 3'd3, 2'b01);
+        $display("incr: beats=%d got0=%h got3=%h", beats, got[0], got[3]);
+        $assert(beats == 4);
+        $assert(lastat == 3);
+        $assert(gerr == 0);
+        $assert(got[0] == pattern(4));
+        $assert(got[3] == pattern(7));
+
+        // --- 2. WRAP read from the middle of the block: 10, 11, then 8, 9.
+        //     Only the last beat of the burst carries rlast. ---
+        rd(32'h50, 3, 3'd3, 2'b10);
+        $display("wrap: beats=%d last=%d got=%h %h %h %h", beats, lastat, got[0], got[1], got[2], got[3]);
+        $assert(beats == 4);
+        $assert(lastat == 3);
+        $assert(gerr == 0);
+        $assert(got[0] == pattern(10));
+        $assert(got[1] == pattern(11));
+        $assert(got[2] == pattern(8));
+        $assert(got[3] == pattern(9));
+
+        // --- 3. INCR write, read back ---
+        wr(32'h0, 1, 3'd3, 2'b01, 64'h1000, 8'hff);
+        rd(32'h0, 1, 3'd3, 2'b01);
+        $assert(berrs == 0);
+        $assert(got[0] == 64'h1000);
+        $assert(got[1] == 64'h1001);
+
+        // --- 4. a one-byte store and a one-byte load: the load returns the
+        //     whole beat, laid out by address ---
+        wr(32'h13, 0, 3'd0, 2'b01, 64'h0000_0000_ab00_0000, 8'b0000_1000);
+        rd(32'h13, 0, 3'd0, 2'b01);
+        $display("byte: got0=%h", got[0]);
+        $assert(berrs == 0);
+        $assert(beats == 1);
+        $assert(got[0] == 64'hbeef_0002_ab00_0002);
+
+        // --- 5. WRAP write from the middle: 13, 14, 15, then 12 ---
+        wr(32'h68, 3, 3'd3, 2'b10, 64'h2000, 8'hff);
+        rd(32'h60, 3, 3'd3, 2'b01);
+        $display("wrap write: %h %h %h %h", got[0], got[1], got[2], got[3]);
+        $assert(berrs == 0);
+        $assert(got[0] == 64'h2003);
+        $assert(got[1] == 64'h2000);
+        $assert(got[2] == 64'h2001);
+        $assert(got[3] == 64'h2002);
+        $assert(refused == 0);
+
+        // --- 6. FIXED is refused both ways; the write changes nothing ---
+        rd(32'h0, 1, 3'd3, 2'b00);
+        $assert(beats == 2);
+        $assert(gerr == 16'b11);
+        $assert(got[0] == 0);
+        wr(32'h0, 1, 3'd3, 2'b00, 64'h9999, 8'hff);
+        $assert(berrs == 1);
+        rd(32'h0, 0, 3'd3, 2'b01);
+        $assert(got[0] == 64'h1000);
+        $assert(refused == 2);
+
+        // --- 7. a narrow burst is refused ---
+        rd(32'h0, 1, 3'd2, 2'b01);
+        $assert(beats == 2);
+        $assert(gerr == 16'b11);
+        $assert(refused == 3);
+
+        // --- 8. past the end of the memory: the memory's error comes back
+        //     on that beat, and on the write response ---
+        rd(32'd4088, 1, 3'd3, 2'b01);
+        $display("past the end: gerr=%h", gerr);
+        $assert(beats == 2);
+        $assert(gerr == 16'b10);
+        wr(32'd4088, 1, 3'd3, 2'b01, 64'h3000, 8'hff);
+        $assert(berrs == 2);
+        $assert(refused == 3);
+    }
+}

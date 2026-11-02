@@ -27,6 +27,12 @@ use crate::manifest::{Addressing, Backing, Contract, Manifest, Role, TraceFormat
 /// `<bundle>_depth` register, so a default never takes effect unseen.
 pub const DEFAULT_DEPTH: u32 = 256;
 
+/// `host_mem` moves host memory one 4 KB page at a time.
+pub const HOST_MEM_PAGE: u32 = 4096;
+
+/// The widest `host_mem` beat: the AXI width of the borrowed DMA engine.
+pub const HOST_MEM_MAX_BEAT: usize = 256;
+
 /// The default number of words in the BRAM behind AXI4. It is far smaller than
 /// a real DDR, so set `depth` for a test where size matters. This value is also
 /// readable from the `<bundle>_depth` register.
@@ -264,12 +270,13 @@ impl MemPlan {
 /// The plan to terminate a transfer-level interface (`rd_cmd_*` / `rd_*` /
 /// `wr_*`).
 ///
-/// `backing` says where the data lives: BRAM in the FPGA for `bram`, real host
-/// memory for `host_mem`. The latter needs a PCIe requester for the DUT, which
-/// does not exist yet (`plan::generatable` rejects it).
+/// `backing` says where the data lives: BRAM in the FPGA for `bram`
+/// (`hns::hmem`), real host memory over PCIe for `host_mem` (`hns::hostmem`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostMemPlan {
     pub bundle: String,
+    /// `Bram` or `HostMem`.
+    pub backing: Backing,
 
     /// The beat width. It must be the same in both directions, because both
     /// access the same storage.
@@ -282,10 +289,28 @@ pub struct HostMemPlan {
     /// The write side. May be missing too.
     pub write: Option<HostMemWrite>,
 
-    /// The number of beats in the stand-in BRAM.
+    /// The number of beats in the stand-in BRAM. Unused for `host_mem`.
     pub depth: u32,
     /// Whether the default depth was used. Kept so that the value is reported.
     pub depth_defaulted: bool,
+    /// The bytes of host memory the DUT may reach. `host_mem` only.
+    pub aperture: Option<u32>,
+    /// An AXI4 master of the DUT instead of the transfer-level roles.
+    /// `hns::axi2xfer` turns it into the transfer level, and `read` / `write`
+    /// are `None`. `host_mem` only.
+    pub axi: Option<HostMemAxi>,
+}
+
+/// The AXI4 side of a `host_mem` bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostMemAxi {
+    /// The DUT port name (a `::master` modport port).
+    pub port: String,
+    /// `std::axi4_pkg::<..>`, with the same arguments the DUT used.
+    pub pkg: String,
+    /// The DUT address of byte 0 of the host memory. With one,
+    /// `hns::axi_range` takes it off and answers the rest with DECERR.
+    pub dut_base: u64,
 }
 
 /// The read side of `host_mem`.
@@ -327,9 +352,18 @@ impl HostMemPlan {
         self.depth.trailing_zeros() as usize
     }
 
-    /// The BRAM bytes the stand-in uses.
+    /// The BRAM bytes the terminator uses. `host_mem` holds one 4 KB page
+    /// per direction.
     pub fn bram_bytes(&self) -> u64 {
+        if self.backing == Backing::HostMem {
+            return 2 * HOST_MEM_PAGE as u64;
+        }
         self.depth as u64 * (self.data_width.div_ceil(8) as u64)
+    }
+
+    /// Whether the data lives in host memory.
+    pub fn is_host(&self) -> bool {
+        self.backing == Backing::HostMem
     }
 }
 
@@ -700,6 +734,41 @@ pub enum TerminatorError {
         )
     )]
     HostMemBeatWidth { bundle: String, width: usize },
+
+    /// The pages move through the 256-bit AXI side of the DMA engine, which
+    /// holds a whole number of beats.
+    #[error("[bundle.{bundle}] has {width}-bit beats, wider than host memory can serve")]
+    #[diagnostic(
+        code(harness::terminator::host_mem_beat_too_wide),
+        help(
+            "`host_mem` serves beats of up to 256 bits, the width of the PCIe DMA engine. Make the DUT's data (`rd_data` / `wr_data`, or the AXI4 data bus) 256 bits or narrower."
+        )
+    )]
+    HostMemBeatTooWide { bundle: String, width: usize },
+
+    /// Nothing says how much host memory the DUT may reach.
+    #[error("[bundle.{bundle}] is `host_mem` without `aperture`")]
+    #[diagnostic(
+        code(harness::terminator::host_mem_needs_aperture),
+        help(
+            "Say how many bytes of host memory the DUT may reach. The host hands over one huge page (2 MB on most machines), so it can be at most that:\n\n    [bundle.{bundle}]\n    aperture = \"2M\""
+        )
+    )]
+    HostMemNeedsAperture { bundle: String },
+
+    /// The pages are 4 KB, and the check at the end works per page.
+    #[error("[bundle.{bundle}] aperture = {aperture} is not a whole number of 4 KB pages")]
+    #[diagnostic(
+        code(harness::terminator::host_mem_aperture_not_pages),
+        help(
+            "Host memory moves in 4 KB pages, so the aperture is a multiple of 4096 bytes, and not 0. For example:\n\n    aperture = {suggestion}"
+        )
+    )]
+    HostMemApertureNotPages {
+        bundle: String,
+        aperture: u32,
+        suggestion: u32,
+    },
 
     /// The pointers wrap by counting. With a depth that is not a power of two,
     /// they wrap early and the order breaks.
@@ -1493,8 +1562,7 @@ pub fn resolve_host_mem(
         let declared = &manifest.bundle[&binding.bundle];
         // The interface shape decides: bundles with transfer-level roles
         // (`rd_cmd_*` / `wr_*`) come here. `backing` says where the data lives:
-        // the FPGA for `bram`, the host for `host_mem` (not built yet, so `gen`
-        // rejects it).
+        // the FPGA for `bram`, the host for `host_mem`.
         if !matches!(declared.backing, Backing::Bram | Backing::HostMem) {
             continue;
         }
@@ -1508,6 +1576,17 @@ pub fn resolve_host_mem(
                     .any(|assignment| assignment.role.is_host_mem())
             });
         if !has_transfer_roles {
+            // `host_mem` also takes an AXI4 master, through `hns::axi2xfer`.
+            // A `bram` one is `hns::axi_mem`'s (`resolve_axi_mems`).
+            if declared.backing == Backing::HostMem {
+                let axi = binding.ports.iter().find_map(|name| {
+                    let port = port_of(dut, name);
+                    port.axi4.as_ref().map(|axi4| (port, axi4))
+                });
+                if let Some((port, axi4)) = axi {
+                    plans.push(host_mem_axi(binding, declared, port, axi4)?);
+                }
+            }
             continue;
         }
 
@@ -1533,8 +1612,21 @@ pub fn resolve_host_mem(
             });
         }
 
+        let aperture = if declared.backing == Backing::HostMem {
+            if data_width > HOST_MEM_MAX_BEAT {
+                return Err(TerminatorError::HostMemBeatTooWide {
+                    bundle: binding.bundle.clone(),
+                    width: data_width,
+                });
+            }
+            Some(host_mem_aperture(&binding.bundle, declared.aperture)?)
+        } else {
+            None
+        };
+
         plans.push(HostMemPlan {
             bundle: binding.bundle.clone(),
+            backing: declared.backing,
             data_width,
             cmd_addr_width,
             cmd_size_width,
@@ -1542,10 +1634,98 @@ pub fn resolve_host_mem(
             write,
             depth,
             depth_defaulted: declared.depth.is_none(),
+            aperture,
+            axi: None,
         });
     }
 
     Ok(plans)
+}
+
+/// A `host_mem` bundle whose DUT side is an AXI4 master.
+fn host_mem_axi(
+    binding: &Binding,
+    declared: &crate::manifest::Bundle,
+    port: &crate::dut::Port,
+    axi4: &crate::dut::Axi4Port,
+) -> Result<HostMemPlan, TerminatorError> {
+    let bundle = binding.bundle.clone();
+    // The harness is the slave. A one-sided modport would leave the other
+    // channels undriven while they only look connected.
+    if axi4.modport != "master" {
+        return Err(TerminatorError::AxiMemNotAMaster {
+            bundle,
+            port: port.name.clone(),
+            modport: axi4.modport.clone(),
+        });
+    }
+    let data_width = axi4.data_bytes() as usize * 8;
+    if data_width > HOST_MEM_MAX_BEAT {
+        return Err(TerminatorError::HostMemBeatTooWide {
+            bundle,
+            width: data_width,
+        });
+    }
+    let aperture = host_mem_aperture(&bundle, declared.aperture)?;
+
+    let dut_base = declared.dut_base.unwrap_or(0);
+    if dut_base != 0 {
+        const PAGE: u64 = 4096;
+        if !dut_base.is_multiple_of(PAGE) {
+            return Err(TerminatorError::DutBaseNot4k {
+                bundle,
+                base: dut_base,
+                below: dut_base - dut_base % PAGE,
+                above: dut_base - dut_base % PAGE + PAGE,
+            });
+        }
+    }
+    let addr_width = axi4.addr_width();
+    let end = u128::from(dut_base) + u128::from(aperture);
+    if end > 1u128 << addr_width.min(127) {
+        return Err(TerminatorError::DutBasePastAddress {
+            bundle,
+            port: port.name.clone(),
+            base: dut_base,
+            end,
+            bits: addr_width as usize,
+        });
+    }
+
+    Ok(HostMemPlan {
+        bundle,
+        backing: declared.backing,
+        data_width,
+        cmd_addr_width: addr_width as usize,
+        cmd_size_width: 32,
+        read: None,
+        write: None,
+        depth: 0,
+        depth_defaulted: false,
+        aperture: Some(aperture),
+        axi: Some(HostMemAxi {
+            port: port.name.clone(),
+            pkg: axi4.pkg(),
+            dut_base,
+        }),
+    })
+}
+
+/// The `aperture` of a `host_mem` bundle: required, whole 4 KB pages.
+fn host_mem_aperture(bundle: &str, aperture: Option<u32>) -> Result<u32, TerminatorError> {
+    let Some(aperture) = aperture else {
+        return Err(TerminatorError::HostMemNeedsAperture {
+            bundle: bundle.to_string(),
+        });
+    };
+    if aperture == 0 || aperture % HOST_MEM_PAGE != 0 {
+        return Err(TerminatorError::HostMemApertureNotPages {
+            bundle: bundle.to_string(),
+            aperture,
+            suggestion: aperture.div_ceil(HOST_MEM_PAGE).max(1) * HOST_MEM_PAGE,
+        });
+    }
+    Ok(aperture)
 }
 
 /// An addressable slave interface of the DUT (`backing = "slave"`; `addr` is a
@@ -3604,8 +3784,7 @@ fn aperture_of(
 /// about the hardware.
 ///
 /// `latency` is not checked here. `contract::resolve` reports a mismatch with
-/// the contract, and each `resolve_*` reports a missing one. Backings without a
-/// terminator yet (`host_mem`) are rejected by `gen`.
+/// the contract, and each `resolve_*` reports a missing one.
 #[allow(clippy::too_many_arguments)]
 pub fn check_claimed(
     manifest: &Manifest,
@@ -3651,9 +3830,23 @@ pub fn check_claimed(
                 &[DEPTH, ADDRESSING, ACCESS, APERTURE, DUT_BASE][..],
             ),
             (
-                host_mems.iter().any(|p| p.bundle == name),
+                host_mems.iter().any(|p| p.bundle == name && !p.is_host()),
                 "a transfer-level memory port",
                 &[DEPTH][..],
+            ),
+            (
+                host_mems
+                    .iter()
+                    .any(|p| p.bundle == name && p.is_host() && p.axi.is_none()),
+                "a transfer-level port to host memory",
+                &[APERTURE][..],
+            ),
+            (
+                host_mems
+                    .iter()
+                    .any(|p| p.bundle == name && p.axi.is_some()),
+                "an AXI4 port to host memory",
+                &[APERTURE, DUT_BASE][..],
             ),
             (
                 slaves.iter().any(|p| p.bundle == name),
@@ -3708,7 +3901,8 @@ pub fn check_claimed(
             }
             (None, _) => match declared.backing {
                 Backing::Reg => ("a `reg` bundle", &[][..]),
-                // No terminator yet. `gen` rejects it (`plan::generatable`).
+                // Only the transfer-level shape reaches host memory. The
+                // contract check names the roles it needs.
                 Backing::HostMem => continue,
                 backing => {
                     return Err(TerminatorError::NotTerminated {
