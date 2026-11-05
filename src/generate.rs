@@ -89,6 +89,8 @@ pub struct Invocation {
     pub target_file: Option<PathBuf>,
     #[serde(default)]
     pub target_patch: Vec<PathBuf>,
+    /// `--transport` only. `host_transport` is read from the manifest again,
+    /// so `update` follows an edit to it.
     pub transport: Option<String>,
 }
 

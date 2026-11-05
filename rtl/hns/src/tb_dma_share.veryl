@@ -1,0 +1,365 @@
+/// `hns::dma_share`: two clients take turns at one engine, each descriptor's
+/// status goes back to the client that sent it, and the engine's AXI reaches
+/// that client's memory only.
+#[test(dma_share_routes_each_descriptor_to_its_client)]
+module test_dma_share {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    inst ebus: $std::axi4_if::<$std::axi4_pkg::<16, 4, 2, 1, 1, 1, 1, 1>>;
+    inst abus: $std::axi4_if::<$std::axi4_pkg::<16, 4, 2, 1, 1, 1, 1, 1>>;
+    inst bbus: $std::axi4_if::<$std::axi4_pkg::<16, 4, 2, 1, 1, 1, 1, 1>>;
+
+    // The clients. Each holds `valid` until its descriptor is taken.
+    var a_rd_valid: logic;
+    var a_wr_valid: logic;
+    var b_rd_valid: logic;
+    var b_wr_valid: logic;
+    var a_rd_ready: logic;
+    var a_wr_ready: logic;
+    var b_rd_ready: logic;
+    var b_wr_ready: logic;
+    var a_rd_done : logic;
+    var a_wr_done : logic;
+    var b_rd_done : logic;
+    var b_wr_done : logic;
+
+    // The engines.
+    var rd_pcie        : logic<64>;
+    var rd_tag         : logic<8> ;
+    var rd_valid       : logic    ;
+    var rd_ready       : logic    ;
+    var rd_status_valid: logic    ;
+    var wr_pcie        : logic<64>;
+    var wr_valid       : logic    ;
+    var wr_ready       : logic    ;
+    var wr_status_valid: logic    ;
+
+    inst u: dma_share::<$std::axi4_pkg::<16, 4, 2, 1, 1, 1, 1, 1>> (
+        i_clk: clk                           ,
+        i_rst: rst                           ,
+        i_a_rd_pcie_addr   : 64'h1000        ,
+        i_a_rd_axi_addr    : 0               ,
+        i_a_rd_len         : 32              ,
+        i_a_rd_tag         : 5               ,
+        i_a_rd_valid       : a_rd_valid      ,
+        o_a_rd_ready       : a_rd_ready      ,
+        o_a_rd_status_valid: a_rd_done       ,
+        o_a_rd_status_error: _               ,
+        i_a_wr_pcie_addr   : 64'h3000        ,
+        i_a_wr_axi_addr    : 0               ,
+        i_a_wr_len         : 32              ,
+        i_a_wr_tag         : 6               ,
+        i_a_wr_valid       : a_wr_valid      ,
+        o_a_wr_ready       : a_wr_ready      ,
+        o_a_wr_status_valid: a_wr_done       ,
+        o_a_wr_status_error: _               ,
+        i_b_rd_pcie_addr   : 64'h2000        ,
+        i_b_rd_axi_addr    : 0               ,
+        i_b_rd_len         : 64              ,
+        i_b_rd_tag         : 0               ,
+        i_b_rd_valid       : b_rd_valid      ,
+        o_b_rd_ready       : b_rd_ready      ,
+        o_b_rd_status_valid: b_rd_done       ,
+        o_b_rd_status_error: _               ,
+        i_b_wr_pcie_addr   : 64'h4000        ,
+        i_b_wr_axi_addr    : 0               ,
+        i_b_wr_len         : 64              ,
+        i_b_wr_tag         : 0               ,
+        i_b_wr_valid       : b_wr_valid      ,
+        o_b_wr_ready       : b_wr_ready      ,
+        o_b_wr_status_valid: b_wr_done       ,
+        o_b_wr_status_error: _               ,
+        o_rd_pcie_addr     : rd_pcie         ,
+        o_rd_axi_addr      : _               ,
+        o_rd_len           : _               ,
+        o_rd_tag           : rd_tag          ,
+        o_rd_valid         : rd_valid        ,
+        i_rd_ready         : rd_ready        ,
+        i_rd_status_valid  : rd_status_valid ,
+        i_rd_status_error  : 0               ,
+        o_wr_pcie_addr     : wr_pcie         ,
+        o_wr_axi_addr      : _               ,
+        o_wr_len           : _               ,
+        o_wr_tag           : _               ,
+        o_wr_valid         : wr_valid        ,
+        i_wr_ready         : wr_ready        ,
+        i_wr_status_valid  : wr_status_valid ,
+        i_wr_status_error  : 0               ,
+        s_axi              : ebus            ,
+        m_a                : abus            ,
+        m_b                : bbus            ,
+    );
+
+    var a_addr: logic<4> ;
+    var b_addr: logic<4> ;
+    var a_data: logic<32>;
+    var b_data: logic<32>;
+
+    inst ma: axi_mem::<$std::axi4_pkg::<16, 4, 2, 1, 1, 1, 1, 1>> #(
+        DEPTH: 16,
+    ) (
+        i_clk   : clk   ,
+        i_rst   : rst   ,
+        axi     : abus  ,
+        i_haddr : a_addr,
+        i_hwdata: 0     ,
+        i_hwstrb: 0     ,
+        i_hwe   : 0     ,
+        o_hrdata: a_data,
+    );
+
+    inst mb: axi_mem::<$std::axi4_pkg::<16, 4, 2, 1, 1, 1, 1, 1>> #(
+        DEPTH: 16,
+    ) (
+        i_clk   : clk   ,
+        i_rst   : rst   ,
+        axi     : bbus  ,
+        i_haddr : b_addr,
+        i_hwdata: 0     ,
+        i_hwstrb: 0     ,
+        i_hwe   : 0     ,
+        o_hrdata: b_data,
+    );
+
+    // What each client was given, counted at the clock edge.
+    var a_rd_taken: logic<4>;
+    var a_wr_taken: logic<4>;
+    var b_rd_taken: logic<4>;
+    var b_wr_taken: logic<4>;
+    var a_rd_seen : logic<4>;
+    var a_wr_seen : logic<4>;
+    var b_rd_seen : logic<4>;
+    var b_wr_seen : logic<4>;
+
+    always_ff (clk, rst) {
+        if_reset {
+            a_rd_taken = 0;
+            a_wr_taken = 0;
+            b_rd_taken = 0;
+            b_wr_taken = 0;
+            a_rd_seen  = 0;
+            a_wr_seen  = 0;
+            b_rd_seen  = 0;
+            b_wr_seen  = 0;
+        } else {
+            a_rd_taken = a_rd_taken + (a_rd_valid & a_rd_ready) as 4;
+            a_wr_taken = a_wr_taken + (a_wr_valid & a_wr_ready) as 4;
+            b_rd_taken = b_rd_taken + (b_rd_valid & b_rd_ready) as 4;
+            b_wr_taken = b_wr_taken + (b_wr_valid & b_wr_ready) as 4;
+            a_rd_seen = a_rd_seen + a_rd_done as 4;
+            a_wr_seen = a_wr_seen + a_wr_done as 4;
+            b_rd_seen = b_rd_seen + b_rd_done as 4;
+            b_wr_seen = b_wr_seen + b_wr_done as 4;
+        }
+    }
+
+    var got: logic<32>;
+
+    /// The host-to-card engine takes the descriptor on offer.
+    function take_rd () {
+        rd_ready = 1;
+        clk.next(1);
+        rd_ready = 0;
+    }
+
+    /// The card-to-host engine takes the descriptor on offer.
+    function take_wr () {
+        wr_ready = 1;
+        clk.next(1);
+        wr_ready = 0;
+    }
+
+    /// The host-to-card engine reports one descriptor done.
+    function rd_status () {
+        rd_status_valid = 1;
+        clk.next(1);
+        rd_status_valid = 0;
+        clk.next(1);
+    }
+
+    /// The card-to-host engine reports one descriptor done.
+    function wr_status () {
+        wr_status_valid = 1;
+        clk.next(1);
+        wr_status_valid = 0;
+        clk.next(1);
+    }
+
+    /// The engine writes one beat to the card. Each valid drops right after
+    /// its ready, or AXI4 would count a second transfer.
+    function put (
+        addr: input logic<16>,
+        data: input logic<32>,
+    ) {
+        ebus.awaddr  = addr;
+        ebus.awvalid = 1;
+        for _i in 0..64 {
+            if ebus.awready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        ebus.awvalid = 0;
+        ebus.wdata   = data;
+        ebus.wvalid  = 1;
+        for _i in 0..64 {
+            if ebus.wready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        ebus.wvalid = 0;
+        for _i in 0..64 {
+            if ebus.bvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+    }
+
+    /// The engine reads one beat of the card into `got`.
+    function get (
+        addr: input logic<16>,
+    ) {
+        ebus.araddr  = addr;
+        ebus.arvalid = 1;
+        for _i in 0..64 {
+            if ebus.arready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        ebus.arvalid = 0;
+        for _i in 0..64 {
+            if ebus.rvalid {
+                got = ebus.rdata;
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+    }
+
+    always_comb {
+        ebus.awsize   = 3'd2;
+        ebus.awburst  = 2'b01;
+        ebus.awid     = 1;
+        ebus.awlen    = 0;
+        ebus.awcache  = 0;
+        ebus.awprot   = 0;
+        ebus.awlock   = 0;
+        ebus.awqos    = 0;
+        ebus.awregion = 0;
+        ebus.awuser   = 0;
+        ebus.wstrb    = 4'hf;
+        ebus.wlast    = 1;
+        ebus.wuser    = 0;
+        ebus.arsize   = 3'd2;
+        ebus.arburst  = 2'b01;
+        ebus.arid     = 2;
+        ebus.arlen    = 0;
+        ebus.arcache  = 0;
+        ebus.arprot   = 0;
+        ebus.arlock   = 0;
+        ebus.arqos    = 0;
+        ebus.arregion = 0;
+        ebus.aruser   = 0;
+    }
+
+    initial {
+        ebus.awvalid    = 0;
+        ebus.wvalid     = 0;
+        ebus.arvalid    = 0;
+        ebus.bready     = 1;
+        ebus.rready     = 1;
+        a_rd_valid      = 0;
+        a_wr_valid      = 0;
+        b_rd_valid      = 0;
+        b_wr_valid      = 0;
+        rd_ready        = 0;
+        rd_status_valid = 0;
+        wr_ready        = 0;
+        wr_status_valid = 0;
+        a_addr          = 0;
+        b_addr          = 0;
+        rst.assert(4);
+        clk.next(4);
+
+        // --- host to card: both ask at once, and a goes first ---
+        a_rd_valid = 1;
+        b_rd_valid = 1;
+        clk.next(1);
+        $assert(rd_valid);
+        $assert(rd_pcie == 64'h1000 && rd_tag == 5);
+        take_rd();
+        a_rd_valid = 0;
+        $assert(a_rd_taken == 1 && b_rd_taken == 0);
+        // One descriptor at a time: b waits for a's status.
+        clk.next(2);
+        $assert(!rd_valid);
+        $assert(b_rd_taken == 0);
+
+        // a's data lands in a's memory.
+        put(16'h0, 32'haaaa_0001);
+        rd_status();
+        $assert(a_rd_seen == 1 && b_rd_seen == 0);
+
+        // Now b, and its data lands in b's memory only.
+        $assert(rd_valid);
+        $assert(rd_pcie == 64'h2000 && rd_tag == 0);
+        take_rd();
+        b_rd_valid = 0;
+        $assert(b_rd_taken == 1);
+        put(16'h0, 32'hbbbb_0001);
+        rd_status();
+        $assert(a_rd_seen == 1 && b_rd_seen == 1);
+        $assert(!rd_valid);
+
+        a_addr = 0;
+        b_addr = 0;
+        clk.next(2);
+        $display("a: %h b: %h", a_data, b_data);
+        $assert(a_data == 32'haaaa_0001);
+        $assert(b_data == 32'hbbbb_0001);
+
+        // --- card to host: b alone, then both, and a goes first ---
+        b_wr_valid = 1;
+        clk.next(1);
+        $assert(wr_valid && wr_pcie == 64'h4000);
+        take_wr();
+        b_wr_valid = 0;
+        get(16'h0);
+        $assert(got == 32'hbbbb_0001);
+        wr_status();
+        $assert(b_wr_seen == 1 && a_wr_seen == 0);
+
+        a_wr_valid = 1;
+        b_wr_valid = 1;
+        clk.next(1);
+        $assert(wr_pcie == 64'h3000);
+        take_wr();
+        a_wr_valid = 0;
+        $assert(a_wr_taken == 1 && b_wr_taken == 1);
+        get(16'h0);
+        $assert(got == 32'haaaa_0001);
+        wr_status();
+        $assert(a_wr_seen == 1 && b_wr_seen == 1);
+
+        $assert(wr_pcie == 64'h4000);
+        take_wr();
+        b_wr_valid = 0;
+        $assert(b_wr_taken == 2);
+        get(16'h0);
+        $assert(got == 32'hbbbb_0001);
+        wr_status();
+        $assert(a_wr_seen == 1 && b_wr_seen == 2);
+
+        clk.next(4);
+        $finish();
+    }
+}

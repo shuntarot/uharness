@@ -122,7 +122,7 @@ pub struct Common {
     #[arg(long, value_name = "PATH")]
     pub target_patch: Vec<PathBuf>,
 
-    /// Transport: `pcie` or `jtag` (`sim` for `--target sim`). Without it, jtag, or the board's only transport.
+    /// Transport: `pcie` or `jtag` (`sim` for `--target sim`). Overrides `host_transport` in Harness.toml. Without either, jtag, or the board's only transport.
     #[arg(long, value_name = "NAME")]
     pub transport: Option<String>,
 }

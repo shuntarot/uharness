@@ -812,6 +812,79 @@ fn host_mem_refuses_what_it_cannot_serve() {
     }
 }
 
+/// `dram` and `host_mem` together share the one DMA engine through
+/// `hns::dma_share`: the gate of `dram` is client a, `hns::hostmem` client b,
+/// and the engine's AXI reaches the DRAM path or the page buffers.
+#[test]
+fn dram_and_host_mem_share_the_dma_engine() {
+    let dir = host_mem_fixture(&format!("aperture = \"2M\"\n{HOST_MEM_PORTS}"));
+    fs::write(
+        dir.path().join("Veryl.toml"),
+        format!(
+            "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n\n[dependencies]\nhns = {{ path = \"{}/rtl/hns\" }}\n",
+            env!("CARGO_MANIFEST_DIR")
+        ),
+    )
+    .unwrap();
+    let source = fs::read_to_string(dir.path().join("src/fixture.veryl")).unwrap();
+    let source = source
+        .replace(
+            "    i_rst     : input  reset    ,\n",
+            "    i_rst     : input  reset    ,\n    mem       : modport $std::axi4_if::<$std::axi4_pkg::<28, 4, 8, 1, 1, 1, 1, 1>>::master,\n",
+        )
+        .replace(
+            "    assign o_rc_valid = 0;\n",
+            "    always_comb {\n        mem.awvalid  = 0;\n        mem.awaddr   = 0;\n        mem.awsize   = 3'd2;\n        mem.awburst  = 2'b01;\n        mem.awcache  = 0;\n        mem.awprot   = 0;\n        mem.awid     = 0;\n        mem.awlen    = 0;\n        mem.awlock   = 0;\n        mem.awqos    = 0;\n        mem.awregion = 0;\n        mem.awuser   = 0;\n        mem.wvalid   = 0;\n        mem.wlast    = 0;\n        mem.wdata    = 0;\n        mem.wstrb    = 0;\n        mem.wuser    = 0;\n        mem.bready   = 1;\n        mem.arvalid  = 0;\n        mem.araddr   = 0;\n        mem.arsize   = 3'd2;\n        mem.arburst  = 2'b01;\n        mem.arcache  = 0;\n        mem.arprot   = 0;\n        mem.arid     = 0;\n        mem.arlen    = 0;\n        mem.arlock   = 0;\n        mem.arqos    = 0;\n        mem.arregion = 0;\n        mem.aruser   = 0;\n        mem.rready   = 1;\n    }\n    assign o_rc_valid = 0;\n",
+        );
+    fs::write(dir.path().join("src/fixture.veryl"), source).unwrap();
+    fs::write(
+        dir.path().join("Harness.toml"),
+        format!(
+            "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 100\n\n[bundle.mem]\nbacking = \"dram\"\ndepth = \"64M\"\naperture = 256\nports = [\"mem\"]\n\n[bundle.hmem]\nbacking = \"host_mem\"\naperture = \"2M\"\n{HOST_MEM_PORTS}"
+        ),
+    )
+    .unwrap();
+
+    let (code, value) = gen_host_mem(&dir);
+    assert_eq!(code, Some(0), "{value}");
+    if let Err(why) = common::veryl_check(&dir.path().join("hns")) {
+        panic!("the shared DMA harness does not check:\n{why}");
+    }
+
+    let squash = |text: String| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+    let top = squash(fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap());
+    for want in [
+        "instu_dma_gate:hns::dma_gate",
+        "instu_hostmem_hmem:hns::hostmem::<",
+        "instu_dma_share:hns::dma_share::<",
+        "i_a_rd_valid:dma_rd_valid,",
+        "i_b_wr_valid:hm_hmem_wr_valid,",
+        "s_axi:eaxi_dma,",
+        "m_a:qaxi_mem,",
+        "m_b:haxi_hmem,",
+        "i_desc_valid:ds_wr_valid,",
+        "i_desc_valid:ds_rd_valid,",
+    ] {
+        assert!(top.contains(want), "{want} missing:\n{top}");
+    }
+    // One pair of engines, not two.
+    assert_eq!(top.matches("hns::dma_wr::<").count(), 1, "{top}");
+    assert_eq!(top.matches("hns::dma_rd::<").count(), 1, "{top}");
+
+    let regs: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("hns/regs.json")).unwrap())
+            .unwrap();
+    let names: Vec<&str> = regs["registers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    for want in ["dma_go", "dma_base", "hmem_base", "hmem_on"] {
+        assert!(names.contains(&want), "{want} missing: {names:?}");
+    }
+}
+
 /// A DUT with an output stream (for host_poll_fifo tests).
 fn fifo_fixture(harness_toml: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -2689,6 +2762,46 @@ fn the_bar_aperture_reaches_the_generated_top() {
             "bar_bytes {bar_bytes:?} should give {bits} address bits\n{top}"
         );
     }
+}
+
+/// `host_transport` in Harness.toml picks the transport, `--transport`
+/// overrides it, and `harness.json` keeps only the command line, so `update`
+/// reads the key again.
+#[test]
+fn host_transport_in_the_manifest_is_overridden_by_the_command_line() {
+    let harness_toml = format!("host_transport = \"pcie\"\n\n{HARNESS_TOML}");
+    let dir = fixture(&veryl_toml(), &harness_toml);
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_veryl-harness"))
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    run(&["gen", "--target", "xilinx/vcu118", "-o", "pcie"]);
+    assert!(dir.path().join("pcie/syn/pcie.tcl").is_file());
+    let record = fs::read_to_string(dir.path().join("pcie/harness.json")).unwrap();
+    assert!(record.contains("\"transport\": null"), "{record}");
+    run(&["update", "-o", "pcie"]);
+    assert!(dir.path().join("pcie/syn/pcie.tcl").is_file());
+
+    run(&[
+        "gen",
+        "--target",
+        "xilinx/vcu118",
+        "--transport",
+        "jtag",
+        "-o",
+        "jtag",
+    ]);
+    assert!(!dir.path().join("jtag/syn/pcie.tcl").exists());
 }
 
 /// The class code reaches the PCIe IP in the form each IP takes. On the PCIE3

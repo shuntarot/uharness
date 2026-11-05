@@ -324,16 +324,6 @@ pub enum PlanError {
         )
     )]
     HostMemMoreThanOne { first: String, second: String },
-
-    /// The DMA engine would need to be shared, which is not built yet.
-    #[error("[bundle.{host_mem}] reaches host memory, and [bundle.{dram}] has the card's DMA")]
-    #[diagnostic(
-        code(harness::plan::host_mem_with_dram_dma),
-        help(
-            "With `dram` over PCIe, the harness uses its DMA engine for `hio load` / `memtest`. Sharing it with `host_mem` is not built yet. Put [bundle.{host_mem}] on `backing = \"bram\"` (the same ports), or use the `dram` design without `host_mem`."
-        )
-    )]
-    HostMemWithDramDma { host_mem: String, dram: String },
 }
 
 /// Resolves the manifest and the DUT, and runs every check.
@@ -643,19 +633,11 @@ fn generatable(plan: &Plan) -> Result<(), PlanError> {
         }
     }
     let mut hosts = plan.host_mems.iter().filter(|h| h.is_host());
-    if let Some(first) = hosts.next() {
-        if let Some(second) = hosts.next() {
-            return Err(PlanError::HostMemMoreThanOne {
-                first: first.bundle.clone(),
-                second: second.bundle.clone(),
-            });
-        }
-        if let Some(dram) = &plan.registers.requester {
-            return Err(PlanError::HostMemWithDramDma {
-                host_mem: first.bundle.clone(),
-                dram: dram.clone(),
-            });
-        }
+    if let (Some(first), Some(second)) = (hosts.next(), hosts.next()) {
+        return Err(PlanError::HostMemMoreThanOne {
+            first: first.bundle.clone(),
+            second: second.bundle.clone(),
+        });
     }
 
     if let Some(slave) = plan
