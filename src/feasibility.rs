@@ -484,15 +484,18 @@ pub enum FeasibilityError {
         bytes: u64,
     },
 
-    #[error("target `{target}` does not provide transport `{requested}`")]
+    #[error("target `{target}` does not provide transport `{requested}`{named_by}")]
     #[diagnostic(
         code(harness::feasibility::transport_not_provided),
-        help("`{target}` provides: {available}\n\nPick one of these with `--transport`.")
+        help("`{target}` provides: {available}\n\n{fix}")
     )]
     TransportNotProvided {
         target: String,
         requested: String,
         available: String,
+        /// Empty for `--transport`; names the manifest key otherwise.
+        named_by: &'static str,
+        fix: &'static str,
     },
 
     /// `hns::axi_dw` does the widening. The id widths must match only when no
@@ -559,7 +562,9 @@ pub enum FeasibilityError {
     #[error("target `{target}` provides more than one transport and no `jtag`")]
     #[diagnostic(
         code(harness::feasibility::transport_ambiguous),
-        help("`{target}` provides: {available}\n\nPick one with `--transport`.")
+        help(
+            "`{target}` provides: {available}\n\nPick one with `--transport`, or set `host_transport` for the project. It goes above the first table of Harness.toml."
+        )
     )]
     TransportAmbiguous { target: String, available: String },
 
@@ -759,7 +764,7 @@ pub fn check(
     target: &Target,
     requested_transport: Option<&str>,
 ) -> Result<Feasibility, FeasibilityError> {
-    let transport = select_transport(target, requested_transport)?;
+    let transport = select_transport(target, requested_transport, manifest)?;
 
     // The DUT's AXI4 must fit the controller's AXI4. A shape the harness
     // cannot convert is refused.
@@ -1128,11 +1133,20 @@ pub fn check_capacity(
 
 /// Chooses the transport.
 ///
-/// If none is requested, it is jtag when the target has it, or else the only
+/// `--transport` comes first, then `host_transport` in the manifest. If
+/// neither names one, it is jtag when the target has it, or else the only
 /// one. With several and no jtag, the user must choose: the choice changes the
 /// verdict and the register map (`dma_*`), so the first in the list is not
 /// taken silently.
-fn select_transport(target: &Target, requested: Option<&str>) -> Result<String, FeasibilityError> {
+///
+/// `--target sim` ignores `host_transport`. The manifest names the board's
+/// transport, and a simulation has only its socket; failing there would make
+/// every PCIe project pass `--transport sim` to simulate.
+fn select_transport(
+    target: &Target,
+    requested: Option<&str>,
+    manifest: &Manifest,
+) -> Result<String, FeasibilityError> {
     let available: Vec<String> = target
         .table
         .get("provides")
@@ -1152,6 +1166,20 @@ fn select_transport(target: &Target, requested: Option<&str>) -> Result<String, 
         });
     }
 
+    let from_manifest = manifest
+        .host_transport
+        .as_deref()
+        .filter(|_| target.name != crate::target::SIM);
+    let (requested, named_by, fix) = match (requested, from_manifest) {
+        (Some(requested), _) => (Some(requested), "", "Pick one of these with `--transport`."),
+        (None, Some(requested)) => (
+            Some(requested),
+            ", named by `host_transport` in Harness.toml",
+            "Change `host_transport` to one of these, or override it with `--transport`.",
+        ),
+        (None, None) => (None, "", ""),
+    };
+
     match requested {
         Some(requested) => {
             if available.iter().any(|x| x == requested) {
@@ -1161,6 +1189,8 @@ fn select_transport(target: &Target, requested: Option<&str>) -> Result<String, 
                     target: target.name.clone(),
                     requested: requested.to_string(),
                     available: available.join(", "),
+                    named_by,
+                    fix,
                 })
             }
         }
@@ -1904,6 +1934,48 @@ mod tests {
             panic!("expected TransportNotProvided, got {err:?}");
         };
         assert_eq!(available, "jtag");
+    }
+
+    /// `host_transport` stands in for `--transport`, and `--transport` wins.
+    #[test]
+    fn the_manifest_names_a_transport_and_the_command_line_overrides_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two.toml");
+        std::fs::write(
+            &path,
+            "[board]\nprovider = \"acme\"\nname = \"proto\"\n\n[device]\nvendor = \"xilinx\"\nfamily = \"artix7\"\npart = \"xc7a35t\"\n\n[provides]\ntransport = [\"jtag\", \"pcie\"]\n",
+        )
+        .unwrap();
+        let target = target::load_file(&path, &[]).unwrap();
+        let manifest = manifest("host_transport = \"pcie\"\n\n[dut]\nmodule = \"t\"\n");
+
+        let result = check(&manifest, &[], &[], &[], &target, None).unwrap();
+        assert_eq!(result.transport, "pcie");
+        let result = check(&manifest, &[], &[], &[], &target, Some("jtag")).unwrap();
+        assert_eq!(result.transport, "jtag");
+    }
+
+    /// A board without the manifest's transport is refused, and the error says
+    /// where the name came from.
+    #[test]
+    fn an_unavailable_host_transport_names_the_manifest() {
+        let manifest = manifest("host_transport = \"pcie\"\n\n[dut]\nmodule = \"t\"\n");
+        let err = check(&manifest, &[], &[], &[], &arty(), None).unwrap_err();
+
+        assert!(err.to_string().contains("`host_transport`"), "{err}");
+        let help = miette::Diagnostic::help(&err).unwrap().to_string();
+        assert!(help.contains("--transport"), "{help}");
+    }
+
+    /// `--target sim` has only its socket, so the manifest's transport is
+    /// not asked of it.
+    #[test]
+    fn the_sim_target_ignores_host_transport() {
+        let manifest = manifest("host_transport = \"pcie\"\n\n[dut]\nmodule = \"t\"\n");
+        let sim = target::resolve(target::SIM, &[]).unwrap();
+
+        let result = check(&manifest, &[], &[], &[], &sim, None).unwrap();
+        assert_eq!(result.transport, "sim");
     }
 
     /// With several transports, jtag is chosen if it is one of them.

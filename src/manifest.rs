@@ -1053,10 +1053,24 @@ pub struct Clock {
     pub freq_mhz: f64,
 }
 
+/// The values `host_transport` takes. `sim` is not one: it belongs to
+/// `--target sim`, which ignores the key.
+pub const HOST_TRANSPORTS: &[&str] = &["jtag", "pcie"];
+
 /// The content of `Harness.toml`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
+    /// The transport between the host and the window: `jtag` or `pcie`.
+    /// `--transport` overrides it. Without either, the board picks (jtag, or
+    /// its only transport).
+    ///
+    /// The board stays out of the manifest, but the transport may be in it:
+    /// a design with `host_mem`, `host_irq` or `pcie_flr` works only over
+    /// PCIe, so it can say so once instead of on every command line.
+    #[serde(default)]
+    pub host_transport: Option<String>,
+
     pub dut: Dut,
 
     /// Bundle name -> declaration. A `BTreeMap` keeps generation deterministic:
@@ -1336,6 +1350,13 @@ pub enum ManifestError {
         )
     )]
     EmptyModule,
+
+    #[error("host_transport = \"{value}\" is not a transport")]
+    #[diagnostic(
+        code(harness::manifest::unknown_host_transport),
+        help("Valid values are `jtag` and `pcie`. Remove the key to let the board pick.")
+    )]
+    UnknownHostTransport { value: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -1413,11 +1434,19 @@ fn has_metadata_section(veryl_toml: &Path) -> bool {
 }
 
 fn parse(text: &str, path: &Path) -> Result<Loaded, ManifestError> {
-    let manifest: Manifest = toml::from_str(text).map_err(|err| ManifestError::Parse {
-        path: path.to_path_buf(),
-        src: NamedSource::new(path.display().to_string(), text.to_string()),
-        span: err.span().map(SourceSpan::from),
-        message: err.message().to_string(),
+    let manifest: Manifest = toml::from_str(text).map_err(|err| {
+        let mut message = err.message().to_string();
+        // Below a table header, the key belongs to that table, and serde
+        // reports only an unknown field there.
+        if message.starts_with("unknown field `host_transport`") {
+            message.push_str(". `host_transport` goes above the first table");
+        }
+        ManifestError::Parse {
+            path: path.to_path_buf(),
+            src: NamedSource::new(path.display().to_string(), text.to_string()),
+            span: err.span().map(SourceSpan::from),
+            message,
+        }
     })?;
 
     manifest.validate()?;
@@ -1445,6 +1474,14 @@ impl Manifest {
     fn validate(&self) -> Result<(), ManifestError> {
         if self.dut.module.trim().is_empty() {
             return Err(ManifestError::EmptyModule);
+        }
+
+        if let Some(value) = &self.host_transport
+            && !HOST_TRANSPORTS.contains(&value.as_str())
+        {
+            return Err(ManifestError::UnknownHostTransport {
+                value: value.clone(),
+            });
         }
 
         if let Some(pcie) = &self.pcie {
@@ -1953,5 +1990,34 @@ whatever = true
         let err = load(dir.path(), None).unwrap_err();
 
         assert!(matches!(err, ManifestError::EmptyModule));
+    }
+
+    #[test]
+    fn an_unknown_host_transport_is_rejected() {
+        let dir = dir_with(&[(
+            MANIFEST_NAME,
+            "host_transport = \"pcei\"\n\n[dut]\nmodule = \"t\"\n",
+        )]);
+        let err = load(dir.path(), None).unwrap_err();
+
+        assert!(matches!(err, ManifestError::UnknownHostTransport { .. }));
+    }
+
+    /// Below `[dut]`, the key would be `dut.host_transport`.
+    #[test]
+    fn host_transport_below_a_table_says_where_it_goes() {
+        let dir = dir_with(&[(
+            MANIFEST_NAME,
+            "[dut]\nmodule = \"t\"\nhost_transport = \"pcie\"\n",
+        )]);
+        let err = load(dir.path(), None).unwrap_err();
+
+        let ManifestError::Parse { message, .. } = &err else {
+            panic!("expected a parse error, got {err:?}");
+        };
+        assert!(
+            message.contains("above the first table"),
+            "message was: {message}"
+        );
     }
 }

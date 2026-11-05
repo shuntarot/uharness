@@ -1,0 +1,53 @@
+[dut]
+module = "share_top"
+
+[clock.i_clk]
+freq_mhz = 100
+
+# Two copies of the engine: `d` on the board's DRAM, `h` on host memory. Over
+# PCIe the card has one DMA engine. The host's `load --dma` / `memtest --dma`
+# into the DRAM and the `h` copy's host memory take turns at it.
+#
+#   veryl harness gen --config Harness.share.toml --target <board> --transport pcie -o hns/<board>_share
+[bundle.dctl]
+backing  = "reg"
+ports    = ["i_d_start", "i_d_addr", "i_d_dst", "i_d_size", "o_d_busy", "o_d_done", "o_d_sum",
+            "o_d_beats", "o_d_errors"]
+
+[bundle.dmem]
+backing  = "dram"
+aperture = "64k"
+ports   = { rd_cmd_valid = "o_d_cmd_valid", rd_cmd_ready  = "i_d_cmd_ready",
+            rd_cmd_addr  = "o_d_cmd_addr",  rd_cmd_size   = "o_d_cmd_size",
+            rd_valid     = "i_d_rd_valid",  rd_ready      = "o_d_rd_ready",
+            rd_data      = "i_d_rd_data",   rd_last       = "i_d_rd_last",
+            rd_error     = "i_d_rd_error",
+            wr_cmd_valid = "o_d_wcmd_valid", wr_cmd_ready = "i_d_wcmd_ready",
+            wr_cmd_addr  = "o_d_wcmd_addr",  wr_cmd_size  = "o_d_wcmd_size",
+            wr_valid     = "o_d_w_valid",    wr_ready     = "i_d_w_ready",
+            wr_data      = "o_d_w_data",     wr_last      = "o_d_w_last",
+            wr_done_valid = "i_d_w_done",    wr_done_error = "i_d_w_done_error" }
+
+[bundle.hctl]
+backing  = "reg"
+ports    = ["i_h_start", "i_h_addr", "i_h_dst", "i_h_size", "o_h_busy", "o_h_done", "o_h_sum",
+            "o_h_beats", "o_h_errors"]
+
+[bundle.hmem]
+backing  = "host_mem"
+aperture = "2M"
+ports   = { rd_cmd_valid = "o_h_cmd_valid", rd_cmd_ready  = "i_h_cmd_ready",
+            rd_cmd_addr  = "o_h_cmd_addr",  rd_cmd_size   = "o_h_cmd_size",
+            rd_valid     = "i_h_rd_valid",  rd_ready      = "o_h_rd_ready",
+            rd_data      = "i_h_rd_data",   rd_last       = "i_h_rd_last",
+            rd_error     = "i_h_rd_error",
+            wr_cmd_valid = "o_h_wcmd_valid", wr_cmd_ready = "i_h_wcmd_ready",
+            wr_cmd_addr  = "o_h_wcmd_addr",  wr_cmd_size  = "o_h_wcmd_size",
+            wr_valid     = "o_h_w_valid",    wr_ready     = "i_h_w_ready",
+            wr_data      = "o_h_w_data",     wr_last      = "o_h_w_last",
+            wr_done_valid = "i_h_w_done",    wr_done_error = "i_h_w_done_error" }
+
+# The BAR holds the window and the registers: the next power of two above the
+# 64k aperture.
+[pcie]
+bar_bytes = "128k"

@@ -4559,6 +4559,139 @@ fn dma_engine(
     out.push_str("    );\n\n");
 }
 
+/// The AXI type of the DMA engine in front of a DRAM: 256 bits, with the
+/// controller's address and ID widths.
+fn dma_pkg(plan: &Plan, axi_mem: &crate::terminator::AxiMemPlan) -> String {
+    let controller = controller_axi(plan, axi_mem);
+    format!(
+        "$std::axi4_pkg::<{}, {DMA_BUS_BYTES}, {}, 1, 1, 1, 1, 1>",
+        controller.addr_width, controller.id_width
+    )
+}
+
+/// The `dram` bundle whose DMA engine `host_mem` shares, and the engine's AXI
+/// type. There is one pair of engines: with both on PCIe, `hns::dma_share`
+/// gives it to the host's descriptors and the DUT's in turn.
+fn shared_dma(plan: &Plan) -> Option<(&str, String)> {
+    if !has_pcie(plan) || !plan.host_mems.iter().any(|h| h.is_host()) {
+        return None;
+    }
+    let dram = plan.registers.requester.as_deref()?;
+    let axi_mem = plan.axi_mems.iter().find(|m| m.bundle == dram)?;
+    Some((dram, dma_pkg(plan, axi_mem)))
+}
+
+/// The DMA engine shared by `dram`'s gate (client a) and `hns::hostmem`
+/// (client b). Its AXI goes to the DRAM path (`qaxi_<dram>`) or to the
+/// page buffers (`haxi_<bundle>`), whichever client owns the transfer.
+#[allow(clippy::too_many_arguments)]
+fn shared_engine(
+    out: &mut String,
+    plan: &Plan,
+    domain: &str,
+    dpkg: &str,
+    dram: &str,
+    bundle: &str,
+    b_rd: &DescWires<'_>,
+    b_wr: &DescWires<'_>,
+) {
+    let host = plan.board().clocks.window.clone();
+    out.push_str(&format!(
+        "    inst eaxi_dma: {domain}$std::axi4_if::<{dpkg}>;\n"
+    ));
+    for dir in ["rd", "wr"] {
+        for (name, width) in [
+            ("pcie_addr", 64),
+            ("axi_addr", 64),
+            ("len", 20),
+            ("tag", 8),
+            ("valid", 1),
+            ("ready", 1),
+            ("status_valid", 1),
+            ("status_error", 4),
+        ] {
+            out.push_str(&format!(
+                "    var ds_{dir}_{name}: {domain}{};\n",
+                logic(width)
+            ));
+        }
+    }
+    out.push('\n');
+
+    out.push_str(&format!(
+        "    inst u_dma_share: hns::dma_share::<{dpkg}> (\n"
+    ));
+    out.push_str(&format!("        i_clk: clk_{host},\n"));
+    out.push_str(&format!("        i_rst: rst_{host},\n"));
+    for (client, dir, wires) in [
+        ("a", "rd", &GATE_RD),
+        ("a", "wr", &GATE_WR),
+        ("b", "rd", b_rd),
+        ("b", "wr", b_wr),
+    ] {
+        for (port, wire) in [
+            ("i_{c}_{d}_pcie_addr", wires.pcie_addr),
+            ("i_{c}_{d}_axi_addr", wires.axi_addr),
+            ("i_{c}_{d}_len", wires.len),
+            ("i_{c}_{d}_tag", wires.tag),
+            ("i_{c}_{d}_valid", wires.valid),
+            ("o_{c}_{d}_ready", wires.ready),
+            ("o_{c}_{d}_status_valid", wires.status_valid),
+            ("o_{c}_{d}_status_error", wires.status_error),
+        ] {
+            let port = port.replace("{c}", client).replace("{d}", dir);
+            out.push_str(&format!("        {port}: {wire},\n"));
+        }
+    }
+    for dir in ["rd", "wr"] {
+        for (port, name) in [
+            ("o_{d}_pcie_addr", "pcie_addr"),
+            ("o_{d}_axi_addr", "axi_addr"),
+            ("o_{d}_len", "len"),
+            ("o_{d}_tag", "tag"),
+            ("o_{d}_valid", "valid"),
+            ("i_{d}_ready", "ready"),
+            ("i_{d}_status_valid", "status_valid"),
+            ("i_{d}_status_error", "status_error"),
+        ] {
+            let port = port.replace("{d}", dir);
+            out.push_str(&format!("        {port}: ds_{dir}_{name},\n"));
+        }
+    }
+    out.push_str("        s_axi: eaxi_dma,\n");
+    out.push_str(&format!("        m_a: qaxi_{dram},\n"));
+    out.push_str(&format!("        m_b: haxi_{bundle},\n"));
+    out.push_str("    );\n\n");
+
+    let names: Vec<String> = ["rd", "wr"]
+        .iter()
+        .flat_map(|dir| {
+            [
+                "pcie_addr",
+                "axi_addr",
+                "len",
+                "tag",
+                "valid",
+                "ready",
+                "status_error",
+                "status_valid",
+            ]
+            .map(|name| format!("ds_{dir}_{name}"))
+        })
+        .collect();
+    let wires = |at: usize| DescWires {
+        pcie_addr: &names[at],
+        axi_addr: &names[at + 1],
+        len: &names[at + 2],
+        tag: &names[at + 3],
+        valid: &names[at + 4],
+        ready: &names[at + 5],
+        status_error: &names[at + 6],
+        status_valid: &names[at + 7],
+    };
+    dma_engine(out, plan, domain, "eaxi_dma", dpkg, &wires(8), &wires(0));
+}
+
 /// The AXI address width between the DMA engine and `hns::hostmem`. Only the
 /// offset in a 4 KB page is used; a little more keeps the engine's own
 /// arithmetic away from the top bit.
@@ -4647,9 +4780,19 @@ fn host_mem_instance(
     let aperture = hmem
         .aperture
         .expect("`resolve_host_mem` requires an aperture for host memory");
-    let dpkg = format!(
-        "$std::axi4_pkg::<{HOST_MEM_AXI_ADDR}, {DMA_BUS_BYTES}, {HOST_MEM_AXI_ID}, 1, 1, 1, 1, 1>"
-    );
+    // A shared engine has one AXI type, the DRAM's. `hns::hostmem` uses only
+    // the page offset of the address, so a wider one costs nothing.
+    let shared = if second_master {
+        shared_dma(plan)
+    } else {
+        None
+    };
+    let dpkg = match &shared {
+        Some((_, pkg)) => pkg.clone(),
+        None => format!(
+            "$std::axi4_pkg::<{HOST_MEM_AXI_ADDR}, {DMA_BUS_BYTES}, {HOST_MEM_AXI_ID}, 1, 1, 1, 1, 1>"
+        ),
+    };
 
     out.push_str(&format!(
         "    inst haxi_{bundle}: {domain}$std::axi4_if::<{dpkg}>;\n"
@@ -4865,15 +5008,19 @@ fn host_mem_instance(
             status_error: &names[at + 5],
             status_valid: &names[at + 6],
         };
-        dma_engine(
-            out,
-            plan,
-            domain,
-            &format!("haxi_{bundle}"),
-            &dpkg,
-            &wires(7),
-            &wires(0),
-        );
+        if let Some((dram, _)) = &shared {
+            shared_engine(out, plan, domain, &dpkg, dram, bundle, &wires(0), &wires(7));
+        } else {
+            dma_engine(
+                out,
+                plan,
+                domain,
+                &format!("haxi_{bundle}"),
+                &dpkg,
+                &wires(7),
+                &wires(0),
+            );
+        }
     } else {
         // Nothing takes a descriptor or drives the AXI side.
         out.push_str("    always_comb {\n");
@@ -4984,7 +5131,7 @@ fn mig_instance(
         .iter()
         .any(|r| r.role == Some(DMA_GO));
     let into_cdc = if has_pcie(plan) && gate {
-        let dpkg = format!("$std::axi4_pkg::<{aw}, {DMA_BUS_BYTES}, {idw}, 1, 1, 1, 1, 1>");
+        let dpkg = dma_pkg(plan, axi_mem);
         out.push_str(&format!(
             "    inst qaxi_{bundle}: {domain}$std::axi4_if::<{dpkg}>;\n"
         ));
@@ -5010,15 +5157,19 @@ fn mig_instance(
         out.push_str(&format!(
             "    inst paxi_{bundle}: {domain}$std::axi4_if::<{cpkg}>;\n"
         ));
-        dma_engine(
-            out,
-            plan,
-            domain,
-            &format!("qaxi_{bundle}"),
-            &dpkg,
-            &GATE_WR,
-            &GATE_RD,
-        );
+        // With `host_mem` too, the engine is placed with `hns::dma_share`,
+        // which drives this interface.
+        if shared_dma(plan).is_none() {
+            dma_engine(
+                out,
+                plan,
+                domain,
+                &format!("qaxi_{bundle}"),
+                &dpkg,
+                &GATE_WR,
+                &GATE_RD,
+            );
+        }
 
         // The DUT and the window are m0, the DMA engine m1. The order has no
         // meaning, but it is fixed so that diffs of the output stay readable.

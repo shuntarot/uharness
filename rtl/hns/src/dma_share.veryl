@@ -1,0 +1,312 @@
+/// One pair of borrowed DMA engines (`hns::dma_rd` / `hns::dma_wr`), shared by
+/// two clients: `a` is `hns::dma_gate` (the host's `load` / `memtest` into the
+/// DRAM), `b` is `hns::hostmem` (the DUT's host memory).
+///
+/// ```
+///   a descriptors --+                      +--> m_a (DRAM)
+///                   +--> engines -- s_axi -+
+///   b descriptors --+                      +--> m_b (host_mem page)
+/// ```
+///
+/// Each engine holds one descriptor at a time. The next one is taken only
+/// after the status of the last one, and the clients take turns when both
+/// wait. Neither client sends a second descriptor before the first is done, so
+/// nothing is lost by this.
+///
+/// The AXI side follows the client whose descriptor is in the engine. The
+/// borrowed code returns the status only after its AXI traffic is over (the
+/// last B for `dma_rd`, the last R for `dma_wr`), so the owner cannot change
+/// under a burst. The write channels follow `dma_rd`, which writes the card,
+/// and the read channels follow `dma_wr`, which reads it.
+pub module dma_share::<PKG: $std::axi4_prototype> (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    // client a, host to card (dma_rd)
+    i_a_rd_pcie_addr   : input  logic<64>,
+    i_a_rd_axi_addr    : input  logic<64>,
+    i_a_rd_len         : input  logic<20>,
+    i_a_rd_tag         : input  logic<8> ,
+    i_a_rd_valid       : input  logic    ,
+    o_a_rd_ready       : output logic    ,
+    o_a_rd_status_valid: output logic    ,
+    o_a_rd_status_error: output logic<4> ,
+
+    // client a, card to host (dma_wr)
+    i_a_wr_pcie_addr   : input  logic<64>,
+    i_a_wr_axi_addr    : input  logic<64>,
+    i_a_wr_len         : input  logic<20>,
+    i_a_wr_tag         : input  logic<8> ,
+    i_a_wr_valid       : input  logic    ,
+    o_a_wr_ready       : output logic    ,
+    o_a_wr_status_valid: output logic    ,
+    o_a_wr_status_error: output logic<4> ,
+
+    // client b, host to card (dma_rd)
+    i_b_rd_pcie_addr   : input  logic<64>,
+    i_b_rd_axi_addr    : input  logic<64>,
+    i_b_rd_len         : input  logic<20>,
+    i_b_rd_tag         : input  logic<8> ,
+    i_b_rd_valid       : input  logic    ,
+    o_b_rd_ready       : output logic    ,
+    o_b_rd_status_valid: output logic    ,
+    o_b_rd_status_error: output logic<4> ,
+
+    // client b, card to host (dma_wr)
+    i_b_wr_pcie_addr   : input  logic<64>,
+    i_b_wr_axi_addr    : input  logic<64>,
+    i_b_wr_len         : input  logic<20>,
+    i_b_wr_tag         : input  logic<8> ,
+    i_b_wr_valid       : input  logic    ,
+    o_b_wr_ready       : output logic    ,
+    o_b_wr_status_valid: output logic    ,
+    o_b_wr_status_error: output logic<4> ,
+
+    // the engine, host to card
+    o_rd_pcie_addr   : output logic<64>,
+    o_rd_axi_addr    : output logic<64>,
+    o_rd_len         : output logic<20>,
+    o_rd_tag         : output logic<8> ,
+    o_rd_valid       : output logic    ,
+    i_rd_ready       : input  logic    ,
+    i_rd_status_valid: input  logic    ,
+    i_rd_status_error: input  logic<4> ,
+
+    // the engine, card to host
+    o_wr_pcie_addr   : output logic<64>,
+    o_wr_axi_addr    : output logic<64>,
+    o_wr_len         : output logic<20>,
+    o_wr_tag         : output logic<8> ,
+    o_wr_valid       : output logic    ,
+    i_wr_ready       : input  logic    ,
+    i_wr_status_valid: input  logic    ,
+    i_wr_status_error: input  logic<4> ,
+
+    /// The AXI master of the engines.
+    s_axi: modport $std::axi4_if::<PKG>::slave ,
+    /// The card memory of client a, and of client b.
+    m_a: modport $std::axi4_if::<PKG>::master,
+    m_b: modport $std::axi4_if::<PKG>::master,
+) {
+    var rd_own: logic;
+    var wr_own: logic;
+
+    inst u_rd: dma_turn (
+        i_clk                                ,
+        i_rst                                ,
+        i_a_pcie_addr   : i_a_rd_pcie_addr   ,
+        i_a_axi_addr    : i_a_rd_axi_addr    ,
+        i_a_len         : i_a_rd_len         ,
+        i_a_tag         : i_a_rd_tag         ,
+        i_a_valid       : i_a_rd_valid       ,
+        o_a_ready       : o_a_rd_ready       ,
+        o_a_status_valid: o_a_rd_status_valid,
+        o_a_status_error: o_a_rd_status_error,
+        i_b_pcie_addr   : i_b_rd_pcie_addr   ,
+        i_b_axi_addr    : i_b_rd_axi_addr    ,
+        i_b_len         : i_b_rd_len         ,
+        i_b_tag         : i_b_rd_tag         ,
+        i_b_valid       : i_b_rd_valid       ,
+        o_b_ready       : o_b_rd_ready       ,
+        o_b_status_valid: o_b_rd_status_valid,
+        o_b_status_error: o_b_rd_status_error,
+        o_pcie_addr     : o_rd_pcie_addr     ,
+        o_axi_addr      : o_rd_axi_addr      ,
+        o_len           : o_rd_len           ,
+        o_tag           : o_rd_tag           ,
+        o_valid         : o_rd_valid         ,
+        i_ready         : i_rd_ready         ,
+        i_status_valid  : i_rd_status_valid  ,
+        i_status_error  : i_rd_status_error  ,
+        o_own           : rd_own             ,
+    );
+
+    inst u_wr: dma_turn (
+        i_clk                                ,
+        i_rst                                ,
+        i_a_pcie_addr   : i_a_wr_pcie_addr   ,
+        i_a_axi_addr    : i_a_wr_axi_addr    ,
+        i_a_len         : i_a_wr_len         ,
+        i_a_tag         : i_a_wr_tag         ,
+        i_a_valid       : i_a_wr_valid       ,
+        o_a_ready       : o_a_wr_ready       ,
+        o_a_status_valid: o_a_wr_status_valid,
+        o_a_status_error: o_a_wr_status_error,
+        i_b_pcie_addr   : i_b_wr_pcie_addr   ,
+        i_b_axi_addr    : i_b_wr_axi_addr    ,
+        i_b_len         : i_b_wr_len         ,
+        i_b_tag         : i_b_wr_tag         ,
+        i_b_valid       : i_b_wr_valid       ,
+        o_b_ready       : o_b_wr_ready       ,
+        o_b_status_valid: o_b_wr_status_valid,
+        o_b_status_error: o_b_wr_status_error,
+        o_pcie_addr     : o_wr_pcie_addr     ,
+        o_axi_addr      : o_wr_axi_addr      ,
+        o_len           : o_wr_len           ,
+        o_tag           : o_wr_tag           ,
+        o_valid         : o_wr_valid         ,
+        i_ready         : i_wr_ready         ,
+        i_status_valid  : i_wr_status_valid  ,
+        i_status_error  : i_wr_status_error  ,
+        o_own           : wr_own             ,
+    );
+
+    always_comb {
+        // --- Write address, data and response: dma_rd's owner ---
+        m_a.awaddr   = s_axi.awaddr;
+        m_a.awsize   = s_axi.awsize;
+        m_a.awburst  = s_axi.awburst;
+        m_a.awcache  = s_axi.awcache;
+        m_a.awprot   = s_axi.awprot;
+        m_a.awid     = s_axi.awid;
+        m_a.awlen    = s_axi.awlen;
+        m_a.awlock   = s_axi.awlock;
+        m_a.awqos    = s_axi.awqos;
+        m_a.awregion = s_axi.awregion;
+        m_a.awuser   = s_axi.awuser;
+        m_a.awvalid  = s_axi.awvalid & ~rd_own;
+        m_b.awaddr   = s_axi.awaddr;
+        m_b.awsize   = s_axi.awsize;
+        m_b.awburst  = s_axi.awburst;
+        m_b.awcache  = s_axi.awcache;
+        m_b.awprot   = s_axi.awprot;
+        m_b.awid     = s_axi.awid;
+        m_b.awlen    = s_axi.awlen;
+        m_b.awlock   = s_axi.awlock;
+        m_b.awqos    = s_axi.awqos;
+        m_b.awregion = s_axi.awregion;
+        m_b.awuser   = s_axi.awuser;
+        m_b.awvalid  = s_axi.awvalid & rd_own;
+        s_axi.awready = if rd_own ? m_b.awready : m_a.awready;
+
+        m_a.wdata    = s_axi.wdata;
+        m_a.wstrb    = s_axi.wstrb;
+        m_a.wlast    = s_axi.wlast;
+        m_a.wuser    = s_axi.wuser;
+        m_a.wvalid   = s_axi.wvalid & ~rd_own;
+        m_b.wdata    = s_axi.wdata;
+        m_b.wstrb    = s_axi.wstrb;
+        m_b.wlast    = s_axi.wlast;
+        m_b.wuser    = s_axi.wuser;
+        m_b.wvalid   = s_axi.wvalid & rd_own;
+        s_axi.wready = if rd_own ? m_b.wready : m_a.wready;
+
+        m_a.bready   = s_axi.bready & ~rd_own;
+        m_b.bready   = s_axi.bready & rd_own;
+        s_axi.bvalid = if rd_own ? m_b.bvalid : m_a.bvalid;
+        s_axi.bresp  = if rd_own ? m_b.bresp : m_a.bresp;
+        s_axi.bid    = if rd_own ? m_b.bid : m_a.bid;
+        s_axi.buser  = if rd_own ? m_b.buser : m_a.buser;
+
+        // --- Read address and data: dma_wr's owner ---
+        m_a.araddr   = s_axi.araddr;
+        m_a.arsize   = s_axi.arsize;
+        m_a.arburst  = s_axi.arburst;
+        m_a.arcache  = s_axi.arcache;
+        m_a.arprot   = s_axi.arprot;
+        m_a.arid     = s_axi.arid;
+        m_a.arlen    = s_axi.arlen;
+        m_a.arlock   = s_axi.arlock;
+        m_a.arqos    = s_axi.arqos;
+        m_a.arregion = s_axi.arregion;
+        m_a.aruser   = s_axi.aruser;
+        m_a.arvalid  = s_axi.arvalid & ~wr_own;
+        m_b.araddr   = s_axi.araddr;
+        m_b.arsize   = s_axi.arsize;
+        m_b.arburst  = s_axi.arburst;
+        m_b.arcache  = s_axi.arcache;
+        m_b.arprot   = s_axi.arprot;
+        m_b.arid     = s_axi.arid;
+        m_b.arlen    = s_axi.arlen;
+        m_b.arlock   = s_axi.arlock;
+        m_b.arqos    = s_axi.arqos;
+        m_b.arregion = s_axi.arregion;
+        m_b.aruser   = s_axi.aruser;
+        m_b.arvalid  = s_axi.arvalid & wr_own;
+        s_axi.arready = if wr_own ? m_b.arready : m_a.arready;
+
+        m_a.rready   = s_axi.rready & ~wr_own;
+        m_b.rready   = s_axi.rready & wr_own;
+        s_axi.rvalid = if wr_own ? m_b.rvalid : m_a.rvalid;
+        s_axi.rdata  = if wr_own ? m_b.rdata : m_a.rdata;
+        s_axi.rresp  = if wr_own ? m_b.rresp : m_a.rresp;
+        s_axi.rid    = if wr_own ? m_b.rid : m_a.rid;
+        s_axi.rlast  = if wr_own ? m_b.rlast : m_a.rlast;
+        s_axi.ruser  = if wr_own ? m_b.ruser : m_a.ruser;
+    }
+}
+
+/// One engine's descriptors from two clients, one in the engine at a time.
+module dma_turn (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    i_a_pcie_addr   : input  logic<64>,
+    i_a_axi_addr    : input  logic<64>,
+    i_a_len         : input  logic<20>,
+    i_a_tag         : input  logic<8> ,
+    i_a_valid       : input  logic    ,
+    o_a_ready       : output logic    ,
+    o_a_status_valid: output logic    ,
+    o_a_status_error: output logic<4> ,
+
+    i_b_pcie_addr   : input  logic<64>,
+    i_b_axi_addr    : input  logic<64>,
+    i_b_len         : input  logic<20>,
+    i_b_tag         : input  logic<8> ,
+    i_b_valid       : input  logic    ,
+    o_b_ready       : output logic    ,
+    o_b_status_valid: output logic    ,
+    o_b_status_error: output logic<4> ,
+
+    o_pcie_addr   : output logic<64>,
+    o_axi_addr    : output logic<64>,
+    o_len         : output logic<20>,
+    o_tag         : output logic<8> ,
+    o_valid       : output logic    ,
+    i_ready       : input  logic    ,
+    i_status_valid: input  logic    ,
+    i_status_error: input  logic<4> ,
+
+    /// The client whose descriptor is in the engine, or was last: 0 is a.
+    o_own: output logic,
+) {
+    var busy: logic;
+    var own : logic;
+    var prev: logic;
+
+    // Ask the side that did not win last time first, as `hns::axi_rr` does.
+    // With a fixed priority, the host's `load` could keep the DUT waiting.
+    let pick: logic = if prev == 0 ? (if i_b_valid ? 1 : 0) : (if i_a_valid ? 0 : 1);
+
+    assign o_valid     = ~busy & (i_a_valid | i_b_valid);
+    assign o_pcie_addr = if pick ? i_b_pcie_addr : i_a_pcie_addr;
+    assign o_axi_addr  = if pick ? i_b_axi_addr : i_a_axi_addr;
+    assign o_len       = if pick ? i_b_len : i_a_len;
+    assign o_tag       = if pick ? i_b_tag : i_a_tag;
+    assign o_a_ready   = ~busy & ~pick & i_ready;
+    assign o_b_ready   = ~busy & pick & i_ready;
+
+    assign o_a_status_valid = i_status_valid & ~own;
+    assign o_b_status_valid = i_status_valid & own;
+    assign o_a_status_error = i_status_error;
+    assign o_b_status_error = i_status_error;
+
+    assign o_own = own;
+
+    always_ff {
+        if_reset {
+            busy = 0;
+            own  = 0;
+            prev = 1;
+        } else {
+            if busy && i_status_valid {
+                busy = 0;
+                prev = own;
+            } else if o_valid && i_ready {
+                busy = 1;
+                own  = pick;
+            }
+        }
+    }
+}

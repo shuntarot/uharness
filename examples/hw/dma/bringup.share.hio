@@ -1,0 +1,55 @@
+# dma on both memories -- sudo hio -p run bringup.share.hio
+# The design from Harness.share.toml: copy `d` on the board's DRAM, copy `h`
+# on host memory. The card has one DMA engine, and `h` and the host's
+# `load --dma` / `memtest --dma` take turns at it.
+
+echo == identity ==
+id
+# 1 once the memory controller is calibrated; nothing reaches it before
+read dmem_calib
+
+echo == hand the h copy a page of host memory ==
+hostmem attach hmem
+hostmem load hmem ramp.bin
+
+echo == the DMA into the DRAM, then the d copy ==
+load dmem ramp.bin --dma --verify
+write i_d_addr 0 0
+write i_d_dst 16000 0
+write i_d_size 2400
+write i_d_start 1
+write i_d_start 0
+sleep 10
+# 0, 300 (0x12c), 45150 (0xb05e), 0
+read o_d_busy
+read o_d_beats
+read o_d_sum
+read o_d_errors
+# 1 0, then 300 0
+read dmem 16000 2
+read dmem 18392 2
+
+echo == the h copy: 1 MB, then the host tests the DRAM by DMA ==
+# ramp.bin is at the start of the page and the rest is 0, so the sum is the
+# same as for ramp.bin alone. The copy takes about 2 ms. A host command takes
+# longer to set up, so the two seldom use the engine at the same moment.
+write i_h_addr 0 0
+write i_h_dst 0x100000 0
+write i_h_size 0x100000
+write i_h_start 1
+write i_h_start 0
+load dmem ramp.bin --at 2048 --dma --verify
+memtest dmem --dma --size 16M
+# 0, 131072 (0x20000), 45150 (0xb05e), 0
+read o_h_busy
+read o_h_beats
+read o_h_sum
+read o_h_errors
+# 1 0 2 0, then 300 0
+hostmem read hmem 0x100000 4
+hostmem read hmem 0x100958 2
+
+echo == nothing was refused ==
+read dmem_oor
+read hmem_oor
+read hmem_failed
