@@ -30,8 +30,11 @@ use crate::clock::ClockPlan;
 use crate::dut::{Dut, PortDirection};
 use crate::generate::MARKER;
 use crate::plan::Plan;
-use crate::regmap::{Access, ClearSource, DMA_GO, DUT_RESET, DUT_RESET_STATE, Kind, WORD_BITS};
+use crate::regmap::{
+    Access, ClearSource, DMA_GO, DUT_RESET, DUT_RESET_STATE, Kind, SEED_NAME, WORD_BITS,
+};
 use crate::unconnected::Kind as UnconnectedKind;
+use crate::unconnected::PinRole as UnconnectedPinRole;
 
 #[derive(Debug, Error, Diagnostic)]
 #[error("the generator produced Veryl it cannot parse: {message}")]
@@ -1539,6 +1542,26 @@ pub fn sim_module(plan: &Plan, prefixes: &DirectionPrefixes) -> String {
             heartbeat.resource
         ));
     }
+    // [pin] ports, so that a testbench can see and drive them. A tri-state
+    // pin has no driver here: its value, enable and input are ports as the
+    // DUT has them.
+    for pin in top_pins(plan) {
+        let ty = if pin.width == 1 {
+            "logic".to_string()
+        } else {
+            format!("logic<{}>", pin.width)
+        };
+        match &pin.tristate {
+            None => out.push_str(&format!("    {}: {} {tag}{ty},\n", pin.name, pin.direction)),
+            Some(tristate) => {
+                out.push_str(&format!("    pin_{}: output {tag}{ty},\n", tristate.o));
+                out.push_str(&format!("    pin_{}: output {tag}{ty},\n", tristate.t));
+                if let Some(i) = &tristate.i {
+                    out.push_str(&format!("    pin_{i}: input {tag}{ty},\n"));
+                }
+            }
+        }
+    }
     out.push_str(") {\n");
 
     // `core_body` expects the bus as `axi_*`; connect it to the ports.
@@ -2099,6 +2122,13 @@ fn core_body(
                 "    var t_{}_ready: {domain}logic;\n",
                 fifo.bundle
             ));
+            if plan.stalled(&fifo.bundle) {
+                out.push_str(&format!(
+                    "    var t_{}_fready: {domain}logic;\n",
+                    fifo.bundle
+                ));
+                out.push_str(&format!("    var stall_{}: {domain}logic;\n", fifo.bundle));
+            }
         }
         out.push_str(&format!(
             "    var t_{}_data: {domain}logic<{}>;\n",
@@ -2377,6 +2407,16 @@ fn core_body(
     }
     out.push('\n');
 
+    // The stall stages: their registers, and the seed they share.
+    let stalled = stalled_bundles(plan);
+    for bundle in &stalled {
+        out.push_str(&format!("    var t_{bundle}_delay: {domain}logic<8>;\n"));
+        out.push_str(&format!("    var t_{bundle}_jitter: {domain}logic;\n"));
+    }
+    if !stalled.is_empty() {
+        out.push_str(&format!("    var t_{SEED_NAME}: {domain}logic<32>;\n\n"));
+    }
+
     // The card-issued DMA: wires between the CSR and `hns::dma_gate`.
     for register in dma_registers(map) {
         out.push_str(&format!(
@@ -2490,6 +2530,12 @@ fn core_body(
                         logic(width)
                     ));
                 }
+            } else if plan.stalled(bundle) {
+                for (role, width) in xfer_stage_wires(hmem) {
+                    out.push_str(&format!(
+                        "    var h_{bundle}_{role}: {domain}logic<{width}>;\n"
+                    ));
+                }
             }
             continue;
         }
@@ -2509,31 +2555,8 @@ fn core_body(
         out.push_str(&format!(
             "    var t_{bundle}_oor: {domain}logic<{WORD_BITS}>;\n"
         ));
-        out.push_str(&format!("    var t_{bundle}_delay: {domain}logic<8>;\n"));
-        out.push_str(&format!("    var t_{bundle}_jitter: {domain}logic;\n"));
-        // Between the stress stage and the terminator; not the DUT-side `w_*`.
-        for (role, width) in [
-            ("rd_cmd_valid", 1),
-            ("rd_cmd_ready", 1),
-            ("rd_cmd_addr", hmem.cmd_addr_width),
-            ("rd_cmd_size", hmem.cmd_size_width),
-            ("rd_valid", 1),
-            ("rd_ready", 1),
-            ("rd_data", hmem.data_width),
-            ("rd_last", 1),
-            ("rd_error", 1),
-            ("wr_cmd_valid", 1),
-            ("wr_cmd_ready", 1),
-            ("wr_cmd_addr", hmem.cmd_addr_width),
-            ("wr_cmd_size", hmem.cmd_size_width),
-            ("wr_valid", 1),
-            ("wr_ready", 1),
-            ("wr_data", hmem.data_width),
-            ("wr_strb", hmem.data_width / 8),
-            ("wr_last", 1),
-            ("wr_done", 1),
-            ("wr_done_error", 1),
-        ] {
+        // Between the stall stage and the terminator; not the DUT-side `w_*`.
+        for (role, width) in xfer_stage_wires(hmem) {
             out.push_str(&format!(
                 "    var h_{bundle}_{role}: {domain}logic<{width}>;\n"
             ));
@@ -3122,6 +3145,17 @@ fn core_body(
         "    assign t_{DUT_RESET_STATE} = dut_rst_req;\n\n"
     ));
     for (bundle, pkg) in &fenced {
+        // The stall stage comes after the fence, so the fence sees the DUT's
+        // own handshakes, and before the arbiter, so the host is never stalled.
+        let stalled = plan.stalled(bundle);
+        let fenced_to = if stalled {
+            out.push_str(&format!(
+                "    inst jaxi_{bundle}: {domain}$std::axi4_if::<{pkg}>;\n"
+            ));
+            format!("jaxi_{bundle}")
+        } else {
+            format!("faxi_{bundle}")
+        };
         out.push_str(&format!(
             "    inst u_fence_{bundle}: hns::axi_fence::<{pkg}> (\n"
         ));
@@ -3131,8 +3165,24 @@ fn core_body(
         out.push_str(&format!("        o_closed: fence_closed_{bundle},\n"));
         out.push_str(&format!("        o_idle  : fence_idle_{bundle},\n"));
         out.push_str(&format!("        s_axi   : axi_{bundle},\n"));
-        out.push_str(&format!("        m_axi   : faxi_{bundle},\n"));
+        out.push_str(&format!("        m_axi   : {fenced_to},\n"));
         out.push_str("    );\n\n");
+        if stalled {
+            out.push_str(&format!(
+                "    inst u_stall_{bundle}: hns::axi_stall::<{pkg}> #(\n"
+            ));
+            out.push_str(&format!("        SALT: {},\n", stall_salt(bundle)));
+            out.push_str("    ) (\n");
+            out.push_str(&format!("        i_clk   : {clk},\n"));
+            out.push_str(&format!("        i_rst   : {rst},\n"));
+            out.push_str(&format!("        i_seed  : t_{SEED_NAME},\n"));
+            out.push_str("        i_hold  : dut_rst_req,\n");
+            out.push_str(&format!("        i_delay : t_{bundle}_delay,\n"));
+            out.push_str(&format!("        i_jitter: t_{bundle}_jitter,\n"));
+            out.push_str(&format!("        s_axi   : jaxi_{bundle},\n"));
+            out.push_str(&format!("        m_axi   : faxi_{bundle},\n"));
+            out.push_str("    );\n\n");
+        }
     }
     // `hns_sim` has no `hns_clk`, so the DUT reset is made here. It comes from
     // a flop, so no LUT drives the reset net.
@@ -3279,9 +3329,17 @@ fn core_body(
         } else {
             format!("w_{}", fifo.valid)
         };
-        out.push_str(&format!("        i_push: {push},\n"));
+        // A stall hides both the push and ready: hiding ready alone would
+        // store a beat the DUT does not see taken, and it would send it again.
+        let stalled = fifo.ready.is_some() && plan.stalled(bundle);
+        if stalled {
+            out.push_str(&format!("        i_push: ({push}) & ~stall_{bundle},\n"));
+        } else {
+            out.push_str(&format!("        i_push: {push},\n"));
+        }
         out.push_str(&format!("        i_data: w_{},\n", fifo.data));
         match &fifo.ready {
+            Some(_) if stalled => out.push_str(&format!("        o_ready: t_{bundle}_fready,\n")),
             Some(_) => out.push_str(&format!("        o_ready: t_{bundle}_ready,\n")),
             // The DUT cannot be stalled. Nobody reads ready; drops are counted.
             None => out.push_str("        o_ready: _,\n"),
@@ -3295,6 +3353,25 @@ fn core_body(
             out.push_str("        o_drops: _,\n");
         }
         out.push_str("    );\n\n");
+
+        if stalled {
+            out.push_str(&format!("    inst u_stall_{bundle}: hns::stall #(\n"));
+            out.push_str(&format!("        SALT: {},\n", stall_salt(bundle)));
+            out.push_str("    ) (\n");
+            out.push_str(&format!("        i_clk   : {clk},\n"));
+            out.push_str(&format!("        i_rst   : {rst},\n"));
+            out.push_str(&format!("        i_seed  : t_{SEED_NAME},\n"));
+            out.push_str("        i_hold  : dut_rst_req,\n");
+            out.push_str(&format!("        i_delay : t_{bundle}_delay,\n"));
+            out.push_str(&format!("        i_jitter: t_{bundle}_jitter,\n"));
+            out.push_str(&format!("        i_offer : {push},\n"));
+            out.push_str(&format!("        i_fire  : ({push}) & t_{bundle}_ready,\n"));
+            out.push_str(&format!("        o_stall : stall_{bundle},\n"));
+            out.push_str("    );\n");
+            out.push_str(&format!(
+                "    assign t_{bundle}_ready = t_{bundle}_fready & ~stall_{bundle};\n\n"
+            ));
+        }
 
         // Undo the inversion here (`ready = "!i_stall"`).
         if let Some(ready) = &fifo.ready {
@@ -3640,118 +3717,16 @@ fn core_body(
 
     // The host_mem stand-in: a BRAM behind a transfer-level interface.
     //
-    // A stress stage (`hns::delay`) sits in front. It passes through by
-    // default, but can add wait states without a new synthesis. The stand-in
-    // is fast and regular, so without it the DUT is never tested against a
-    // slow partner on the board.
+    // With `stall = true`, a stall stage (`hns::delay`) sits in front. It
+    // passes through until the host asks for wait states, so no new synthesis
+    // is needed. The stand-in is fast and regular, so without it the DUT is
+    // never tested against a slow partner on the board.
     for hmem in plan.host_mems.iter().filter(|h| h.is_host()) {
         host_mem_instance(out, plan, hmem, second_master, &d);
     }
     for hmem in plan.host_mems.iter().filter(|h| !h.is_host()) {
         let bundle = &hmem.bundle;
-        let dut_side = |port: Option<&String>, width: usize, input: bool| -> String {
-            match port {
-                Some(name) => format!("w_{name}"),
-                None if input => format!("{width}'b0"),
-                None => "_".to_string(),
-            }
-        };
-        let read = hmem.read.as_ref();
-        let write = hmem.write.as_ref();
-
-        out.push_str(&format!("    inst u_delay_{bundle}: hns::delay #(\n"));
-        out.push_str(&format!("        DW: {},\n", hmem.data_width));
-        out.push_str(&format!("        ADDR_W: {},\n", hmem.cmd_addr_width));
-        out.push_str(&format!("        SIZE_W: {},\n", hmem.cmd_size_width));
-        out.push_str("    ) (\n");
-        out.push_str(&format!("        i_clk: {clk},\n"));
-        out.push_str(&format!("        i_rst: {rst},\n"));
-        out.push_str(&format!("        i_delay: t_{bundle}_delay,\n"));
-        out.push_str(&format!("        i_jitter: t_{bundle}_jitter,\n"));
-        for (port, chosen, width, input) in [
-            ("i_d_rd_cmd_valid", read.map(|r| &r.cmd_valid), 1, true),
-            ("o_d_rd_cmd_ready", read.map(|r| &r.cmd_ready), 1, false),
-            (
-                "i_d_rd_cmd_addr",
-                read.map(|r| &r.cmd_addr),
-                hmem.cmd_addr_width,
-                true,
-            ),
-            (
-                "i_d_rd_cmd_size",
-                read.map(|r| &r.cmd_size),
-                hmem.cmd_size_width,
-                true,
-            ),
-            ("o_d_rd_valid", read.map(|r| &r.valid), 1, false),
-            ("i_d_rd_ready", read.map(|r| &r.ready), 1, true),
-            ("o_d_rd_data", read.map(|r| &r.data), hmem.data_width, false),
-            ("o_d_rd_last", read.map(|r| &r.last), 1, false),
-            ("o_d_rd_error", read.map(|r| &r.error), 1, false),
-            ("i_d_wr_cmd_valid", write.map(|w| &w.cmd_valid), 1, true),
-            ("o_d_wr_cmd_ready", write.map(|w| &w.cmd_ready), 1, false),
-            (
-                "i_d_wr_cmd_addr",
-                write.map(|w| &w.cmd_addr),
-                hmem.cmd_addr_width,
-                true,
-            ),
-            (
-                "i_d_wr_cmd_size",
-                write.map(|w| &w.cmd_size),
-                hmem.cmd_size_width,
-                true,
-            ),
-            ("i_d_wr_valid", write.map(|w| &w.valid), 1, true),
-            ("o_d_wr_ready", write.map(|w| &w.ready), 1, false),
-            ("i_d_wr_data", write.map(|w| &w.data), hmem.data_width, true),
-            (
-                "i_d_wr_strb",
-                write.and_then(|w| w.strb.as_ref()),
-                hmem.data_width / 8,
-                true,
-            ),
-            ("i_d_wr_last", write.map(|w| &w.last), 1, true),
-            ("o_d_wr_done", write.map(|w| &w.done_valid), 1, false),
-            ("o_d_wr_done_error", write.map(|w| &w.done_error), 1, false),
-        ] {
-            out.push_str(&format!(
-                "        {port}: {},\n",
-                dut_side(chosen, width, input)
-            ));
-        }
-        for role in [
-            "rd_cmd_valid",
-            "rd_cmd_ready",
-            "rd_cmd_addr",
-            "rd_cmd_size",
-            "rd_valid",
-            "rd_ready",
-            "rd_data",
-            "rd_last",
-            "rd_error",
-            "wr_cmd_valid",
-            "wr_cmd_ready",
-            "wr_cmd_addr",
-            "wr_cmd_size",
-            "wr_valid",
-            "wr_ready",
-            "wr_data",
-            "wr_strb",
-            "wr_last",
-            "wr_done",
-            "wr_done_error",
-        ] {
-            // Directions seen from the terminator side. The terminator drives
-            // ready, data and done.
-            let prefix = match role {
-                "rd_cmd_ready" | "rd_valid" | "rd_data" | "rd_last" | "rd_error"
-                | "wr_cmd_ready" | "wr_ready" | "wr_done" | "wr_done_error" => "i_t_",
-                _ => "o_t_",
-            };
-            out.push_str(&format!("        {prefix}{role}: h_{bundle}_{role},\n"));
-        }
-        out.push_str("    );\n\n");
+        delay_instance(out, plan, hmem, &d);
 
         out.push_str(&format!("    inst u_hmem_{bundle}: hns::hmem #(\n"));
         // If the DUT has a byte strobe, it is carried as is. Without one, each
@@ -3942,31 +3917,151 @@ pub fn uart_module(plan: &crate::heartbeat::HeartbeatPlan) -> String {
     out
 }
 
-/// Ports terminated by `[pin]`, in DUT declaration order:
-/// (port name, resource name, width, domain).
+/// A port of `hns_top` that ends at board pins.
+struct TopPin {
+    /// The top-level port: the DUT port name for a direct pin,
+    /// `o_<resource>` / `io_<resource>` for a tri-state one.
+    name: String,
+    /// `output`, `input` or `inout`.
+    direction: &'static str,
+    width: usize,
+    /// The clock domain written on the port, as `port_domain` gives it.
+    domain: String,
+    /// One per bit, bit 0 first.
+    pins: Vec<String>,
+    standard: Option<String>,
+    resource: String,
+    /// For a tri-state pin: the DUT ports behind it.
+    tristate: Option<Tristate>,
+}
+
+/// The DUT side of a tri-state pin. The DUT ports connect to `pin_<port>`.
+struct Tristate {
+    o: String,
+    t: String,
+    i: Option<String>,
+}
+
+/// Ports terminated by `[pin]`, as top-level ports, in DUT declaration order
+/// of the port that names the pin.
 ///
 /// A port with an unknown width is left out. Emitting it as one bit would be
-/// a silent default.
-fn pin_ports(plan: &Plan) -> Vec<(String, String, usize, String)> {
-    plan.unconnected
-        .iter()
-        .filter_map(|entry| match &entry.kind {
-            UnconnectedKind::Pin { resource, .. } => {
-                let port = plan.dut.ports.iter().find(|p| p.name == entry.port)?;
-                let width = match port.signals.as_slice() {
-                    [signal] => signal.width?,
-                    _ => return None,
-                };
-                Some((
-                    entry.port.clone(),
-                    resource.clone(),
-                    width,
-                    port_domain(plan, port),
-                ))
-            }
+/// a silent default (`unconnected::resolve` refuses it first).
+fn top_pins(plan: &Plan) -> Vec<TopPin> {
+    let member = |resource: &str, role: UnconnectedPinRole| {
+        plan.unconnected.iter().find_map(|entry| match &entry.kind {
+            UnconnectedKind::Pin {
+                resource: r,
+                role: x,
+                ..
+            } if r == resource && *x == role => Some(entry.port.clone()),
             _ => None,
         })
+    };
+    plan.unconnected
+        .iter()
+        .filter_map(|entry| {
+            let UnconnectedKind::Pin {
+                resource,
+                role,
+                pins,
+                standard,
+            } = &entry.kind
+            else {
+                return None;
+            };
+            let port = plan.dut.ports.iter().find(|p| p.name == entry.port)?;
+            let width = port.width()?;
+            let (name, direction, tristate) = match role {
+                UnconnectedPinRole::Direct => (
+                    entry.port.clone(),
+                    if port.direction == crate::dut::PortDirection::Input {
+                        "input"
+                    } else {
+                        "output"
+                    },
+                    None,
+                ),
+                UnconnectedPinRole::Out => {
+                    let t = member(resource, UnconnectedPinRole::Enable)?;
+                    let i = member(resource, UnconnectedPinRole::In);
+                    let (name, direction) = match i {
+                        Some(_) => (format!("io_{resource}"), "inout"),
+                        None => (format!("o_{resource}"), "output"),
+                    };
+                    (
+                        name,
+                        direction,
+                        Some(Tristate {
+                            o: entry.port.clone(),
+                            t,
+                            i,
+                        }),
+                    )
+                }
+                // The enable and the input come with their `o`.
+                UnconnectedPinRole::Enable | UnconnectedPinRole::In => return None,
+            };
+            Some(TopPin {
+                name,
+                direction,
+                width,
+                domain: port_domain(plan, port),
+                pins: pins.clone(),
+                standard: standard.clone(),
+                resource: resource.clone(),
+                tristate,
+            })
+        })
         .collect()
+}
+
+/// The driver of each tri-state pin: `t` = 1 lets go of it, and `i` reads
+/// it. Vivado makes an `OBUFT` or `IOBUF` per bit from this.
+fn tristate_body(pins: &[TopPin]) -> String {
+    let mut out = String::new();
+    for pin in pins {
+        let Some(tristate) = &pin.tristate else {
+            continue;
+        };
+        let ty = if pin.width == 1 {
+            "logic".to_string()
+        } else {
+            format!("logic<{}>", pin.width)
+        };
+        out.push_str(&format!(
+            "    // [pin] {}: `{}` drives it, `{}` = 1 lets go of it (high impedance).\n",
+            pin.resource, tristate.o, tristate.t
+        ));
+        for port in std::iter::once(&tristate.o)
+            .chain(std::iter::once(&tristate.t))
+            .chain(tristate.i.iter())
+        {
+            out.push_str(&format!("    var pin_{port}: {}{ty};\n", pin.domain));
+        }
+        let (o, t) = (&tristate.o, &tristate.t);
+        if pin.width == 1 {
+            out.push_str(&format!(
+                "    assign {} = if pin_{t} ? 1'bz : pin_{o};\n",
+                pin.name
+            ));
+        } else {
+            out.push_str(&format!(
+                "    for b in 0..{} :g_pin_{} {{\n",
+                pin.width, pin.resource
+            ));
+            out.push_str(&format!(
+                "        assign {}[b] = if pin_{t}[b] ? 1'bz : pin_{o}[b];\n",
+                pin.name
+            ));
+            out.push_str("    }\n");
+        }
+        if let Some(i) = &tristate.i {
+            out.push_str(&format!("    assign pin_{i} = {};\n", pin.name));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// The clock domain written on a top-level port. It maps the DUT port domain
@@ -4701,6 +4796,179 @@ const HOST_MEM_AXI_ADDR: u32 = 16;
 /// with the ID it was given.
 const HOST_MEM_AXI_ID: u32 = 8;
 
+/// The stall stage (`hns::delay`) between a transfer-level DUT port and its
+/// terminator: the DUT's `w_*` on one side, `h_<bundle>_*` on the other.
+fn delay_instance(
+    out: &mut String,
+    plan: &Plan,
+    hmem: &crate::terminator::HostMemPlan,
+    d: &Domain<'_>,
+) {
+    let (clk, rst) = (d.clk, d.rst);
+    let bundle = &hmem.bundle;
+    let dut_side = |port: Option<&String>, width: usize, input: bool| -> String {
+        match port {
+            Some(name) => format!("w_{name}"),
+            None if input => format!("{width}'b0"),
+            None => "_".to_string(),
+        }
+    };
+    let read = hmem.read.as_ref();
+    let write = hmem.write.as_ref();
+
+    out.push_str(&format!("    inst u_delay_{bundle}: hns::delay #(\n"));
+    out.push_str(&format!("        DW: {},\n", hmem.data_width));
+    out.push_str(&format!("        ADDR_W: {},\n", hmem.cmd_addr_width));
+    out.push_str(&format!("        SIZE_W: {},\n", hmem.cmd_size_width));
+    out.push_str(&format!("        SALT: {},\n", stall_salt(bundle)));
+    out.push_str("    ) (\n");
+    out.push_str(&format!("        i_clk: {clk},\n"));
+    out.push_str(&format!("        i_rst: {rst},\n"));
+    // Without a stage, the constants make it a few wires: synthesis keeps
+    // no counter and no gate.
+    if plan.stalled(bundle) {
+        out.push_str(&format!("        i_seed: t_{SEED_NAME},\n"));
+        out.push_str("        i_hold: dut_rst_req,\n");
+        out.push_str(&format!("        i_delay: t_{bundle}_delay,\n"));
+        out.push_str(&format!("        i_jitter: t_{bundle}_jitter,\n"));
+    } else {
+        out.push_str("        i_seed: 0,\n");
+        out.push_str("        i_hold: 0,\n");
+        out.push_str("        i_delay: 0,\n");
+        out.push_str("        i_jitter: 0,\n");
+    }
+    for (port, chosen, width, input) in [
+        ("i_d_rd_cmd_valid", read.map(|r| &r.cmd_valid), 1, true),
+        ("o_d_rd_cmd_ready", read.map(|r| &r.cmd_ready), 1, false),
+        (
+            "i_d_rd_cmd_addr",
+            read.map(|r| &r.cmd_addr),
+            hmem.cmd_addr_width,
+            true,
+        ),
+        (
+            "i_d_rd_cmd_size",
+            read.map(|r| &r.cmd_size),
+            hmem.cmd_size_width,
+            true,
+        ),
+        ("o_d_rd_valid", read.map(|r| &r.valid), 1, false),
+        ("i_d_rd_ready", read.map(|r| &r.ready), 1, true),
+        ("o_d_rd_data", read.map(|r| &r.data), hmem.data_width, false),
+        ("o_d_rd_last", read.map(|r| &r.last), 1, false),
+        ("o_d_rd_error", read.map(|r| &r.error), 1, false),
+        ("i_d_wr_cmd_valid", write.map(|w| &w.cmd_valid), 1, true),
+        ("o_d_wr_cmd_ready", write.map(|w| &w.cmd_ready), 1, false),
+        (
+            "i_d_wr_cmd_addr",
+            write.map(|w| &w.cmd_addr),
+            hmem.cmd_addr_width,
+            true,
+        ),
+        (
+            "i_d_wr_cmd_size",
+            write.map(|w| &w.cmd_size),
+            hmem.cmd_size_width,
+            true,
+        ),
+        ("i_d_wr_valid", write.map(|w| &w.valid), 1, true),
+        ("o_d_wr_ready", write.map(|w| &w.ready), 1, false),
+        ("i_d_wr_data", write.map(|w| &w.data), hmem.data_width, true),
+        (
+            "i_d_wr_strb",
+            write.and_then(|w| w.strb.as_ref()),
+            hmem.data_width / 8,
+            true,
+        ),
+        ("i_d_wr_last", write.map(|w| &w.last), 1, true),
+        ("o_d_wr_done", write.map(|w| &w.done_valid), 1, false),
+        ("o_d_wr_done_error", write.map(|w| &w.done_error), 1, false),
+    ] {
+        out.push_str(&format!(
+            "        {port}: {},\n",
+            dut_side(chosen, width, input)
+        ));
+    }
+    for role in [
+        "rd_cmd_valid",
+        "rd_cmd_ready",
+        "rd_cmd_addr",
+        "rd_cmd_size",
+        "rd_valid",
+        "rd_ready",
+        "rd_data",
+        "rd_last",
+        "rd_error",
+        "wr_cmd_valid",
+        "wr_cmd_ready",
+        "wr_cmd_addr",
+        "wr_cmd_size",
+        "wr_valid",
+        "wr_ready",
+        "wr_data",
+        "wr_strb",
+        "wr_last",
+        "wr_done",
+        "wr_done_error",
+    ] {
+        // Directions seen from the terminator side. The terminator drives
+        // ready, data and done.
+        let prefix = match role {
+            "rd_cmd_ready" | "rd_valid" | "rd_data" | "rd_last" | "rd_error" | "wr_cmd_ready"
+            | "wr_ready" | "wr_done" | "wr_done_error" => "i_t_",
+            _ => "o_t_",
+        };
+        out.push_str(&format!("        {prefix}{role}: h_{bundle}_{role},\n"));
+    }
+    out.push_str("    );\n\n");
+}
+
+/// The bundles that get a stall stage (`terminator::stalled_bundles`).
+fn stalled_bundles(plan: &Plan) -> Vec<String> {
+    crate::terminator::stalled_bundles(
+        &plan.loaded.manifest,
+        &plan.fifos,
+        &plan.host_mems,
+        &plan.axi_mems,
+    )
+}
+
+/// A stage's own mix for the shared seed, from its bundle name (FNV-1a), so
+/// that two bundles never stall in step.
+fn stall_salt(bundle: &str) -> String {
+    let hash = bundle.bytes().fold(0x811c_9dc5u32, |h, b| {
+        (h ^ b as u32).wrapping_mul(0x0100_0193)
+    });
+    format!("32'h{hash:08x}")
+}
+
+/// The wires between `hns::delay` and the terminator behind it, named by the
+/// terminator side's role.
+fn xfer_stage_wires(hmem: &crate::terminator::HostMemPlan) -> Vec<(&'static str, usize)> {
+    vec![
+        ("rd_cmd_valid", 1),
+        ("rd_cmd_ready", 1),
+        ("rd_cmd_addr", hmem.cmd_addr_width),
+        ("rd_cmd_size", hmem.cmd_size_width),
+        ("rd_valid", 1),
+        ("rd_ready", 1),
+        ("rd_data", hmem.data_width),
+        ("rd_last", 1),
+        ("rd_error", 1),
+        ("wr_cmd_valid", 1),
+        ("wr_cmd_ready", 1),
+        ("wr_cmd_addr", hmem.cmd_addr_width),
+        ("wr_cmd_size", hmem.cmd_size_width),
+        ("wr_valid", 1),
+        ("wr_ready", 1),
+        ("wr_data", hmem.data_width),
+        ("wr_strb", hmem.data_width / 8),
+        ("wr_last", 1),
+        ("wr_done", 1),
+        ("wr_done_error", 1),
+    ]
+}
+
 /// The AXI4 masters of the DUT that get a reset fence, with their types: the
 /// memories on AXI4, and `host_mem` on AXI4.
 fn fenced_masters(plan: &Plan) -> Vec<(&str, &str)> {
@@ -4870,9 +5138,21 @@ fn host_mem_instance(
         ));
     }
 
+    // A transfer-level port meets the stall stage first.
+    let staged = hmem.axi.is_none() && plan.stalled(bundle);
+    if staged {
+        delay_instance(out, plan, hmem, d);
+    }
     let dut_side = |name: &str, port: Option<&String>, width: usize, input: bool| -> String {
         if hmem.axi.is_some() {
             return format!("hx_{bundle}_{}", &name[2..]);
+        }
+        if staged {
+            let role = match &name[2..] {
+                "wr_done_valid" => "wr_done",
+                role => role,
+            };
+            return format!("h_{bundle}_{role}");
         }
         match port {
             Some(name) => format!("w_{name}"),
@@ -5484,7 +5764,7 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
     );
 
     // Ports terminated by `[pin]` pass through the top to physical pins.
-    let pins = pin_ports(plan);
+    let pins = top_pins(plan);
     if !pins.is_empty() {
         out.push_str("/// Ports the manifest sent to board pins ([pin]) also reach the top.\n");
     }
@@ -5521,15 +5801,20 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
             heartbeat.resource, clocks.window
         ));
     }
-    for (port, _resource, width, domain) in &pins {
-        let ty = if *width == 1 {
+    for pin in &pins {
+        let ty = if pin.width == 1 {
             "logic".to_string()
         } else {
-            format!("logic<{width}>")
+            format!("logic<{}>", pin.width)
         };
-        // Use the DUT port name as is. It already has a direction prefix;
-        // adding `o_` would give `o_o_uart_tx`.
-        out.push_str(&format!("    {port}: output {domain}{ty},\n"));
+        // A direct pin uses the DUT port name as is. It already has a
+        // direction prefix; adding `o_` would give `o_o_uart_tx`. Veryl
+        // requires `tri` on a port with a tri-state driver.
+        let tri = if pin.tristate.is_some() { "tri " } else { "" };
+        out.push_str(&format!(
+            "    {}: {} {}{tri}{ty},\n",
+            pin.name, pin.direction, pin.domain
+        ));
     }
     // The clock that the controller takes itself. It does not go through the
     // MMCM, so the board pins reach the top directly.
@@ -5630,6 +5915,10 @@ pub fn top_module(plan: &Plan, prefixes: &DirectionPrefixes, csr_ident: &str) ->
         out.push_str(&format!("        o_tx : o_{},\n", heartbeat.resource));
         out.push_str("    );\n\n");
     }
+
+    // Tri-state pins. Declared before `core_body`, which connects the DUT
+    // to them.
+    out.push_str(&tristate_body(&pins));
 
     // The PCIe end. The hard block has 121 ports, but from here it is a few
     // wires and one AXI4-Lite bus (`rtl/pcie/rtl/hns_pcie_wrap.v`).
@@ -6261,8 +6550,13 @@ fn connection(
         return match &entry.kind {
             UnconnectedKind::Tie(value) => value.text.clone(),
             UnconnectedKind::Open => "_".to_string(),
-            // A pin terminator passes through to a port of `hns_top`.
-            UnconnectedKind::Pin { .. } => port.name.clone(),
+            // A direct pin passes through to a port of `hns_top`. The ports of
+            // a tri-state pin meet its driver in `pin_<port>`.
+            UnconnectedKind::Pin {
+                role: UnconnectedPinRole::Direct,
+                ..
+            } => port.name.clone(),
+            UnconnectedKind::Pin { .. } => format!("pin_{}", port.name),
         };
     }
 
@@ -6660,25 +6954,27 @@ pub fn board_xdc(plan: &Plan) -> String {
         ));
     }
 
-    // Ports terminated by `[pin]`. The values come from the target.
-    let pins = pin_ports(plan);
+    // Ports terminated by `[pin]`, one line per bit. The values come from
+    // the target. Only the pin and its IOSTANDARD: the timing of a pin is the
+    // DUT's to state, with `[vivado] tcl`.
+    let pins = top_pins(plan);
     if !pins.is_empty() {
         out.push_str("# Ports the manifest sent to board pins ([pin]).\n");
-        for (port, resource, _width, _domain) in &pins {
-            let Some(entry) = plan.unconnected.iter().find(|entry| &entry.port == port) else {
+        for pin in &pins {
+            let Some(standard) = &pin.standard else {
                 continue;
             };
-            let UnconnectedKind::Pin {
-                pin: Some(pin),
-                standard: Some(standard),
-                ..
-            } = &entry.kind
-            else {
-                continue;
-            };
-            out.push_str(&format!(
-                "set_property -dict {{ PACKAGE_PIN {pin} IOSTANDARD {standard} }} [get_ports {{ {port} }}]  ;# {resource}\n"
-            ));
+            for (bit, package_pin) in pin.pins.iter().enumerate() {
+                let port = if pin.width == 1 {
+                    pin.name.clone()
+                } else {
+                    format!("{}[{bit}]", pin.name)
+                };
+                out.push_str(&format!(
+                    "set_property -dict {{ PACKAGE_PIN {package_pin} IOSTANDARD {standard} }} [get_ports {{ {port} }}]  ;# {}\n",
+                    pin.resource
+                ));
+            }
         }
         out.push('\n');
     }
@@ -7976,9 +8272,14 @@ fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
             "where `{bundle}`'s window starts in the memory, for this transport. `hio` moves it for you"
         )),
         Some("delay") => notes.push(
-            "cycles to hold each answer back, to make the DUT wait on purpose. 0 by default".to_string(),
+            "cycles to hold each beat back before it goes through, to make the DUT wait on purpose. 0 by default".to_string(),
         ),
-        Some("jitter") => notes.push("1 varies the hold-back from answer to answer".to_string()),
+        Some("jitter") => notes.push(
+            "1 varies the hold-back at random, from `harness_seed`".to_string(),
+        ),
+        Some(SEED_NAME) => notes.push(
+            "the seed of every `_jitter`. It is loaded while the DUT is in reset, so the same seed gives the same stalls on every run".to_string(),
+        ),
         Some(role) if crate::regmap::PCIE_TLP_COUNTERS
             .iter()
             .any(|(name, _)| *name == role) =>

@@ -1,0 +1,156 @@
+/// `hns::delay` for an AXI4 master: holds back each beat of the five
+/// channels, so the DUT meets a slow and irregular memory.
+///
+/// It sits on the DUT's side of the arbiter, so the host's own accesses are
+/// never stalled. Off by default: `i_delay = 0` passes everything through
+/// combinationally.
+pub module axi_stall::<PKG: $std::axi4_prototype> #(
+    /// Mixed into the seed of each channel (see `hns::stall`).
+    param SALT: logic<32> = 32'h1234_5678,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    i_seed: input logic<32>,
+    /// Restart the random numbers from the seed (the DUT is in reset).
+    i_hold: input logic,
+    /// Cycles to hold each beat back. 0 disables the stage.
+    i_delay: input logic<8>,
+    /// Vary the hold-back between 0 and `i_delay` instead of using it exactly.
+    i_jitter: input logic,
+
+    /// Master side.
+    s_axi: modport $std::axi4_if::<PKG>::slave,
+    /// Downstream side.
+    m_axi: modport $std::axi4_if::<PKG>::master,
+) {
+    var s_aw: logic;
+    var s_w : logic;
+    var s_b : logic;
+    var s_ar: logic;
+    var s_r : logic;
+
+    // Each channel stalls on its own schedule; sharing one would make them
+    // move together, which a real memory never does.
+    inst g_aw: stall #(
+        SALT: SALT ^ 32'h0000_a5a5,
+    ) (
+        i_clk                                   ,
+        i_rst                                   ,
+        i_seed                                  ,
+        i_hold                                  ,
+        i_delay                                 ,
+        i_jitter                                ,
+        i_offer : s_axi.awvalid                 ,
+        i_fire  : m_axi.awvalid && m_axi.awready,
+        o_stall : s_aw                          ,
+    );
+    inst g_w: stall #(
+        SALT: SALT ^ 32'h0000_3c3c,
+    ) (
+        i_clk                                 ,
+        i_rst                                 ,
+        i_seed                                ,
+        i_hold                                ,
+        i_delay                               ,
+        i_jitter                              ,
+        i_offer : s_axi.wvalid                ,
+        i_fire  : m_axi.wvalid && m_axi.wready,
+        o_stall : s_w                         ,
+    );
+    inst g_b: stall #(
+        SALT: SALT ^ 32'h0000_9696,
+    ) (
+        i_clk                                 ,
+        i_rst                                 ,
+        i_seed                                ,
+        i_hold                                ,
+        i_delay                               ,
+        i_jitter                              ,
+        i_offer : m_axi.bvalid                ,
+        i_fire  : s_axi.bvalid && s_axi.bready,
+        o_stall : s_b                         ,
+    );
+    inst g_ar: stall #(
+        SALT: SALT ^ 32'h0000_0ff0,
+    ) (
+        i_clk                                   ,
+        i_rst                                   ,
+        i_seed                                  ,
+        i_hold                                  ,
+        i_delay                                 ,
+        i_jitter                                ,
+        i_offer : s_axi.arvalid                 ,
+        i_fire  : m_axi.arvalid && m_axi.arready,
+        o_stall : s_ar                          ,
+    );
+    inst g_r: stall #(
+        SALT: SALT ^ 32'h0000_6c6c,
+    ) (
+        i_clk                                 ,
+        i_rst                                 ,
+        i_seed                                ,
+        i_hold                                ,
+        i_delay                               ,
+        i_jitter                              ,
+        i_offer : m_axi.rvalid                ,
+        i_fire  : s_axi.rvalid && s_axi.rready,
+        o_stall : s_r                         ,
+    );
+
+    always_comb {
+        // --- Write address ---
+        m_axi.awaddr   = s_axi.awaddr;
+        m_axi.awsize   = s_axi.awsize;
+        m_axi.awburst  = s_axi.awburst;
+        m_axi.awcache  = s_axi.awcache;
+        m_axi.awprot   = s_axi.awprot;
+        m_axi.awid     = s_axi.awid;
+        m_axi.awlen    = s_axi.awlen;
+        m_axi.awlock   = s_axi.awlock;
+        m_axi.awqos    = s_axi.awqos;
+        m_axi.awregion = s_axi.awregion;
+        m_axi.awuser   = s_axi.awuser;
+        m_axi.awvalid  = s_axi.awvalid && !s_aw;
+        s_axi.awready  = m_axi.awready && !s_aw;
+
+        // --- Write data ---
+        m_axi.wdata  = s_axi.wdata;
+        m_axi.wstrb  = s_axi.wstrb;
+        m_axi.wlast  = s_axi.wlast;
+        m_axi.wuser  = s_axi.wuser;
+        m_axi.wvalid = s_axi.wvalid && !s_w;
+        s_axi.wready = m_axi.wready && !s_w;
+
+        // --- Write response ---
+        s_axi.bresp  = m_axi.bresp;
+        s_axi.bid    = m_axi.bid;
+        s_axi.buser  = m_axi.buser;
+        s_axi.bvalid = m_axi.bvalid && !s_b;
+        m_axi.bready = s_axi.bready && !s_b;
+
+        // --- Read address ---
+        m_axi.araddr   = s_axi.araddr;
+        m_axi.arsize   = s_axi.arsize;
+        m_axi.arburst  = s_axi.arburst;
+        m_axi.arcache  = s_axi.arcache;
+        m_axi.arprot   = s_axi.arprot;
+        m_axi.arid     = s_axi.arid;
+        m_axi.arlen    = s_axi.arlen;
+        m_axi.arlock   = s_axi.arlock;
+        m_axi.arqos    = s_axi.arqos;
+        m_axi.arregion = s_axi.arregion;
+        m_axi.aruser   = s_axi.aruser;
+        m_axi.arvalid  = s_axi.arvalid && !s_ar;
+        s_axi.arready  = m_axi.arready && !s_ar;
+
+        // --- Read data ---
+        s_axi.rdata  = m_axi.rdata;
+        s_axi.rresp  = m_axi.rresp;
+        s_axi.rid    = m_axi.rid;
+        s_axi.rlast  = m_axi.rlast;
+        s_axi.ruser  = m_axi.ruser;
+        s_axi.rvalid = m_axi.rvalid && !s_r;
+        m_axi.rready = s_axi.rready && !s_r;
+    }
+}

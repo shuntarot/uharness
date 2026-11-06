@@ -1,19 +1,22 @@
 /// The stress stage **makes a transfer take longer without changing it**.
 ///
 /// The same read is run twice, once with the stage disabled and once with it
-/// holding off eight cycles after every transfer. Both must hand back the same
+/// holding every beat back eight cycles. Both must hand back the same
 /// four beats and the same sum; only the time differs. **A stage that changed
-/// the data would be worse than no stage at all.**
+/// the data would be worse than no stage at all.** With jitter, the same seed
+/// gives the same time again after a hold, so a run can be repeated.
 #[test(delay_slows_a_transfer_without_altering_it)]
 module test_delay {
     const DW   : u32 = 64;
-    const DEPTH: u32 = 8 ;
+    const DEPTH: u32 = 8;
 
     inst clk: $tb::clock_gen;
     inst rst: $tb::reset_gen ( clk );
 
-    var hold  : logic<8>;
-    var jitter: logic   ;
+    var hold   : logic<8> ;
+    var jitter : logic    ;
+    var seed   : logic<32>;
+    var restart: logic    ;
 
     // DUT side of the stage.
     var d_cmd_valid: logic    ;
@@ -80,50 +83,52 @@ module test_delay {
         ADDR_W: 64,
         SIZE_W: 32,
     ) (
-        i_clk           : clk              ,
-        i_rst           : rst              ,
-        i_delay         : hold             ,
-        i_jitter        : jitter           ,
-        i_d_rd_cmd_valid: d_cmd_valid      ,
-        o_d_rd_cmd_ready: d_cmd_ready      ,
-        i_d_rd_cmd_addr : d_cmd_addr       ,
-        i_d_rd_cmd_size : d_cmd_size       ,
-        o_d_rd_valid    : d_rd_valid       ,
-        i_d_rd_ready    : d_rd_ready       ,
-        o_d_rd_data     : d_rd_data        ,
-        o_d_rd_last     : d_rd_last        ,
-        o_d_rd_error    : _                ,
-        i_d_wr_cmd_valid: 1'b0             ,
-        o_d_wr_cmd_ready: _                ,
-        i_d_wr_cmd_addr : 64'b0            ,
-        i_d_wr_cmd_size : 32'b0            ,
-        i_d_wr_valid    : 1'b0             ,
-        o_d_wr_ready    : _                ,
-        i_d_wr_data     : 64'b0            ,
-        i_d_wr_strb     : 8'b0             ,
-        i_d_wr_last     : 1'b0             ,
-        o_d_wr_done     : _                ,
-        o_d_wr_done_error: _               ,
-        o_t_rd_cmd_valid: t_cmd_valid      ,
-        i_t_rd_cmd_ready: t_cmd_ready      ,
-        o_t_rd_cmd_addr : t_cmd_addr       ,
-        o_t_rd_cmd_size : t_cmd_size       ,
-        i_t_rd_valid    : t_rd_valid       ,
-        o_t_rd_ready    : t_rd_ready       ,
-        i_t_rd_data     : t_rd_data        ,
-        i_t_rd_last     : t_rd_last        ,
-        i_t_rd_error    : t_rd_error       ,
-        o_t_wr_cmd_valid: _                ,
-        i_t_wr_cmd_ready: 1'b1             ,
-        o_t_wr_cmd_addr : _                ,
-        o_t_wr_cmd_size : _                ,
-        o_t_wr_valid    : _                ,
-        i_t_wr_ready    : 1'b1             ,
-        o_t_wr_data     : _                ,
-        o_t_wr_strb     : _                ,
-        o_t_wr_last     : _                ,
-        i_t_wr_done     : 1'b0             ,
-        i_t_wr_done_error: 1'b0            ,
+        i_clk            : clk        ,
+        i_rst            : rst        ,
+        i_seed           : seed       ,
+        i_hold           : restart    ,
+        i_delay          : hold       ,
+        i_jitter         : jitter     ,
+        i_d_rd_cmd_valid : d_cmd_valid,
+        o_d_rd_cmd_ready : d_cmd_ready,
+        i_d_rd_cmd_addr  : d_cmd_addr ,
+        i_d_rd_cmd_size  : d_cmd_size ,
+        o_d_rd_valid     : d_rd_valid ,
+        i_d_rd_ready     : d_rd_ready ,
+        o_d_rd_data      : d_rd_data  ,
+        o_d_rd_last      : d_rd_last  ,
+        o_d_rd_error     : _          ,
+        i_d_wr_cmd_valid : 1'b0       ,
+        o_d_wr_cmd_ready : _          ,
+        i_d_wr_cmd_addr  : 64'b0      ,
+        i_d_wr_cmd_size  : 32'b0      ,
+        i_d_wr_valid     : 1'b0       ,
+        o_d_wr_ready     : _          ,
+        i_d_wr_data      : 64'b0      ,
+        i_d_wr_strb      : 8'b0       ,
+        i_d_wr_last      : 1'b0       ,
+        o_d_wr_done      : _          ,
+        o_d_wr_done_error: _          ,
+        o_t_rd_cmd_valid : t_cmd_valid,
+        i_t_rd_cmd_ready : t_cmd_ready,
+        o_t_rd_cmd_addr  : t_cmd_addr ,
+        o_t_rd_cmd_size  : t_cmd_size ,
+        i_t_rd_valid     : t_rd_valid ,
+        o_t_rd_ready     : t_rd_ready ,
+        i_t_rd_data      : t_rd_data  ,
+        i_t_rd_last      : t_rd_last  ,
+        i_t_rd_error     : t_rd_error ,
+        o_t_wr_cmd_valid : _          ,
+        i_t_wr_cmd_ready : 1'b1       ,
+        o_t_wr_cmd_addr  : _          ,
+        o_t_wr_cmd_size  : _          ,
+        o_t_wr_valid     : _          ,
+        i_t_wr_ready     : 1'b1       ,
+        o_t_wr_data      : _          ,
+        o_t_wr_strb      : _          ,
+        o_t_wr_last      : _          ,
+        i_t_wr_done      : 1'b0       ,
+        i_t_wr_done_error: 1'b0       ,
     );
 
     inst h: hmem #(
@@ -132,37 +137,48 @@ module test_delay {
         ADDR_W: 64   ,
         SIZE_W: 32   ,
     ) (
-        i_clk           : clk              ,
-        i_rst          : rst               ,
-        i_rd_cmd_valid : t_cmd_valid       ,
-        o_rd_cmd_ready : t_cmd_ready       ,
-        i_rd_cmd_addr  : t_cmd_addr        ,
-        i_rd_cmd_size  : t_cmd_size        ,
-        o_rd_valid     : t_rd_valid        ,
-        i_rd_ready     : t_rd_ready        ,
-        o_rd_data      : t_rd_data         ,
-        o_rd_last      : t_rd_last         ,
-        o_rd_error     : t_rd_error        ,
-        i_wr_cmd_valid : 1'b0              ,
-        o_wr_cmd_ready : _                 ,
-        i_wr_cmd_addr  : 64'b0             ,
-        i_wr_cmd_size  : 32'b0             ,
-        i_wr_valid     : 1'b0              ,
-        o_wr_ready     : _                 ,
-        i_wr_data      : 64'b0             ,
-        i_wr_strb      : '1,
-        i_wr_last      : 1'b0              ,
-        o_wr_done_valid: _                 ,
-        o_wr_done_error: _                 ,
-        i_haddr        : haddr             ,
-        i_hwdata       : hwdata            ,
-        i_hwe          : hwe               ,
-        o_hrdata       : _                 ,
-        o_widened      : _,
-        o_oor          : oor               ,
+        i_clk          : clk        ,
+        i_rst          : rst        ,
+        i_rd_cmd_valid : t_cmd_valid,
+        o_rd_cmd_ready : t_cmd_ready,
+        i_rd_cmd_addr  : t_cmd_addr ,
+        i_rd_cmd_size  : t_cmd_size ,
+        o_rd_valid     : t_rd_valid ,
+        i_rd_ready     : t_rd_ready ,
+        o_rd_data      : t_rd_data  ,
+        o_rd_last      : t_rd_last  ,
+        o_rd_error     : t_rd_error ,
+        i_wr_cmd_valid : 1'b0       ,
+        o_wr_cmd_ready : _          ,
+        i_wr_cmd_addr  : 64'b0      ,
+        i_wr_cmd_size  : 32'b0      ,
+        i_wr_valid     : 1'b0       ,
+        o_wr_ready     : _          ,
+        i_wr_data      : 64'b0      ,
+        i_wr_strb      : '1         ,
+        i_wr_last      : 1'b0       ,
+        o_wr_done_valid: _          ,
+        o_wr_done_error: _          ,
+        i_haddr        : haddr      ,
+        i_hwdata       : hwdata     ,
+        i_hwe          : hwe        ,
+        o_hrdata       : _          ,
+        o_widened      : _          ,
+        o_oor          : oor        ,
     );
 
     var quick: logic<32>;
+    var first: logic<32>;
+    var moved: logic    ;
+
+    function from_seed (
+        value: input logic<32>,
+    ) {
+        seed    = value;
+        restart = 1;
+        clk.next(1);
+        restart = 0;
+    }
 
     function one_read () {
         clear = 1;
@@ -172,6 +188,13 @@ module test_delay {
         d_cmd_addr  = 0;
         d_cmd_size  = 32;
         d_cmd_valid = 1;
+        // A valid holds until ready; the stage may hold the command back.
+        for _i in 0..400 {
+            if d_cmd_ready {
+                break;
+            }
+            clk.next(1);
+        }
         clk.next(1);
         d_cmd_valid = 0;
         for _i in 0..400 {
@@ -197,6 +220,10 @@ module test_delay {
         clear       = 0;
         counting    = 0;
         quick       = 0;
+        first       = 0;
+        moved       = 0;
+        seed        = 0;
+        restart     = 0;
 
         rst.assert(4);
         clk.next(4);
@@ -217,7 +244,7 @@ module test_delay {
         $assert(sum == 10);
         quick = ticks;
 
-        // 2. the same read, held off eight cycles after every transfer.
+        // 2. the same read, every beat held back eight cycles.
         hold = 8;
         one_read();
         $display("hold=8: beats=%d sum=%d ticks=%d", beats, sum, ticks);
@@ -227,12 +254,35 @@ module test_delay {
         // **The time is not.** If it were, the stage would not be doing anything.
         $assert(ticks >: quick);
 
-        // 3. jitter varies the hold-off; the answer still does not change.
+        // 3. jitter varies the hold-back; the answer still does not change.
         jitter = 1;
         one_read();
         $display("jitter: beats=%d sum=%d ticks=%d", beats, sum, ticks);
         $assert(beats == 4);
         $assert(sum == 10);
         $assert(oor == 0);
+
+        // 4. the same seed after a hold gives the same time.
+        from_seed(32'h0000_0001);
+        one_read();
+        first = ticks;
+        from_seed(32'h0000_0001);
+        one_read();
+        $display("seed 1 twice: ticks=%d and %d", first, ticks);
+        $assert(beats == 4);
+        $assert(sum == 10);
+        $assert(ticks == first);
+
+        // 5. another seed gives other stalls, at least for one of a few seeds.
+        for i in 2..10 {
+            from_seed(i as 32);
+            one_read();
+            $assert(sum == 10);
+            if ticks != first {
+                moved = 1;
+            }
+        }
+        $display("another seed changed the time: %d", moved);
+        $assert(moved);
     }
 }

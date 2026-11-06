@@ -554,7 +554,9 @@ fn gen_host_mem(dir: &tempfile::TempDir) -> (Option<i32>, serde_json::Value) {
 /// descriptors. `hns_sim` has no PCIe, so it keeps the port switched off.
 #[test]
 fn host_mem_reaches_host_memory_through_the_dma_engine() {
-    let dir = host_mem_fixture(&format!("aperture = \"2M\"\n{HOST_MEM_PORTS}"));
+    let dir = host_mem_fixture(&format!(
+        "aperture = \"2M\"\nstall = true\n{HOST_MEM_PORTS}"
+    ));
     let (code, value) = gen_host_mem(&dir);
     assert_eq!(code, Some(0), "{value}");
 
@@ -565,8 +567,12 @@ fn host_mem_reaches_host_memory_through_the_dma_engine() {
         "APERTURE:64'h200000,",
         "i_base:t_mem_host_base,",
         "i_on:t_mem_host_on,",
-        "i_rd_cmd_valid:w_o_rc_valid,",
-        "o_wr_done_error:w_i_w_error,",
+        // The DUT meets the stall stage first; `hns::hostmem` sits behind it.
+        "instu_delay_mem:hns::delay#(",
+        "i_d_rd_cmd_valid:w_o_rc_valid,",
+        "o_d_wr_done_error:w_i_w_error,",
+        "i_rd_cmd_valid:h_mem_rd_cmd_valid,",
+        "o_wr_done_error:h_mem_wr_done_error,",
         "instu_dma_wr:hns::dma_wr::<",
         "i_desc_valid:hm_mem_wr_valid,",
         "i_desc_valid:hm_mem_rd_valid,",
@@ -618,7 +624,7 @@ fn host_mem_reaches_host_memory_through_the_dma_engine() {
 #[test]
 fn host_mem_carries_a_byte_strobe() {
     let dir = host_mem_fixture(&format!(
-        "aperture = \"2M\"\n{}",
+        "aperture = \"2M\"\nstall = true\n{}",
         HOST_MEM_PORTS.replace("wr_last", "wr_strb = \"o_w_strb\", wr_last")
     ));
     let (code, value) = gen_host_mem(&dir);
@@ -629,7 +635,27 @@ fn host_mem_carries_a_byte_strobe() {
         .filter(|c| !c.is_whitespace())
         .collect();
     assert!(top.contains("HAS_STRB:true,"), "{top}");
-    assert!(top.contains("i_wr_strb:w_o_w_strb,"), "{top}");
+    assert!(top.contains("i_d_wr_strb:w_o_w_strb,"), "{top}");
+    assert!(top.contains("i_wr_strb:h_mem_wr_strb,"), "{top}");
+}
+
+/// Without `stall = true` there is no stall stage: `hns::hostmem` meets the
+/// DUT's wires directly, and no stall register is placed.
+#[test]
+fn host_mem_has_no_stall_stage_by_default() {
+    let dir = host_mem_fixture(&format!("aperture = \"2M\"\n{HOST_MEM_PORTS}"));
+    let (code, value) = gen_host_mem(&dir);
+    assert_eq!(code, Some(0), "{value}");
+    let top: String = fs::read_to_string(dir.path().join("hns/src/top.veryl"))
+        .unwrap()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(top.contains("i_rd_cmd_valid:w_o_rc_valid,"), "{top}");
+    assert!(!top.contains("hns::delay"), "{top}");
+    let regs = fs::read_to_string(dir.path().join("hns/regs.json")).unwrap();
+    assert!(!regs.contains("mem_delay"), "{regs}");
+    assert!(!regs.contains("harness_seed"), "{regs}");
 }
 
 /// A DUT whose memory port is an AXI4 master, on `host_mem`. It depends on
@@ -2513,6 +2539,9 @@ module dut_top (
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    if let Err(why) = common::veryl_check(&dir.path().join("hns")) {
+        panic!("the [pin] harness does not check:\n{why}");
+    }
 
     let top = fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap();
     assert!(
@@ -2532,6 +2561,99 @@ module dut_top (
         !regs.contains("o_uart_tx"),
         "a pin port is not a register:\n{regs}"
     );
+}
+
+/// Tri-state and bidirectional pins: the DUT gives plain ports (`o`, `t`
+/// with 1 = high impedance, `i`), and the top makes `o_<resource>` /
+/// `io_<resource>` with one constraint per bit. An input with
+/// `sync = false` reaches the DUT as it is.
+#[test]
+fn tristate_pins_reach_the_top_and_the_xdc() {
+    let dir = fixture(
+        &veryl_toml(),
+        "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n\
+         [pin]\n\
+         o_dout = { pin = \"cfg_dat\", t = \"o_dout_t\", i = \"i_din\", sync = false }\n\
+         o_cs   = { pin = \"cfg_cs\", t = \"o_cs_t\" }\n\
+         i_rx   = { pin = \"uart_rx\", sync = false }\n\n\
+         [bundle.csr]\ncontract = \"fixed_latency\"\nlatency = 1\nbacking = \"reg\"\n",
+    );
+    fs::write(
+        dir.path().join("pads.toml"),
+        "[pins.cfg_dat]\npin = [\"K1\", \"K2\", \"K3\", \"K4\"]\nstandard = \"LVCMOS33\"\ndirection = \"inout\"\n\n\
+         [pins.cfg_cs]\npin = \"L1\"\nstandard = \"LVCMOS33\"\ndirection = \"output\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src").join("fixture.veryl"),
+        r#"
+module dut_top (
+    i_clk      : input  clock   ,
+    i_rst      : input  reset   ,
+    i_csr_wdata: input  logic<8>,
+    o_csr_rdata: output logic<8>,
+    o_dout     : output logic<4>,
+    o_dout_t   : output logic<4>,
+    i_din      : input  logic<4>,
+    o_cs       : output logic   ,
+    o_cs_t     : output logic   ,
+    i_rx       : input  logic   ,
+) {
+    always_ff {
+        if_reset {
+            o_csr_rdata = 0;
+        } else {
+            o_csr_rdata = {i_din, 3'b0, i_rx};
+        }
+    }
+    assign o_dout   = i_csr_wdata[3:0];
+    assign o_dout_t = i_csr_wdata[7:4];
+    assign o_cs     = i_csr_wdata[0];
+    assign o_cs_t   = i_csr_wdata[1];
+}
+"#,
+    )
+    .unwrap();
+
+    let out = run_gen(&dir, &["--target-patch", "pads.toml"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if let Err(why) = common::veryl_check(&dir.path().join("hns")) {
+        panic!("the tri-state harness does not check:\n{why}");
+    }
+
+    let squash = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+    let top = squash(&fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap());
+    for want in [
+        "io_cfg_dat:inout'c0trilogic<4>,",
+        "o_cfg_cs:output'c0trilogic,",
+        "i_rx:input'c0logic,",
+        "assignio_cfg_dat[b]=ifpin_o_dout_t[b]?1'bz:pin_o_dout[b];",
+        "assignpin_i_din=io_cfg_dat;",
+        "assigno_cfg_cs=ifpin_o_cs_t?1'bz:pin_o_cs;",
+        "o_dout:pin_o_dout,",
+        "i_din:pin_i_din,",
+        "i_rx:i_rx,",
+    ] {
+        assert!(top.contains(want), "missing `{want}`:\n{top}");
+    }
+
+    let xdc = fs::read_to_string(dir.path().join("hns/syn/board.xdc")).unwrap();
+    for want in [
+        "PACKAGE_PIN K1 IOSTANDARD LVCMOS33 } [get_ports { io_cfg_dat[0] }]",
+        "PACKAGE_PIN K4 IOSTANDARD LVCMOS33 } [get_ports { io_cfg_dat[3] }]",
+        "PACKAGE_PIN L1 IOSTANDARD LVCMOS33 } [get_ports { o_cfg_cs }]",
+        "[get_ports { i_rx }]",
+    ] {
+        assert!(xdc.contains(want), "missing `{want}`:\n{xdc}");
+    }
+    // Only where the pins are. Their timing is the DUT's to state.
+    assert!(!xdc.contains("set_input_delay"), "{xdc}");
+    assert!(!xdc.contains("set_output_delay"), "{xdc}");
 }
 
 /// An unknown resource name fails and lists the resources the target has.
@@ -4244,17 +4366,23 @@ fn switching_from_pcie_to_jtag_removes_the_borrowed_verilog() {
             "{transport}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        String::from_utf8(output.stdout).unwrap()
     };
     let vendor = dir.path().join("hns/vendor");
-    generate("pcie");
+    let stdout = generate("pcie");
     assert!(
         fs::read_dir(&vendor).unwrap().count() > 0,
         "pcie writes the borrowed Verilog"
     );
+    // Both windows are named: the JTAG one is in every harness.
+    assert!(stdout.contains("BSCANE2"), "{stdout}");
+    assert!(stdout.contains("hio)\" -p id"), "{stdout}");
     // A user file outside `vendor/` is not touched.
     fs::write(dir.path().join("hns/mine.txt"), "keep\n").unwrap();
 
-    generate("jtag");
+    let stdout = generate("jtag");
+    assert!(stdout.contains("BSCANE2"), "{stdout}");
+    assert!(!stdout.contains("PCIe BAR"), "{stdout}");
     let left: Vec<_> = fs::read_dir(&vendor)
         .map(|entries| entries.flatten().map(|e| e.path()).collect())
         .unwrap_or_default();

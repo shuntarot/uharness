@@ -8,7 +8,7 @@ freq_mhz = 100
 [bundle.ctl]
 backing  = "reg"
 ports    = ["i_start", "i_addr", "i_dst", "i_size", "o_busy", "o_done", "o_sum", "o_beats",
-            "o_errors"]
+            "o_errors", "o_cycles"]
 
 # A transfer-level port: "read N bytes from address A" and the data comes back
 # as a stream. The DUT is written as though it were reaching host memory;
@@ -17,6 +17,9 @@ ports    = ["i_start", "i_addr", "i_dst", "i_size", "o_busy", "o_done", "o_sum",
 [bundle.hmem]
 backing = "bram"
 depth   = 512
+# A stall stage, so the host can make the memory answer slowly
+# (`hmem_delay`); bringup.hio uses it.
+stall   = true
 ports   = { rd_cmd_valid = "o_cmd_valid", rd_cmd_ready  = "i_cmd_ready",
             rd_cmd_addr  = "o_cmd_addr",  rd_cmd_size = "o_cmd_size",
             rd_valid     = "i_rd_valid",  rd_ready      = "o_rd_ready",

@@ -101,6 +101,10 @@ pub const DUT_RESET: &str = "dut_reset";
 /// changes.
 pub const DUT_RESET_STATE: &str = "dut_reset_state";
 
+/// The seed of every stall stage. A stage reloads it while the DUT is in
+/// reset, so write it before `dut_reset` is released.
+pub const SEED_NAME: &str = "harness_seed";
+
 /// TLP counts on PCIe, each paired with the output of `hns::tlp_count` that
 /// drives it. Requests that reached the BAR, and completions sent back.
 pub const PCIE_TLP_COUNTERS: [(&str, &str); 7] = [
@@ -436,7 +440,7 @@ pub enum RegMapError {
     #[diagnostic(
         code(harness::regmap::reserved_name),
         help(
-            "The harness puts `{MAGIC_NAME}`, `{MAP_HASH_NAME}` and `{TIMEOUT_NAME}` at the end of the window, and also places `dut_reset`, `dut_reset_state`, `dma_*` and `<bundle>_base_*`. Rename the port in the wrapper you point [dut] at."
+            "The harness puts `{MAGIC_NAME}`, `{MAP_HASH_NAME}` and `{TIMEOUT_NAME}` at the end of the window, and also places `dut_reset`, `dut_reset_state`, `harness_seed`, `dma_*`, `<bundle>_base_*`, `<bundle>_delay` and `<bundle>_jitter`. Rename the port in the wrapper you point [dut] at."
         )
     )]
     ReservedName { port: String },
@@ -1032,6 +1036,45 @@ pub fn build(
         offset += WORD_BITS / 8;
     }
 
+    // The stall stages. Two registers per bundle add delay on purpose; the
+    // default is 0, which does nothing. They are registers, not manifest keys,
+    // so a sweep needs no new synthesis. One seed serves every stage, and each
+    // stage starts again from it while the DUT is held in reset, so the same
+    // seed gives the same stalls on every run.
+    let stalled = crate::terminator::stalled_bundles(manifest, fifos, host_mems, axi_mems);
+    for bundle in &stalled {
+        for (role, width) in [("delay", 8), ("jitter", 1)] {
+            registers.push(Register {
+                name: format!("{bundle}_{role}"),
+                kind: Kind::Terminator,
+                offset,
+                words: 1,
+                width,
+                access: Access::ReadWrite,
+                bundle: Some(bundle.clone()),
+                value: None,
+                self_clearing: None,
+                role: Some(role),
+            });
+            offset += WORD_BITS / 8;
+        }
+    }
+    if !stalled.is_empty() {
+        registers.push(Register {
+            name: SEED_NAME.to_string(),
+            kind: Kind::Terminator,
+            offset,
+            words: 1,
+            width: WORD_BITS,
+            access: Access::ReadWrite,
+            bundle: None,
+            value: None,
+            self_clearing: None,
+            role: Some(SEED_NAME),
+        });
+        offset += WORD_BITS / 8;
+    }
+
     // The registers for the card to write host memory: only on PCIe with
     // `dram`. The DMA engine master is fixed at 256 bits and cannot connect
     // behind a `bram` (DUT bus width). Registers that lead nowhere are not
@@ -1168,23 +1211,6 @@ pub fn build(
             WORD_BITS,
             Access::ReadOnly,
             "oor",
-            None,
-        ));
-        // Two registers that add delay on purpose. The default is 0, which does
-        // nothing. They are registers, not manifest keys, so they can be changed
-        // without synthesizing again.
-        registers.push(place(
-            format!("{}_delay", hmem.bundle),
-            8,
-            Access::ReadWrite,
-            "delay",
-            None,
-        ));
-        registers.push(place(
-            format!("{}_jitter", hmem.bundle),
-            1,
-            Access::ReadWrite,
-            "jitter",
             None,
         ));
     }

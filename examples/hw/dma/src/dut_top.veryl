@@ -40,6 +40,7 @@ module dut_top (
     o_sum  : output logic<64>, // sum of the beats seen
     o_beats: output logic<32>, // how many beats were seen
     o_errors: output logic<32>, // failed read beats and failed writes
+    o_cycles: output logic<32>, // clock cycles from the start to the end
 
     // --- the read port into host memory (this is what `host_mem` terminates) ---
     o_cmd_valid: output logic    ,
@@ -76,6 +77,7 @@ module dut_top (
     var sum      : logic<64>;
     var beats    : logic<32>;
     var errors   : logic<32>;
+    var cycles   : logic<32>;
     var done     : logic    ;
     var rd_posted: logic    ;
     var wr_posted: logic    ;
@@ -108,6 +110,7 @@ module dut_top (
         o_sum   = sum;
         o_beats = beats;
         o_errors = errors;
+        o_cycles = cycles;
     }
 
     always_ff {
@@ -119,6 +122,7 @@ module dut_top (
             sum       = 0;
             beats     = 0;
             errors    = 0;
+            cycles    = 0;
             done      = 0;
             rd_posted = 0;
             wr_posted = 0;
@@ -126,6 +130,11 @@ module dut_top (
         } else {
             done    = 0;
             start_q = i_start;
+            // How long a copy took shows the memory's answers being held back
+            // (`hmem_delay`), and repeats when the seed does.
+            if state != S_IDLE {
+                cycles = cycles + 1;
+            }
             case state {
                 S_IDLE: {
                     if start && i_size != 0 {
@@ -138,6 +147,7 @@ module dut_top (
                         sum       = 0;
                         beats     = 0;
                         errors    = 0;
+                        cycles    = 0;
                         rd_posted = 0;
                         wr_posted = 0;
                         state     = S_CMD;

@@ -20,6 +20,7 @@ module test_dma {
     var sum  : logic<64>;
     var beats: logic<32>;
     var errors: logic<32>;
+    var cycles: logic<32>;
 
     var cmd_valid: logic    ;
     var cmd_ready: logic    ;
@@ -60,6 +61,7 @@ module test_dma {
         o_sum       : sum       ,
         o_beats     : beats     ,
         o_errors    : errors    ,
+        o_cycles    : cycles    ,
         o_cmd_valid : cmd_valid ,
         i_cmd_ready : cmd_ready ,
         o_cmd_addr  : cmd_addr  ,

@@ -8,7 +8,7 @@ freq_mhz = 100
 [bundle.ctl]
 backing  = "reg"
 ports    = ["i_start", "i_addr", "i_dst", "i_size", "o_busy", "o_done", "o_sum", "o_beats",
-            "o_errors"]
+            "o_errors", "o_cycles"]
 
 # The same DUT on the board's DRAM: only `backing` changes, and `dram` adds
 # `aperture`, because the memory does not fit in the window. `hns::xfer2axi`

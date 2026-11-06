@@ -48,7 +48,9 @@ use crate::unconnected::Kind;
 ///   `registers.dut_base`, `registers.dut_read_only`,
 ///   `bundles[].memory.dut_base` and `bundles[].axi_mem.dut_base`
 /// - 16: added `bundles[].dmi`
-pub const FORMAT_VERSION: u32 = 16;
+/// - 17: added `ports[].unconnected.pins` and `.role` for `[pin]`; `pin`
+///   is set only for a resource of one pin
+pub const FORMAT_VERSION: u32 = 17;
 
 /// How deep `related` is followed. Veryl diagnostics can nest.
 const MAX_RELATED_DEPTH: usize = 3;
@@ -209,11 +211,15 @@ pub enum UnconnectedOutput {
     TieOff { value: String },
     /// An output left unconnected.
     LeaveOpen,
-    /// An output on a board pin. `pin` / `standard` are set only when a
-    /// target is given.
+    /// A port on board pins. `pin` / `pins` / `standard` are set only when a
+    /// target is given; `pin` only when the resource has one pin.
     Pin {
         resource: String,
+        /// `direct`, or `o` / `t` / `i` of a tri-state pin.
+        role: &'static str,
         pin: Option<String>,
+        /// One per bit, bit 0 first.
+        pins: Vec<String>,
         standard: Option<String>,
     },
 }
@@ -873,11 +879,17 @@ pub fn ok(
                     Kind::Open => UnconnectedOutput::LeaveOpen,
                     Kind::Pin {
                         resource,
-                        pin,
+                        role,
+                        pins,
                         standard,
                     } => UnconnectedOutput::Pin {
                         resource: resource.clone(),
-                        pin: pin.clone(),
+                        role: role.as_str(),
+                        pin: match pins.as_slice() {
+                            [pin] => Some(pin.clone()),
+                            _ => None,
+                        },
+                        pins: pins.clone(),
                         standard: standard.clone(),
                     },
                 }),

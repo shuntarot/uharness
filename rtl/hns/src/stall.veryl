@@ -1,0 +1,87 @@
+/// Hold each transfer of a channel back for a while.
+///
+/// When a beat is first offered, the stage hides it for `i_delay` cycles (or a
+/// random number up to it), then lets it through. Every beat waits, the first
+/// one included, so a DUT that keeps one request outstanding still meets a
+/// slow partner. The user masks both valid and ready with `o_stall`, so no
+/// beat is lost. The stall starts in the very cycle the beat is offered, and
+/// each beat is decided once: a valid that was shown is never taken back,
+/// even when the other side is not ready for it yet.
+///
+/// The random numbers restart from the seed while `i_hold` is 1, and move on
+/// once per beat, not once per cycle. The harness holds every stage while the
+/// DUT is in reset, so one seed gives the same stalls on every run. On a board
+/// the host starts the DUT at no fixed time after the reset; counting beats
+/// keeps that time out of the stalls.
+pub module stall #(
+    /// Mixed into the seed, so that stages sharing a seed do not move
+    /// together.
+    param SALT: logic<32> = 32'h1234_5678,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    i_seed: input logic<32>,
+    /// Restart from the seed, with no stall.
+    i_hold: input logic,
+    /// Cycles to hold each beat back. 0 disables the stage.
+    i_delay: input logic<8>,
+    /// Vary the hold-back between 0 and `i_delay` instead of using it exactly.
+    i_jitter: input logic,
+    /// A beat is offered on this channel (valid at the stage's input).
+    i_offer: input logic,
+    /// A beat went through on this channel.
+    i_fire : input  logic,
+    o_stall: output logic,
+) {
+    var count: logic<8>;
+    /// The beat on offer has been decided: it waits, or has waited, its turn.
+    var waited: logic    ;
+    var state : logic<32>;
+
+    // xorshift32. A shift register alone moves a seed's low bits out within
+    // a few cycles, so small seeds such as 1 and 2 gave the same stalls; each
+    // step here spreads every bit over the word. It is never 0 once it is not.
+    function xorshift (
+        x: input logic<32>,
+    ) -> logic<32> {
+        var a: logic<32>;
+        var b: logic<32>;
+        a = x ^ (x << 13);
+        b = a ^ (a >> 17);
+        return b ^ (b << 5);
+    }
+    let next_state: logic<32> = xorshift(state);
+    let mixed     : logic<32> = xorshift(i_seed ^ SALT);
+    let start     : logic<32> = if mixed == 0 ? 32'h1 : mixed;
+
+    let pick    : logic<8> = if i_jitter ? (state[7:0] & i_delay) : i_delay;
+    let decide  : logic    = i_offer && !waited && count == 0;
+    let wait_now: logic    = decide && pick != 0;
+
+    assign o_stall = count != 0 || wait_now;
+
+    always_ff {
+        if_reset {
+            count  = 0;
+            waited = 0;
+            state  = 32'h1;
+        } else if i_hold {
+            count  = 0;
+            waited = 0;
+            state  = start;
+        } else {
+            if decide {
+                state = next_state;
+            }
+            if i_fire {
+                waited = 0;
+            } else if decide {
+                count  = if wait_now ? pick - 1 : 0;
+                waited = 1;
+            } else if count != 0 {
+                count = count - 1;
+            }
+        }
+    }
+}

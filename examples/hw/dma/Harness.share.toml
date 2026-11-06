@@ -12,7 +12,7 @@ freq_mhz = 100
 [bundle.dctl]
 backing  = "reg"
 ports    = ["i_d_start", "i_d_addr", "i_d_dst", "i_d_size", "o_d_busy", "o_d_done", "o_d_sum",
-            "o_d_beats", "o_d_errors"]
+            "o_d_beats", "o_d_errors", "o_d_cycles"]
 
 [bundle.dmem]
 backing  = "dram"
@@ -31,7 +31,7 @@ ports   = { rd_cmd_valid = "o_d_cmd_valid", rd_cmd_ready  = "i_d_cmd_ready",
 [bundle.hctl]
 backing  = "reg"
 ports    = ["i_h_start", "i_h_addr", "i_h_dst", "i_h_size", "o_h_busy", "o_h_done", "o_h_sum",
-            "o_h_beats", "o_h_errors"]
+            "o_h_beats", "o_h_errors", "o_h_cycles"]
 
 [bundle.hmem]
 backing  = "host_mem"
