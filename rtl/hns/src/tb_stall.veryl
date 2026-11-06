@@ -1,0 +1,70 @@
+/// `hns::stall` **never takes back a beat it has shown.** With jitter, a beat
+/// may be let through at once. If the other side is not ready for it, the
+/// beat stays on offer, and the stage must not hide it in a later cycle.
+///
+/// The receiver here is ready only every other cycle, and the hold-back is
+/// often 0, so beats that are shown and not yet taken come up many times.
+#[test(stall_keeps_shown_beats)]
+module test_stall {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var hold : logic;
+    var ready: logic;
+    var held : logic;
+
+    // A new beat follows each one taken, so a beat is always on offer.
+    let fire: logic = !held && ready;
+
+    inst s: stall #(
+        SALT: 32'h0,
+    ) (
+        i_clk   : clk  ,
+        i_rst   : rst  ,
+        i_seed  : 32'h1,
+        i_hold  : hold ,
+        i_delay : 8'd3 ,
+        i_jitter: 1    ,
+        i_offer : 1    ,
+        i_fire  : fire ,
+        o_stall : held ,
+    );
+
+    var shown: logic    ;
+    var bad  : logic<32>;
+    var beats: logic<32>;
+    var waits: logic<32>;
+
+    initial {
+        hold  = 0;
+        ready = 0;
+        shown = 0;
+        bad   = 0;
+        beats = 0;
+        waits = 0;
+        rst.assert(4);
+        clk.next(4);
+        hold = 1;
+        clk.next(1);
+        hold = 0;
+        for _i in 0..400 {
+            ready = !ready;
+            if shown && held {
+                bad = bad + 1;
+            }
+            if held {
+                waits = waits + 1;
+            }
+            if fire {
+                beats = beats + 1;
+            }
+            shown = !held && !fire;
+            clk.next(1);
+        }
+        $display("beats=%d stalled cycles=%d taken back=%d", beats, waits, bad);
+        $assert(bad == 0);
+        $assert(beats >: 0);
+        $assert(waits >: 0);
+        $finish();
+    }
+}

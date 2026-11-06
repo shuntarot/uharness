@@ -8,7 +8,7 @@ freq_mhz = 100
 [bundle.ctl]
 backing  = "reg"
 ports    = ["i_start", "i_addr", "i_dst", "i_size", "o_busy", "o_done", "o_sum", "o_beats",
-            "o_errors"]
+            "o_errors", "o_cycles"]
 
 # The same DUT on host memory, over PCIe: only `backing` changes, and
 # `host_mem` adds `aperture`, the bytes of host memory the DUT may reach. The

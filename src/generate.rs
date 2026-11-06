@@ -509,7 +509,8 @@ pub fn run(
             if sim {
                 print_sim_next_steps(&out);
             } else {
-                print_next_steps(&out);
+                let transport = plan.feasibility().map(|f| f.transport.as_str());
+                print_next_steps(&out, transport == Some("pcie"));
             }
         }
         Format::Json => {
@@ -523,7 +524,11 @@ pub fn run(
                 project,
                 &plan,
                 crate::check::checked_items(true),
-                crate::check::not_checked_items(true, &plan.sv_blackboxes),
+                crate::check::not_checked_items(
+                    true,
+                    &plan.sv_blackboxes,
+                    !plan.loaded.manifest.pin.is_empty(),
+                ),
             );
             output.written = written
                 .iter()
@@ -729,8 +734,8 @@ fn commit(pending: Vec<Pending>) -> Result<Vec<Written>, GenError> {
         .collect()
 }
 
-/// What to run next to get a bitstream.
-fn print_next_steps(out: &Path) {
+/// What to run next to get a bitstream, and how to reach the window.
+fn print_next_steps(out: &Path, pcie: bool) {
     println!("next:");
     println!("  make -C {}", out.join("syn").display());
     println!("      # veryl build -> IP generation -> synthesis -> bitstream");
@@ -738,6 +743,12 @@ fn print_next_steps(out: &Path) {
     println!("The harness uses its own BSCANE2 bridge, which Vivado cannot see, so the");
     println!("window is reached with `hio` rather than hw_server. `make program`");
     println!("still goes through Vivado. Configuration uses a separate JTAG path.");
+    if pcie {
+        // A PCIe harness keeps the JTAG window too, so the text above stays true.
+        println!();
+        println!("The same window is also on the PCIe BAR. Reaching it there needs root:");
+        println!("  sudo \"$(command -v hio)\" -p id");
+    }
 }
 
 /// What to run next for `--target sim`.

@@ -16,7 +16,7 @@ use crate::clock::ClockPlan;
 use crate::manifest::Manifest;
 use crate::regmap::RegisterMap;
 use crate::target::Target;
-use crate::unconnected::{Kind, Unconnected};
+use crate::unconnected::{Kind, PinRole, Unconnected};
 
 pub struct HeartbeatPlan {
     /// Clocks per bit.
@@ -78,6 +78,19 @@ pub enum HeartbeatError {
         resource: String,
         target: String,
         direction: String,
+    },
+
+    #[error("[heartbeat] drives one pin, and `{resource}` of target `{target}` has {count}")]
+    #[diagnostic(
+        code(harness::heartbeat::pin_not_one),
+        help(
+            "A UART sends on one wire. Name a resource with a single pin, usually the TX of the board's USB-UART."
+        )
+    )]
+    PinNotOne {
+        resource: String,
+        target: String,
+        count: usize,
     },
 
     #[error("[pins.{resource}] of target `{target}` does not say {missing}")]
@@ -184,6 +197,13 @@ pub fn resolve(
             missing,
         });
     }
+    if found.pins.len() > 1 {
+        return Err(HeartbeatError::PinNotOne {
+            resource: resource.clone(),
+            target: target.name.clone(),
+            count: found.pins.len(),
+        });
+    }
     if !found.fpga_drives() {
         return Err(HeartbeatError::PinDirectionMismatch {
             resource: resource.clone(),
@@ -195,7 +215,9 @@ pub fn resolve(
     let name = port_name(resource);
     for item in unconnected {
         let Kind::Pin {
-            resource: other, ..
+            resource: other,
+            role,
+            ..
         } = &item.kind
         else {
             continue;
@@ -206,7 +228,9 @@ pub fn resolve(
                 port: item.port.clone(),
             });
         }
-        if item.port == name {
+        // Only a direct port keeps its DUT name at the top. A tri-state pin is
+        // `o_<resource>` / `io_<resource>`, and its resource differs from ours.
+        if *role == PinRole::Direct && item.port == name {
             return Err(HeartbeatError::PortNameTaken {
                 name,
                 resource: resource.clone(),
@@ -230,7 +254,7 @@ pub fn resolve(
             registers.dut
         ),
         resource: resource.clone(),
-        pin: found.pin.unwrap_or_default(),
+        pin: found.pins.first().cloned().unwrap_or_default(),
         standard: found.standard.unwrap_or_default(),
     }))
 }

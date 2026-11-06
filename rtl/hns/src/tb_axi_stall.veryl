@@ -1,0 +1,238 @@
+/// `hns::axi_stall` **makes AXI4 transfers take longer without changing them**,
+/// and one seed gives the same time on every run.
+///
+/// Four words are written and read back through the stage into `hns::axi_mem`:
+/// once passed through, once with every beat held back eight cycles, and
+/// with jitter from a seed. The data never changes; only the time does.
+#[test(axi_stall_slows_without_altering)]
+module test_axi_stall {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    inst bus : $std::axi4_if::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>>;
+    inst mbus: $std::axi4_if::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>>;
+
+    var delay  : logic<8> ;
+    var jitter : logic    ;
+    var seed   : logic<32>;
+    var restart: logic    ;
+
+    inst s: axi_stall::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>> (
+        i_clk   : clk    ,
+        i_rst   : rst    ,
+        i_seed  : seed   ,
+        i_hold  : restart,
+        i_delay : delay  ,
+        i_jitter: jitter ,
+        s_axi   : bus    ,
+        m_axi   : mbus   ,
+    );
+
+    inst u: axi_mem::<$std::axi4_pkg::<32, 4, 4, 1, 1, 1, 1, 1>> #(
+        DEPTH: 16,
+    ) (
+        i_clk   : clk ,
+        i_rst   : rst ,
+        axi     : mbus,
+        i_haddr : 0   ,
+        i_hwdata: 0   ,
+        i_hwstrb: 0   ,
+        i_hwe   : 0   ,
+        o_hrdata: _   ,
+    );
+
+    var ticks   : logic<32>;
+    var counting: logic    ;
+
+    always_ff (clk, rst) {
+        if_reset {
+            ticks = 0;
+        } else if counting {
+            ticks = ticks + 1;
+        }
+    }
+
+    /// Writes one beat. Each valid drops right after its handshake; a valid
+    /// held longer would start a second transfer.
+    function put (
+        addr: input logic<32>,
+        data: input logic<32>,
+    ) {
+        bus.awaddr  = addr;
+        bus.awvalid = 1;
+        for _i in 0..600 {
+            if bus.awready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        bus.awvalid = 0;
+        bus.wdata   = data;
+        bus.wvalid  = 1;
+        for _i in 0..600 {
+            if bus.wready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        bus.wvalid = 0;
+        for _i in 0..600 {
+            if bus.bvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+    }
+
+    function get (
+        addr: input logic<32>,
+    ) -> logic<32> {
+        var data       : logic<32>;
+        bus.araddr  = addr;
+        bus.arvalid = 1;
+        for _i in 0..600 {
+            if bus.arready {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        bus.arvalid = 0;
+        for _i in 0..600 {
+            if bus.rvalid {
+                break;
+            }
+            clk.next(1);
+        }
+        data = bus.rdata;
+        clk.next(1);
+        return data;
+    }
+
+    var good: logic;
+
+    /// Writes four words, reads them back, and counts the cycles it took.
+    function round (
+        base: input logic<32>,
+    ) {
+        ticks    = 0;
+        counting = 1;
+        good     = 1;
+        for i in 0..4 {
+            put((i * 4) as 32, base + (i as 32));
+        }
+        for i in 0..4 {
+            if get((i * 4) as 32) != base + (i as 32) {
+                good = 0;
+            }
+        }
+        counting = 0;
+        clk.next(1);
+    }
+
+    function from_seed (
+        value: input logic<32>,
+    ) {
+        seed    = value;
+        restart = 1;
+        clk.next(1);
+        restart = 0;
+    }
+
+    always_comb {
+        bus.awsize   = 3'd2;
+        bus.awburst  = 2'b01;
+        bus.awcache  = 0;
+        bus.awprot   = 0;
+        bus.awid     = 1;
+        bus.awlen    = 0;
+        bus.awlock   = 0;
+        bus.awqos    = 0;
+        bus.awregion = 0;
+        bus.awuser   = 0;
+        bus.wstrb    = 4'hf;
+        bus.wlast    = 1;
+        bus.wuser    = 0;
+        bus.arsize   = 3'd2;
+        bus.arburst  = 2'b01;
+        bus.arcache  = 0;
+        bus.arprot   = 0;
+        bus.arid     = 2;
+        bus.arlen    = 0;
+        bus.arlock   = 0;
+        bus.arqos    = 0;
+        bus.arregion = 0;
+        bus.aruser   = 0;
+        bus.bready   = 1;
+        bus.rready   = 1;
+    }
+
+    var quick: logic<32>;
+    var first: logic<32>;
+    var moved: logic    ;
+
+    initial {
+        bus.awaddr  = 0;
+        bus.awvalid = 0;
+        bus.wdata   = 0;
+        bus.wvalid  = 0;
+        bus.araddr  = 0;
+        bus.arvalid = 0;
+        delay       = 0;
+        jitter      = 0;
+        seed        = 0;
+        restart     = 0;
+        counting    = 0;
+        moved       = 0;
+        rst.assert(4);
+        clk.next(4);
+
+        // 1. passed through.
+        round(32'h1000);
+        $display("delay=0: good=%d ticks=%d", good, ticks);
+        $assert(good);
+        quick = ticks;
+
+        // 2. every beat held back eight cycles: same data, more time.
+        delay = 8;
+        round(32'h2000);
+        $display("delay=8: good=%d ticks=%d", good, ticks);
+        $assert(good);
+        $assert(ticks >: quick);
+
+        // 3. jitter from a seed, three times: the same time each time.
+        jitter = 1;
+        delay  = 255;
+        from_seed(32'h0000_0001);
+        round(32'h3000);
+        $assert(good);
+        first = ticks;
+        from_seed(32'h0000_0001);
+        round(32'h3000);
+        $display("seed 1 twice: ticks=%d and %d", first, ticks);
+        $assert(good);
+        $assert(ticks == first);
+
+        // On a board the host starts the DUT at no fixed time after the
+        // reset, so the stalls must not depend on when the first beat comes.
+        from_seed(32'h0000_0001);
+        clk.next(7);
+        round(32'h3000);
+        $display("seed 1, started 7 cycles later: ticks=%d", ticks);
+        $assert(good);
+        $assert(ticks == first);
+
+        // 4. another seed gives other stalls.
+        from_seed(32'h0000_0002);
+        round(32'h4000);
+        $display("seed 2: good=%d ticks=%d", good, ticks);
+        $assert(good);
+        $assert(ticks != first);
+
+        clk.next(4);
+        $finish();
+    }
+}

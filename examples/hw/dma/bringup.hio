@@ -23,6 +23,8 @@ read o_busy
 read o_beats
 read o_sum
 read o_errors
+# clock cycles the copy took
+read o_cycles
 
 echo == read the destination back through the backdoor ==
 # What was loaded is what has to be there. Entries 8..11 must read 1, 2, 3, 4.
@@ -36,6 +38,17 @@ write hmem_maddr 10
 read hmem_mdata
 write hmem_maddr 11
 read hmem_mdata
+
+echo == the same copy, with every answer held back 8 cycles ==
+# The sum is still 10 and nothing failed; only o_cycles grows.
+write hmem_delay 8
+write i_start 1
+write i_start 0
+sleep 10
+read o_sum
+read o_errors
+read o_cycles
+write hmem_delay 0
 
 echo == nothing was refused ==
 read hmem_oor

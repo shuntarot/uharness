@@ -110,6 +110,18 @@ impl Plan {
         self.board.as_ref().expect("gen requires a target")
     }
 
+    /// Whether this bundle gets a stall stage (`terminator::stalled_bundles`).
+    pub fn stalled(&self, bundle: &str) -> bool {
+        crate::terminator::stalled_bundles(
+            &self.loaded.manifest,
+            &self.fifos,
+            &self.host_mems,
+            &self.axi_mems,
+        )
+        .iter()
+        .any(|b| b == bundle)
+    }
+
     /// PCIe lanes the board offers, or 0 without PCIe.
     pub fn pcie_lanes(&self) -> u32 {
         self.target()

@@ -1515,7 +1515,7 @@ module dut_top (
     let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n\
          [bundle.ctl]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\n\
          ports = [\"i_start\", \"i_addr\", \"i_nbytes\", \"o_busy\", \"o_sum\", \"o_beats\", \"o_errs\"]\n\n\
-         [bundle.hmem]\nbacking = \"bram\"\ndepth = 8\n\
+         [bundle.hmem]\nbacking = \"bram\"\ndepth = 8\nstall = true\n\
          ports = { rd_cmd_valid = \"o_cmd_valid\", rd_cmd_ready = \"i_cmd_ready\", \
          rd_cmd_addr = \"o_cmd_addr\", rd_cmd_size = \"o_cmd_nbytes\", \
          rd_valid = \"i_rd_valid\", rd_ready = \"o_rd_ready\", \
@@ -3229,15 +3229,9 @@ module dm_reset {{
     );
 }
 
-/// A DUT AXI4 master is terminated by FPGA memory. The host reaches the same
-/// memory through an arbiter. With `backing = "dram"`, the shape stays and a
-/// controller sits below it.
-///
-/// Two checks: AXI4 is really connected, and the DUT and the host see the
-/// same memory. Without the second, the stand-in is useless for data.
-#[test]
-fn an_axi4_master_shares_its_memory_with_the_host() {
-    let dut = r#"
+/// An AXI4 master: when run, it writes address 3, then reads address 1 into
+/// `o_last`.
+const AXI_MASTER_DUT: &str = r#"
 module dut_top (
     i_clk : input  clock                                                              ,
     i_rst : input  reset                                                              ,
@@ -3317,6 +3311,16 @@ module dut_top (
     assign axi.rready   = 1;
 }
 "#;
+
+/// A DUT AXI4 master is terminated by FPGA memory. The host reaches the same
+/// memory through an arbiter. With `backing = "dram"`, the shape stays and a
+/// controller sits below it.
+///
+/// Two checks: AXI4 is really connected, and the DUT and the host see the
+/// same memory. Without the second, the stand-in is useless for data.
+#[test]
+fn an_axi4_master_shares_its_memory_with_the_host() {
+    let dut = AXI_MASTER_DUT;
     let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.run]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"i_run\"]\n\n[bundle.last]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"o_last\"]\n\n[bundle.ddr]\nbacking = \"bram\"\ndepth = 64\nports = [\"axi\"]\n";
 
     let dir = fixture(manifest, dut, "");
@@ -3360,6 +3364,65 @@ module axi_mem_region {{
         // The neighbours are not affected.
         $assert(rd({base} + 8) == 0);
         $assert(rd({base} + 4) == 32'ha5a5_0001);
+
+        $finish();
+    }}
+}}
+"#
+    );
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
+/// The stall stage holds the DUT's AXI4 beats back: with `<bundle>_delay`
+/// set, the same run takes longer and still moves the same data.
+#[test]
+fn an_axi4_master_waits_out_the_stall_stage() {
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.run]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"i_run\"]\n\n[bundle.last]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"o_last\"]\n\n[bundle.ddr]\nbacking = \"bram\"\ndepth = 64\nstall = true\nports = [\"axi\"]\n";
+
+    let dir = fixture(manifest, AXI_MASTER_DUT, "");
+    let map = offsets(dir.path());
+    let (base, run, last, delay, jitter, seed) = (
+        region_base(&map, "ddr"),
+        offset_of(&map, "i_run"),
+        offset_of(&map, "o_last"),
+        offset_of(&map, "ddr_delay"),
+        offset_of(&map, "ddr_jitter"),
+        offset_of(&map, "harness_seed"),
+    );
+
+    let tb = format!(
+        r#"
+#[test(axi_stall_wired)]
+module axi_stall_wired {{
+{BUS}
+    initial {{
+        start();
+
+        wr({base} + 4, 32'ha5a5_0001);
+        wr({delay}, 200);
+        $assert(rd({delay}) == 200);
+        wr({jitter}, 0);
+        wr({seed}, 7);
+        $assert(rd({seed}) == 7);
+
+        wr({run}, 1);
+        clk.next(1);
+        wr({run}, 0);
+        // Without the stage, 32 cycles were enough. Every beat now waits 200.
+        clk.next(32);
+        $assert(rd({last}) == 0);
+        $assert(rd({base} + 12) == 0);
+
+        clk.next(2000);
+        var seen: logic<32>;
+        seen = rd({last});
+        $display("o_last = %h", seen);
+        $assert(seen == 32'ha5a5_0001);
+        $assert(rd({base} + 12) == 32'hbeef_0003);
 
         $finish();
     }}

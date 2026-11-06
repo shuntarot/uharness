@@ -730,6 +730,14 @@ pub struct Bundle {
     /// with an error, needs more: set it above the slave's own timeout.
     #[serde(default)]
     pub timeout: Option<u32>,
+
+    /// Whether the harness puts a stall stage on this bundle's handshakes
+    /// (memories with a handshake, `host_mem`, and a `host_poll_fifo` with
+    /// ready). Off by default: the stage costs about 100 LUTs per channel and
+    /// a gate on ready and valid. With `true` it passes everything through
+    /// until the host writes `<bundle>_delay`.
+    #[serde(default)]
+    pub stall: Option<bool>,
 }
 
 /// What the records of a `trace` are.
@@ -1033,6 +1041,98 @@ fn default_perst_resets_dut() -> bool {
 /// BAR0 of the test machine also has this size.
 pub const MIN_BAR_BYTES: u32 = 4 * 1024;
 
+/// One entry of `[pin]`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PinBinding {
+    /// `o_uart_tx = "uart_tx"`: an output driven onto the pin all the time.
+    Resource(String),
+    /// `{ pin = "...", t = "...", i = "...", sync = false }`.
+    Detail(PinDetail),
+}
+
+/// The table form of a `[pin]` entry. The key is the port that drives the
+/// pin, or the input for a pin that is only read.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinDetail {
+    /// The resource name the target declares.
+    pub pin: String,
+    /// The DUT output that turns the driver off: 1 = high impedance, as the
+    /// `T` input of a Xilinx `IOBUF` / `OBUFT`.
+    #[serde(default)]
+    pub t: Option<String>,
+    /// The DUT input that reads the pin back.
+    #[serde(default)]
+    pub i: Option<String>,
+    /// Whether the harness puts a synchronizer on the input. Required for
+    /// every input: only the DUT knows whether it samples the pin itself.
+    #[serde(default)]
+    pub sync: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for PinBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = PinBinding;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a resource name, or a table such as `{ pin = \"<resource>\", t = \"<port>\" }`")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<PinBinding, E> {
+                Ok(PinBinding::Resource(value.to_string()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<PinBinding, A::Error> {
+                // Through the derived struct, so that a typo in a key is
+                // reported by name.
+                PinDetail::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(PinBinding::Detail)
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl PinBinding {
+    pub fn resource(&self) -> &str {
+        match self {
+            PinBinding::Resource(resource) => resource,
+            PinBinding::Detail(detail) => &detail.pin,
+        }
+    }
+
+    pub fn t(&self) -> Option<&str> {
+        match self {
+            PinBinding::Resource(_) => None,
+            PinBinding::Detail(detail) => detail.t.as_deref(),
+        }
+    }
+
+    pub fn i(&self) -> Option<&str> {
+        match self {
+            PinBinding::Resource(_) => None,
+            PinBinding::Detail(detail) => detail.i.as_deref(),
+        }
+    }
+
+    pub fn sync(&self) -> Option<bool> {
+        match self {
+            PinBinding::Resource(_) => None,
+            PinBinding::Detail(detail) => detail.sync,
+        }
+    }
+
+    /// The ports this entry names besides its key.
+    pub fn companions(&self) -> impl Iterator<Item = &str> {
+        self.t().into_iter().chain(self.i())
+    }
+}
+
 /// `[leave_open]`: outputs that stay unconnected.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1089,8 +1189,8 @@ pub struct Manifest {
     #[serde(default)]
     pub leave_open: LeaveOpen,
 
-    /// `[pin]`: outputs that end at a board pin. Port name -> a resource name
-    /// the target declares.
+    /// `[pin]`: ports that end at board pins. Port name -> a resource name
+    /// the target declares, or a table for a tri-state pin and for inputs.
     ///
     /// Pin numbers must not be written here. Otherwise the manifest works for
     /// one board only, and the same DUT can no longer go on every target. The
@@ -1099,10 +1199,13 @@ pub struct Manifest {
     ///
     /// ```toml
     /// [pin]
-    /// o_uart_tx = "uart_tx"
+    /// o_uart_tx   = "uart_tx"
+    /// o_cfg_cs    = { pin = "cfg_cs", t = "o_cfg_cs_t" }
+    /// o_cfg_dout  = { pin = "cfg_dat", t = "o_cfg_dout_t", i = "i_cfg_din", sync = false }
+    /// i_button    = { pin = "button", sync = false }
     /// ```
     #[serde(default)]
-    pub pin: BTreeMap<String, String>,
+    pub pin: BTreeMap<String, PinBinding>,
 
     /// Clock port name -> the frequency it needs.
     #[serde(default)]
@@ -1330,7 +1433,7 @@ pub enum ManifestError {
     #[diagnostic(
         code(harness::manifest::pin_and_other),
         help(
-            "Each port gets one termination: [pin] sends an output to a board pin, [leave_open] leaves an output unconnected, and [tie_off] drives an input with a constant. Keep one."
+            "Each port gets one termination: [pin] connects it to a board pin, [leave_open] leaves an output unconnected, and [tie_off] drives an input with a constant. Keep one."
         )
     )]
     PinAndOther { port: String, other: &'static str },
@@ -1357,6 +1460,24 @@ pub enum ManifestError {
         help("Valid values are `jtag` and `pcie`. Remove the key to let the board pick.")
     )]
     UnknownHostTransport { value: String },
+
+    #[error("[pin] names `{port}` twice")]
+    #[diagnostic(
+        code(harness::manifest::pin_port_twice),
+        help(
+            "Each port reaches one pin once: as the key of an entry, or as its `t` or `i`. Remove the second one."
+        )
+    )]
+    PinPortTwice { port: String },
+
+    #[error("[pin] `{port}` asks for `sync = true`, which is not built yet")]
+    #[diagnostic(
+        code(harness::manifest::pin_sync_not_built),
+        help(
+            "A synchronizer on a pin input is not built yet. If the DUT samples the pin itself, for example with a clock it drives out, write `sync = false`. Otherwise put a synchronizer in the DUT and write `sync = false`."
+        )
+    )]
+    PinSyncNotBuilt { port: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -1513,18 +1634,31 @@ impl Manifest {
                 return Err(ManifestError::TieAndOpen { port: port.clone() });
             }
         }
-        for port in self.pin.keys() {
-            if open.contains(port) {
-                return Err(ManifestError::PinAndOther {
-                    port: port.clone(),
-                    other: "leave_open",
-                });
+        let mut pinned = std::collections::HashSet::new();
+        for (key, binding) in &self.pin {
+            for port in std::iter::once(key.as_str()).chain(binding.companions()) {
+                if !pinned.insert(port) {
+                    return Err(ManifestError::PinPortTwice {
+                        port: port.to_string(),
+                    });
+                }
+                let port = port.to_string();
+                if open.contains(&port) {
+                    return Err(ManifestError::PinAndOther {
+                        port,
+                        other: "leave_open",
+                    });
+                }
+                if self.tie_off.contains_key(&port) {
+                    return Err(ManifestError::PinAndOther {
+                        port,
+                        other: "tie_off",
+                    });
+                }
             }
-            if self.tie_off.contains_key(port) {
-                return Err(ManifestError::PinAndOther {
-                    port: port.clone(),
-                    other: "tie_off",
-                });
+            // Only `sync = false` is built so far.
+            if binding.sync() == Some(true) {
+                return Err(ManifestError::PinSyncNotBuilt { port: key.clone() });
             }
         }
 
@@ -2001,6 +2135,63 @@ whatever = true
         let err = load(dir.path(), None).unwrap_err();
 
         assert!(matches!(err, ManifestError::UnknownHostTransport { .. }));
+    }
+
+    #[test]
+    fn a_pin_entry_is_a_resource_or_a_table() {
+        let dir = dir_with(&[(
+            MANIFEST_NAME,
+            "[dut]\nmodule = \"t\"\n\n[pin]\no_a = \"uart_tx\"\no_b = { pin = \"dat\", t = \"o_b_t\", i = \"i_b\", sync = false }\n",
+        )]);
+        let pin = load(dir.path(), None).unwrap().manifest.pin;
+
+        assert_eq!(pin["o_a"], PinBinding::Resource("uart_tx".to_string()));
+        assert_eq!(pin["o_b"].resource(), "dat");
+        assert_eq!(
+            pin["o_b"].companions().collect::<Vec<_>>(),
+            ["o_b_t", "i_b"]
+        );
+        assert_eq!(pin["o_b"].sync(), Some(false));
+    }
+
+    /// A typo inside the table is reported by name.
+    #[test]
+    fn a_typo_in_a_pin_table_is_named() {
+        let dir = dir_with(&[(
+            MANIFEST_NAME,
+            "[dut]\nmodule = \"t\"\n\n[pin]\no_b = { pin = \"dat\", tt = \"o_b_t\" }\n",
+        )]);
+        let err = load(dir.path(), None).unwrap_err();
+
+        let ManifestError::Parse { message, .. } = &err else {
+            panic!("expected a parse error, got {err:?}");
+        };
+        assert!(message.contains("`tt`"), "message was: {message}");
+    }
+
+    #[test]
+    fn a_port_reaches_one_pin_once() {
+        let dir = dir_with(&[(
+            MANIFEST_NAME,
+            "[dut]\nmodule = \"t\"\n\n[pin]\no_a = { pin = \"a\", t = \"o_t\" }\no_b = { pin = \"b\", t = \"o_t\" }\n",
+        )]);
+        let err = load(dir.path(), None).unwrap_err();
+
+        assert!(matches!(err, ManifestError::PinPortTwice { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_pin_synchronizer_is_not_built_yet() {
+        let dir = dir_with(&[(
+            MANIFEST_NAME,
+            "[dut]\nmodule = \"t\"\n\n[pin]\ni_a = { pin = \"a\", sync = true }\n",
+        )]);
+        let err = load(dir.path(), None).unwrap_err();
+
+        assert!(
+            matches!(err, ManifestError::PinSyncNotBuilt { .. }),
+            "{err:?}"
+        );
     }
 
     /// Below `[dut]`, the key would be `dut.host_transport`.

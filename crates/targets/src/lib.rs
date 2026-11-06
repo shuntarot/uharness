@@ -666,25 +666,41 @@ pub fn flash(target: &Target) -> Option<Flash> {
 /// Values come from the board files (`part0_pins.xml` / `board.xml`).
 #[derive(Debug, Clone, Default)]
 pub struct PinResource {
-    pub pin: Option<String>,
+    /// One package pin per bit, bit 0 first. `pin = "D10"` is one pin, and
+    /// `pin = ["AV28", "AW28"]` is a 2-bit resource. Empty when `pin` is
+    /// missing or is neither a string nor a list of strings.
+    pub pins: Vec<String>,
     pub standard: Option<String>,
     /// Direction as the FPGA sees it, from `port_map ... dir=` in
-    /// `board.xml`.
+    /// `board.xml`: `output`, `input`, or `inout` for a pin that both sides
+    /// may drive.
     pub direction: Option<String>,
 }
 
 impl PinResource {
-    /// Whether the FPGA may drive this pin: only for `output`. An `input`
-    /// would fight the board's driver, and any other value has no known
-    /// meaning. `[pin]` and `[heartbeat]` share this rule.
+    /// Whether the FPGA may drive this pin all the time: only for `output`.
+    /// An `input` would fight the board's driver, an `inout` may be driven
+    /// only through a tri-state, and any other value has no known meaning.
+    /// `[pin]` and `[heartbeat]` share this rule.
     pub fn fpga_drives(&self) -> bool {
         self.direction.as_deref() == Some("output")
     }
 
+    /// Whether the FPGA may drive this pin through a tri-state: `output` or
+    /// `inout`.
+    pub fn fpga_may_drive(&self) -> bool {
+        matches!(self.direction.as_deref(), Some("output" | "inout"))
+    }
+
+    /// Whether the FPGA may read this pin: `input` or `inout`.
+    pub fn fpga_reads(&self) -> bool {
+        matches!(self.direction.as_deref(), Some("input" | "inout"))
+    }
+
     /// The first field a constraint needs that is missing.
     pub fn missing(&self) -> Option<&'static str> {
-        match (&self.pin, &self.standard, &self.direction) {
-            (None, _, _) => Some("which package pin it is (`pin`)"),
+        match (self.pins.is_empty(), &self.standard, &self.direction) {
+            (true, _, _) => Some("which package pin it is (`pin`)"),
             (_, None, _) => Some("its IOSTANDARD (`standard`)"),
             (_, _, None) => Some("which way it goes (`direction`)"),
             _ => None,
@@ -1140,8 +1156,19 @@ pub fn pin_resource(target: &Target, name: &str) -> Option<PinResource> {
             .and_then(|value| value.as_str())
             .map(|value| value.to_string())
     };
+    // A list is taken only when every entry is a string. Anything else is
+    // reported as a missing `pin`, never read in part.
+    let pins = match table.get("pin") {
+        Some(toml::Value::String(pin)) => vec![pin.clone()],
+        Some(toml::Value::Array(list)) => list
+            .iter()
+            .map(|value| value.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
     Some(PinResource {
-        pin: text("pin"),
+        pins,
         standard: text("standard"),
         direction: text("direction"),
     })
@@ -1162,7 +1189,14 @@ pub fn pin_resources(target: &Target) -> String {
                 .and_then(|table| table.get("direction"))
                 .and_then(|value| value.as_str())
                 .unwrap_or("?");
-            format!("    {name} ({dir})")
+            match value
+                .as_table()
+                .and_then(|table| table.get("pin"))
+                .and_then(|value| value.as_array())
+            {
+                Some(list) => format!("    {name} ({dir}, {} pins)", list.len()),
+                None => format!("    {name} ({dir})"),
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1786,6 +1820,28 @@ mod tests {
         assert_eq!(resolve("xilinx/v", &[]).unwrap().name, "xilinx/vcu118");
         let err = resolve("xilinx/v:nope", &[]).unwrap_err();
         assert!(matches!(err, TargetError::ConfigNotFound { .. }), "{err:?}");
+    }
+
+    /// A string is one pin, a list is one per bit. A list with anything but
+    /// strings is not read in part.
+    #[test]
+    fn a_pin_resource_may_list_one_pin_per_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = dir.path().join("pins.toml");
+        std::fs::write(
+            &patch,
+            "[pins.bus]\npin = [\"A1\", \"A2\"]\nstandard = \"LVCMOS18\"\ndirection = \"inout\"\n\n[pins.bad]\npin = [\"A3\", 4]\nstandard = \"LVCMOS18\"\ndirection = \"output\"\n",
+        )
+        .unwrap();
+        let target = resolve("digilent/arty-a7-35", &[patch]).unwrap();
+
+        let bus = pin_resource(&target, "bus").unwrap();
+        assert_eq!(bus.pins, ["A1", "A2"]);
+        assert!(bus.fpga_may_drive() && bus.fpga_reads() && !bus.fpga_drives());
+        assert_eq!(pin_resource(&target, "uart_tx").unwrap().pins, ["D10"]);
+        let bad = pin_resource(&target, "bad").unwrap();
+        assert!(bad.missing().is_some_and(|m| m.contains("`pin`")));
+        assert!(pin_resources(&target).contains("bus (inout, 2 pins)"));
     }
 
     #[test]

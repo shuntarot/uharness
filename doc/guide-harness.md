@@ -91,6 +91,7 @@ data lives (`backing`); the shape of the port is read from the DUT.**
 | `reset` | port name | `dmi` only: the Debug Module's own reset port |
 | `format` | `"rvfi"` | `trace` only: the records are RVFI; names and widths are checked |
 | `trigger` | array of ports | `trace` only: the ports `hio trace start --when` may test, from `ports`; only these get a comparator. Default: none |
+| `stall` | `true` / `false` | a bundle with a handshake the harness answers (an AXI4 or pzcorebus memory, a transfer-level port, `host_mem`, a `host_poll_fifo` with ready): `true` adds a [stall stage](#stalls-making-the-dut-wait). Default `false` |
 | `timeout` | cycles of the bundle's clock | a slave with a handshake (AXI4, pzcorebus, APB, `dmi`): how long the window waits for an answer before it ends the access with an error. Default 10 us. Set it above the slave's own timeout when the slave answers late on purpose. Over PCIe, more than 50 us is warned about |
 
 A key the bundle's shape does not use is an error, not ignored.
@@ -295,9 +296,7 @@ latency assumed.
 | write | `wr_cmd_valid` `wr_cmd_ready` `wr_cmd_addr` `wr_cmd_size` | `wr_valid` `wr_ready` `wr_data` `wr_last` (+ optional `wr_strb`) | `wr_done_valid` `wr_done_error` |
 
 Name every role of whichever half the DUT has. `*_cmd_size` is a byte count.
-Write `<bundle>_delay` (0-255) to stall every transfer that many cycles, and
-`<bundle>_jitter` to vary it — FPGA memory is fast and regular, so without this
-"the DUT survives a slow responder" is never actually tested.
+To make the DUT wait, see [Stalls](#stalls-making-the-dut-wait).
 
 The address must be on a beat boundary; the size is rounded up to whole
 beats. Commands may be posted back to back, and they complete in order.
@@ -312,8 +311,8 @@ command is counted in `<bundle>_oor`.
 With `backing = "dram"` the same port is turned into AXI4 bursts (at most 256
 beats, never across 4 KB) on the board's memory. `wr_done_valid` then comes
 once the memory has taken every burst, and an error response from the memory
-sets `rd_error` or `wr_done_error`. `<bundle>_delay` is not there: the
-memory is slow and uneven by itself.
+sets `rd_error` or `wr_done_error`. A stall stage (`stall = true`) sits on the
+AXI4 side, so it holds back bursts rather than the commands themselves.
 
 **A register file inside the DUT.** Same roles as memory; the difference is
 direction — `addr` is a DUT input.
@@ -426,6 +425,49 @@ reset   = "i_dm_rst"  # the Debug Module's own reset port
   reset and `hio reset` clears it. Inside the DUT, reset the core with the DUT
   reset *or* the Debug Module's `ndmreset` / hart reset.
 
+### Stalls: making the DUT wait
+
+FPGA memory is fast and regular, and a harness FIFO is rarely full. Without
+help, "the DUT survives a slow, irregular partner" is never tested on the
+board. So a handshake the harness answers can have a stall stage in front:
+`stall = true` on an AXI4 or pzcorebus memory (all five channels), a
+transfer-level port, `host_mem`, or a `host_poll_fifo` with ready. The host's
+own accesses are never stalled.
+
+```toml
+[bundle.mem]
+backing = "bram"
+depth   = 256
+stall   = true
+ports   = ["axi"]
+```
+
+| register | meaning |
+|---|---|
+| `<bundle>_delay` | hold each beat back this many cycles (0-255) before it goes through, on every channel. 0, the default, passes everything through |
+| `<bundle>_jitter` | 1: hold each beat back a random number of cycles up to `_delay` instead |
+| `harness_seed` | the seed of the random numbers, shared by every bundle |
+
+A stall hides valid and ready together, so no beat is lost and no valid is
+taken back. The random numbers start again from `harness_seed` while the DUT is in
+reset, and move on once per beat, not once per cycle. So **the same seed gives
+the same stalls on every run**, on the board and in `--target sim` alike, however
+long the host takes to start the DUT after the reset:
+
+```bash
+hio write mem_delay 16
+hio write mem_jitter 1
+hio write harness_seed 7
+hio reset            # the stalls start from seed 7
+```
+
+Exact repeats need the rest of the run to repeat too: real DRAM and PCIe
+answer at varying times, so only a `bram`-backed run repeats cycle for cycle.
+
+The stage is off by default because it is not free: each stalled channel costs
+about 100 LUTs and 40 flip-flops (an AXI4 bundle has five channels), and puts a
+gate on its ready and valid.
+
 ### `access`: `region` or `indirect`
 
 Independent of what the DUT's port looks like:
@@ -484,8 +526,11 @@ i_mode = 0
 [leave_open]              # outputs only
 ports = ["o_debug"]
 
-[pin]                     # 1-bit outputs only; the name is a board resource
-o_uart_tx = "uart_tx"
+[pin]                     # the value is a board resource, never a pin number
+o_uart_tx = "uart_tx"                                   # an output
+o_cs      = { pin = "pmod_cs", t = "o_cs_t" }           # a tri-state output
+o_dout    = { pin = "pmod_dq", t = "o_dout_t", i = "i_din", sync = false }  # bidirectional
+i_button  = { pin = "button", sync = false }            # an input
 
 [heartbeat]               # a UART the harness itself drives, 8N1
 pin  = "uart_tx"
@@ -516,6 +561,23 @@ tcl = "vivado.tcl"        # relative to Harness.toml
 - Pin numbers and IOSTANDARD come from the **target description**, never from
   the manifest — otherwise the manifest is tied to one board. See what a board
   offers in `target.description` of `veryl harness check --target <name> --json`.
+- `[pin]` takes plain DUT ports, one bit per board pin. The key is the port
+  that drives the pin, or the input for a pin that is only read. For a
+  tri-state pin, `t` is the DUT output that turns the driver off:
+  **`t` = 1 means high impedance**, as the `T` of a Xilinx `IOBUF`. `i` reads
+  the pin back. The top gets `o_<resource>` (with `t`) or `io_<resource>`
+  (with `t` and `i`), and Vivado makes the `OBUFT` / `IOBUF` from it. The
+  value, `t` and `i` have the same width and clock domain.
+- Every input from a pin says `sync`. `sync = false` connects the pin as it
+  is: the DUT samples it itself. A synchronizer from the harness
+  (`sync = true`) is not built yet.
+- The board's `direction` decides what may connect: an output needs
+  `"output"`, a tri-state output `"output"` or `"inout"`, a bidirectional
+  pin `"inout"`, an input `"input"` or `"inout"`. A wider port needs a
+  resource with as many pins, listed bit 0 first:
+  `pin = ["AV28", "AW28", "AU27", "AV27"]`.
+- The XDC gets only the pin and its IOSTANDARD. Input and output delays are
+  yours to state, in `[vivado] tcl`.
 - The heartbeat repeats one line a second, and **the counter at the end
   increases** — a stopped harness cannot look alive. It works even when no
   transport does.

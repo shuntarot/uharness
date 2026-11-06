@@ -3809,14 +3809,20 @@ pub fn check_claimed(
     const FORMAT: &str = "format";
     const TRIGGER: &str = "trigger";
     const TIMEOUT: &str = "timeout";
+    const STALL: &str = "stall";
 
     for binding in bindings {
         let name = binding.bundle.as_str();
         let declared = &manifest.bundle[name];
         let claims = [
             (
-                fifos.iter().any(|p| p.bundle == name),
-                "a `host_poll_fifo`",
+                fifos.iter().any(|p| p.bundle == name && p.ready.is_some()),
+                "a `host_poll_fifo` with ready",
+                &[DEPTH, STALL][..],
+            ),
+            (
+                fifos.iter().any(|p| p.bundle == name && p.ready.is_none()),
+                "a `host_poll_fifo` without ready",
                 &[DEPTH][..],
             ),
             (
@@ -3832,21 +3838,21 @@ pub fn check_claimed(
             (
                 host_mems.iter().any(|p| p.bundle == name && !p.is_host()),
                 "a transfer-level memory port",
-                &[DEPTH][..],
+                &[DEPTH, STALL][..],
             ),
             (
                 host_mems
                     .iter()
                     .any(|p| p.bundle == name && p.is_host() && p.axi.is_none()),
                 "a transfer-level port to host memory",
-                &[APERTURE][..],
+                &[APERTURE, STALL][..],
             ),
             (
                 host_mems
                     .iter()
                     .any(|p| p.bundle == name && p.axi.is_some()),
                 "an AXI4 port to host memory",
-                &[APERTURE, DUT_BASE][..],
+                &[APERTURE, DUT_BASE, STALL][..],
             ),
             (
                 slaves.iter().any(|p| p.bundle == name),
@@ -3868,14 +3874,14 @@ pub fn check_claimed(
                     .iter()
                     .any(|p| p.bundle == name && p.xfer.is_none()),
                 "an AXI4 memory port",
-                &[DEPTH, APERTURE, DUT_BASE][..],
+                &[DEPTH, APERTURE, DUT_BASE, STALL][..],
             ),
             (
                 axi_mems
                     .iter()
                     .any(|p| p.bundle == name && p.xfer.is_some()),
                 "a transfer-level `dram` port",
-                &[DEPTH, APERTURE][..],
+                &[DEPTH, APERTURE, STALL][..],
             ),
             (
                 axi_slaves.iter().any(|p| p.bundle == name),
@@ -3923,6 +3929,7 @@ pub fn check_claimed(
             (FORMAT, declared.format.is_some()),
             (TRIGGER, declared.trigger.is_some()),
             (TIMEOUT, declared.timeout.is_some()),
+            (STALL, declared.stall.is_some()),
         ] {
             if set && !takes.contains(&key) {
                 return Err(TerminatorError::KeyNotApplicable {
@@ -3930,7 +3937,7 @@ pub fn check_claimed(
                     key,
                     shape,
                     takes: if takes.is_empty() {
-                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`, `reset`, `format`, `trigger`, `timeout`"
+                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`, `reset`, `format`, `trigger`, `timeout`, `stall`"
                             .to_string()
                     } else {
                         takes
@@ -3944,6 +3951,34 @@ pub fn check_claimed(
         }
     }
     Ok(())
+}
+
+/// The bundles that get a stall stage, sorted by name: the handshakes the
+/// harness answers to the DUT whose bundle says `stall = true`.
+///
+/// A port without a handshake cannot be stalled: a RAM port's latency is part
+/// of its contract, and a `valid_only` stream would only drop beats.
+pub fn stalled_bundles(
+    manifest: &Manifest,
+    fifos: &[FifoPlan],
+    host_mems: &[HostMemPlan],
+    axi_mems: &[AxiMemPlan],
+) -> Vec<String> {
+    let mut names: Vec<String> = fifos
+        .iter()
+        .filter(|f| f.ready.is_some())
+        .map(|f| f.bundle.clone())
+        .chain(host_mems.iter().map(|h| h.bundle.clone()))
+        .chain(axi_mems.iter().map(|m| m.bundle.clone()))
+        .filter(|name| {
+            manifest
+                .bundle
+                .get(name)
+                .is_some_and(|b| b.stall == Some(true))
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 fn port_of<'a>(dut: &'a Dut, name: &str) -> &'a Port {

@@ -89,7 +89,11 @@ pub fn run(
             print_clocks(plan.clocks());
             print_heartbeat(plan.heartbeat.as_ref());
             print_registers(&plan.registers, emit_regs);
-            print_not_checked_yet(plan.board.is_some(), &plan.sv_blackboxes);
+            print_not_checked_yet(
+                plan.board.is_some(),
+                &plan.sv_blackboxes,
+                !plan.loaded.manifest.pin.is_empty(),
+            );
             for item in warnings(&plan) {
                 println!("warning: {}", item.what);
             }
@@ -103,7 +107,11 @@ pub fn run(
                 project,
                 &plan,
                 checked_items(plan.board.is_some()),
-                not_checked_items(plan.board.is_some(), &plan.sv_blackboxes),
+                not_checked_items(
+                    plan.board.is_some(),
+                    &plan.sv_blackboxes,
+                    !plan.loaded.manifest.pin.is_empty(),
+                ),
             );
             println!("{}", json::render(&output));
         }
@@ -186,7 +194,11 @@ fn checked_always() -> Vec<Item> {
 
 /// What was not checked, so that exit 0 is not read as "the harness can be
 /// built". JSON always carries it too, because agents need it most.
-pub(crate) fn not_checked_items(with_target: bool, sv_blackboxes: &[String]) -> Vec<Item> {
+pub(crate) fn not_checked_items(
+    with_target: bool,
+    sv_blackboxes: &[String],
+    pins: bool,
+) -> Vec<Item> {
     let mut items = vec![
         Item::new(
             "latency_vs_rtl",
@@ -217,6 +229,13 @@ pub(crate) fn not_checked_items(with_target: bool, sv_blackboxes: &[String]) -> 
         items.push(Item::new(
             "board_pins",
             "whether the resources [pin] and [heartbeat] name exist on the board and may be driven, and the heartbeat's baud rate (no --target was given)",
+        ));
+    }
+    // The XDC places [pin] ports but states no timing for them.
+    if pins {
+        items.push(Item::new(
+            "pin_timing",
+            "the timing of the [pin] ports. The XDC gives each its pin and IOSTANDARD but no input or output delay, and an input with `sync = false` reaches the DUT as it is. State the delays in `[vivado] tcl` if they matter",
         ));
     }
     // `$sv::` sources are not read. Whether they arrive depends on the DUT's
@@ -781,9 +800,9 @@ fn print_feasibility(feasibility: Option<&Feasibility>) {
 }
 
 /// The list that keeps exit 0 from reading as "the harness can be built".
-fn print_not_checked_yet(with_target: bool, sv_blackboxes: &[String]) {
+fn print_not_checked_yet(with_target: bool, sv_blackboxes: &[String], pins: bool) {
     println!("NOT CHECKED YET (exit 0 does not mean the harness is feasible):");
-    for item in not_checked_items(with_target, sv_blackboxes) {
+    for item in not_checked_items(with_target, sv_blackboxes, pins) {
         println!("  - {}", item.what);
     }
     println!("What ran here:");
@@ -988,10 +1007,14 @@ fn print_summary(plan: &plan::Plan, emit_regs: Option<&Path>) {
         line("--", "warning", &item.what);
     }
 
-    let not_checked: Vec<&str> = not_checked_items(plan.board.is_some(), &plan.sv_blackboxes)
-        .iter()
-        .map(|item| short_not_checked(item.id))
-        .collect();
+    let not_checked: Vec<&str> = not_checked_items(
+        plan.board.is_some(),
+        &plan.sv_blackboxes,
+        !plan.loaded.manifest.pin.is_empty(),
+    )
+    .iter()
+    .map(|item| short_not_checked(item.id))
+    .collect();
     println!("not checked: {}", not_checked.join(", "));
 }
 
@@ -1083,6 +1106,7 @@ fn short_not_checked(id: &str) -> &'static str {
         "feasibility" => "feasibility (no --target)",
         "board_pins" => "board pins (no --target)",
         "sv_blackbox_sources" => "$sv:: sources",
+        "pin_timing" => "the timing of [pin] ports",
         _ => "other items (see --verbose)",
     }
 }
