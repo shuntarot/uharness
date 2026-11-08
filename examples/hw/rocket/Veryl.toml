@@ -7,3 +7,8 @@ reset_type = "async_low"
 
 [dependencies]
 hns = { path = "../../../rtl/hns" }
+
+# hns::mem writes its array from both ports, the form Vivado infers a
+# true dual port BRAM from. Veryl asks the user of hns to accept that.
+[lint.portability]
+allow_in_dependencies = ["multiple_assign"]

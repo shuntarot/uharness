@@ -6867,14 +6867,19 @@ pub fn veryl_toml(plan: &Plan, hns: &str, dut_path: &str, extra: &[(String, Stri
     for (name, line) in extra {
         out.push_str(&format!("{name} = {line}\n"));
     }
-    let allowed = &plan.metadata.lint.portability.allow_in_dependencies;
-    if !allowed.is_empty() {
-        let items: Vec<String> = allowed.iter().map(|item| format!("\"{item}\"")).collect();
-        out.push_str(&format!(
-            "\n[lint.portability]\nallow_in_dependencies = [{}]\n",
-            items.join(", ")
-        ));
+    // `hns::mem` writes its array from both ports, so `multiple_assign` is
+    // always allowed. The DUT's own allowances are kept as well.
+    let mut items = vec!["\"multiple_assign\"".to_string()];
+    for item in &plan.metadata.lint.portability.allow_in_dependencies {
+        let item = format!("\"{item}\"");
+        if !items.contains(&item) {
+            items.push(item);
+        }
     }
+    out.push_str(&format!(
+        "\n[lint.portability]\nallow_in_dependencies = [{}]\n",
+        items.join(", ")
+    ));
     if plan.target().is_some_and(|target| target.is_sim()) {
         out.push_str(&format!("\n[[components]]\npath = \"{SIM_LINK_DIR}\"\n"));
     }

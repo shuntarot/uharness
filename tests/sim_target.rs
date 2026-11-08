@@ -37,7 +37,7 @@ fn fixture(dut: &str, harness_toml: &str) -> tempfile::TempDir {
     fs::write(
         dir.path().join("Veryl.toml"),
         format!(
-            "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n\n[dependencies]\nhns = {{ path = \"{}/rtl/hns\" }}\n",
+            "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n\n[dependencies]\nhns = {{ path = \"{}/rtl/hns\" }}\n\n[lint.portability]\nallow_in_dependencies = [\"multiple_assign\"]\n",
             env!("CARGO_MANIFEST_DIR")
         ),
     )

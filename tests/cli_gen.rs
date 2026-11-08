@@ -44,7 +44,7 @@ module dut_top (
 /// refers to `hns::axil`, `hns::fifo` and `hns::mem`.
 fn veryl_toml() -> String {
     format!(
-        "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n\n[dependencies]\nhns = {{ path = \"{}/rtl/hns\" }}\n",
+        "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n\n[dependencies]\nhns = {{ path = \"{}/rtl/hns\" }}\n\n[lint.portability]\nallow_in_dependencies = [\"multiple_assign\"]\n",
         env!("CARGO_MANIFEST_DIR")
     )
 }
@@ -165,7 +165,7 @@ fn gen_writes_nothing_when_a_late_file_is_refused() {
 /// not mix into the DUT build either.
 #[test]
 fn the_output_is_a_project_of_its_own() {
-    let veryl_toml = "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\nsources = [\"src\"]\n\n[dependencies]\nhns = { path = \"HNS\" }\n"
+    let veryl_toml = "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\nsources = [\"src\"]\n\n[dependencies]\nhns = { path = \"HNS\" }\n\n[lint.portability]\nallow_in_dependencies = [\"multiple_assign\"]\n"
         .replace("HNS", &format!("{}/rtl/hns", env!("CARGO_MANIFEST_DIR")));
     let dir = fixture(&veryl_toml, HARNESS_TOML);
 
@@ -194,7 +194,7 @@ fn the_output_is_a_project_of_its_own() {
 /// Veryl's default is written.
 #[test]
 fn the_output_keeps_the_analysis_settings_of_the_dut() {
-    let veryl_toml = "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\nevaluate_size_limit = 16777216\n\n[dependencies]\nhns = { path = \"HNS\" }\n\n[lint.portability]\nallow_in_dependencies = [\"initial_assign\"]\n"
+    let veryl_toml = "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\nevaluate_size_limit = 16777216\n\n[dependencies]\nhns = { path = \"HNS\" }\n\n[lint.portability]\nallow_in_dependencies = [\"initial_assign\", \"multiple_assign\"]\n"
         .replace("HNS", &format!("{}/rtl/hns", env!("CARGO_MANIFEST_DIR")));
     let dir = fixture(&veryl_toml, HARNESS_TOML);
 
@@ -210,7 +210,9 @@ fn the_output_keeps_the_analysis_settings_of_the_dut() {
     assert!(toml.contains("evaluate_size_limit = 16777216"), "{toml}");
     assert!(!toml.contains("evaluate_array_limit"), "{toml}");
     assert!(
-        toml.contains("[lint.portability]\nallow_in_dependencies = [\"initial_assign\"]"),
+        toml.contains(
+            "[lint.portability]\nallow_in_dependencies = [\"multiple_assign\", \"initial_assign\"]"
+        ),
         "{toml}"
     );
     let metadata = veryl_metadata::Metadata::load(dir.path().join("hns/Veryl.toml")).unwrap();
@@ -222,7 +224,7 @@ fn the_output_keeps_the_analysis_settings_of_the_dut() {
 /// matches the harness build when they agree.
 #[test]
 fn the_output_keeps_the_naming_rules_of_the_dut() {
-    let veryl_toml = "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\nreset_low_suffix = \"_n\"\nclock_posedge_prefix = \"p_\"\nhashed_mangled_name = true\nflatten_array_interface = true\n\n[dependencies]\nhns = { path = \"HNS\" }\n"
+    let veryl_toml = "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\nreset_low_suffix = \"_n\"\nclock_posedge_prefix = \"p_\"\nhashed_mangled_name = true\nflatten_array_interface = true\n\n[dependencies]\nhns = { path = \"HNS\" }\n\n[lint.portability]\nallow_in_dependencies = [\"multiple_assign\"]\n"
         .replace("HNS", &format!("{}/rtl/hns", env!("CARGO_MANIFEST_DIR")));
     let dir = fixture(&veryl_toml, HARNESS_TOML);
 
@@ -665,7 +667,7 @@ fn host_mem_axi_fixture(extra: &str) -> tempfile::TempDir {
     fs::write(
         dir.path().join("Veryl.toml"),
         format!(
-            "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n\n[dependencies]\nhns = {{ path = \"{}/rtl/hns\" }}\n",
+            "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n\n[dependencies]\nhns = {{ path = \"{}/rtl/hns\" }}\n\n[lint.portability]\nallow_in_dependencies = [\"multiple_assign\"]\n",
             env!("CARGO_MANIFEST_DIR")
         ),
     )
@@ -847,7 +849,7 @@ fn dram_and_host_mem_share_the_dma_engine() {
     fs::write(
         dir.path().join("Veryl.toml"),
         format!(
-            "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n\n[dependencies]\nhns = {{ path = \"{}/rtl/hns\" }}\n",
+            "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n\n[dependencies]\nhns = {{ path = \"{}/rtl/hns\" }}\n\n[lint.portability]\nallow_in_dependencies = [\"multiple_assign\"]\n",
             env!("CARGO_MANIFEST_DIR")
         ),
     )
@@ -4065,7 +4067,8 @@ fn an_out_of_tree_output_still_names_one_package() {
         format!(
             "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n\
              [build]\nreset_type = \"async_low\"\n\n\
-             [dependencies]\nhns = {{ path = \"{relative}\" }}\n"
+             [dependencies]\nhns = {{ path = \"{relative}\" }}\n\n\
+             [lint.portability]\nallow_in_dependencies = [\"multiple_assign\"]\n"
         ),
     )
     .unwrap();
