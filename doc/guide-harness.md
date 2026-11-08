@@ -697,7 +697,16 @@ it yourself; a path needs no publishing:
 ```toml
 [dependencies]
 hns = { path = "/path/to/uharness/rtl/hns" }
+
+[lint.portability]
+allow_in_dependencies = ["multiple_assign"]
 ```
+
+Whenever your `Veryl.toml` names `hns`, it needs the `[lint.portability]`
+lines too. `hns::mem` writes its array from two processes, one per port. That
+is the form Vivado needs for a true dual port BRAM, but SystemVerilog does not
+allow it in `always_ff`. Without the lines, `veryl check` stops with
+`non_portable_dependency`. The output's own `Veryl.toml` always has them.
 
 ```bash
 veryl harness gen -o hns/arty   --target digilent/arty-a7-35

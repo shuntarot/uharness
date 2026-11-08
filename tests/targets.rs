@@ -20,7 +20,7 @@ mod common;
 /// and `hns::mem`.
 fn veryl_toml() -> String {
     format!(
-        "[project]\nname = \"reference\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n\n[dependencies]\nhns = {{ path = \"{}/rtl/hns\" }}\n",
+        "[project]\nname = \"reference\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n\n[dependencies]\nhns = {{ path = \"{}/rtl/hns\" }}\n\n[lint.portability]\nallow_in_dependencies = [\"multiple_assign\"]\n",
         env!("CARGO_MANIFEST_DIR")
     )
 }

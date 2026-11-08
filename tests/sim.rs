@@ -19,7 +19,7 @@ use clap::Parser;
 /// refers to `hns::axil`, `hns::fifo` and `hns::mem`.
 fn veryl_toml() -> String {
     format!(
-        "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n\n[dependencies]\nhns = {{ path = \"{}/rtl/hns\" }}\n",
+        "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[build]\nreset_type = \"async_low\"\n\n[dependencies]\nhns = {{ path = \"{}/rtl/hns\" }}\n\n[lint.portability]\nallow_in_dependencies = [\"multiple_assign\"]\n",
         env!("CARGO_MANIFEST_DIR")
     )
 }
@@ -2467,7 +2467,10 @@ fn corebus_fixture(harness_toml: &str, dut: &str) -> tempfile::TempDir {
 
 /// The same, before `gen`.
 fn corebus_project(harness_toml: &str, dut: &str) -> tempfile::TempDir {
-    let veryl_toml = format!("{}cbstub = {{ path = \"cbstub\" }}\n", veryl_toml());
+    let veryl_toml = veryl_toml().replace(
+        "\n\n[lint.portability]",
+        "\ncbstub = { path = \"cbstub\" }\n\n[lint.portability]",
+    );
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("cbstub").join("src")).unwrap();
     fs::write(

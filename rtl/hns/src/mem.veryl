@@ -45,7 +45,11 @@ pub module mem #(
     const ENTRY  : u32                  = WIDTH * SLICES;
     const INDEX_W: u32                  = $clog2(DEPTH);
     const LANE_W : u32                  = $clog2(SLICES);
-    var   mem    : logic<ENTRY> [DEPTH];
+    // Both ports write it, each from its own block: the true dual port form
+    // Vivado infers a BRAM from. SystemVerilog forbids that for always_ff, so
+    // Veryl emits these blocks as plain always.
+    #[allow(multiple_assign)]
+    var mem: logic<ENTRY> [DEPTH];
 
     // The DUT's address is not folded into range. SHIFT drops the bits that
     // pick a byte or a word inside an entry; what is left either names an
