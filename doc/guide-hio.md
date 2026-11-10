@@ -440,6 +440,9 @@ console` do not, because they take over the terminal.
 `mem` goes through the window to the memories `dut_base` places at that
 address, so it needs no Debug Module and no halt. A CPU with a data cache may
 hold newer data than it shows. A symbol is read whole unless a count is given.
+`mem --sba` goes through the Debug Module's System Bus Access instead. It is
+slower, but on a system whose caches stay coherent with that bus it shows
+what the harts see, while they run.
 
 `disasm` reads the same way, so with a place and `--elf` it needs no Debug
 Module either. Where two memories hold the address, it reads the one the CPU

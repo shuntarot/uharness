@@ -823,7 +823,9 @@ enum CpuCmd {
     /// The place is an address or a symbol (with the ELF). It goes through
     /// the window to the memories `dut_base` places there, not through the
     /// CPU, so the hart need not halt; a CPU with a data cache may hold newer
-    /// data. Without a count a symbol is read whole, an address as one word.
+    /// data. `--sba` goes through the Debug Module's System Bus Access
+    /// instead. Without a count a symbol is read whole, an address as one
+    /// word.
     Mem {
         /// Address or symbol.
         place: String,
@@ -832,6 +834,12 @@ enum CpuCmd {
         /// Words to write there instead, in order.
         #[arg(long, num_args = 1.., value_name = "WORD", value_parser = parse_u32)]
         write: Vec<u32>,
+        /// Go through the Debug Module's system bus, not the window.
+        ///
+        /// Slower, but on a system that keeps its caches coherent with that
+        /// bus it sees what the harts see.
+        #[arg(long)]
+        sba: bool,
         #[command(flatten)]
         hart: HartArgs,
     },
@@ -956,7 +964,13 @@ enum RttLayout {
 }
 
 fn parse_u32(s: &str) -> Result<u32, String> {
-    parse_u64(s).map(|v| v as u32)
+    let v = parse_u64(s)?;
+    u32::try_from(v).map_err(|_| format!("{s:?} does not fit in 32 bits"))
+}
+
+fn parse_u16(s: &str) -> Result<u16, String> {
+    let v = parse_u64(s)?;
+    u16::try_from(v).map_err(|_| format!("{s:?} does not fit in 16 bits"))
 }
 
 fn parse_u64(s: &str) -> Result<u64, String> {
@@ -992,7 +1006,7 @@ fn parse_pair(s: &str) -> Result<(u16, u16), String> {
     let (a, b) = s
         .split_once(':')
         .ok_or_else(|| format!("expected `data:direction`, got {s:?}"))?;
-    Ok((parse_u32(a)? as u16, parse_u32(b)? as u16))
+    Ok((parse_u16(a)?, parse_u16(b)?))
 }
 
 fn main() {
@@ -8808,14 +8822,12 @@ fn prompt_lines(
 /// `cpu mem`: words at a DUT address, four to a line, each line named by
 /// the symbol it falls in.
 fn mem(
-    bus: &mut Bus,
-    map: &RegisterMap,
+    mem: &mut dyn hns_host::rtt::Memory,
     elf: Option<&hns_host::elf::Elf>,
     place: &str,
     words: Option<u32>,
     write: &[u32],
 ) -> Result<(), String> {
-    use hns_host::rtt::Memory;
     /// Words read when a symbol is larger, unless a count is given.
     const MOST: u64 = 256;
 
@@ -8827,11 +8839,6 @@ fn mem(
         (_, false) => write.len() as u64,
         (Some(n), true) => u64::from(n.max(1)),
         (None, true) => size.unwrap_or(1).min(MOST),
-    };
-    let mut mem = WindowMem {
-        bus,
-        map,
-        spans: spans(map)?,
     };
     if !write.is_empty() {
         let bytes: Vec<u8> = write.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -9442,15 +9449,26 @@ fn cpu_debug(
         }
         (None, None) => None,
     };
-    // Memory goes through the window, not the Debug Module.
+    // Memory goes through the window unless asked for the system bus.
     if let CpuCmd::Mem {
         place,
         words,
         write,
+        sba,
         ..
     } = cmd
     {
-        return mem(bus, map, elf, place, *words, write);
+        if *sba {
+            let base = dmi_base(map, args.dmi.as_deref())?;
+            let mut sb = hns_host::dm::SystemBus::open(WindowDmi::new(bus, map, base))?;
+            return mem(&mut sb, elf, place, *words, write);
+        }
+        let mut window = WindowMem {
+            bus,
+            map,
+            spans: spans(map)?,
+        };
+        return mem(&mut window, elf, place, *words, write);
     }
     // A listing of a named place needs only the memory and the ELF's width,
     // so it works on a CPU without a Debug Module too.
@@ -10149,6 +10167,16 @@ fn size_note(r: &hns_regs::Register, words: &[u32]) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// A value too wide for its argument is refused, not cut to its low bits:
+    /// `cpu mem --write 0x1122334455667788` once wrote 0x55667788.
+    #[test]
+    fn a_number_too_wide_for_its_argument_is_refused() {
+        assert_eq!(parse_u32("0xffffffff"), Ok(0xffff_ffff));
+        assert!(parse_u32("0x1122334455667788").is_err());
+        assert_eq!(parse_pair("0x0403:6014"), Ok((0x0403, 6014)));
+        assert!(parse_pair("0x10000:0").is_err());
+    }
 
     /// Wide values go out lowest word first. Reversed, a descriptor address
     /// would have its halves swapped, and with the IOMMU in identity mode the

@@ -49,6 +49,10 @@ pub mod reg {
     pub const ABSTRACTAUTO: u32 = 0x18;
     pub const PROGBUF0: u32 = 0x20;
     pub const SBCS: u32 = 0x38;
+    pub const SBADDRESS0: u32 = 0x39;
+    pub const SBADDRESS1: u32 = 0x3a;
+    pub const SBDATA0: u32 = 0x3c;
+    pub const SBDATA1: u32 = 0x3d;
     pub const HALTSUM0: u32 = 0x40;
 
     /// Names for the registers a person types, as the spec spells them.
@@ -64,6 +68,10 @@ pub mod reg {
         ("progbuf0", PROGBUF0),
         ("progbuf1", PROGBUF0 + 1),
         ("sbcs", SBCS),
+        ("sbaddress0", SBADDRESS0),
+        ("sbaddress1", SBADDRESS1),
+        ("sbdata0", SBDATA0),
+        ("sbdata1", SBDATA1),
         ("haltsum0", HALTSUM0),
     ];
 
@@ -328,8 +336,22 @@ fn cmderr_text(cmderr: u32) -> &'static str {
 }
 
 /// A failed abstract command, kept apart so a caller can fall back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CmdErr(u32);
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CmdErr {
+    /// `abstractcs.cmderr`, as the Debug Module set it.
+    Dm(u32),
+    /// The window failed, or the command never finished.
+    Other(String),
+}
+
+impl std::fmt::Display for CmdErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CmdErr::Dm(e) => f.write_str(cmderr_text(*e)),
+            CmdErr::Other(e) => f.write_str(e),
+        }
+    }
+}
 
 /// How the Debug Module describes itself, read without disturbing the hart.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -717,7 +739,13 @@ impl<D: Dmi> Debug<D> {
         self.write_reg(Reg::Csr(DCSR), dcsr | DCSR_STEP)?;
         self.dmi.hart_runs(true)?;
         self.write(reg::DMCONTROL, self.control(RESUMEREQ))?;
-        let waited = self.wait("the hart to finish the step", |dm| dm.is_halted());
+        // `allhalted` stays set until the hart has left debug mode, which
+        // takes a while on a slow core and a fast link. It means the step is
+        // done only once `allresumeack` says the hart did resume.
+        let waited = self.wait("the hart to finish the step", |dm| {
+            let s = dm.status()?;
+            Ok(s & ALLRESUMEACK != 0 && s & ALLHALTED != 0)
+        });
         self.write(reg::DMCONTROL, self.control(0))?;
         if waited.is_err() {
             // It ran away (a WFI, or a step the hart ignored): stop it.
@@ -814,18 +842,22 @@ impl<D: Dmi> Debug<D> {
             while cs & BUSY != 0 {
                 polls += 1;
                 if polls > POLLS {
-                    return Err("timed out waiting for an abstract command".to_string());
+                    return Err(
+                        "the abstract command stayed busy: the hart did not run it. \
+                         `hio cpu dmi dmcontrol 0`, then `1`, resets the Debug Module \
+                         and drops the command."
+                            .to_string(),
+                    );
                 }
                 cs = dm.read(reg::ABSTRACTCS)?;
             }
             Ok(cs)
         };
-        // A transport error is not a command error; report it as "other".
-        let cs = run(self).map_err(|_| CmdErr(7))?;
+        let cs = run(self).map_err(CmdErr::Other)?;
         let cmderr = (cs >> 8) & 0x7;
         if cmderr != 0 {
             let _ = self.write(reg::ABSTRACTCS, CMDERR_CLEAR);
-            return Err(CmdErr(cmderr));
+            return Err(CmdErr::Dm(cmderr));
         }
         Ok(())
     }
@@ -848,23 +880,21 @@ impl<D: Dmi> Debug<D> {
         }
         let xlen = match self.command(self.access(0x1000 + S0, false, true, false, 64)) {
             Ok(()) => 64,
-            Err(CmdErr(2)) => {
+            Err(CmdErr::Dm(2)) => {
                 match self.command(self.access(0x1000 + S0, false, true, false, 32)) {
                     Ok(()) => 32,
-                    Err(CmdErr(e)) => {
+                    Err(e) => {
                         return Err(format!(
                             "cannot read a register of hart {}: {}",
-                            self.hart,
-                            cmderr_text(e)
+                            self.hart, e
                         ));
                     }
                 }
             }
-            Err(CmdErr(e)) => {
+            Err(e) => {
                 return Err(format!(
                     "cannot read a register of hart {}: {}",
-                    self.hart,
-                    cmderr_text(e)
+                    self.hart, e
                 ));
             }
         };
@@ -902,12 +932,12 @@ impl<D: Dmi> Debug<D> {
         }
         match self.command(self.access(reg.regno(), false, true, false, xlen)) {
             Ok(()) => self.read_data(xlen),
-            Err(CmdErr(2)) if matches!(reg, Reg::Csr(_)) => {
+            Err(CmdErr::Dm(2)) if matches!(reg, Reg::Csr(_)) => {
                 self.csr_by_progbuf = true;
                 let Reg::Csr(csr) = reg else { unreachable!() };
                 self.read_csr_by_progbuf(csr, xlen)
             }
-            Err(CmdErr(e)) => Err(format!("cannot read {reg}: {}", cmderr_text(e))),
+            Err(e) => Err(format!("cannot read {reg}: {e}")),
         }
     }
 
@@ -923,12 +953,12 @@ impl<D: Dmi> Debug<D> {
         self.write_data(xlen, value)?;
         match self.command(self.access(reg.regno(), true, true, false, xlen)) {
             Ok(()) => Ok(()),
-            Err(CmdErr(2)) if matches!(reg, Reg::Csr(_)) => {
+            Err(CmdErr::Dm(2)) if matches!(reg, Reg::Csr(_)) => {
                 self.csr_by_progbuf = true;
                 let Reg::Csr(csr) = reg else { unreachable!() };
                 self.write_csr_by_progbuf(csr, value, xlen)
             }
-            Err(CmdErr(e)) => Err(format!("cannot write {reg}: {}", cmderr_text(e))),
+            Err(e) => Err(format!("cannot write {reg}: {e}")),
         }
     }
 
@@ -955,7 +985,7 @@ impl<D: Dmi> Debug<D> {
         self.load_program((csr << 20) | (0b010 << 12) | (S0 << 7) | 0x73)?;
         let ran = self
             .command(self.access(0, false, false, true, xlen))
-            .map_err(|CmdErr(e)| format!("cannot read csr {csr:#05x}: {}", cmderr_text(e)));
+            .map_err(|e| format!("cannot read csr {csr:#05x}: {e}"));
         let value = match ran {
             Ok(()) => self.read_reg(Reg::Gpr(S0)),
             Err(e) => Err(e),
@@ -973,7 +1003,7 @@ impl<D: Dmi> Debug<D> {
         // Write s0, then run the program.
         let ran = self
             .command(self.access(0x1000 + S0, true, true, true, xlen))
-            .map_err(|CmdErr(e)| format!("cannot write csr {csr:#05x}: {}", cmderr_text(e)));
+            .map_err(|e| format!("cannot write csr {csr:#05x}: {e}"));
         self.write_reg(Reg::Gpr(S0), s0)?;
         ran
     }
@@ -1286,6 +1316,278 @@ impl<D: Dmi> Debug<D> {
     }
 }
 
+// sbcs
+const SBBUSYERROR: u32 = 1 << 22;
+const SBBUSY: u32 = 1 << 21;
+const SBREADONADDR: u32 = 1 << 20;
+const SBAUTOINCREMENT: u32 = 1 << 16;
+const SBREADONDATA: u32 = 1 << 15;
+const SBERROR: u32 = 0x7 << 12;
+
+/// Accesses sent in one list, so a list stays a modest batch.
+const SB_CHUNK: usize = 256;
+
+/// Memory through the Debug Module's System Bus Access.
+///
+/// The accesses go out on the system's own bus, beside the harts. Where the
+/// system keeps its caches coherent with that bus, they see what the harts
+/// see. A harness window onto the memory behind the caches does not.
+///
+/// A list of accesses is sent without waiting in between. When the bus is
+/// still busy with one access as the next arrives, the module refuses it and
+/// sets `sbbusyerror`. Then this waits for every access from then on.
+pub struct SystemBus<D: Dmi> {
+    dmi: D,
+    /// Bytes per access: 4, or 8 when the bus takes no 32-bit access.
+    unit: u64,
+    addr_bits: u32,
+    /// Wait for each access to finish before sending the next.
+    lockstep: bool,
+}
+
+impl<D: Dmi> SystemBus<D> {
+    /// Turns the Debug Module on if it is off, and checks that it has a
+    /// system bus this can use.
+    pub fn open(mut dmi: D) -> Result<Self, String> {
+        let read = |dmi: &mut D, r| -> Result<u32, String> { Ok(dmi.run(&[Op::Read(r)])?[0]) };
+        if read(&mut dmi, reg::DMCONTROL)? & DMACTIVE == 0 {
+            dmi.run(&[Op::Write(reg::DMCONTROL, DMACTIVE)])?;
+            let mut on = false;
+            for _ in 0..POLLS {
+                if read(&mut dmi, reg::DMCONTROL)? & DMACTIVE != 0 {
+                    on = true;
+                    break;
+                }
+            }
+            if !on {
+                return Err("timed out waiting for the Debug Module to come out of reset".into());
+            }
+        }
+        let sbcs = read(&mut dmi, reg::SBCS)?;
+        let version = sbcs >> 29;
+        let addr_bits = (sbcs >> 5) & 0x7f;
+        if version != 1 || addr_bits == 0 {
+            return Err(format!(
+                "this Debug Module has no system bus access (sbcs {sbcs:#010x}: \
+                 version {version}, {addr_bits} address bits). \
+                 Drop `--sba` to go through the window."
+            ));
+        }
+        let unit = if sbcs & (1 << 2) != 0 {
+            4
+        } else if sbcs & (1 << 3) != 0 {
+            8
+        } else {
+            return Err(format!(
+                "the system bus takes neither 32- nor 64-bit accesses (sbcs {sbcs:#010x}). \
+                 Drop `--sba` to go through the window."
+            ));
+        };
+        Ok(SystemBus {
+            dmi,
+            unit,
+            addr_bits,
+            lockstep: false,
+        })
+    }
+
+    /// `sbcs` for a run of accesses. `clear` also clears the errors.
+    fn mode(&self, bits: u32, clear: bool) -> u32 {
+        let access = if self.unit == 8 { 3 } else { 2 };
+        let clear = if clear { SBBUSYERROR | SBERROR } else { 0 };
+        (access << 17) | clear | bits
+    }
+
+    fn address(&self, at: u64, ops: &mut Vec<Op>) {
+        if self.addr_bits > 32 {
+            ops.push(Op::Write(reg::SBADDRESS1, (at >> 32) as u32));
+        }
+        ops.push(Op::Write(reg::SBADDRESS0, at as u32));
+    }
+
+    fn check_range(&self, at: u64, len: u64) -> Result<(), String> {
+        let beyond = match at.checked_add(len) {
+            None => true,
+            Some(end) => self.addr_bits < 64 && end > 1u64 << self.addr_bits,
+        };
+        if beyond {
+            return Err(format!(
+                "{at:#x} + {len:#x} bytes is beyond the system bus's {} address bits",
+                self.addr_bits
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads `sbcs` until the access in flight has finished.
+    fn settle(&mut self, mut sbcs: u32) -> Result<u32, String> {
+        for _ in 0..POLLS {
+            if sbcs & SBBUSY == 0 {
+                return Ok(sbcs);
+            }
+            sbcs = self.dmi.run(&[Op::Read(reg::SBCS)])?[0];
+        }
+        Err("timed out waiting for a system bus access to finish".into())
+    }
+
+    fn data_reads(&self, ops: &mut Vec<Op>) {
+        if self.unit == 8 {
+            ops.push(Op::Read(reg::SBDATA1));
+        }
+        ops.push(Op::Read(reg::SBDATA0));
+    }
+
+    fn data_writes(&self, value: u64, ops: &mut Vec<Op>) {
+        if self.unit == 8 {
+            ops.push(Op::Write(reg::SBDATA1, (value >> 32) as u32));
+        }
+        ops.push(Op::Write(reg::SBDATA0, value as u32));
+    }
+
+    /// One value per access, from what `data_reads` read.
+    fn values(&self, got: &[u32]) -> Vec<u64> {
+        if self.unit == 8 {
+            got.chunks(2)
+                .map(|p| (u64::from(p[0]) << 32) | u64::from(p[1]))
+                .collect()
+        } else {
+            got.iter().map(|&v| u64::from(v)).collect()
+        }
+    }
+
+    fn read_units(&mut self, at: u64, n: usize) -> Result<Vec<u64>, String> {
+        if !self.lockstep {
+            let mut ops = vec![Op::Write(
+                reg::SBCS,
+                self.mode(SBREADONADDR | SBREADONDATA | SBAUTOINCREMENT, true),
+            )];
+            self.address(at, &mut ops);
+            for i in 0..n {
+                if i + 1 == n {
+                    // The last data read starts no read past the end, which
+                    // could fall in a hole.
+                    ops.push(Op::Write(reg::SBCS, self.mode(SBAUTOINCREMENT, false)));
+                }
+                self.data_reads(&mut ops);
+            }
+            ops.push(Op::Read(reg::SBCS));
+            let got = self.dmi.run(&ops)?;
+            let (sbcs, data) = got.split_last().expect("sbcs was read");
+            let sbcs = self.settle(*sbcs)?;
+            if sbcs & SBBUSYERROR == 0 {
+                sb_error(sbcs, at)?;
+                return Ok(self.values(data));
+            }
+            self.lockstep = true;
+        }
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = at + i as u64 * self.unit;
+            let mut ops = vec![Op::Write(reg::SBCS, self.mode(SBREADONADDR, true))];
+            self.address(a, &mut ops);
+            ops.push(Op::Read(reg::SBCS));
+            let got = self.dmi.run(&ops)?;
+            let sbcs = self.settle(got[0])?;
+            sb_error(sbcs, a)?;
+            let mut ops = Vec::new();
+            self.data_reads(&mut ops);
+            let got = self.dmi.run(&ops)?;
+            out.extend(self.values(&got));
+        }
+        Ok(out)
+    }
+
+    fn write_units(&mut self, at: u64, values: &[u64]) -> Result<(), String> {
+        if !self.lockstep {
+            let mut ops = vec![Op::Write(reg::SBCS, self.mode(SBAUTOINCREMENT, true))];
+            self.address(at, &mut ops);
+            for &v in values {
+                self.data_writes(v, &mut ops);
+            }
+            ops.push(Op::Read(reg::SBCS));
+            let got = self.dmi.run(&ops)?;
+            let sbcs = self.settle(got[0])?;
+            if sbcs & SBBUSYERROR == 0 {
+                return sb_error(sbcs, at);
+            }
+            self.lockstep = true;
+        }
+        for (i, &v) in values.iter().enumerate() {
+            let a = at + i as u64 * self.unit;
+            let mut ops = vec![Op::Write(reg::SBCS, self.mode(0, true))];
+            self.address(a, &mut ops);
+            self.data_writes(v, &mut ops);
+            ops.push(Op::Read(reg::SBCS));
+            let got = self.dmi.run(&ops)?;
+            let sbcs = self.settle(got[0])?;
+            sb_error(sbcs, a)?;
+        }
+        Ok(())
+    }
+}
+
+impl<D: Dmi> crate::rtt::Memory for SystemBus<D> {
+    fn read(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), String> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let u = self.unit;
+        let start = addr & !(u - 1);
+        let end = (addr + buf.len() as u64).next_multiple_of(u);
+        self.check_range(start, end - start)?;
+        let mut bytes = Vec::with_capacity((end - start) as usize);
+        let mut at = start;
+        while at < end {
+            let n = (((end - at) / u) as usize).min(SB_CHUNK);
+            for v in self.read_units(at, n)? {
+                bytes.extend_from_slice(&v.to_le_bytes()[..u as usize]);
+            }
+            at += n as u64 * u;
+        }
+        let off = (addr - start) as usize;
+        buf.copy_from_slice(&bytes[off..off + buf.len()]);
+        Ok(())
+    }
+
+    fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), String> {
+        let u = self.unit;
+        if !addr.is_multiple_of(u) || !(data.len() as u64).is_multiple_of(u) {
+            return Err(format!(
+                "this system bus is written in whole {u}-byte accesses: \
+                 give an address and a length that are multiples of {u}"
+            ));
+        }
+        self.check_range(addr, data.len() as u64)?;
+        for (i, chunk) in data.chunks(SB_CHUNK * u as usize).enumerate() {
+            let values: Vec<u64> = chunk
+                .chunks(u as usize)
+                .map(|c| {
+                    let mut b = [0u8; 8];
+                    b[..c.len()].copy_from_slice(c);
+                    u64::from_le_bytes(b)
+                })
+                .collect();
+            self.write_units(addr + (i * SB_CHUNK) as u64 * u, &values)?;
+        }
+        Ok(())
+    }
+}
+
+/// `sbcs.sberror` as an error.
+fn sb_error(sbcs: u32, at: u64) -> Result<(), String> {
+    let what = match (sbcs >> 12) & 0x7 {
+        0 => return Ok(()),
+        1 => "it timed out",
+        2 => "nothing answers at that address",
+        3 => "the address is not aligned",
+        4 => "the bus does not take that access size",
+        _ => "the bus reported an error",
+    };
+    Err(format!(
+        "the system bus refused an access from {at:#x}: {what} (sbcs {sbcs:#010x})"
+    ))
+}
+
 /// An address trigger set by a debugger to halt on execute.
 fn is_breakpoint(tdata1: u64, xlen: u32) -> bool {
     let kind = tdata1 >> (xlen - 4);
@@ -1328,6 +1630,13 @@ mod tests {
         /// Commands run, and resumes asked for, while the debugger said the
         /// other thing: either would put its own work in a trace.
         mistold: usize,
+        /// How many `dmstatus` reads a resume takes to happen. Until then
+        /// the hart still reads as halted, without `allresumeack`, and
+        /// refuses commands, as a hart that is leaving debug mode does.
+        resume_lag: u32,
+        resuming: u32,
+        /// An abstract command that never finishes.
+        stuck: bool,
     }
 
     impl Model {
@@ -1403,7 +1712,7 @@ mod tests {
             if self.cmderr != 0 {
                 return;
             }
-            if !self.halted {
+            if !self.halted || self.resuming != 0 {
                 self.cmderr = 4;
                 return;
             }
@@ -1479,18 +1788,26 @@ mod tests {
                 let dcsr = self.csr[&DCSR] & !(0x7 << 6);
                 self.csr.insert(DCSR, dcsr | (3 << 6));
             }
-            if v & RESUMEREQ != 0 && self.halted {
-                self.resumeack = true;
-                let dcsr = self.csr[&DCSR] & !(0x7 << 6);
-                // The address trigger fires before the instruction at the PC.
-                if is_breakpoint(self.tdata[0][0], self.xlen) && self.tdata[0][1] == self.pc {
-                    self.csr.insert(DCSR, dcsr | (2 << 6));
-                } else if self.csr[&DCSR] & DCSR_STEP != 0 {
-                    self.pc += 4;
-                    self.csr.insert(DCSR, dcsr | (4 << 6));
-                } else {
-                    self.halted = false;
+            if v & RESUMEREQ != 0 && self.halted && self.resuming == 0 {
+                self.resumeack = false;
+                self.resuming = self.resume_lag;
+                if self.resuming == 0 {
+                    self.resume();
                 }
+            }
+        }
+
+        fn resume(&mut self) {
+            self.resumeack = true;
+            let dcsr = self.csr[&DCSR] & !(0x7 << 6);
+            // The address trigger fires before the instruction at the PC.
+            if is_breakpoint(self.tdata[0][0], self.xlen) && self.tdata[0][1] == self.pc {
+                self.csr.insert(DCSR, dcsr | (2 << 6));
+            } else if self.csr[&DCSR] & DCSR_STEP != 0 {
+                self.pc += 4;
+                self.csr.insert(DCSR, dcsr | (4 << 6));
+            } else {
+                self.halted = false;
             }
         }
     }
@@ -1505,8 +1822,19 @@ mod tests {
                         reg::DATA0 => self.data[0],
                         reg::DATA1 => self.data[1],
                         reg::DMCONTROL => u32::from(self.active),
-                        reg::DMSTATUS => self.dmstatus(),
-                        reg::ABSTRACTCS => (2 << 24) | (self.cmderr << 8) | 2,
+                        reg::DMSTATUS => {
+                            let s = self.dmstatus();
+                            if self.resuming != 0 {
+                                self.resuming -= 1;
+                                if self.resuming == 0 {
+                                    self.resume();
+                                }
+                            }
+                            s
+                        }
+                        reg::ABSTRACTCS => {
+                            (2 << 24) | (u32::from(self.stuck) << 12) | (self.cmderr << 8) | 2
+                        }
                         reg::HARTINFO => 0x0010_0bff,
                         _ => 0,
                     }),
@@ -1631,6 +1959,36 @@ mod tests {
         assert_eq!(dm.cause().unwrap(), 4);
         assert_eq!(m.csr[&DCSR] & DCSR_STEP, 0);
         assert!(m.halted);
+    }
+
+    /// A hart that is slow to leave debug mode still reads as halted for a
+    /// while after the resume request. The step is not over until it has
+    /// resumed and halted again.
+    #[test]
+    fn a_step_waits_for_a_hart_that_is_slow_to_resume() {
+        let mut m = Model::new(32);
+        m.pc = 0x8000_0000;
+        m.resume_lag = 20;
+        let mut dm = Debug::attach(&mut m, 0).unwrap();
+        dm.halt().unwrap();
+        dm.step().unwrap();
+        dm.step().unwrap();
+        assert_eq!(dm.read_reg(Reg::Csr(DPC)).unwrap(), 0x8000_0008);
+        assert_eq!(m.csr[&DCSR] & DCSR_STEP, 0);
+        assert_eq!(m.cmderr, 0);
+    }
+
+    /// A command that stays busy says so, and how to get out of it, rather
+    /// than an error with no reason.
+    #[test]
+    fn a_command_that_stays_busy_says_how_to_drop_it() {
+        let mut m = Model::new(64);
+        let mut dm = Debug::attach(&mut m, 0).unwrap();
+        dm.halt().unwrap();
+        dm.dmi.stuck = true;
+        let err = dm.read_reg(Reg::Gpr(5)).unwrap_err();
+        assert!(err.contains("stayed busy"), "{err}");
+        assert!(err.contains("dmcontrol 0"), "{err}");
     }
 
     #[test]
@@ -1868,5 +2226,257 @@ mod tests {
         assert_eq!(Reg::Gpr(2).to_string(), "sp");
         assert_eq!(Reg::Csr(0x7b1).to_string(), "pc");
         assert_eq!(Reg::Csr(0x123).to_string(), "csr0x123");
+    }
+}
+
+#[cfg(test)]
+mod system_bus_tests {
+    use super::*;
+    use crate::rtt::Memory;
+
+    /// A Debug Module's system bus as the spec describes it: one access at a
+    /// time, which stays busy for the next `latency` DMI accesses, over a
+    /// memory at `BASE`.
+    struct Bus {
+        active: bool,
+        widths: u32,
+        config: u32,
+        addr: u64,
+        data: [u32; 2],
+        mem: Vec<u8>,
+        latency: usize,
+        seen: usize,
+        busy_until: usize,
+        busyerror: bool,
+        error: u32,
+        runs: usize,
+    }
+
+    const BASE: u64 = 0x8000_0000;
+    const CONFIG: u32 = SBREADONADDR | SBREADONDATA | SBAUTOINCREMENT | (0x7 << 17);
+
+    impl Bus {
+        fn new(widths: u32, latency: usize) -> Self {
+            Bus {
+                active: false,
+                widths,
+                config: 0,
+                addr: 0,
+                data: [0; 2],
+                mem: (0..64u8).collect(),
+                latency,
+                seen: 0,
+                busy_until: 0,
+                busyerror: false,
+                error: 0,
+                runs: 0,
+            }
+        }
+
+        /// An access to the data or the address while busy is refused.
+        fn refuse(&mut self, busy: bool) -> bool {
+            if busy {
+                self.busyerror = true;
+            }
+            busy
+        }
+
+        fn busy(&self) -> bool {
+            self.seen < self.busy_until
+        }
+
+        fn start(&mut self, write: bool) {
+            if self.busyerror || self.error != 0 {
+                return;
+            }
+            let size = 1u64 << ((self.config >> 17) & 0x7);
+            let off = self.addr.wrapping_sub(BASE);
+            if off + size > self.mem.len() as u64 {
+                self.error = 2;
+                return;
+            }
+            let at = off as usize..(off + size) as usize;
+            if write {
+                let v = (u64::from(self.data[1]) << 32) | u64::from(self.data[0]);
+                self.mem[at].copy_from_slice(&v.to_le_bytes()[..size as usize]);
+            } else {
+                let mut b = [0u8; 8];
+                b[..size as usize].copy_from_slice(&self.mem[at]);
+                let v = u64::from_le_bytes(b);
+                self.data = [v as u32, (v >> 32) as u32];
+            }
+            self.busy_until = self.seen + 1 + self.latency;
+            if self.config & SBAUTOINCREMENT != 0 {
+                self.addr += size;
+            }
+        }
+
+        fn access(&mut self, op: Op) -> Option<u32> {
+            let busy = self.busy();
+            match op {
+                Op::Read(reg::DMCONTROL) => Some(u32::from(self.active)),
+                Op::Write(reg::DMCONTROL, v) => {
+                    self.active = v & DMACTIVE != 0;
+                    None
+                }
+                Op::Read(reg::SBCS) => Some(
+                    (1 << 29)
+                        | (u32::from(self.busyerror) << 22)
+                        | (u32::from(busy) << 21)
+                        | self.config
+                        | (self.error << 12)
+                        | (32 << 5)
+                        | self.widths,
+                ),
+                Op::Write(reg::SBCS, v) => {
+                    self.config = v & CONFIG;
+                    if v & SBBUSYERROR != 0 {
+                        self.busyerror = false;
+                    }
+                    if v & SBERROR != 0 {
+                        self.error = 0;
+                    }
+                    None
+                }
+                Op::Write(reg::SBADDRESS0, v) => {
+                    if !self.refuse(busy) {
+                        self.addr = u64::from(v);
+                        if self.config & SBREADONADDR != 0 {
+                            self.start(false);
+                        }
+                    }
+                    None
+                }
+                Op::Read(reg::SBDATA0) => Some(if self.refuse(busy) {
+                    0
+                } else {
+                    let v = self.data[0];
+                    if self.config & SBREADONDATA != 0 {
+                        self.start(false);
+                    }
+                    v
+                }),
+                Op::Read(reg::SBDATA1) => Some(if self.refuse(busy) { 0 } else { self.data[1] }),
+                Op::Write(reg::SBDATA0, v) => {
+                    if !self.refuse(busy) {
+                        self.data[0] = v;
+                        self.start(true);
+                    }
+                    None
+                }
+                Op::Write(reg::SBDATA1, v) => {
+                    if !self.refuse(busy) {
+                        self.data[1] = v;
+                    }
+                    None
+                }
+                Op::Read(_) => Some(0),
+                Op::Write(..) => None,
+            }
+        }
+    }
+
+    impl Dmi for &mut Bus {
+        fn run(&mut self, ops: &[Op]) -> Result<Vec<u32>, String> {
+            self.runs += 1;
+            let mut out = Vec::new();
+            for &op in ops {
+                out.extend(self.access(op));
+                self.seen += 1;
+            }
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn a_quick_bus_reads_in_one_list() {
+        let mut bus = Bus::new(0b1111, 0);
+        let mut sb = SystemBus::open(&mut bus).unwrap();
+        assert!(sb.dmi.active);
+        let before = sb.dmi.runs;
+        let mut buf = [0u8; 10];
+        sb.read(BASE + 3, &mut buf).unwrap();
+        assert_eq!(buf, [3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(sb.dmi.runs - before, 1);
+        assert!(!sb.lockstep);
+    }
+
+    #[test]
+    fn the_last_read_starts_nothing_past_the_end() {
+        let mut bus = Bus::new(0b0100, 0);
+        let mut sb = SystemBus::open(&mut bus).unwrap();
+        let mut buf = [0u8; 4];
+        sb.read(BASE + 60, &mut buf).unwrap();
+        assert_eq!(buf, [60, 61, 62, 63]);
+    }
+
+    #[test]
+    fn a_slow_bus_is_waited_for() {
+        let mut bus = Bus::new(0b0100, 3);
+        let mut sb = SystemBus::open(&mut bus).unwrap();
+        let mut buf = [0u8; 12];
+        sb.read(BASE + 8, &mut buf).unwrap();
+        assert_eq!(buf, [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+        assert!(sb.lockstep);
+        sb.write(BASE + 16, &[0xaa; 8]).unwrap();
+        sb.read(BASE + 12, &mut buf).unwrap();
+        assert_eq!(
+            buf,
+            [
+                12, 13, 14, 15, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa
+            ]
+        );
+    }
+
+    #[test]
+    fn a_quick_bus_writes_in_one_list() {
+        let mut bus = Bus::new(0b0100, 0);
+        let mut sb = SystemBus::open(&mut bus).unwrap();
+        let before = sb.dmi.runs;
+        sb.write(BASE + 4, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        assert_eq!(sb.dmi.runs - before, 1);
+        assert_eq!(&bus.mem[4..12], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn a_64_bit_bus_takes_whole_dwords() {
+        let mut bus = Bus::new(0b1000, 0);
+        let mut sb = SystemBus::open(&mut bus).unwrap();
+        let mut buf = [0u8; 4];
+        sb.read(BASE + 12, &mut buf).unwrap();
+        assert_eq!(buf, [12, 13, 14, 15]);
+        sb.write(BASE + 8, &0x1122_3344_5566_7788u64.to_le_bytes())
+            .unwrap();
+        let err = sb.write(BASE + 4, &[0; 4]).unwrap_err();
+        assert!(err.contains("multiples of 8"), "{err}");
+        assert_eq!(&bus.mem[8..16], &0x1122_3344_5566_7788u64.to_le_bytes());
+    }
+
+    #[test]
+    fn a_hole_is_named() {
+        let mut bus = Bus::new(0b0100, 0);
+        let mut sb = SystemBus::open(&mut bus).unwrap();
+        let mut buf = [0u8; 8];
+        let err = sb.read(BASE + 60, &mut buf).unwrap_err();
+        assert!(err.contains("nothing answers"), "{err}");
+        // The error is cleared for the next access.
+        sb.read(BASE, &mut buf).unwrap();
+        assert_eq!(buf, [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn no_system_bus_says_how_to_go_on() {
+        struct NoBus;
+        impl Dmi for NoBus {
+            fn run(&mut self, ops: &[Op]) -> Result<Vec<u32>, String> {
+                Ok(ops
+                    .iter()
+                    .filter(|op| matches!(op, Op::Read(_)))
+                    .map(|_| 1)
+                    .collect())
+            }
+        }
+        let err = SystemBus::open(NoBus).err().unwrap();
+        assert!(err.contains("Drop `--sba`"), "{err}");
     }
 }
