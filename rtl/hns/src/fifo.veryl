@@ -1,5 +1,10 @@
 /// A stream the DUT pushes; the host polls it out through the CSR.
 /// Depth and width come from the instance, so one module serves every bundle.
+///
+/// The queue is `std::fifo`. Its storage is written outside any reset, so
+/// synthesis builds it from RAM rather than from one flip-flop per bit. This
+/// module adds what the host reads besides the data: the level, and how many
+/// beats arrived with no room left.
 pub module fifo #(
     param WIDTH: u32 = 8  ,
     param DEPTH: u32 = 256,
@@ -14,48 +19,43 @@ pub module fifo #(
     o_level: output logic<$clog2(DEPTH) + 1>,
     o_drops: output logic<32>               ,
 ) {
-    var mem  : logic<WIDTH>             [DEPTH];
-    var wp   : logic<$clog2(DEPTH)>            ;
-    var rp   : logic<$clog2(DEPTH)>            ;
-    var level: logic<$clog2(DEPTH) + 1>        ;
-    var drops: logic<32>                       ;
-
-    let full : logic = level == DEPTH;
-    let empty: logic = level == 0;
+    var full : logic                   ;
+    var empty: logic                   ;
+    var count: logic<$clog2(DEPTH + 1)>;
+    var drops: logic<32>               ;
 
     // A beat is dropped exactly when a push arrives with no room left.
     let drop: logic = i_push & full;
     let take: logic = i_push & ~full;
     let give: logic = i_pop & ~empty;
 
+    inst u_fifo: $std::fifo #(
+        WIDTH: WIDTH,
+        DEPTH: DEPTH,
+    ) (
+        i_clk               ,
+        i_rst               ,
+        i_clear      : 1'b0 ,
+        o_empty      : empty,
+        o_almost_full: _    ,
+        o_full       : full ,
+        o_word_count : count,
+        i_push       : take ,
+        i_data              ,
+        i_pop        : give ,
+        o_data              ,
+    );
+
     always_ff {
         if_reset {
-            wp    = 0;
-            rp    = 0;
-            level = 0;
             drops = 0;
-        } else {
-            if take {
-                mem[wp] = i_data;
-                wp      = wp + 1;
-            }
-            if give {
-                rp = rp + 1;
-            }
-            if take && !give {
-                level = level + 1;
-            } else if give && !take {
-                level = level - 1;
-            }
+        } else if drop && drops != 32'hffff_ffff {
             // Saturate. A counter that wraps reads as "only a few were lost".
-            if drop && drops != 32'hffff_ffff {
-                drops = drops + 1;
-            }
+            drops = drops + 1;
         }
     }
 
     assign o_ready = ~full;
-    assign o_data  = mem[rp];
-    assign o_level = level;
+    assign o_level = count;
     assign o_drops = drops;
 }
