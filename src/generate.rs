@@ -392,15 +392,15 @@ pub fn run(
                 &emit::pcie_tcl(&plan, &board),
                 "PCIe hard block (Tcl)",
             )?);
-            written.push(write(
-                &out.join("syn").join("pcie.xdc"),
-                &emit::pcie_xdc(&board),
-                "PCIe pins (XDC)",
-            )?);
             let block = plan
                 .target()
                 .and_then(emit::pcie_block)
                 .expect("plan::generatable checks the family");
+            written.push(write(
+                &out.join("syn").join("pcie.xdc"),
+                &emit::pcie_xdc(&board, block),
+                "PCIe pins (XDC)",
+            )?);
             let wrap = crate::vendor::pcie_wrap(block);
             for file in crate::vendor::PCIE
                 .iter()

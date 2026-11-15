@@ -3700,6 +3700,25 @@ module dut_top (
         xdc.contains("*u_rc_cdc/u_fifo/u_reset_sync/*rg_reg*"),
         "{xdc}"
     );
+    // In the TLP FIFOs only the paths that cross are bounded; the whole
+    // hierarchy is bounded only in the borrowed `axil_cdc`.
+    for cdc in ["u_rq_cdc", "u_rc_cdc"] {
+        assert!(
+            xdc.contains(&format!("*{cdc}/*u_synchronizer_*rg_reg*")),
+            "{xdc}"
+        );
+        assert!(xdc.contains(&format!("*{cdc}/*ram_reg*")), "{xdc}");
+        assert!(xdc.contains(&format!("*{cdc}/*q_reg*")), "{xdc}");
+    }
+    assert_eq!(
+        xdc.matches("-from $hns_cdc -to $hns_cdc ").count(),
+        1,
+        "{xdc}"
+    );
+    // The harness's side of the hard block is kept in its SLR.
+    let pcie = fs::read_to_string(dir.path().join("hns").join("syn").join("pcie.xdc")).unwrap();
+    assert!(pcie.contains("create_pblock hns_pcie"), "{pcie}");
+    assert!(pcie.contains("u_rc_cdc}"), "{pcie}");
 
     // JTAG gets none of this: the card has no host memory to write to.
     run("jtag", "hnsj");

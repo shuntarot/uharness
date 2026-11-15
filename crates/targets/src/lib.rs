@@ -786,6 +786,11 @@ pub struct Jtag {
     /// Selects the system monitor's DRP (`XADC_DRP` or `SYSMON_DRP` in the
     /// BSDL). It works without a bitstream.
     pub sysmon_ir: Option<u32>,
+    /// Selects the DNA register (`FUSE_DNA` in the BSDL; with several SLRs,
+    /// the master's). It works without a bitstream.
+    pub dna_ir: Option<u32>,
+    /// The length of that register (`DNA[<bits>]` in the BSDL).
+    pub dna_bits: Option<u32>,
     /// Reads whether the erase finished. It carries the SVF `TDO`/`MASK` as
     /// is, with no meaning given to the bits. Without it, the host only
     /// waits.
@@ -1129,6 +1134,8 @@ pub fn jtag(target: &Target) -> Jtag {
         jstart_ir: int("jstart_ir").map(|v| v as u32),
         bypass_ir: int("bypass_ir").map(|v| v as u32),
         sysmon_ir: int("sysmon_ir").map(|v| v as u32),
+        dna_ir: int("dna_ir").map(|v| v as u32),
+        dna_bits: int("dna_bits").map(|v| v as u32),
     }
 }
 
