@@ -595,11 +595,12 @@ fn ddr4_tcl(dram: &hns_targets::Dram) -> String {
     out
 }
 
-/// `hns/syn/pcie.xdc`: the PCIe pins of the board.
+/// `hns/syn/pcie.xdc`: the PCIe pins of the board, and where the harness's
+/// side of the hard block goes.
 ///
-/// Only the reference clock, the reset and the lanes, from `[pcie]` in the
-/// target. The n side of each pair is not written; Vivado derives it.
-pub fn pcie_xdc(board: &hns_targets::Pcie) -> String {
+/// The pins are the reference clock, the reset and the lanes, from `[pcie]`
+/// in the target. The n side of each pair is not written; Vivado derives it.
+pub fn pcie_xdc(board: &hns_targets::Pcie, block: PcieBlock) -> String {
     let mut out = header_tcl();
     out.push_str("#\n# PCIe pins, from the target description.\n\n");
 
@@ -633,6 +634,27 @@ pub fn pcie_xdc(board: &hns_targets::Pcie) -> String {
         out.push_str(&format!(
             "set_property -dict {{ PACKAGE_PIN {pin} }} [get_ports {{ o_pcie_tx_p[{i}] }}]\n"
         ));
+    }
+
+    // The harness logic on the user clock stays in the SLR of the hard block.
+    // On a VU440 board (three SLRs) a DUT spread over all of them pulled it
+    // apart, and its 250 MHz paths crossed an SLR: WNS -0.69 ns over 913
+    // endpoints, 90 % of it routing; with the pblock it met timing (+0.07 ns).
+    // With one SLR the pblock is the whole device and changes nothing. The
+    // IP is left out: its own constraints place it and its transceivers.
+    if let Some(site) = &board.block {
+        out.push_str("\n# The harness's side of the hard block, in the hard block's SLR.\n");
+        out.push_str("create_pblock hns_pcie\n");
+        out.push_str(&format!(
+            "resize_pblock [get_pblocks hns_pcie] -add [get_slrs -of_objects [get_sites PCIE*_{site}]]\n"
+        ));
+        out.push_str(&format!(
+            "add_cells_to_pblock [get_pblocks hns_pcie] [get_cells -quiet -filter {{REF_NAME != {}_0}} u_pcie/*]\n",
+            block.ip()
+        ));
+        out.push_str(
+            "add_cells_to_pblock [get_pblocks hns_pcie] [get_cells -quiet {u_tlp_count u_rq_hold u_rq_cdc u_rc_cdc}]\n",
+        );
     }
     out
 }
@@ -7075,12 +7097,24 @@ fn flash_xdc(flash: &hns_targets::Flash) -> String {
     out
 }
 
+/// What is inside a CDC the XDC bounds, which decides the paths it bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CdcKind {
+    /// One or more `std::async_fifo`. Only the paths that cross are bounded:
+    /// the Gray pointers into the synchronizers, and the RAM into the
+    /// reader's output register. The paths inside one clock keep that clock's
+    /// period. A bound on the whole hierarchy would hold them to the faster
+    /// period: on a VU440 board the 10 MHz side of the RC FIFO then had to meet
+    /// 4 ns, with 0.008 ns to spare.
+    StdFifo,
+    /// A borrowed part whose crossing paths have no names to pick out. The
+    /// whole hierarchy is bounded; the field is its synchronizer flops.
+    Whole(&'static str),
+}
+
 /// The CDCs that the XDC bounds: instance path, the faster clock period, and
-/// the synchronizer cell name.
-///
-/// The faster period is used because the hierarchy also holds paths inside
-/// one clock; the slower period would relax them.
-pub fn cdc_instances(plan: &Plan) -> Vec<(String, f64, &'static str)> {
+/// what is inside.
+pub fn cdc_instances(plan: &Plan) -> Vec<(String, f64, CdcKind)> {
     let Some(clocks) = plan.clocks() else {
         return Vec::new();
     };
@@ -7094,7 +7128,11 @@ pub fn cdc_instances(plan: &Plan) -> Vec<(String, f64, &'static str)> {
     {
         let host_mhz = clocks.window_output().freq_mhz;
         let fastest = dram_mhz.map_or(host_mhz, |ui| ui.max(host_mhz));
-        out.push((format!("u_cdc_{}", m.bundle), 1000.0 / fastest, "rg_reg"));
+        out.push((
+            format!("u_cdc_{}", m.bundle),
+            1000.0 / fastest,
+            CdcKind::StdFifo,
+        ));
     }
 
     // The PCIe window also crosses. `axil_cdc` (borrowed from verilog-pcie)
@@ -7115,14 +7153,14 @@ pub fn cdc_instances(plan: &Plan) -> Vec<(String, f64, &'static str)> {
         out.push((
             "axil_cdc_inst".to_string(),
             1000.0 / fastest,
-            "flag_sync_reg",
+            CdcKind::Whole("flag_sync_reg"),
         ));
         // The requester streams cross between the same two clocks
         // (`hns::tlp_cdc`). Inside is the same `std::async_fifo` as in
         // `hns::axi_cdc`, so the bound is the same.
         if !dma_registers(&plan.registers).is_empty() {
-            out.push(("u_rq_cdc".to_string(), 1000.0 / fastest, "rg_reg"));
-            out.push(("u_rc_cdc".to_string(), 1000.0 / fastest, "rg_reg"));
+            out.push(("u_rq_cdc".to_string(), 1000.0 / fastest, CdcKind::StdFifo));
+            out.push(("u_rc_cdc".to_string(), 1000.0 / fastest, CdcKind::StdFifo));
         }
     }
     out
@@ -7236,7 +7274,7 @@ pub fn sync_instances(plan: &Plan) -> Vec<(String, String, f64)> {
 /// a missing cell prints a warning instead of doing nothing silently.
 pub fn harness_xdc(
     tck_mhz: f64,
-    cdc_instances: &[(String, f64, &'static str)],
+    cdc_instances: &[(String, f64, CdcKind)],
     sync_instances: &[(String, String, f64)],
 ) -> String {
     let mut out = header_tcl();
@@ -7265,17 +7303,44 @@ pub fn harness_xdc(
     // Neither `set_false_path` nor `set_clock_groups` is used. The first
     // ignores the paths; the second drops the whole clock pair. Both would
     // hide a crossing that skips the synchronizer.
-    // `set_max_delay -datapath_only` bounds only this hierarchy, by the faster
-    // period: the crossing is allowed, but a slow one fails.
-    for (path, period_ns, sync_cells) in cdc_instances {
+    // `set_max_delay -datapath_only` bounds only paths in this hierarchy, by
+    // the faster period: the crossing is allowed, but a slow one fails.
+    for (path, period_ns, kind) in cdc_instances {
         out.push_str(&format!("# The crossing at {path}. Bounded, not cut.\n"));
         out.push_str(&format!(
             "set hns_cdc [get_cells -hier -filter {{IS_SEQUENTIAL && NAME =~ *{path}/*}}]\n"
         ));
         out.push_str("if {[llength $hns_cdc]} {\n");
-        out.push_str(&format!(
-            "    set_max_delay -datapath_only -from $hns_cdc -to $hns_cdc {period_ns:.3}\n"
-        ));
+        let sync_cells = match kind {
+            CdcKind::StdFifo => {
+                // `$std::synchronizer_basic` names its flops `rg`; the
+                // FIFO's own are `u_synchronizer_wp` and `u_synchronizer_rp`.
+                out.push_str(&format!(
+                    "    set_max_delay -datapath_only -from $hns_cdc -to [get_cells -hier -filter {{IS_SEQUENTIAL && NAME =~ *{path}/*u_synchronizer_*rg_reg*}}] {period_ns:.3}\n"
+                ));
+                // As LUTRAM the RAM's cells are not flops, so it is picked by
+                // name. In block RAM the read register is inside it: then
+                // there is no `q` flop and no path to bound.
+                out.push_str(&format!(
+                    "    set hns_cdc_ram [get_cells -hier -filter {{IS_PRIMITIVE && NAME =~ *{path}/*ram_reg*}}]\n"
+                ));
+                out.push_str(&format!(
+                    "    set hns_cdc_q [get_cells -hier -filter {{IS_SEQUENTIAL && NAME =~ *{path}/*q_reg*}}]\n"
+                ));
+                out.push_str("    if {[llength $hns_cdc_ram] && [llength $hns_cdc_q]} {\n");
+                out.push_str(&format!(
+                    "        set_max_delay -datapath_only -from $hns_cdc_ram -to $hns_cdc_q {period_ns:.3}\n"
+                ));
+                out.push_str("    }\n");
+                "rg_reg"
+            }
+            CdcKind::Whole(sync_cells) => {
+                out.push_str(&format!(
+                    "    set_max_delay -datapath_only -from $hns_cdc -to $hns_cdc {period_ns:.3}\n"
+                ));
+                sync_cells
+            }
+        };
         out.push_str(
             "    set_property ASYNC_REG TRUE [get_cells -hier -filter {IS_SEQUENTIAL && NAME =~ *",
         );
@@ -8540,7 +8605,7 @@ mod pcie_emit_tests {
             return;
         };
         let b = board();
-        std::fs::write(format!("{dir}/pcie.xdc"), pcie_xdc(&b)).unwrap();
+        std::fs::write(format!("{dir}/pcie.xdc"), pcie_xdc(&b, PcieBlock::Pcie4)).unwrap();
     }
 
     /// The board facts reach the XDC unchanged. A mistake here still
@@ -8548,7 +8613,7 @@ mod pcie_emit_tests {
     #[test]
     fn the_xdc_names_every_lane_once() {
         let b = board();
-        let xdc = pcie_xdc(&b);
+        let xdc = pcie_xdc(&b, PcieBlock::Pcie4);
         assert!(xdc.contains("PACKAGE_PIN AC9"), "refclk missing:\n{xdc}");
         assert!(xdc.contains("PACKAGE_PIN AM17"), "reset missing");
         assert!(xdc.contains("create_clock -period 10.000"), "100MHz refclk");
@@ -8567,6 +8632,20 @@ mod pcie_emit_tests {
         assert_eq!(
             b.rx_p.len() + b.tx_p.len() + 2,
             xdc.matches("PACKAGE_PIN").count()
+        );
+    }
+
+    /// The pblock takes the SLR of the block the IP is placed in, and leaves
+    /// the IP itself out.
+    #[test]
+    fn the_harness_side_stays_in_the_slr_of_the_block() {
+        let b = board();
+        let xdc = pcie_xdc(&b, PcieBlock::Pcie4);
+        let site = b.block.as_deref().unwrap();
+        assert!(xdc.contains(&format!("[get_sites PCIE*_{site}]")), "{xdc}");
+        assert!(
+            xdc.contains("-filter {REF_NAME != pcie4_uscale_plus_0} u_pcie/*"),
+            "{xdc}"
         );
     }
 }

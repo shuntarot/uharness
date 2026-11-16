@@ -209,6 +209,13 @@ enum Cmd {
     /// erase or configuration, which restart it.
     Sysmon,
 
+    /// Read the FPGA's DNA, its unique ID, over JTAG.
+    ///
+    /// It uses the DNA's own JTAG instruction (`dna_ir` and `dna_bits` in the
+    /// target's [jtag]), so it works with no bitstream loaded, and while any
+    /// design runs. Bit 0 of the number is the first bit out of TDO.
+    Dna,
+
     /// Read and write memory through the ARM DAP on the JTAG chain.
     ///
     /// A Zynq-7000 has one. It reaches the PS's memory and registers with no
@@ -489,6 +496,12 @@ enum Cmd {
         /// Stop after this many entries.
         #[arg(long, value_name = "N")]
         max: Option<usize>,
+        /// Print the entries as text, one byte each.
+        ///
+        /// For a stream of characters, such as a serial output. The entries
+        /// must be at most 8 bits wide.
+        #[arg(long)]
+        text: bool,
     },
 
     /// Start, stop and read a trace ring (`backing = "trace"`).
@@ -1207,6 +1220,7 @@ fn parse_step(line: &str) -> Result<Step, String> {
         ),
         Cmd::Probe
         | Cmd::Sysmon
+        | Cmd::Dna
         | Cmd::Dap(_)
         | Cmd::Targets
         | Cmd::Check
@@ -1244,6 +1258,7 @@ fn run_step(
         | Cmd::Cpu(CpuCmd::Boot { .. } | CpuCmd::Console { .. })
         | Cmd::Probe
         | Cmd::Sysmon
+        | Cmd::Dna
         | Cmd::Dap(_)
         | Cmd::Targets
         | Cmd::Serve { .. }
@@ -1257,7 +1272,7 @@ fn run_step(
         Cmd::Dump => dump(bus, map),
         Cmd::Reset { hold, release } => reset(bus, map, hold, release),
         Cmd::Check => unreachable!("refused by parse_step"),
-        Cmd::Drain { bundle, max } => drain(bus, map, &bundle, max),
+        Cmd::Drain { bundle, max, text } => drain(bus, map, &bundle, max, text),
         Cmd::Trace(cmd) => trace(bus, map, &cmd),
         Cmd::Hostmem(cmd) => match pages {
             Some(pages) => hostmem(cli, bus, map, pages, &cmd),
@@ -1648,6 +1663,85 @@ fn sysmon(cli: &Cli) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Bits shifted in ahead of the DNA. They come out right after it only if the
+/// register is as long as the target says.
+const DNA_MARK: u32 = 0xa5c3_5a3c;
+
+/// Reads the DNA through its JTAG instruction.
+fn dna(cli: &Cli) -> Result<(), String> {
+    use hns_host::bridge::JtagIo;
+
+    let Some(target) = resolve_target(cli)? else {
+        return Err(
+            "`dna` needs to know the board: the IR value that selects the DNA.\n\
+             Pass --target naming the board."
+                .to_string(),
+        );
+    };
+    let jtag = hns_targets::jtag(&target);
+    let (Some(ir), Some(bits)) = (jtag.dna_ir, jtag.dna_bits) else {
+        return Err(format!(
+            "`{}` does not say how to read the DNA.\n\
+             Add `dna_ir` and `dna_bits` to its [jtag]. The device's BSDL lists the IR as \
+             `FUSE_DNA` (with several SLRs, `FUSE_DNA_SLR<n>` of the master) and the \
+             length as `DNA[<bits>]`.",
+            target.name
+        ));
+    };
+    let bits = bits as usize;
+    if bits == 0 || bits > 128 {
+        return Err(format!(
+            "`dna_bits` of `{}` is {bits}, and hio reads 1 to 128 bits.\n\
+             Check it against the BSDL.",
+            target.name
+        ));
+    }
+    let cfg = resolve_probe(cli)?;
+    let mut m = Mpsse::attach(Ftdi::open(&cfg).map_err(|e| e.to_string())?, &cfg)
+        .map_err(|e| e.to_string())?;
+    let capture = m.scan_ir(ir, cfg.ir_length).map_err(|e| e.to_string())?;
+    if !Mpsse::<Ftdi>::ir_length_looks_right(capture) {
+        return Err(format!(
+            "the IR captured {capture:#x}, and its low two bits are not `01`.\n\
+             The IR length ({}) is wrong, or the chain is. `hio probe` measures it.",
+            cfg.ir_length
+        ));
+    }
+    let tdo = m.scan_dr(&dna_tdi(bits)).map_err(|e| e.to_string())?;
+    let (dna, mark) = split_dna(&tdo, bits);
+    if mark != DNA_MARK {
+        return Err(format!(
+            "the DNA register is not {bits} bits long: the bits shifted in ahead of it \
+             came back as {mark:#010x}, not {DNA_MARK:#010x}.\n\
+             Check `dna_ir` and `dna_bits` of `{}` against the BSDL.",
+            target.name
+        ));
+    }
+    println!("dna       {dna:#0width$x}", width = bits.div_ceil(4) + 2);
+    println!("note      bit 0 is the first bit out of TDO");
+    Ok(())
+}
+
+/// What to shift in: the mark, then zeros for the length of the DNA.
+fn dna_tdi(bits: usize) -> Vec<bool> {
+    let mut tdi: Vec<bool> = (0..32).map(|i| (DNA_MARK >> i) & 1 == 1).collect();
+    tdi.resize(32 + bits, false);
+    tdi
+}
+
+/// The DNA, bit 0 first out, and the 32 bits that came out after it.
+fn split_dna(tdo: &[bool], bits: usize) -> (u128, u32) {
+    let dna = tdo[..bits]
+        .iter()
+        .enumerate()
+        .fold(0u128, |a, (i, &b)| a | (u128::from(b) << i));
+    let mark = tdo[bits..bits + 32]
+        .iter()
+        .enumerate()
+        .fold(0u32, |a, (i, &b)| a | (u32::from(b) << i));
+    (dna, mark)
 }
 
 type DapLink = hns_host::adi::Dap<Mpsse<Ftdi>>;
@@ -2426,7 +2520,7 @@ fn completions(shell: Shell) -> Result<(), String> {
 }
 
 /// Commands left out of the short help. `--list` and completions still show them.
-const RARE_COMMANDS: &[&str] = &["dma-fire"];
+const RARE_COMMANDS: &[&str] = &["dma-fire", "dna"];
 
 fn run() -> Result<(), String> {
     // Both are answered before parsing: clap would ask for a command first.
@@ -2592,6 +2686,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
         let only_jtag = match &cmd {
             Cmd::Probe => Some("probe"),
             Cmd::Sysmon => Some("sysmon"),
+            Cmd::Dna => Some("dna"),
             Cmd::Dap(_) => Some("dap"),
             Cmd::Program { .. } => Some("program"),
             Cmd::Erase => Some("erase"),
@@ -2613,6 +2708,9 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
     }
     if matches!(cmd, Cmd::Sysmon) {
         return sysmon(&cli);
+    }
+    if matches!(cmd, Cmd::Dna) {
+        return dna(&cli);
     }
     if let Cmd::Dap(dap) = &cmd {
         return dap_cmd(&cli, dap);
@@ -2663,6 +2761,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
         Cmd::Targets
         | Cmd::Probe
         | Cmd::Sysmon
+        | Cmd::Dna
         | Cmd::Dap(_)
         | Cmd::Program { .. }
         | Cmd::Erase
@@ -2678,7 +2777,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
         Cmd::Write { who, values } => do_write(&mut bus, &map, &who, &values),
         Cmd::Dump => dump(&mut bus, &map),
         Cmd::Reset { hold, release } => reset(&mut bus, &map, hold, release),
-        Cmd::Drain { bundle, max } => drain(&mut bus, &map, &bundle, max),
+        Cmd::Drain { bundle, max, text } => drain(&mut bus, &map, &bundle, max, text),
         Cmd::Trace(ref cmd) => trace(&mut bus, &map, cmd),
         Cmd::Memtest {
             ref bundle,
@@ -2853,6 +2952,7 @@ fn refuse_over_connect(cmd: &Cmd) -> Result<(), String> {
     let cable = match cmd {
         Cmd::Probe => Some("probe"),
         Cmd::Sysmon => Some("sysmon"),
+        Cmd::Dna => Some("dna"),
         Cmd::Dap(_) => Some("dap"),
         Cmd::Program {
             file: Some(file), ..
@@ -8316,6 +8416,13 @@ fn console(
             match semihosting_call(mem, started)? {
                 None => watch.examined = true,
                 Some((outcome, said)) => {
+                    // RTT output from before the call comes first.
+                    if let hns_host::semihosting::Outcome::Exit(_) = outcome
+                        && let Some(link) = &link
+                        && !at_prompt
+                    {
+                        show_rest(mem, link, &raw, &mut out)?;
+                    }
                     let mut text = said.stdout;
                     text.extend(said.stderr);
                     if at_prompt {
@@ -8381,6 +8488,7 @@ fn console(
             {
                 let code = link.rtt.read_up(mem, n, 1)?;
                 if let Some(&code) = code.first() {
+                    show_rest(mem, link, &raw, &mut out)?;
                     drop(raw);
                     return Ok(code as i32);
                 }
@@ -8388,6 +8496,9 @@ fn console(
             if let Some(addr) = program.tohost
                 && let Some(code) = read_tohost(mem, addr, program.ptr)?
             {
+                if let Some(link) = &link {
+                    show_rest(mem, link, &raw, &mut out)?;
+                }
                 drop(raw);
                 return Ok(code);
             }
@@ -8412,6 +8523,24 @@ fn console(
 
 /// Target output kept while at the prompt.
 const HELD_MAX: usize = 1 << 20;
+
+/// Shows what the program wrote after the console last read, once it has
+/// exited: it may write its last lines and exit between that read and the
+/// look at its exit status.
+fn show_rest(
+    mem: &mut WindowMem,
+    link: &Link,
+    raw: &RawTerminal,
+    out: &mut std::io::Stdout,
+) -> Result<(), String> {
+    loop {
+        let text = link.rtt.read_up(mem, 0, 4096)?;
+        if text.is_empty() {
+            return Ok(());
+        }
+        to_terminal(raw, out, &text)?;
+    }
+}
 
 /// Writes to the terminal. In raw mode a bare LF does not return the
 /// carriage, so it gets a CR.
@@ -9834,8 +9963,15 @@ impl Drop for RawTerminal {
 /// Takes entries out of a `host_poll_fifo`, oldest first.
 ///
 /// It needs no knowledge of the DUT, only the roles `data` / `level` /
-/// `pop`. Reading does not remove an entry; each write to `pop` does.
-fn drain(bus: &mut Bus, map: &RegisterMap, bundle: &str, max: Option<usize>) -> Result<(), String> {
+/// `pop`. Reading does not remove an entry; each write to `pop` does. With
+/// `text`, each entry is one byte of text, printed as it is.
+fn drain(
+    bus: &mut Bus,
+    map: &RegisterMap,
+    bundle: &str,
+    max: Option<usize>,
+    text: bool,
+) -> Result<(), String> {
     let bundles: Vec<&str> = {
         let mut v: Vec<&str> = map
             .registers
@@ -9861,6 +9997,13 @@ fn drain(bus: &mut Bus, map: &RegisterMap, bundle: &str, max: Option<usize>) -> 
     let data = role_of(map, bundle, "data").ok_or_else(|| missing("data"))?;
     let level = role_of(map, bundle, "level").ok_or_else(|| missing("level"))?;
     let pop = role_of(map, bundle, "pop").ok_or_else(|| missing("pop"))?;
+    if text && data.width > 8 {
+        return Err(format!(
+            "`{bundle}` entries are {} bits wide, and --text prints one byte per entry.\n\
+             Drop --text to see them as numbers.",
+            data.width
+        ));
+    }
 
     if let Some(d) = role_of(map, bundle, "drops") {
         let n = rd(bus, d.offset as u32)?;
@@ -9873,6 +10016,7 @@ fn drain(bus: &mut Bus, map: &RegisterMap, bundle: &str, max: Option<usize>) -> 
 
     let have = rd(bus, level.offset as u32)? as usize;
     let want = max.map_or(have, |m| m.min(have));
+    let mut bytes = Vec::new();
     for i in 0..want {
         // One entry's reads and its `pop` share one round trip. Do not batch
         // across entries: a lost batch would lose FIFO contents.
@@ -9883,7 +10027,18 @@ fn drain(bus: &mut Bus, map: &RegisterMap, bundle: &str, max: Option<usize>) -> 
         b.write(pop.offset as u32, 1);
         let got = bus.run(&b)?;
         let words: Vec<u32> = handles.into_iter().map(|h| got[h]).collect();
-        println!("{i:5}  {}", show(&words));
+        if text {
+            bytes.push(words[0] as u8);
+        } else {
+            println!("{i:5}  {}", show(&words));
+        }
+    }
+    if text && !bytes.is_empty() {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        out.write_all(&ended(bytes))
+            .and_then(|()| out.flush())
+            .map_err(|e| format!("cannot write the text out: {e}"))?;
     }
     if want < have {
         println!("({} left)", have - want);
@@ -9893,6 +10048,15 @@ fn drain(bus: &mut Bus, map: &RegisterMap, bundle: &str, max: Option<usize>) -> 
         println!("{bundle}: empty");
     }
     Ok(())
+}
+
+/// Text from `drain --text`, ending in a newline so that what follows
+/// starts on a line of its own.
+fn ended(mut bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.last().is_some_and(|&b| b != b'\n') {
+        bytes.push(b'\n');
+    }
+    bytes
 }
 
 /// `hio trace`: starts, stops, and reads the ring of a `trace` bundle.
@@ -10167,6 +10331,21 @@ fn size_note(r: &hns_regs::Register, words: &[u32]) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// `drain --text` ends its output on a line of its own, and leaves text
+    /// that already does as it is.
+    #[test]
+    fn drained_text_ends_in_a_newline() {
+        assert_eq!(ended(b"done".to_vec()), b"done\n");
+        assert_eq!(ended(b"done\n".to_vec()), b"done\n");
+        assert_eq!(ended(Vec::new()), b"");
+    }
+
+    #[test]
+    fn drain_takes_text() {
+        let cli = Cli::try_parse_from(["hio", "drain", "uart", "--text"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Drain { text: true, .. })));
+    }
 
     /// A value too wide for its argument is refused, not cut to its low bits:
     /// `cpu mem --write 0x1122334455667788` once wrote 0x55667788.
@@ -11578,6 +11757,28 @@ mod tests {
         );
         let target = run(&named).unwrap().unwrap();
         assert_eq!(target.name, "digilent/arty-a7-35");
+    }
+
+    #[test]
+    fn the_dna_is_read_only_when_the_register_has_the_stated_length() {
+        // A shift register of `len` bits holding `dna`: what comes out is
+        // the DNA, then what was shifted in.
+        let shift = |dna: u128, len: usize, tdi: &[bool]| -> Vec<bool> {
+            (0..tdi.len())
+                .map(|k| {
+                    if k < len {
+                        (dna >> k) & 1 == 1
+                    } else {
+                        tdi[k - len]
+                    }
+                })
+                .collect()
+        };
+        let dna = 0x4002_0000_0123_4567_89ab_cdef_u128;
+        let tdi = dna_tdi(96);
+        assert_eq!(split_dna(&shift(dna, 96, &tdi), 96), (dna, DNA_MARK));
+        assert_ne!(split_dna(&shift(dna, 95, &tdi), 96).1, DNA_MARK);
+        assert_ne!(split_dna(&shift(dna, 97, &tdi), 96).1, DNA_MARK);
     }
 
     /// Every short help fits on one line.

@@ -16,6 +16,7 @@ Generating the harness is in [guide-harness.md](guide-harness.md).
 - [`hio trace`: the last instructions](#hio-trace-the-last-instructions)
 - [`hio program` and `erase`](#hio-program-and-erase)
 - [`hio sysmon`: temperature and voltages](#hio-sysmon-temperature-and-voltages)
+- [`hio dna`: the FPGA's unique ID](#hio-dna-the-fpgas-unique-id)
 - [`hio dap`: the Zynq-7000 PS](#hio-dap-the-zynq-7000-ps)
 
 ## `id`, `read`, `write`, `dump`: the basics
@@ -55,7 +56,7 @@ enough (`--serial 8107`).
 | `read` / `write` | a register by name, or a region as `<region> <off> [words]` |
 | `load <bundle> <file>` | put a `.bin` or `.elf` in a memory |
 | `memtest <bundle>` | write a pattern and read it back; **the contents are lost** |
-| `drain <bundle>` | empty a `host_poll_fifo`, oldest first |
+| `drain <bundle>` | empty a `host_poll_fifo`, oldest first; `--text` prints 8-bit entries as text, such as a serial output |
 | `trace …` | a `trace` ring: `start`, `stop`, `status`, `dump`; see [`hio trace`](#hio-trace-the-last-instructions) |
 | `dump` | read every register |
 | `reset` | reset the DUT only; `--hold` / `--release` keep it in reset |
@@ -65,6 +66,7 @@ enough (`--serial 8107`).
 | `run <file>` | a file of commands, holding the link open (`-` for standard input) |
 | `serve` | serve the window to `hio --connect` on other machines |
 | `sysmon` | the FPGA's temperature and supply voltages |
+| `dna` | the FPGA's DNA, its unique ID |
 | `dap …` | the Zynq-7000 PS's memory, through the ARM DAP: `info`, `read`, `write`, `ps7-init` |
 | `completions <shell>` | a shell completion script |
 | `cpu …` | firmware and the CPU: `boot`, `console`, and the Debug Module (`halt`, `step`, `regs`, `break`, `mem`, `catch`, …); see [`hio cpu boot` and `cpu console`: run firmware](#hio-cpu-boot-and-cpu-console-run-firmware) and [`hio cpu halt`, `step`, `regs`: debug the CPU](#hio-cpu-halt-step-regs-debug-the-cpu) |
@@ -179,7 +181,7 @@ hio --regs regs.json --connect localhost:5555 id
 - `--connect` reaches only the window, with three exceptions: `program`
   (below), [`hostmem`](#hio-hostmem-host-memory-for-the-dut), and the card's
   DMA for `load` and `memtest` over PCIe: the server holds the page, and the
-  data crosses the connection once. `erase`, `probe`, `sysmon`, `dap`,
+  data crosses the connection once. `erase`, `probe`, `sysmon`, `dna`, `dap`,
   `program <file>.svf` and `dma-fire` run on the server's machine.
 - Over PCIe, the registers that point the card at host memory
   (`<bundle>_base`, `<bundle>_on`, `dma_base`, `dma_size`) belong to the
@@ -610,6 +612,24 @@ The temperature uses the formulas of Xilinx's drivers. On UltraScale+ with the
 internal reference, Vivado's hardware manager can show a few degrees less for
 the same codes. On UltraScale (SYSMONE1) only the codes are shown. Stop
 `hw_server` first, as for `program`.
+
+## `hio dna`: the FPGA's unique ID
+
+```bash
+hio --target xilinx/vcu118 dna
+```
+
+```text
+dna       0x4000000001161a603c6122c5
+note      bit 0 is the first bit out of TDO
+```
+
+It reads the device DNA through its own JTAG instruction, `dna_ir` and
+`dna_bits` in the target's `[jtag]` (`FUSE_DNA` and `DNA[<bits>]` in the
+BSDL). Like `sysmon`, it needs no bitstream and does not disturb a running
+design. A device with several SLRs shows the master SLR. Each read also checks
+that the register is `dna_bits` long, so a wrong IR is an error, not a wrong
+number.
 
 ## `hio dap`: the Zynq-7000 PS
 
