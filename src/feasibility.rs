@@ -192,6 +192,16 @@ pub fn capability(backing: Backing) -> Capability {
             needs_pcie: false,
             needs: &[],
         },
+
+        // Counters. The DUT reports a number every cycle and is never kept
+        // waiting; nothing is dropped.
+        Backing::Count => Capability {
+            serves_dut_requests: false,
+            deterministic: true,
+            sink: false,
+            needs_pcie: false,
+            needs: &[],
+        },
     }
 }
 
@@ -1241,6 +1251,7 @@ fn alternatives_over(transport: &str) -> String {
         Backing::PcieFlr,
         Backing::HostPollFifo,
         Backing::Trace,
+        Backing::Count,
     ];
     all.iter()
         .filter(|backing| !(capability(**backing).needs_pcie && transport != "pcie"))

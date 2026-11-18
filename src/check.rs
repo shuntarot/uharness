@@ -449,6 +449,9 @@ fn print_bundles(plan: &crate::plan::Plan) {
             Some(_) if bundle.backing == crate::manifest::Backing::PcieFlr => {
                 "level line".to_string()
             }
+            Some(_) if bundle.backing == crate::manifest::Backing::Count => {
+                "a number each cycle".to_string()
+            }
             Some(resolved) => format!("{} (inferred)", resolved.contract),
             None => "?".to_string(),
         };
@@ -849,6 +852,12 @@ fn print_summary(plan: &plan::Plan, emit_regs: Option<&Path>) {
             }
             Some(_) if bundle.backing == crate::manifest::Backing::PcieFlr => {
                 value += ", level line, high during the host's FLR";
+            }
+            Some(_) if bundle.backing == crate::manifest::Backing::Count => {
+                value += ", a number each cycle";
+                if let Some(dmi) = &bundle.halt {
+                    value += &format!(", halts through `{dmi}`");
+                }
             }
             Some(resolved) => value += &format!(", {} (inferred)", resolved.contract),
             None => {}

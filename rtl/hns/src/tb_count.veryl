@@ -1,0 +1,114 @@
+/// `hns::count`: counts only while running and out of reset, marks both
+/// values with the cycle and the count, halts only where asked, and starts
+/// over on the next run.
+#[test(count_marks_the_cycle_a_value_is_reached)]
+module test_count {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen (
+        clk: clk,
+    );
+
+    var hold       : logic    ;
+    var run        : logic    ;
+    var n          : logic<2> ;
+    var start      : logic<64>;
+    var finish     : logic<64>;
+    var halt_on    : logic<2> ;
+    var total      : logic<64>;
+    var cycles     : logic<64>;
+    var start_hit  : logic    ;
+    var start_cycle: logic<64>;
+    var start_count: logic<64>;
+    var end_hit    : logic    ;
+    var end_cycle  : logic<64>;
+    var end_count  : logic<64>;
+    var halt       : logic    ;
+    var held       : logic<64>;
+
+    inst u_count: count #(
+        WIDTH: 2,
+    ) (
+        i_clk        : clk        ,
+        i_rst        : rst        ,
+        i_hold       : hold       ,
+        i_run        : run        ,
+        i_n          : n          ,
+        i_start      : start      ,
+        i_end        : finish     ,
+        i_halt_on    : halt_on    ,
+        o_count      : total      ,
+        o_cycles     : cycles     ,
+        o_start_hit  : start_hit  ,
+        o_start_cycle: start_cycle,
+        o_start_count: start_count,
+        o_end_hit    : end_hit    ,
+        o_end_cycle  : end_cycle  ,
+        o_end_count  : end_count  ,
+        o_halt       : halt       ,
+    );
+
+    // The rise of run clears; the next edge takes the first `n`, and the one
+    // after counts it. So k edges after the rise, k - 2 cycles are counted.
+    initial {
+        hold    = 0;
+        run     = 0;
+        n       = 0;
+        start   = 0;
+        finish  = 0;
+        halt_on = 0;
+        rst.assert(4);
+        clk.next(2);
+
+        // Stopped: nothing is counted.
+        n = 1;
+        clk.next(3);
+        $assert(total == 0 && cycles == 0, "counted while stopped");
+
+        // One per cycle. Start at 5 only marks; end at 9 also halts.
+        start   = 5;
+        finish  = 9;
+        halt_on = 2'b10;
+        run     = 1;
+        clk.next(7);
+        $assert(total == 5 && cycles == 5, "five counted");
+        $assert(start_hit && start_cycle == 5 && start_count == 5, "start marked");
+        $assert(!halt, "start does not halt");
+        $assert(!end_hit, "end not yet");
+        clk.next(4);
+        $assert(end_hit && end_cycle == 9 && end_count == 9, "end marked");
+        $assert(halt, "end halts");
+        clk.next(1);
+        $assert(!halt, "the halt request is one cycle");
+        $assert(start_cycle == 5 && start_count == 5, "the start mark stays");
+
+        // Held in reset: neither count moves.
+        hold = 1;
+        clk.next(2);
+        held = cycles;
+        clk.next(3);
+        $assert(cycles == held, "counted cycles while the DUT was held");
+        hold = 0;
+        clk.next(2);
+        $assert(cycles == held + 1, "counting goes on after the hold");
+
+        // Start over, three per cycle. 10 is passed at 12, in the fourth
+        // cycle counted; an end of 0 marks nothing.
+        run = 0;
+        clk.next(1);
+        n       = 3;
+        start   = 10;
+        finish  = 0;
+        halt_on = 2'b01;
+        run     = 1;
+        clk.next(1);
+        $assert(total == 0 && !start_hit && !end_hit, "a new run starts over");
+        clk.next(4);
+        $assert(!start_hit && total == 9, "not yet at 10");
+        clk.next(1);
+        $assert(start_hit && start_cycle == 4 && start_count == 12, "passed 10 at 12");
+        $assert(halt, "start halts");
+        clk.next(20);
+        $assert(!end_hit, "an end of 0 marks nothing");
+        $finish();
+    }
+}

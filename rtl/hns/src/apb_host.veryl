@@ -16,6 +16,11 @@
 /// When the window gives up on a read (`i_rd_abort`, its timeout), a read
 /// that has not started is forgotten, and one on the bus runs to its end but
 /// its data is dropped, for the same reason.
+///
+/// The harness can write too (`i_xwe`), such as a halt request to a Debug
+/// Module when a count is reached. It goes before a window write: while it
+/// waits, `o_wready` is low, so the two never start in the same cycle. A
+/// window read that comes at the same time goes first.
 pub module apb_host #(
     /// Bits of the slave's byte address.
     param ADDR_BITS: u32 = 9,
@@ -39,6 +44,12 @@ pub module apb_host #(
     i_rd_abort: input logic,
     /// The bus is free, so a write can be taken.
     o_wready: output logic,
+
+    // --- the harness's own write: hold `i_xwe` until `o_xtaken` ---
+    i_xwe   : input  logic           ,
+    i_xaddr : input  logic<ADDR_BITS>,
+    i_xwdata: input  logic<32>       ,
+    o_xtaken: output logic           ,
 
     // --- the APB side ---
     o_psel   : output logic           ,
@@ -67,7 +78,11 @@ pub module apb_host #(
     // A read starts now: one just asked for, or one that waited.
     let rd_now: logic = idle && !i_hold && (i_re || (rd_wait && !i_rd_abort));
 
-    assign o_wready = idle && !rd_wait && !i_re && !i_hold;
+    // The harness's write starts now.
+    let x_now: logic = idle && !i_hold && !rd_now && i_xwe;
+
+    assign o_wready = idle && !rd_wait && !i_re && !i_hold && !i_xwe;
+    assign o_xtaken = x_now;
 
     always_ff {
         if_reset {
@@ -108,6 +123,11 @@ pub module apb_host #(
                 o_psel   = 1;
                 o_pwrite = 0;
                 o_paddr  = if rd_wait ? rd_addr : i_addr;
+            } else if x_now {
+                o_psel   = 1;
+                o_pwrite = 1;
+                o_paddr  = i_xaddr;
+                o_pwdata = i_xwdata;
             } else if idle && i_we {
                 o_psel   = 1;
                 o_pwrite = 1;

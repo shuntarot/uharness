@@ -158,6 +158,10 @@ pub enum Backing {
     /// A ring in the FPGA that keeps the last records of a DUT stream, such
     /// as an execution trace. The host starts and stops it, and reads it.
     Trace,
+    /// A counter of what the DUT reports each cycle, such as the
+    /// instructions it retired. It marks the cycle the count reaches two
+    /// values, and can ask a Debug Module to halt there.
+    Count,
 }
 
 /// The values `backing` accepts. Errors list them in this order.
@@ -173,6 +177,7 @@ const BACKING_VALUES: &[&str] = &[
     "host_poll_fifo",
     "dmi",
     "trace",
+    "count",
 ];
 
 impl<'de> Deserialize<'de> for Backing {
@@ -193,6 +198,7 @@ impl<'de> Deserialize<'de> for Backing {
             "host_poll_fifo" => Ok(Backing::HostPollFifo),
             "dmi" => Ok(Backing::Dmi),
             "trace" => Ok(Backing::Trace),
+            "count" => Ok(Backing::Count),
             // `host_bar` became `reg` or `slave`. Only the author knows which,
             // so it cannot be mapped automatically.
             "host_bar" => Err(serde::de::Error::custom(
@@ -225,6 +231,7 @@ impl Backing {
             Backing::HostPollFifo => "host_poll_fifo",
             Backing::Dmi => "dmi",
             Backing::Trace => "trace",
+            Backing::Count => "count",
         }
     }
 }
@@ -738,6 +745,13 @@ pub struct Bundle {
     /// until the host writes `<bundle>_delay`.
     #[serde(default)]
     pub stall: Option<bool>,
+
+    /// The `dmi` bundle a `count` asks to halt (`count` only). The harness
+    /// then writes `dmcontrol` itself in the cycle a marked value is reached,
+    /// when the host has asked for it (`<bundle>_halt_on`). Without it, a
+    /// `count` only marks the cycles.
+    #[serde(default)]
+    pub halt: Option<String>,
 }
 
 /// What the records of a `trace` are.
@@ -1281,6 +1295,28 @@ pub enum ManifestError {
     )]
     AccessNeedsAMemory { bundle: String, backing: String },
 
+    #[error("[bundle.{bundle}] sets `halt`, but its backing is `{backing}`")]
+    #[diagnostic(
+        code(harness::manifest::halt_needs_a_count),
+        help(
+            "`halt` names the Debug Module a `count` asks to halt when it reaches a value. A `{backing}` bundle counts nothing.\n\nRemove it, or use `backing = \"count\"`."
+        )
+    )]
+    HaltNeedsACount { bundle: String, backing: String },
+
+    #[error("[bundle.{bundle}] halt = \"{dmi}\" is not a `dmi` bundle")]
+    #[diagnostic(
+        code(harness::manifest::halt_not_a_dmi),
+        help(
+            "`halt` names the bundle of the Debug Module's DMI, whose `backing` is `dmi`. The `dmi` bundles here: {dmis}.\n\nName one of them, or add the DMI as a `dmi` bundle."
+        )
+    )]
+    HaltNotADmi {
+        bundle: String,
+        dmi: String,
+        dmis: String,
+    },
+
     /// The host decodes by masking address bits, so a size that is not a power
     /// of two answers at unintended addresses too. Below 4 KiB, the IP (1 KB
     /// steps only) and the written value disagree.
@@ -1663,6 +1699,30 @@ impl Manifest {
         }
 
         for (name, bundle) in &self.bundle {
+            if let Some(dmi) = &bundle.halt {
+                if bundle.backing != Backing::Count {
+                    return Err(ManifestError::HaltNeedsACount {
+                        bundle: name.clone(),
+                        backing: bundle.backing.to_string(),
+                    });
+                }
+                match self.bundle.get(dmi) {
+                    Some(target) if target.backing == Backing::Dmi => {}
+                    _ => {
+                        return Err(ManifestError::HaltNotADmi {
+                            bundle: name.clone(),
+                            dmi: dmi.clone(),
+                            dmis: self
+                                .bundle
+                                .iter()
+                                .filter(|(_, b)| b.backing == Backing::Dmi)
+                                .map(|(n, _)| format!("`{n}`"))
+                                .reduce(|a, b| format!("{a}, {b}"))
+                                .unwrap_or_else(|| "none".to_string()),
+                        });
+                    }
+                }
+            }
             // `access` only means something for a memory. On any other
             // terminator it would have no effect, so reject it.
             if bundle.access.is_some() && !bundle.backing.is_memory() {
@@ -1754,6 +1814,33 @@ mod tests {
             m.bundle["imem"].access.unwrap_or_default(),
             MemAccess::Region
         );
+    }
+
+    /// `halt` names a Debug Module for a `count`. On another backing, or
+    /// naming something that is not a `dmi`, it would do nothing.
+    #[test]
+    fn halt_names_a_dmi_and_only_on_a_count() {
+        let head = "[dut]\nmodule = \"dut_top\"\n\n[bundle.dmi]\nbacking = \"dmi\"\n\n";
+        let ok = format!("{head}[bundle.retire]\nbacking = \"count\"\nhalt = \"dmi\"\n");
+        let m: Manifest = toml::from_str(&ok).unwrap();
+        m.validate().unwrap();
+
+        let text = format!("{head}[bundle.ctl]\nbacking = \"reg\"\nhalt = \"dmi\"\n");
+        let m: Manifest = toml::from_str(&text).unwrap();
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(err, ManifestError::HaltNeedsACount { .. }),
+            "{err}"
+        );
+
+        let text = format!("{head}[bundle.retire]\nbacking = \"count\"\nhalt = \"ctl\"\n");
+        let m: Manifest = toml::from_str(&text).unwrap();
+        let err = m.validate().unwrap_err();
+        let help = miette::Diagnostic::help(&err)
+            .map(|h| h.to_string())
+            .unwrap_or_default();
+        assert!(matches!(err, ManifestError::HaltNotADmi { .. }), "{err}");
+        assert!(help.contains("`dmi`"), "{help}");
     }
 
     #[test]

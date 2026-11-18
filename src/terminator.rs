@@ -429,6 +429,16 @@ pub enum TerminatorError {
     )]
     IrqShape { bundle: String, what: String },
 
+    /// The count is one number per cycle, so the bundle is one output.
+    #[error("[bundle.{bundle}] is a count with {what}, not one output of 1 to 16 bits")]
+    #[diagnostic(
+        code(harness::terminator::count_shape),
+        help(
+            "A count bundle is one DUT output that says how many happened in each cycle, such as the instructions retired: 1 bit for a pulse, or the number for a core that retires several at once.\n\nName that port alone:\n\n    [bundle.{bundle}]\n    backing = \"count\"\n    ports   = [\"<port>\"]"
+        )
+    )]
+    CountShape { bundle: String, what: String },
+
     #[error("[bundle.{first}] and [bundle.{second}] are both host_irq")]
     #[diagnostic(
         code(harness::terminator::irq_more_than_one),
@@ -1819,6 +1829,71 @@ pub fn resolve_irqs(
         plans.push(IrqPlan {
             bundle: binding.bundle.clone(),
             port: name.clone(),
+        });
+    }
+    Ok(plans)
+}
+
+/// A `count` terminator: counts what the DUT reports each cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CountPlan {
+    pub bundle: String,
+    /// The DUT output: how many happened this cycle, such as instructions
+    /// retired. 1 bit is a pulse.
+    pub port: String,
+    pub width: usize,
+    /// The `dmi` bundle to halt through, from `halt`.
+    pub halt: Option<String>,
+}
+
+/// The widest count a DUT may report in one cycle. 16 bits is far more than
+/// any core retires per cycle, and a wider adder only costs timing.
+pub const COUNT_MAX_WIDTH: usize = 16;
+
+/// Resolves the `count` bundles, in bundle name order.
+pub fn resolve_counts(
+    dut: &Dut,
+    manifest: &Manifest,
+    bindings: &[Binding],
+) -> Result<Vec<CountPlan>, TerminatorError> {
+    let mut plans = Vec::new();
+    for binding in bindings {
+        let declared = &manifest.bundle[&binding.bundle];
+        if declared.backing != Backing::Count {
+            continue;
+        }
+        let shape = |what: String| TerminatorError::CountShape {
+            bundle: binding.bundle.clone(),
+            what,
+        };
+        let [name] = binding.ports.as_slice() else {
+            return Err(shape(format!("{} ports", binding.ports.len())));
+        };
+        let port = port_of(dut, name);
+        if port.direction != PortDirection::Output {
+            return Err(shape(format!(
+                "`{name}` as {}",
+                match port.direction {
+                    PortDirection::Input => "an input".to_string(),
+                    other => format!("a `{}` port", other.as_str()),
+                }
+            )));
+        }
+        let width = match port.width() {
+            Some(width) if width <= COUNT_MAX_WIDTH => width,
+            Some(width) => return Err(shape(format!("`{name}` {width} bits wide"))),
+            None => {
+                return Err(TerminatorError::UnresolvedWidth {
+                    bundle: binding.bundle.clone(),
+                    port: name.clone(),
+                });
+            }
+        };
+        plans.push(CountPlan {
+            bundle: binding.bundle.clone(),
+            port: name.clone(),
+            width,
+            halt: declared.halt.clone(),
         });
     }
     Ok(plans)
@@ -3799,6 +3874,7 @@ pub fn check_claimed(
     axi_slaves: &[AxiSlavePlan],
     irqs: &[IrqPlan],
     flrs: &[FlrPlan],
+    counts: &[CountPlan],
 ) -> Result<(), TerminatorError> {
     const DEPTH: &str = "depth";
     const ADDRESSING: &str = "addressing";
@@ -3896,6 +3972,11 @@ pub fn check_claimed(
             (
                 flrs.iter().any(|p| p.bundle == name),
                 "a `pcie_flr`",
+                &[][..],
+            ),
+            (
+                counts.iter().any(|p| p.bundle == name),
+                "a `count`",
                 &[][..],
             ),
         ];

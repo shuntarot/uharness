@@ -66,6 +66,9 @@ pub struct Plan {
     /// The `pcie_flr` bundle, if there is one (the card has one function).
     pub flrs: Vec<crate::terminator::FlrPlan>,
 
+    /// `count` terminators, sorted by bundle name.
+    pub counts: Vec<crate::terminator::CountPlan>,
+
     pub registers: RegisterMap,
 
     /// Present only with `[heartbeat]` and a target.
@@ -407,6 +410,7 @@ pub fn build(
     let axi_slaves = terminator::resolve_axi_slaves(&dut, &loaded.manifest, &bindings)?;
     let irqs = terminator::resolve_irqs(&dut, &loaded.manifest, &bindings)?;
     let flrs = terminator::resolve_flrs(&dut, &loaded.manifest, &bindings)?;
+    let counts = terminator::resolve_counts(&dut, &loaded.manifest, &bindings)?;
     terminator::check_claimed(
         &loaded.manifest,
         &bindings,
@@ -420,6 +424,7 @@ pub fn build(
         &axi_slaves,
         &irqs,
         &flrs,
+        &counts,
     )?;
 
     // The clock plan and the feasibility checks need a target.
@@ -502,6 +507,7 @@ pub fn build(
         axi_slaves,
         irqs,
         flrs,
+        counts,
         registers,
         heartbeat,
         board,
