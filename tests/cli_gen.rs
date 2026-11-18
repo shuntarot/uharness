@@ -4539,6 +4539,31 @@ fn a_host_irq_that_is_not_one_line_is_refused() {
     assert!(stderr.contains("host_irq"), "{stderr}");
 }
 
+/// A count is one output of up to 16 bits: one number each cycle.
+#[test]
+fn a_count_that_is_not_one_output_is_refused() {
+    let dir = irq_fixture("[bundle.n]\nbacking = \"count\"\nports = [\"o_irq\", \"o_irqs\"]\n");
+    let out = gen_pcie(&dir, "xilinx/vcu118");
+    assert_ne!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("is a count with 2 ports"), "{stderr}");
+
+    // One output of 2 bits is a count, and the harness builds.
+    let dir = irq_fixture(
+        "[bundle.n]\nbacking = \"count\"\nports = [\"o_irqs\"]\n\n[leave_open]\nports = [\"o_irq\"]\n",
+    );
+    let out = gen_pcie(&dir, "xilinx/vcu118");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let top = tight(&fs::read_to_string(dir.path().join("hns/src/top.veryl")).unwrap());
+    assert!(top.contains("inst u_count_n: hns::count"), "{top}");
+    common::veryl_check(&dir.path().join("hns")).unwrap();
+}
+
 /// PERST# holds the DUT in reset, through the same fence as `dut_reset`,
 /// unless `[pcie] perst_resets_dut = false`.
 #[test]

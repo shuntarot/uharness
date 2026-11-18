@@ -508,6 +508,13 @@ enum Cmd {
     #[command(subcommand)]
     Trace(TraceCmd),
 
+    /// Count instructions and mark two counts (`backing = "count"`).
+    ///
+    /// The count is what the DUT reports each cycle, such as the
+    /// instructions it retired.
+    #[command(subcommand)]
+    Count(CountCmd),
+
     /// Hand host memory to a `host_mem` bundle (PCIe).
     ///
     /// It works in a procedure file or at the prompt, which hold the page.
@@ -653,6 +660,66 @@ enum TraceCmd {
     },
 }
 
+/// `hio count`: a `count` bundle.
+#[derive(Subcommand)]
+enum CountCmd {
+    /// Start over and count: both counts and both marks return to 0.
+    ///
+    /// The first cycle the count reaches `--start`, and the first it reaches
+    /// `--end`, are kept with the count then. With `--halt`, the harness
+    /// also asks the Debug Module to halt the hart there. The hart stops a
+    /// few instructions later; `minstret` says how many.
+    Start {
+        bundle: Option<String>,
+        /// The count to mark first.
+        #[arg(long, value_name = "N", value_parser = parse_u64)]
+        start: Option<u64>,
+        /// The count to mark second.
+        #[arg(long, value_name = "N", value_parser = parse_u64)]
+        end: Option<u64>,
+        /// Halt when this mark is reached. Needs `halt` in the bundle.
+        #[arg(long, value_enum)]
+        halt: Option<HaltAt>,
+        /// The hart to halt, or `all`.
+        ///
+        /// `all` sets the Debug Module's hart array window first, so the one
+        /// write reaches every hart at once.
+        #[arg(long, value_name = "N|all", default_value = "0", value_parser = parse_hart)]
+        hart: HartChoice,
+    },
+    /// Stop counting. The counts and the marks stay.
+    Stop { bundle: Option<String> },
+    /// Print the counts and the marks.
+    Status { bundle: Option<String> },
+}
+
+/// The harts a `count` halts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HartChoice {
+    One(u32),
+    All,
+}
+
+fn parse_hart(s: &str) -> Result<HartChoice, String> {
+    if s == "all" {
+        return Ok(HartChoice::All);
+    }
+    parse_u64(s)
+        .ok()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n < 1 << 20)
+        .map(HartChoice::One)
+        .ok_or_else(|| format!("`{s}` is not a hart: give a number or `all`"))
+}
+
+/// Which mark of a `count` halts the hart.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum HaltAt {
+    Start,
+    End,
+    Both,
+}
+
 /// `hio hostmem`: the host memory a `host_mem` bundle reaches.
 ///
 /// The page is held only while a procedure file (`hio run`) or the prompt
@@ -739,6 +806,11 @@ enum CpuCmd {
         /// in the core and a reset clears them. Needs what `--halt` needs.
         #[arg(long)]
         catch: bool,
+        /// Read what was loaded back and compare it, before the program runs.
+        ///
+        /// Costs a second pass over the ELF.
+        #[arg(long)]
+        verify: bool,
         #[command(flatten)]
         attach: AttachArgs,
         /// Arguments after the ELF, which are ignored.
@@ -1274,6 +1346,7 @@ fn run_step(
         Cmd::Check => unreachable!("refused by parse_step"),
         Cmd::Drain { bundle, max, text } => drain(bus, map, &bundle, max, text),
         Cmd::Trace(cmd) => trace(bus, map, &cmd),
+        Cmd::Count(cmd) => count(bus, map, &cmd),
         Cmd::Hostmem(cmd) => match pages {
             Some(pages) => hostmem(cli, bus, map, pages, &cmd),
             None => Err(
@@ -2779,6 +2852,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
         Cmd::Reset { hold, release } => reset(&mut bus, &map, hold, release),
         Cmd::Drain { bundle, max, text } => drain(&mut bus, &map, &bundle, max, text),
         Cmd::Trace(ref cmd) => trace(&mut bus, &map, cmd),
+        Cmd::Count(ref cmd) => count(&mut bus, &map, cmd),
         Cmd::Memtest {
             ref bundle,
             base,
@@ -2830,6 +2904,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
             ref elf,
             halt,
             catch,
+            verify,
             ref attach,
             ref args,
         }) => {
@@ -2845,7 +2920,11 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
                 &map,
                 elf,
                 attach,
-                Start::Load { halt, catch },
+                Start::Load {
+                    halt,
+                    catch,
+                    verify,
+                },
             )?;
             exit_with(code)
         }
@@ -7846,11 +7925,20 @@ impl hns_host::rtt::Memory for WindowMem<'_> {
     }
 
     fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), String> {
+        self.write_to(None, addr, data)
+    }
+}
+
+impl WindowMem<'_> {
+    /// Writes into every memory that holds `addr..`, or with `only`, into
+    /// that one.
+    fn write_to(&mut self, only: Option<&str>, addr: u64, data: &[u8]) -> Result<(), String> {
         let len = data.len() as u64;
         let targets: Vec<(String, (usize, usize, usize))> = self
             .spans
             .iter()
             .filter(|s| s.covers(addr, len))
+            .filter(|s| only.is_none_or(|b| s.bundle == b))
             .map(|s| Ok((s.bundle.clone(), self.entries_of(s, addr, data.len())?)))
             .collect::<Result<_, String>>()?;
         if targets.is_empty() {
@@ -7878,6 +7966,234 @@ impl hns_host::rtt::Memory for WindowMem<'_> {
         }
         Ok(())
     }
+}
+
+/// What `cpu boot` writes at an address: bytes of the ELF, or the zeros
+/// after them.
+#[derive(Clone, Copy)]
+enum Fill<'a> {
+    Bytes(&'a [u8]),
+    Zeros(usize),
+}
+
+impl Fill<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Fill::Bytes(b) => b.len(),
+            Fill::Zeros(n) => *n,
+        }
+    }
+
+    /// `len` bytes from `from`.
+    fn part(&self, from: usize, len: usize) -> Fill<'_> {
+        match self {
+            Fill::Bytes(b) => Fill::Bytes(&b[from..from + len]),
+            Fill::Zeros(_) => Fill::Zeros(len),
+        }
+    }
+
+    fn copy_to(&self, out: &mut [u8]) {
+        match self {
+            Fill::Bytes(b) => out.copy_from_slice(b),
+            Fill::Zeros(_) => out.fill(0),
+        }
+    }
+}
+
+/// Splits `len` bytes at offset `off` of a memory with `entry`-byte entries:
+/// the part of an entry at the start, the whole entries, and the part of an
+/// entry at the end. The three add up to `len`.
+fn split_entries(off: u64, len: u64, entry: u64) -> (u64, u64, u64) {
+    let head = ((entry - off % entry) % entry).min(len);
+    let whole = (len - head) / entry * entry;
+    (head, whole, len - head - whole)
+}
+
+/// The memory that `cpu boot` has the card write, with the card's mover. The
+/// size decides, as for `load`. The card reaches one memory only.
+fn boot_card(
+    cli: &Cli,
+    mem: &mut WindowMem,
+    plan: &[(&hns_host::elf::Segment, Vec<String>, u64)],
+    total: u64,
+) -> Result<Option<(String, Mover)>, String> {
+    let mut names: Vec<&String> = plan.iter().flat_map(|(_, names, _)| names).collect();
+    names.sort();
+    names.dedup();
+    for bundle in names {
+        let port = mem_port(mem.map, bundle)?;
+        let master = mem.bus.master();
+        let chosen = route(
+            mem.map,
+            master,
+            "cpu boot",
+            bundle,
+            &port,
+            total,
+            DMA_WRITE_ABOVE,
+            None,
+        )?;
+        if let Route::Card { .. } = chosen
+            && let Some(mover) = open_route(mem.bus, mem.map, cli, chosen)?
+        {
+            return Ok(Some((bundle.clone(), mover)));
+        }
+    }
+    Ok(None)
+}
+
+/// Writes at `addr` in every memory that holds it, as `WindowMem::write`
+/// does. In the card's memory the card writes the whole entries; only a part
+/// of an entry at either end goes through the window.
+fn boot_write(
+    mem: &mut WindowMem,
+    card: &mut Option<(String, Mover)>,
+    addr: u64,
+    fill: Fill,
+) -> Result<(), String> {
+    fn window(mem: &mut WindowMem, only: Option<&str>, at: u64, part: Fill) -> Result<(), String> {
+        match part {
+            Fill::Bytes([]) | Fill::Zeros(0) => Ok(()),
+            Fill::Bytes(b) => mem.write_to(only, at, b),
+            Fill::Zeros(n) => mem.write_to(only, at, &vec![0; n]),
+        }
+    }
+    let len = fill.len() as u64;
+    let card_base = card.as_ref().and_then(|(name, _)| {
+        mem.spans
+            .iter()
+            .find(|s| &s.bundle == name && s.covers(addr, len))
+            .map(|s| s.base)
+    });
+    let (Some((name, mover)), Some(base)) = (card, card_base) else {
+        return window(mem, None, addr, fill);
+    };
+    // Any other memory that holds it, through the window.
+    let others: Vec<String> = mem
+        .spans
+        .iter()
+        .filter(|s| &s.bundle != name && s.covers(addr, len))
+        .map(|s| s.bundle.clone())
+        .collect();
+    for other in &others {
+        window(mem, Some(other), addr, fill)?;
+    }
+    let off = addr - base;
+    let entry = mem_port(mem.map, name)?.entry_bytes() as u64;
+    let (head, whole, tail) = split_entries(off, len, entry);
+    window(mem, Some(name), addr, fill.part(0, head as usize))?;
+    let mut done = 0;
+    while done < whole {
+        let n = (whole - done).min(mover.chunk as u64);
+        let part = fill.part((head + done) as usize, n as usize);
+        mover.send(mem.bus, mem.map, off + head + done, n as usize, |page| {
+            part.copy_to(page)
+        })?;
+        done += n;
+    }
+    let at = head + whole;
+    window(
+        mem,
+        Some(name),
+        addr + at,
+        fill.part(at as usize, tail as usize),
+    )
+}
+
+/// The time taken and the rate, such as `0.21 s, 320.5 MB/s`.
+fn took_and_rate(bytes: u64, took: std::time::Duration) -> String {
+    let secs = took.as_secs_f64();
+    let kbps = bytes as f64 / secs / 1e3;
+    if kbps < 1e3 {
+        format!("{secs:.2} s, {kbps:.1} KB/s")
+    } else {
+        format!("{secs:.2} s, {:.1} MB/s", kbps / 1e3)
+    }
+}
+
+/// Reads back what `boot_write` wrote and compares it, by the same routes.
+fn boot_check(
+    mem: &mut WindowMem,
+    card: &mut Option<(String, Mover)>,
+    addr: u64,
+    fill: Fill,
+) -> Result<(), String> {
+    fn window(mem: &mut WindowMem, bundle: &str, at: u64, part: Fill) -> Result<(), String> {
+        if part.len() == 0 {
+            return Ok(());
+        }
+        let span = mem
+            .spans
+            .iter()
+            .find(|s| s.bundle == bundle)
+            .ok_or_else(|| format!("no memory named `{bundle}`"))?;
+        let (from, to, skip) = mem.entries_of(span, at, part.len())?;
+        let got = mem.read_entries(bundle, from, to)?;
+        compare(bundle, at, &got[skip..skip + part.len()], part)
+    }
+    let len = fill.len() as u64;
+    let holders: Vec<(String, u64)> = mem
+        .spans
+        .iter()
+        .filter(|s| s.covers(addr, len))
+        .map(|s| (s.bundle.clone(), s.base))
+        .collect();
+    for (bundle, base) in holders {
+        let Some((_, mover)) = card.as_mut().filter(|(name, _)| *name == bundle) else {
+            window(mem, &bundle, addr, fill)?;
+            continue;
+        };
+        let off = addr - base;
+        let entry = mem_port(mem.map, &bundle)?.entry_bytes() as u64;
+        let (head, whole, tail) = split_entries(off, len, entry);
+        window(mem, &bundle, addr, fill.part(0, head as usize))?;
+        let chunk = mover.chunk as u64;
+        let mut done = 0;
+        while done < whole {
+            let n = (whole - done).min(chunk);
+            // Only a part of the same size can follow on the other half.
+            let next = Some(done + n)
+                .filter(|&d| d < whole && whole - d >= n)
+                .map(|d| off + head + d);
+            let got = mover.fetch(mem.bus, mem.map, off + head + done, n as usize, next)?;
+            let at = addr + head + done;
+            compare(
+                &bundle,
+                at,
+                got,
+                fill.part((head + done) as usize, n as usize),
+            )?;
+            done += n;
+        }
+        let at = head + whole;
+        window(
+            mem,
+            &bundle,
+            addr + at,
+            fill.part(at as usize, tail as usize),
+        )?;
+    }
+    Ok(())
+}
+
+/// Compares bytes read from `bundle` at DUT address `at` with what was
+/// written there.
+fn compare(bundle: &str, at: u64, got: &[u8], want: Fill) -> Result<(), String> {
+    let wanted = |i: usize| match want {
+        Fill::Bytes(b) => b[i],
+        Fill::Zeros(_) => 0,
+    };
+    let Some(i) = (0..got.len()).find(|&i| got[i] != wanted(i)) else {
+        return Ok(());
+    };
+    Err(format!(
+        "{:#x} in `{bundle}` reads {:#04x}, but the ELF puts {:#04x} there.\n\
+         The memory does not hold what was loaded. Check `dut_base` and the depth \
+         against Harness.toml.",
+        at + i as u64,
+        got[i],
+        wanted(i)
+    ))
 }
 
 /// Exits with the program's status. 0 returns, so the caller ends normally.
@@ -7914,8 +8230,12 @@ fn rtt_place(elf: &hns_host::elf::Elf, attach: &AttachArgs) -> Option<(u64, Opti
 #[derive(Clone, Copy)]
 enum Start {
     /// Load the ELF and run it; with `halt`, stop at the first instruction,
-    /// and with `catch`, stop on a fault.
-    Load { halt: bool, catch: bool },
+    /// and with `catch`, stop on a fault. With `verify`, read it back first.
+    Load {
+        halt: bool,
+        catch: bool,
+        verify: bool,
+    },
     /// Connect to a program that is already running.
     Attach,
 }
@@ -7930,8 +8250,9 @@ fn boot(
     attach: &AttachArgs,
     start: Start,
 ) -> Result<i32, String> {
+    let verify = matches!(start, Start::Load { verify: true, .. });
     let (load, halt, catch) = match start {
-        Start::Load { halt, catch } => (true, halt, catch),
+        Start::Load { halt, catch, .. } => (true, halt, catch),
         Start::Attach => (false, false, false),
     };
     // Everything that can be wrong with the file is found before the board
@@ -8006,23 +8327,59 @@ fn boot(
     let mut mem = WindowMem { bus, map, spans };
     if load {
         reset(mem.bus, map, true, false)?;
-        for (segment, names, zeros) in &plan {
-            hns_host::rtt::Memory::write(&mut mem, segment.paddr, &segment.bytes)?;
-            println!(
-                "  {:#012x} -> {}  {} bytes",
-                segment.paddr,
-                names.join(", "),
-                segment.bytes.len()
-            );
-            if *zeros > 0 {
-                let at = segment.paddr + segment.bytes.len() as u64;
-                hns_host::rtt::Memory::write(&mut mem, at, &vec![0; *zeros as usize])?;
+        let total: u64 = plan
+            .iter()
+            .map(|(segment, _, zeros)| segment.bytes.len() as u64 + zeros)
+            .sum();
+        let started = std::time::Instant::now();
+        let mut card = boot_card(cli, &mut mem, &plan, total)?;
+        let result = (|| -> Result<(), String> {
+            for (segment, names, zeros) in &plan {
+                let bytes = Fill::Bytes(&segment.bytes);
+                boot_write(&mut mem, &mut card, segment.paddr, bytes)?;
                 println!(
-                    "  {at:#012x} -> {}  {zeros} bytes of zeros",
-                    names.join(", ")
+                    "  {:#012x} -> {}  {} bytes",
+                    segment.paddr,
+                    names.join(", "),
+                    segment.bytes.len()
+                );
+                if *zeros > 0 {
+                    let at = segment.paddr + segment.bytes.len() as u64;
+                    boot_write(&mut mem, &mut card, at, Fill::Zeros(*zeros as usize))?;
+                    println!(
+                        "  {at:#012x} -> {}  {zeros} bytes of zeros",
+                        names.join(", ")
+                    );
+                }
+            }
+            if let Some((_, mover)) = &mut card {
+                mover.report_losses(mem.bus, map)?;
+            }
+            let how = if card.is_some() {
+                "by the card, the ends of entries through the window"
+            } else {
+                "through the window"
+            };
+            println!(
+                "loaded {total} bytes in {} ({how})",
+                took_and_rate(total, started.elapsed())
+            );
+            if verify {
+                let started = std::time::Instant::now();
+                for (segment, _, zeros) in &plan {
+                    let bytes = Fill::Bytes(&segment.bytes);
+                    boot_check(&mut mem, &mut card, segment.paddr, bytes)?;
+                    let at = segment.paddr + segment.bytes.len() as u64;
+                    boot_check(&mut mem, &mut card, at, Fill::Zeros(*zeros as usize))?;
+                }
+                println!(
+                    "verified in {}: what is in the memory is what is in the ELF",
+                    took_and_rate(total, started.elapsed())
                 );
             }
-        }
+            Ok(())
+        })();
+        close_mover(card.map(|(_, mover)| mover), mem.bus, map, result)?;
         // A control block left by the last program would be taken for a live
         // one before the new program sets up its own. Clearing just the block
         // is enough; zeroing all of .bss and the stack takes long over JTAG.
@@ -8035,6 +8392,11 @@ fn boot(
         }
         if halt || catch || semihosting {
             debug_module(mem.bus, map)?.halt_on_reset(true)?;
+        } else if dmi_base(map, None).is_ok() {
+            // A halt request that `hio count` left would halt the new program
+            // at its first instruction; attaching clears it. A Debug Module
+            // on the DUT reset cannot be reached now, and its reset clears it.
+            let _ = debug_module(mem.bus, map);
         }
         reset(mem.bus, map, false, true)?;
     }
@@ -10060,6 +10422,218 @@ fn ended(mut bytes: Vec<u8>) -> Vec<u8> {
 }
 
 /// `hio trace`: starts, stops, and reads the ring of a `trace` bundle.
+/// `hio count`.
+fn count(bus: &mut Bus, map: &RegisterMap, cmd: &CountCmd) -> Result<(), String> {
+    let (CountCmd::Start { bundle, .. } | CountCmd::Stop { bundle } | CountCmd::Status { bundle }) =
+        cmd;
+    // Only a `count` has a `cycles` register.
+    let names: Vec<&str> = map
+        .registers
+        .iter()
+        .filter(|r| r.role.as_deref() == Some("cycles"))
+        .filter_map(|r| r.bundle.as_deref())
+        .collect();
+    let name = match (bundle, names.as_slice()) {
+        (_, []) => {
+            return Err("this design has no count: no bundle in Harness.toml has \
+                        `backing = \"count\"`."
+                .to_string());
+        }
+        (Some(name), _) if names.contains(&name.as_str()) => name.as_str(),
+        (Some(name), _) => {
+            return Err(format!(
+                "`{name}` is not a count. Counts here: {}.",
+                names.join(", ")
+            ));
+        }
+        (None, [only]) => only,
+        (None, many) => return Err(format!("say which count: {}.", many.join(", "))),
+    };
+    let reg = |role: &str| {
+        role_of(map, name, role)
+            .map(|r| r.offset as u32)
+            .ok_or_else(|| {
+                format!("regs.json has no `{name}_{role}`. Regenerate it with this veryl-harness.")
+            })
+    };
+    let run = reg("run")?;
+
+    match cmd {
+        CountCmd::Start {
+            start,
+            end,
+            halt,
+            hart,
+            ..
+        } => {
+            let start = start.unwrap_or(0);
+            let end = end.unwrap_or(0);
+            let mut b = Batch::new();
+            // 0 then 1: a rise starts over, also when it is counting already.
+            b.write(run, 0);
+            write_wide(&mut b, map, &format!("{name}_start"), start)?;
+            write_wide(&mut b, map, &format!("{name}_end"), end)?;
+            let halt_on = role_of(map, name, "halt_on");
+            match (halt, halt_on) {
+                (Some(_), None) => {
+                    return Err(format!(
+                        "`{name}` cannot halt: its bundle has no `halt` in Harness.toml.\n\
+                         Add `halt = \"<the dmi bundle>\"` to [bundle.{name}] and \
+                         regenerate the harness."
+                    ));
+                }
+                (Some(at), Some(_)) => {
+                    let marks = [
+                        (HaltAt::Start, start, "--start"),
+                        (HaltAt::End, end, "--end"),
+                    ];
+                    for (which, value, flag) in marks {
+                        if (*at == which || *at == HaltAt::Both) && value == 0 {
+                            return Err(format!(
+                                "`--halt` at a mark that is not set: give `{flag}`."
+                            ));
+                        }
+                    }
+                    let bits = match at {
+                        HaltAt::Start => 1,
+                        HaltAt::End => 2,
+                        HaltAt::Both => 3,
+                    };
+                    // The harness writes `dmcontrol` once. A Debug Module that is
+                    // not active takes only `dmactive` from that write and drops
+                    // `haltreq` (as after `cpu boot`), so it is woken up now.
+                    let base = dmi_base(map, None)?;
+                    let first = match hart {
+                        HartChoice::One(n) => *n,
+                        HartChoice::All => 0,
+                    };
+                    let mut dm =
+                        hns_host::dm::Debug::attach(WindowDmi::new(bus, map, base), first)?;
+                    let value = match hart {
+                        HartChoice::One(n) => halt_dmcontrol(*n),
+                        HartChoice::All => dm.halt_all_control()?.0,
+                    };
+                    b.write(reg("halt_on")?, bits);
+                    b.write(reg("dmcontrol")?, value);
+                }
+                (None, Some(_)) => {
+                    b.write(reg("halt_on")?, 0);
+                }
+                (None, None) => {}
+            }
+            b.write(run, 1);
+            bus.run(&b)?;
+            let mark = |value: u64| {
+                if value == 0 {
+                    "none".to_string()
+                } else {
+                    value.to_string()
+                }
+            };
+            let harts = match hart {
+                HartChoice::One(n) => format!("hart {n}"),
+                HartChoice::All => "every hart".to_string(),
+            };
+            let halting = match halt {
+                Some(HaltAt::Start) => format!("; halts {harts} at the start"),
+                Some(HaltAt::End) => format!("; halts {harts} at the end"),
+                Some(HaltAt::Both) => format!("; halts {harts} at both"),
+                None => String::new(),
+            };
+            println!(
+                "{name}: counting; start {}, end {}{halting}",
+                mark(start),
+                mark(end)
+            );
+            Ok(())
+        }
+        CountCmd::Stop { .. } => {
+            let mut b = Batch::new();
+            b.write(run, 0);
+            bus.run(&b)?;
+            println!("{name}: stopped; the counts and the marks stay");
+            Ok(())
+        }
+        CountCmd::Status { .. } => {
+            let mut b = Batch::new();
+            let running = b.read(run);
+            let hits = [b.read(reg("start_hit")?), b.read(reg("end_hit")?)];
+            let got = bus.run(&b)?;
+            let (running, hits) = (got[running] & 1 == 1, [got[hits[0]] & 1, got[hits[1]] & 1]);
+            let mut wide = |role: &str| -> Result<u64, String> { read_live_u64(bus, reg(role)?) };
+            let total = wide("count")?;
+            let cycles = wide("cycles")?;
+            let marks = [
+                (
+                    "start",
+                    wide("start")?,
+                    hits[0],
+                    wide("start_cycle")?,
+                    wide("start_count")?,
+                ),
+                (
+                    "end",
+                    wide("end")?,
+                    hits[1],
+                    wide("end_cycle")?,
+                    wide("end_count")?,
+                ),
+            ];
+            let state = if running { "counting" } else { "stopped" };
+            println!("{name}: {state}");
+            println!("count     {total}");
+            println!("cycles    {cycles}{}", per_cycle(total, cycles));
+            for (label, value, hit, cycle, at) in marks {
+                match (value, hit) {
+                    (0, _) => println!("{label:<9} none"),
+                    (v, 1) => println!("{label:<9} {v}: reached at cycle {cycle}, count {at}"),
+                    (v, _) => println!("{label:<9} {v}: not reached"),
+                }
+            }
+            if hits == [1, 1] {
+                let (_, _, _, c0, n0) = marks[0];
+                let (_, _, _, c1, n1) = marks[1];
+                let (dc, dn) = (c1.wrapping_sub(c0), n1.wrapping_sub(n0));
+                println!("between   {dc} cycles, {dn} counted{}", per_cycle(dn, dc));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `dmcontrol` that asks one hart to halt: `haltreq`, `hartsel` and
+/// `dmactive`.
+fn halt_dmcontrol(hart: u32) -> u32 {
+    let lo = hart & 0x3ff;
+    let hi = (hart >> 10) & 0x3ff;
+    (1 << 31) | (lo << 16) | (hi << 6) | 1
+}
+
+/// `, 1.50 per cycle`, or nothing when no cycles were counted.
+fn per_cycle(count: u64, cycles: u64) -> String {
+    if cycles == 0 {
+        String::new()
+    } else {
+        format!(", {:.2} per cycle", count as f64 / cycles as f64)
+    }
+}
+
+/// Reads a 64-bit register that may be counting: the high word, the low,
+/// then the high again, until the high word holds still.
+fn read_live_u64(bus: &mut Bus, offset: u32) -> Result<u64, String> {
+    for _ in 0..4 {
+        let mut b = Batch::new();
+        let hi = b.read(offset + 4);
+        let lo = b.read(offset);
+        let again = b.read(offset + 4);
+        let got = bus.run(&b)?;
+        if got[hi] == got[again] {
+            return Ok((u64::from(got[hi]) << 32) | u64::from(got[lo]));
+        }
+    }
+    Err("a 64-bit count kept carrying into its high word while it was read".to_string())
+}
+
 fn trace(bus: &mut Bus, map: &RegisterMap, cmd: &TraceCmd) -> Result<(), String> {
     let (TraceCmd::Start { bundle, .. }
     | TraceCmd::Stop { bundle }
@@ -11757,6 +12331,61 @@ mod tests {
         );
         let target = run(&named).unwrap().unwrap();
         assert_eq!(target.name, "digilent/arty-a7-35");
+    }
+
+    /// The value a `count` writes to `dmcontrol`: `haltreq`, the hart split
+    /// into `hartsello` and `hartselhi`, and `dmactive`.
+    #[test]
+    fn a_count_halts_the_hart_it_is_given() {
+        assert_eq!(halt_dmcontrol(0), 0x8000_0001);
+        assert_eq!(halt_dmcontrol(3), 0x8003_0001);
+        assert_eq!(halt_dmcontrol(0x3ff), 0x83ff_0001);
+        assert_eq!(halt_dmcontrol(0x400), 0x8000_0041);
+    }
+
+    #[test]
+    fn a_hart_is_a_number_or_all() {
+        assert_eq!(parse_hart("all"), Ok(HartChoice::All));
+        assert_eq!(parse_hart("3"), Ok(HartChoice::One(3)));
+        assert_eq!(parse_hart("0x10"), Ok(HartChoice::One(16)));
+        assert!(parse_hart("every").unwrap_err().contains("`all`"));
+    }
+
+    /// `cpu boot` gives the card only whole entries; the parts of an entry at
+    /// the ends go through the window, which reads the entry first.
+    #[test]
+    fn a_boot_write_splits_at_entries() {
+        // Aligned on both ends: all whole entries.
+        assert_eq!(split_entries(0, 4096, 64), (0, 4096, 0));
+        // An ELF segment of 4804 bytes, then its zeros from 0x12c4.
+        assert_eq!(split_entries(0, 4804, 64), (0, 4800, 4));
+        assert_eq!(split_entries(0x12c4, 4108, 64), (60, 4032, 16));
+        // Inside one entry: only the head.
+        assert_eq!(split_entries(4, 8, 64), (8, 0, 0));
+        assert_eq!(split_entries(4, 60, 64), (60, 0, 0));
+        // Ends exactly on an entry.
+        assert_eq!(split_entries(4, 124, 64), (60, 64, 0));
+        assert_eq!(split_entries(0, 0, 64), (0, 0, 0));
+        // Entries of one word.
+        assert_eq!(split_entries(6, 10, 4), (2, 8, 0));
+    }
+
+    /// `cpu boot --verify` names the first byte that differs, by its DUT
+    /// address, and zeros are compared as zeros.
+    #[test]
+    fn a_boot_check_names_the_first_byte_that_differs() {
+        assert!(compare("mem", 0x9000_0003, &[1, 2, 3], Fill::Bytes(&[1, 2, 3])).is_ok());
+        let err = compare("mem", 0x9000_0003, &[1, 9, 3], Fill::Bytes(&[1, 2, 3])).unwrap_err();
+        assert!(
+            err.starts_with("0x90000004 in `mem` reads 0x09, but the ELF puts 0x02"),
+            "{err}"
+        );
+        assert!(compare("mem", 0x10, &[0; 8], Fill::Zeros(8)).is_ok());
+        let err = compare("mem", 0x10, &[0, 0, 0xa5], Fill::Zeros(3)).unwrap_err();
+        assert!(
+            err.starts_with("0x12 in `mem` reads 0xa5, but the ELF puts 0x00"),
+            "{err}"
+        );
     }
 
     #[test]

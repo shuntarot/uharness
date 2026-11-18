@@ -3044,6 +3044,121 @@ module dmi_window {{
     );
 }
 
+/// `count`: the harness adds up what the DUT reports each cycle, marks the
+/// cycle each value is reached, and at the end writes `dmcontrol` to the
+/// Debug Module itself (`halt`).
+///
+/// The stand-in reports 1, 2, 1, 2, ... so the count passes some values
+/// without landing on them. Its DMI keeps what is written, so the harness's
+/// write shows at `dmcontrol` (DMI address 0x10).
+#[test]
+fn a_count_marks_its_values_and_halts_through_the_dmi() {
+    let dut = r#"
+module dut_top (
+    i_clk        : input  clock    ,
+    i_rst        : input  reset    ,
+    o_ret_n      : output logic<2> ,
+    i_dmi_psel   : input  logic    ,
+    i_dmi_penable: input  logic    ,
+    i_dmi_pwrite : input  logic    ,
+    i_dmi_paddr  : input  logic<9> ,
+    i_dmi_pwdata : input  logic<32>,
+    o_dmi_prdata : output logic<32>,
+    o_dmi_pready : output logic    ,
+) {
+    var regs : logic<32> [128];
+    var odd  : logic          ;
+    let word : logic<7>       = i_dmi_paddr[8:2];
+
+    assign o_ret_n      = if odd ? 2'd2 : 2'd1;
+    assign o_dmi_pready = 1;
+    assign o_dmi_prdata = regs[word];
+
+    always_ff {
+        if_reset {
+            odd = 0;
+        } else {
+            odd = !odd;
+        }
+    }
+    always_ff {
+        if i_dmi_psel && i_dmi_penable && i_dmi_pwrite {
+            regs[word] = i_dmi_pwdata;
+        }
+    }
+}
+"#;
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.dmi]\nbacking = \"dmi\"\n\n[bundle.ret]\nbacking = \"count\"\nports = [\"o_ret_n\"]\nhalt = \"dmi\"\n";
+
+    let dir = fixture(manifest, dut, "");
+    let map = offsets(dir.path());
+    let at = |name: &str| offset_of(&map, &format!("ret_{name}"));
+    let dmcontrol = region_base(&map, "dmi") + 0x10 * 4;
+    let (run, start, end, halt_on, value) = (
+        at("run"),
+        at("start"),
+        at("end"),
+        at("halt_on"),
+        at("dmcontrol"),
+    );
+    let (start_hit, start_cycle, start_count) =
+        (at("start_hit"), at("start_cycle"), at("start_count"));
+    let (end_hit, end_cycle, end_count) = (at("end_hit"), at("end_cycle"), at("end_count"));
+
+    let tb = format!(
+        r#"
+#[test(count_marks)]
+module count_marks {{
+{BUS}
+    var s_cycle: logic<32>;
+    var e_cycle: logic<32>;
+    var s_count: logic<32>;
+    var e_count: logic<32>;
+
+    initial {{
+        start();
+
+        $assert(rd({dmcontrol}) != 32'h8000_0001);
+        wr({start}, 100);
+        wr({end}, 301);
+        wr({halt_on}, 2);
+        wr({value}, 32'h8000_0001);
+        wr({run}, 1);
+        for _i in 0..400 {{
+            if rd({end_hit}) == 1 {{
+                break;
+            }}
+        }}
+        $assert(rd({start_hit}) == 1 && rd({end_hit}) == 1);
+        s_cycle = rd({start_cycle});
+        e_cycle = rd({end_cycle});
+        s_count = rd({start_count});
+        e_count = rd({end_count});
+        $display("start: cycle %0d count %0d, end: cycle %0d count %0d", s_cycle, s_count, e_cycle, e_count);
+        // 1, 2, 1, 2, ...: 3 every 2 cycles, so 201 more is 134 cycles.
+        $assert(s_count >= 100 && s_count <= 101);
+        $assert(e_count >= 301 && e_count <= 302);
+        $assert(e_cycle - s_cycle == 134);
+        $assert(rd({start_cycle} + 4) == 0, "the high word");
+        // Only the end halts, and the harness wrote dmcontrol itself.
+        $assert(rd({dmcontrol}) == 32'h8000_0001);
+
+        // A new run starts over.
+        wr({run}, 0);
+        wr({run}, 1);
+        $assert(rd({start_hit}) == 0 && rd({end_hit}) == 0);
+        $finish();
+    }}
+}}
+"#
+    );
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
 /// An APB register file in the DUT (`slave` with APB roles).
 ///
 /// The roles come from the `p*` suffixes. The stand-in stretches each access

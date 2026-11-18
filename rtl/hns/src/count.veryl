@@ -1,0 +1,101 @@
+/// Counts what a DUT reports each cycle, such as the instructions it
+/// retired, and marks the cycle the count reaches each of two values.
+///
+/// While `i_run` is high and `i_hold` is low, the count adds `i_n` every
+/// cycle and the cycle count adds 1. A rise of `i_run` starts over: both
+/// counts and both marks return to 0. `i_hold` is the DUT reset: nothing is
+/// counted while the DUT is held in it.
+///
+/// `i_start` and `i_end` are the values to mark; 0 marks nothing. In the
+/// first cycle the count reaches one (equal or above), its hit is set, and
+/// the cycle count and the count after that cycle are kept. With more than
+/// one per cycle the count can pass the value by up to `i_n - 1`; the count
+/// kept says by how much. A value written below the count is reached in the
+/// next cycle that counts.
+///
+/// `o_halt` is high for that one cycle when the bit of `i_halt_on` for the
+/// value is set (bit 0 for start, bit 1 for end). The harness turns it into
+/// a halt request to the Debug Module.
+///
+/// `i_n` is taken one cycle late, from a flip-flop, so the comparison does
+/// not start from the DUT's own logic. The marks are therefore one cycle
+/// after the DUT reported, the same for both, so their difference is exact.
+pub module count #(
+    param WIDTH: u32 = 1,
+) (
+    i_clk        : input  clock       ,
+    i_rst        : input  reset       ,
+    i_hold       : input  logic       ,
+    i_run        : input  logic       ,
+    i_n          : input  logic<WIDTH>,
+    i_start      : input  logic<64>   ,
+    i_end        : input  logic<64>   ,
+    i_halt_on    : input  logic<2>    ,
+    o_count      : output logic<64>   ,
+    o_cycles     : output logic<64>   ,
+    o_start_hit  : output logic       ,
+    o_start_cycle: output logic<64>   ,
+    o_start_count: output logic<64>   ,
+    o_end_hit    : output logic       ,
+    o_end_cycle  : output logic<64>   ,
+    o_end_count  : output logic<64>   ,
+    o_halt       : output logic       ,
+) {
+    var running: logic       ;
+    var on_q   : logic       ;
+    var n_q    : logic<WIDTH>;
+
+    let start    : logic     = i_run & ~running;
+    let next     : logic<64> = o_count + n_q;
+    let start_now: logic     = on_q & ~o_start_hit & (i_start != 0) & (next >= i_start);
+    let end_now  : logic     = on_q & ~o_end_hit & (i_end != 0) & (next >= i_end);
+
+    always_ff {
+        if_reset {
+            running       = 0;
+            on_q          = 0;
+            n_q           = 0;
+            o_count       = 0;
+            o_cycles      = 0;
+            o_start_hit   = 0;
+            o_start_cycle = 0;
+            o_start_count = 0;
+            o_end_hit     = 0;
+            o_end_cycle   = 0;
+            o_end_count   = 0;
+            o_halt        = 0;
+        } else {
+            running = i_run;
+            n_q     = i_n;
+            o_halt  = 0;
+            if start {
+                on_q          = 0;
+                o_count       = 0;
+                o_cycles      = 0;
+                o_start_hit   = 0;
+                o_start_cycle = 0;
+                o_start_count = 0;
+                o_end_hit     = 0;
+                o_end_cycle   = 0;
+                o_end_count   = 0;
+            } else {
+                on_q = i_run & ~i_hold;
+                if on_q {
+                    o_count  = next;
+                    o_cycles = o_cycles + 1;
+                    if start_now {
+                        o_start_hit   = 1;
+                        o_start_cycle = o_cycles + 1;
+                        o_start_count = next;
+                    }
+                    if end_now {
+                        o_end_hit   = 1;
+                        o_end_cycle = o_cycles + 1;
+                        o_end_count = next;
+                    }
+                    o_halt = (start_now & i_halt_on[0]) | (end_now & i_halt_on[1]);
+                }
+            }
+        }
+    }
+}

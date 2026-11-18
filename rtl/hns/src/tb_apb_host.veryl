@@ -26,30 +26,36 @@ module test_apb_host {
     var pslverr: logic    ;
     var slverrs: logic<32>;
     var hold   : logic    ;
+    var xwe    : logic    ;
+    var xtaken : logic    ;
 
     inst u: apb_host #(
         ADDR_BITS: 9,
     ) (
-        i_clk    : clk    ,
-        i_rst    : rst    ,
-        i_hold   : hold   ,
-        i_addr   : addr   ,
-        i_wdata  : wdata  ,
-        i_we     : we     ,
-        i_re     : re     ,
-        o_rdata  : rdata  ,
-        o_rvalid : rvalid ,
-        i_rd_abort: 1'b0,
-        o_wready : wready ,
-        o_psel   : psel   ,
-        o_penable: penable,
-        o_pwrite : pwrite ,
-        o_paddr  : paddr  ,
-        o_pwdata : pwdata ,
-        i_prdata : prdata ,
-        i_pready : pready ,
-        i_pslverr: pslverr,
-        o_slverrs: slverrs,
+        i_clk     : clk          ,
+        i_rst     : rst          ,
+        i_hold    : hold         ,
+        i_addr    : addr         ,
+        i_wdata   : wdata        ,
+        i_we      : we           ,
+        i_re      : re           ,
+        o_rdata   : rdata        ,
+        o_rvalid  : rvalid       ,
+        i_rd_abort: 1'b0         ,
+        o_wready  : wready       ,
+        i_xwe     : xwe          ,
+        i_xaddr   : 9'h040       ,
+        i_xwdata  : 32'h8000_0001,
+        o_xtaken  : xtaken       ,
+        o_psel    : psel         ,
+        o_penable : penable      ,
+        o_pwrite  : pwrite       ,
+        o_paddr   : paddr        ,
+        o_pwdata  : pwdata       ,
+        i_prdata  : prdata       ,
+        i_pready  : pready       ,
+        i_pslverr : pslverr      ,
+        o_slverrs : slverrs      ,
     );
 
     // The slave: 128 words, and a count of the reads it answered. The access
@@ -135,6 +141,7 @@ module test_apb_host {
         re    = 0;
         waits = 0;
         hold  = 0;
+        xwe   = 0;
         rst.assert(4);
         clk.next(4);
 
@@ -208,6 +215,28 @@ module test_apb_host {
         // And it works again.
         get(9'h010);
         $assert(got == 32'h1111_0005 && reads == 6);
+
+        // The harness's own write goes first, and the window's waits for it.
+        waits = 0;
+        clk.next(4);
+        xwe = 1;
+        $assert(!wready, "the window may not write while the harness waits");
+        for _i in 0..8 {
+            if xtaken {
+                break;
+            }
+            clk.next(1);
+        }
+        clk.next(1);
+        xwe = 0;
+        put(9'h044, 32'h4444_0000);
+        clk.next(4);
+        $assert(writes == 5, "both writes reached the slave");
+        get(9'h040);
+        $display("harness write: %h", got);
+        $assert(got == 32'h8000_0007, "the harness's write landed");
+        get(9'h044);
+        $assert(got == 32'h4444_0007, "the window's write landed");
         $finish();
     }
 }

@@ -14,6 +14,7 @@ Generating the harness is in [guide-harness.md](guide-harness.md).
 - [`hio cpu boot` and `cpu console`: run firmware](#hio-cpu-boot-and-cpu-console-run-firmware)
 - [`hio cpu halt`, `step`, `regs`: debug the CPU](#hio-cpu-halt-step-regs-debug-the-cpu)
 - [`hio trace`: the last instructions](#hio-trace-the-last-instructions)
+- [`hio count`: count instructions and mark two counts](#hio-count-count-instructions-and-mark-two-counts)
 - [`hio program` and `erase`](#hio-program-and-erase)
 - [`hio sysmon`: temperature and voltages](#hio-sysmon-temperature-and-voltages)
 - [`hio dna`: the FPGA's unique ID](#hio-dna-the-fpgas-unique-id)
@@ -58,6 +59,7 @@ enough (`--serial 8107`).
 | `memtest <bundle>` | write a pattern and read it back; **the contents are lost** |
 | `drain <bundle>` | empty a `host_poll_fifo`, oldest first; `--text` prints 8-bit entries as text, such as a serial output |
 | `trace …` | a `trace` ring: `start`, `stop`, `status`, `dump`; see [`hio trace`](#hio-trace-the-last-instructions) |
+| `count …` | a `count`: `start`, `stop`, `status`; see [`hio count`](#hio-count-count-instructions-and-mark-two-counts) |
 | `dump` | read every register |
 | `reset` | reset the DUT only; `--hold` / `--release` keep it in reset |
 | `bench` | how fast the window is; `<region> --both` measures writes too; `--suite` measures everything; see [`hio bench`](#hio-bench-how-fast) |
@@ -373,7 +375,10 @@ It holds the DUT in reset, puts each segment into every memory that covers its
 address (`dut_base`), clears the `_SEGGER_RTT` block, and releases the DUT.
 The zeros after a segment's file bytes (`.bss` after `.data`) are written
 too; a segment with no file bytes, usually the stack, is left to the startup
-code. Up
+code. Over PCIe, a large ELF goes the way `load` takes it: the card writes
+the memory it reaches, and only a part of an entry at either end goes through
+the window. `--verify` reads it all back and compares it before the DUT is
+released. Up
 channel 0 goes to the terminal and keys go to down channel 0; Ctrl-A x
 leaves. `hio cpu console <elf>` connects without loading, so leaving and
 coming back is harmless.
@@ -545,6 +550,43 @@ the pc, the instruction, and what it did:
 
 `hio reset` leaves the trace running, so it also records the reset and what
 follows.
+
+## `hio count`: count instructions and mark two counts
+
+A `count` bundle adds up a number the DUT reports every cycle, such as the
+instructions it retired, and counts the cycles beside it. It keeps the cycle
+in which the count first reaches each of two values, so the cycles between
+two instruction counts are exact, without stopping the core:
+
+```bash
+hio count start --start 1000 --end 4000
+hio count status
+```
+
+```text
+retire: counting
+count     597312
+cycles    398220, 1.50 per cycle
+start     1000: reached at cycle 667, count 1001
+end       4000: reached at cycle 2667, count 4001
+between   2000 cycles, 3000 counted, 1.50 per cycle
+```
+
+`start` starts over: both counts and both marks return to 0. The count can
+pass a value when several come in one cycle, so the count at each mark is
+shown too. Nothing is counted while the DUT is held in reset. `stop` stops
+counting and keeps the values.
+
+With `halt` in the bundle, `--halt start`, `--halt end` or `--halt both` also
+halts a hart (`--hart`, default 0) at that mark: the harness writes
+`dmcontrol` itself in that cycle. `--hart all` halts every hart with that one
+write, through the Debug Module's hart array window (`hasel`); a Debug
+Module without one is refused. `start` wakes the Debug Module first: an
+inactive one takes only `dmactive` from the harness's write. Give it its own
+`reset` in the `dmi` bundle, so `hio reset` does not put it back to sleep. A
+hart stops a few instructions after the
+mark; `minstret` says how many. `hio cpu` then works on the halted harts as
+usual.
 
 ## `hio program` and `erase`
 

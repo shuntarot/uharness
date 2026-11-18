@@ -970,6 +970,27 @@ fn logic(width: usize) -> String {
     }
 }
 
+/// The signals of a `count` other than its halt registers, with widths. The
+/// first three come from the CSR; the rest come from `hns::count`.
+const COUNT_WIRES: [(&str, usize); 11] = [
+    ("run", 1),
+    ("start", 64),
+    ("end", 64),
+    ("count", 64),
+    ("cycles", 64),
+    ("start_hit", 1),
+    ("start_cycle", 64),
+    ("start_count", 64),
+    ("end_hit", 1),
+    ("end_cycle", 64),
+    ("end_count", 64),
+];
+
+/// Whether a `count` asks the Debug Module behind `dmi` to halt.
+fn halting(plan: &Plan, dmi: &str) -> bool {
+    plan.counts.iter().any(|c| c.halt.as_deref() == Some(dmi))
+}
+
 /// The registers that let the card issue requests (the harness DMA engine).
 ///
 /// These are the only terminator registers with no bundle: the DMA engine is
@@ -2220,6 +2241,39 @@ fn core_body(
         ));
     }
 
+    // count wires: `w_<port>` on the DUT side, `t_<bundle>_*` on the host
+    // side, and the halt request each count raises.
+    for count in &plan.counts {
+        let bundle = &count.bundle;
+        out.push_str(&format!(
+            "    var w_{}: {domain}{};\n",
+            count.port,
+            logic(count.width)
+        ));
+        for (role, width) in COUNT_WIRES {
+            out.push_str(&format!(
+                "    var t_{bundle}_{role}: {domain}{};\n",
+                logic(width)
+            ));
+        }
+        if count.halt.is_some() {
+            out.push_str(&format!("    var t_{bundle}_halt_on: {domain}logic<2>;\n"));
+            out.push_str(&format!(
+                "    var t_{bundle}_dmcontrol: {domain}logic<{WORD_BITS}>;\n"
+            ));
+        }
+        out.push_str(&format!("    var halt_{bundle}: {domain}logic;\n"));
+    }
+    // The harness's own write to a Debug Module: a count's halt request.
+    for dmi in plan.apbs.iter().filter(|a| halting(plan, &a.bundle)) {
+        let bundle = &dmi.bundle;
+        out.push_str(&format!("    var xwe_{bundle}: {domain}logic;\n"));
+        out.push_str(&format!(
+            "    var xwdata_{bundle}: {domain}logic<{WORD_BITS}>;\n"
+        ));
+        out.push_str(&format!("    var xtaken_{bundle}: {domain}logic;\n"));
+    }
+
     // bram / bram_preload wires: `w_<port>` on the DUT side, `t_<bundle>_m*`
     // on the host side.
     for mem in &plan.memories {
@@ -2642,6 +2696,18 @@ fn core_body(
         out.push_str(&format!("        o_rvalid : t_{bundle}_mrvalid,\n"));
         out.push_str("        i_rd_abort: bus_rd_abort,\n");
         out.push_str(&format!("        o_wready : t_{bundle}_mwready,\n"));
+        if halting(plan, bundle) {
+            // `dmcontrol` is at DMI address 0x10, a byte address here.
+            out.push_str(&format!("        i_xwe    : xwe_{bundle},\n"));
+            out.push_str(&format!("        i_xaddr  : {aw}'h40,\n"));
+            out.push_str(&format!("        i_xwdata : xwdata_{bundle},\n"));
+            out.push_str(&format!("        o_xtaken : xtaken_{bundle},\n"));
+        } else {
+            out.push_str("        i_xwe    : 1'b0,\n");
+            out.push_str(&format!("        i_xaddr  : {aw}'h0,\n"));
+            out.push_str("        i_xwdata : 32'h0,\n");
+            out.push_str("        o_xtaken : _,\n");
+        }
         out.push_str(&format!("        o_psel   : w_{},\n", dmi.psel));
         out.push_str(&format!("        o_penable: w_{},\n", dmi.penable));
         out.push_str(&format!("        o_pwrite : w_{},\n", dmi.pwrite));
@@ -3480,6 +3546,59 @@ fn core_body(
                 "    assign t_{bundle}_mrdata = {{{pad}'h0, t_{bundle}_hrdata}};\n\n"
             ));
         }
+    }
+
+    // count terminators.
+    for count in &plan.counts {
+        let bundle = &count.bundle;
+        out.push_str(&format!("    inst u_count_{bundle}: hns::count #(\n"));
+        out.push_str(&format!("        WIDTH: {},\n", count.width));
+        out.push_str("    ) (\n");
+        out.push_str(&format!("        i_clk        : {clk},\n"));
+        out.push_str(&format!("        i_rst        : {rst},\n"));
+        out.push_str("        i_hold       : dut_rst_req,\n");
+        out.push_str(&format!("        i_run        : t_{bundle}_run,\n"));
+        out.push_str(&format!("        i_n          : w_{},\n", count.port));
+        out.push_str(&format!("        i_start      : t_{bundle}_start,\n"));
+        out.push_str(&format!("        i_end        : t_{bundle}_end,\n"));
+        if count.halt.is_some() {
+            out.push_str(&format!("        i_halt_on    : t_{bundle}_halt_on,\n"));
+        } else {
+            out.push_str("        i_halt_on    : 2'b00,\n");
+        }
+        // The first three are inputs from the CSR.
+        for (role, _) in COUNT_WIRES.iter().skip(3) {
+            out.push_str(&format!("        o_{role:<12}: t_{bundle}_{role},\n"));
+        }
+        out.push_str(&format!("        o_halt       : halt_{bundle},\n"));
+        out.push_str("    );\n\n");
+    }
+    // The halt requests, held until the Debug Module's bus takes the write.
+    for dmi in plan.apbs.iter().filter(|a| halting(plan, &a.bundle)) {
+        let bundle = &dmi.bundle;
+        out.push_str(&format!("    always_ff ({clk}, {rst}) {{\n"));
+        out.push_str("        if_reset {\n");
+        out.push_str(&format!("            xwe_{bundle} = 0;\n"));
+        out.push_str(&format!("            xwdata_{bundle} = 0;\n"));
+        out.push_str("        } else {\n");
+        out.push_str(&format!("            if xtaken_{bundle} {{\n"));
+        out.push_str(&format!("                xwe_{bundle} = 0;\n"));
+        out.push_str("            }\n");
+        for count in plan
+            .counts
+            .iter()
+            .filter(|c| c.halt.as_deref() == Some(bundle.as_str()))
+        {
+            let c = &count.bundle;
+            out.push_str(&format!("            if halt_{c} {{\n"));
+            out.push_str(&format!("                xwe_{bundle} = 1;\n"));
+            out.push_str(&format!(
+                "                xwdata_{bundle} = t_{c}_dmcontrol;\n"
+            ));
+            out.push_str("            }\n");
+        }
+        out.push_str("        }\n");
+        out.push_str("    }\n\n");
     }
 
     // bram / bram_preload terminators, with depth, width and latency as parameters.
@@ -8163,6 +8282,26 @@ fn tlp_counter_note(role: &str) -> &'static str {
 /// What all the TLP counts share, for regs.md.
 const TLP_COUNTER_NOTE: &str = "All `pcie_*` counts saturate, and a link reset does not clear them. A request the PCIe block refuses itself (no BAR hit, Memory Space off) never reaches them: see the function's Device Status. A read over PCIe counts itself; read over JTAG to leave them alone";
 
+/// The notes of a `count` register. Its roles share names with the
+/// `trace` ones (`run`, `count`) but mean other things.
+fn count_note(bundle: &str, role: &str) -> Option<String> {
+    let note = match role {
+        "run" => "1 counts; writing 1 after 0 starts over: both counts and both marks return to 0".to_string(),
+        "start" | "end" => format!(
+            "the count to mark; 0 marks nothing. The first cycle the count reaches it sets `{bundle}_{role}_hit`"
+        ),
+        "count" => "what the DUT reported, added up while running and out of reset; read the high word, the low, then the high again".to_string(),
+        "cycles" => "cycles counted, the same ones as the count".to_string(),
+        "start_hit" | "end_hit" => "1 once the count has reached the value".to_string(),
+        "start_cycle" | "end_cycle" => "the cycle count in the cycle the value was reached".to_string(),
+        "start_count" | "end_count" => "the count after that cycle; above the value when several came in one cycle".to_string(),
+        "halt_on" => "bit 0: halt when the start is reached, bit 1: at the end. The harness then writes `_dmcontrol` to the Debug Module".to_string(),
+        "dmcontrol" => "what the harness writes to `dmcontrol` to halt: `haltreq`, `dmactive` and the harts; `hio count` sets it".to_string(),
+        _ => return None,
+    };
+    Some(note)
+}
+
 /// The notes column. It is derived from `role`, so it cannot disagree with
 /// the map.
 fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
@@ -8185,6 +8324,12 @@ fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
     }
 
     let bundle = register.bundle.as_deref().unwrap_or("");
+    if plan.counts.iter().any(|c| c.bundle == bundle)
+        && let Some(note) = count_note(bundle, register.role.unwrap_or(""))
+    {
+        notes.push(note);
+        return notes.join("; ");
+    }
     if register.name == crate::regmap::TIMEOUT_NAME {
         notes.push(
             "times the window answered for a terminator that did not; those reads returned 0. Write 1 to clear".to_string(),

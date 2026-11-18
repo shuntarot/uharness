@@ -837,6 +837,53 @@ pub fn build(
         registers.push(place("hit_at", WORD_BITS, Access::ReadOnly, "hit_at", None));
     }
 
+    // Counts: control, the counts, and the two marks. 64-bit values are two
+    // words, low first; a live count can change between them, so the host
+    // reads the high word twice.
+    for binding in bindings {
+        let declared = &manifest.bundle[&binding.bundle];
+        if declared.backing != Backing::Count {
+            continue;
+        }
+        let bundle = &binding.bundle;
+        let mut place = |name: &'static str, width: usize, access: Access| {
+            let words = width.div_ceil(WORD_BITS).max(1);
+            let register = Register {
+                name: format!("{bundle}_{name}"),
+                kind: Kind::Terminator,
+                offset,
+                words,
+                width,
+                access,
+                bundle: Some(bundle.clone()),
+                value: None,
+                self_clearing: None,
+                role: Some(name),
+            };
+            offset += words * (WORD_BITS / 8);
+            register
+        };
+        for (name, width, access) in [
+            ("run", 1, Access::ReadWrite),
+            ("start", 64, Access::ReadWrite),
+            ("end", 64, Access::ReadWrite),
+            ("count", 64, Access::ReadOnly),
+            ("cycles", 64, Access::ReadOnly),
+            ("start_hit", 1, Access::ReadOnly),
+            ("start_cycle", 64, Access::ReadOnly),
+            ("start_count", 64, Access::ReadOnly),
+            ("end_hit", 1, Access::ReadOnly),
+            ("end_cycle", 64, Access::ReadOnly),
+            ("end_count", 64, Access::ReadOnly),
+        ] {
+            registers.push(place(name, width, access));
+        }
+        if declared.halt.is_some() {
+            registers.push(place("halt_on", 2, Access::ReadWrite));
+            registers.push(place("dmcontrol", WORD_BITS, Access::ReadWrite));
+        }
+    }
+
     // The APB transfers the slave ended with `pslverr`. A write is answered
     // before its transfer ends, so the error cannot come back with it; the
     // host reads the count instead, before and after.

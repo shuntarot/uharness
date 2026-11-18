@@ -91,6 +91,7 @@ data lives (`backing`); the shape of the port is read from the DUT.**
 | `reset` | port name | `dmi` only: the Debug Module's own reset port |
 | `format` | `"rvfi"` | `trace` only: the records are RVFI; names and widths are checked |
 | `trigger` | array of ports | `trace` only: the ports `hio trace start --when` may test, from `ports`; only these get a comparator. Default: none |
+| `halt` | a `dmi` bundle | `count` only: the Debug Module the harness asks to halt when a marked count is reached. Default: it only marks |
 | `stall` | `true` / `false` | a bundle with a handshake the harness answers (an AXI4 or pzcorebus memory, a transfer-level port, `host_mem`, a `host_poll_fifo` with ready): `true` adds a [stall stage](#stalls-making-the-dut-wait). Default `false` |
 | `timeout` | cycles of the bundle's clock | a slave with a handshake (AXI4, pzcorebus, APB, `dmi`): how long the window waits for an answer before it ends the access with an error. Default 10 us. Set it above the slave's own timeout when the slave answers late on purpose. Over PCIe, more than 50 us is warned about |
 
@@ -108,6 +109,7 @@ Sizes accept a suffix: `4k`, `256M` (1024-based). `depth`, `aperture`,
 | `dmi` | **inside the DUT**: a RISC-V Debug Module's DMI, an APB slave the host drives | works |
 | `host_poll_fifo` | a harness FIFO the host polls | works |
 | `trace` | a ring in FPGA memory that keeps the last records of a stream, such as an execution trace | works |
+| `count` | a 64-bit count of what the DUT reports each cycle, such as instructions retired, with the cycles at two marked counts | works; one output of 1 to 16 bits |
 | `bram` | FPGA memory | works |
 | `bram_preload` | FPGA memory the host fills and the DUT only reads | works |
 | `dram` | the board's DRAM | works |
@@ -141,6 +143,7 @@ Which combinations exist today, by the shapes above:
 | `dmi` | | | | | | | ✅ |
 | `host_poll_fifo` | | | ✅ | | ✅ | | |
 | `trace` | | | | | ✅ | | |
+| `count` | ✅ | | | | | | |
 | `bram` | | ✅ | | ✅ | | ✅ | |
 | `bram_preload` | | ✅ read only | | | | | |
 | `dram` | | | | ✅ | | ✅ | |
@@ -244,6 +247,26 @@ ports   = ["o_rvfi_valid", "o_rvfi_pc_rdata", "o_rvfi_insn", "o_rvfi_mode",
            "o_rvfi_rd_addr", "o_rvfi_rd_wdata", "o_rvfi_trap", "o_rvfi_intr"]
 trigger = ["o_rvfi_pc_rdata", "o_rvfi_trap"]
 ```
+
+**A count.** One DUT output that says how many happened in each cycle, such
+as the instructions a core retired (1 bit for a pulse, up to 16 bits). The
+harness adds it up in 64 bits, with the cycles, while the DUT is out of
+reset. It marks the first cycle the count reaches each of two values, so the
+cycles between two instruction counts are exact. With `halt`, it can also
+write `dmcontrol` of that Debug Module itself in that cycle; the hart stops a
+few instructions later. [`hio count`](guide-hio.md#hio-count-count-instructions-and-mark-two-counts)
+drives it.
+
+```toml
+[bundle.retire]
+backing = "count"
+ports   = ["o_retire"]
+halt    = "dmi"           # optional: the `dmi` bundle to halt
+```
+
+A port belongs to one bundle, so a retire pulse that a `trace` records needs
+a second output for the count. To leave out what the count should not see,
+such as kernel instructions, gate the output in the DUT.
 
 **Memory the DUT reads and writes.**
 

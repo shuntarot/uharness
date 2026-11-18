@@ -44,6 +44,8 @@ pub mod reg {
     pub const DMCONTROL: u32 = 0x10;
     pub const DMSTATUS: u32 = 0x11;
     pub const HARTINFO: u32 = 0x12;
+    pub const HAWINDOWSEL: u32 = 0x14;
+    pub const HAWINDOW: u32 = 0x15;
     pub const ABSTRACTCS: u32 = 0x16;
     pub const COMMAND: u32 = 0x17;
     pub const ABSTRACTAUTO: u32 = 0x18;
@@ -99,6 +101,8 @@ const SETRESETHALTREQ: u32 = 1 << 3;
 const ACKHAVERESET: u32 = 1 << 28;
 const RESUMEREQ: u32 = 1 << 30;
 const HALTREQ: u32 = 1 << 31;
+/// `dmcontrol.hasel`: the harts in `hawindow` are selected too.
+const HASEL: u32 = 1 << 26;
 
 // dmstatus
 const HASRESETHALTREQ: u32 = 1 << 5;
@@ -663,6 +667,44 @@ impl<D: Dmi> Debug<D> {
             hartsel_bits,
             harts,
         })
+    }
+
+    /// Selects every hart through the hart array window, so one write of
+    /// `dmcontrol` with `hasel` reaches them all, and returns that value with
+    /// `haltreq`. Returns the number of harts too.
+    ///
+    /// `hasel` and `hawindow` are optional, so both are written and read
+    /// back first. Only the first window (32 harts) is used.
+    pub fn halt_all_control(&mut self) -> Result<(u32, u32), String> {
+        let harts = self.info()?.harts;
+        if harts > 32 {
+            return Err(format!(
+                "the Debug Module has {harts} harts, and only the first 32 can be halted \
+                 together. Halt one hart with a number instead."
+            ));
+        }
+        let mask = if harts == 32 {
+            u32::MAX
+        } else {
+            (1 << harts) - 1
+        };
+        let got = self.dmi.run(&[
+            Op::Write(reg::HAWINDOWSEL, 0),
+            Op::Write(reg::HAWINDOW, mask),
+            Op::Read(reg::HAWINDOW),
+            Op::Write(reg::DMCONTROL, DMACTIVE | HASEL),
+            Op::Read(reg::DMCONTROL),
+        ])?;
+        self.write(reg::DMCONTROL, self.control(0))?;
+        if got[0] != mask || got[1] & HASEL == 0 {
+            return Err(
+                "this Debug Module has no hart array window (`hasel` and `hawindow` do \
+                 not keep what is written), so one write cannot halt every hart.\n\
+                 Halt one hart with a number instead."
+                    .to_string(),
+            );
+        }
+        Ok((HALTREQ | HASEL | DMACTIVE, harts))
     }
 
     /// Halts the hart. Already halted is fine.
@@ -2189,6 +2231,17 @@ mod tests {
 
         assert_eq!(dm.catch_exceptions(0).unwrap(), 0);
         assert_eq!(dm.caught_exceptions().unwrap(), 0);
+    }
+
+    /// A Debug Module without the hart array window cannot halt every hart
+    /// with one write, so it says so instead of halting only hart 0.
+    #[test]
+    fn halting_every_hart_needs_the_hart_array_window() {
+        let mut m = Model::new(32);
+        let mut dm = Debug::attach(&mut m, 0).unwrap();
+        let err = dm.halt_all_control().unwrap_err();
+        assert!(err.contains("no hart array window"), "{err}");
+        assert!(!m.halted);
     }
 
     #[test]
