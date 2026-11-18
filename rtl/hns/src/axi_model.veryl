@@ -1,0 +1,320 @@
+/// A memory latency and bandwidth model for an AXI4 master: each read and
+/// each write answers a fixed number of cycles after it was issued, however
+/// fast the memory behind it is, and the data beats are held to a rate.
+///
+/// The point is to run a core against the memory of another system, such as
+/// an ASIC's DRAM at its own clock, on an FPGA whose DRAM is much closer in
+/// core cycles. Requests go downstream at once and as many at a time as the
+/// DUT issues, so only the latency changes, not the throughput:
+///
+/// - A read answers `i_rd_latency` cycles after its AR was taken. The R beats
+///   wait in a FIFO until then. Same-ID beats keep their order, and beats of
+///   different IDs leave in the order they came back.
+/// - A write answers `i_wr_latency` cycles after its last W beat was taken:
+///   B waits until then. A W beat goes through only once its AW was taken.
+/// - `i_bw` limits the read and write data beats together, in bytes per
+///   cycle with 8 fraction bits; 0 is no limit.
+///
+/// A memory slower than the latency answers when it answers: the model only
+/// adds waiting. With the latencies and the limit at 0 it passes everything,
+/// one or two cycles later than without it. The registers can change at any
+/// time; a beat already waiting is measured against the new value.
+pub module axi_model::<PKG: $std::axi4_prototype> #(
+    /// Reads, and writes, that can be in flight at once. More stalls the
+    /// next address until one finishes.
+    param DEPTH: u32 = 32,
+    /// Read beats that can wait at once. Fewer holds the memory back.
+    param RBEATS: u32 = 256,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    i_rd_latency: input  logic<16>,
+    i_wr_latency: input  logic<16>,
+    i_bw        : input  logic<16>,
+    o_rd_beats  : output logic<32>,
+    o_wr_beats  : output logic<32>,
+
+    s_axi: modport $std::axi4_if::<PKG>::slave ,
+    m_axi: modport $std::axi4_if::<PKG>::master,
+) {
+    const IW   : u32 = $clog2(DEPTH);
+    const IDW  : u32 = $bits(PKG::id_t);
+    const DW   : u32 = $bits(PKG::data_t);
+    const RUW  : u32 = $bits(PKG::ruser_t);
+    const BUW  : u32 = $bits(PKG::buser_t);
+    const BYTES: u32 = DW / 8;
+    // A beat costs its bytes; the bucket holds two beats.
+    const COST: logic<32> = BYTES * 256;
+    const CAP : logic<32> = BYTES * 512;
+
+    // The cycle count every time is taken from.
+    var now: logic<32>;
+
+    // ---------------------------------------------------------------- reads
+    // A ring of the ARs in flight, in the order they were taken. An entry is
+    // freed by the last beat of its burst, possibly out of order, and the
+    // head skips the freed ones.
+    var rv  : logic         [DEPTH];
+    var rid : logic<IDW>    [DEPTH];
+    var rt  : logic<32>     [DEPTH];
+    var rhd : logic<IW + 1>        ;
+    var rtl : logic<IW + 1>        ;
+    let rful: logic                 = (rtl - rhd) == DEPTH;
+
+    // The oldest AR in flight with the ID of the beat coming back.
+    var r_hit: logic    ;
+    var r_at : logic<IW>;
+    var r_k  : logic<IW>;
+    always_comb {
+        r_hit = 0;
+        r_at  = 0;
+        r_k   = rhd[IW - 1:0];
+        for _i in 0..DEPTH {
+            if !r_hit && rv[r_k] && rid[r_k] == m_axi.rid {
+                r_hit = 1;
+                r_at  = r_k;
+            }
+            r_k += 1;
+        }
+    }
+
+    const RW      : u32       = 32 + RUW + 1 + IDW + 2 + DW;
+    var   rq_empty: logic    ;
+    var   rq_full : logic    ;
+    var   rq_push : logic    ;
+    var   rq_pop  : logic    ;
+    var   rq_in   : logic<RW>;
+    var   rq_out  : logic<RW>;
+
+    inst u_rq: $std::fifo #(
+        WIDTH: RW    ,
+        DEPTH: RBEATS,
+    ) (
+        i_clk                  ,
+        i_rst                  ,
+        i_clear      : 1'b0    ,
+        o_empty      : rq_empty,
+        o_almost_full: _       ,
+        o_full       : rq_full ,
+        o_word_count : _       ,
+        i_push       : rq_push ,
+        i_data       : rq_in   ,
+        i_pop        : rq_pop  ,
+        o_data       : rq_out  ,
+    );
+
+    let r_issued: logic<32> = rq_out[RW - 1:RW - 32];
+    let r_due   : logic     = !rq_empty && (now - r_issued) >= {16'h0, i_rd_latency};
+
+    // --------------------------------------------------------------- writes
+    // The same ring for the AWs. `wdn` marks an AW whose last W beat came;
+    // `wnx` is the next AW waiting for its data, in AW order as W follows.
+    var wv  : logic         [DEPTH];
+    var wdn : logic         [DEPTH];
+    var wid : logic<IDW>    [DEPTH];
+    var wt  : logic<32>     [DEPTH];
+    var whd : logic<IW + 1>        ;
+    var wtl : logic<IW + 1>        ;
+    var wnx : logic<IW + 1>        ;
+    let wful: logic                 = (wtl - whd) == DEPTH;
+    // A W beat goes through only behind its AW.
+    let w_ok: logic = wnx != wtl;
+
+    var b_hit: logic    ;
+    var b_at : logic<IW>;
+    var b_k  : logic<IW>;
+    always_comb {
+        b_hit = 0;
+        b_at  = 0;
+        b_k   = whd[IW - 1:0];
+        for _i in 0..DEPTH {
+            if !b_hit && wv[b_k] && wdn[b_k] && wid[b_k] == m_axi.bid {
+                b_hit = 1;
+                b_at  = b_k;
+            }
+            b_k += 1;
+        }
+    }
+
+    const BW_     : u32        = 32 + BUW + IDW + 2;
+    var   bq_empty: logic     ;
+    var   bq_full : logic     ;
+    var   bq_push : logic     ;
+    var   bq_pop  : logic     ;
+    var   bq_in   : logic<BW_>;
+    var   bq_out  : logic<BW_>;
+
+    inst u_bq: $std::fifo #(
+        WIDTH: BW_  ,
+        DEPTH: DEPTH,
+    ) (
+        i_clk                  ,
+        i_rst                  ,
+        i_clear      : 1'b0    ,
+        o_empty      : bq_empty,
+        o_almost_full: _       ,
+        o_full       : bq_full ,
+        o_word_count : _       ,
+        i_push       : bq_push ,
+        i_data       : bq_in   ,
+        i_pop        : bq_pop  ,
+        o_data       : bq_out  ,
+    );
+
+    let b_issued: logic<32> = bq_out[BW_ - 1:BW_ - 32];
+    let b_due   : logic     = !bq_empty && (now - b_issued) >= {16'h0, i_wr_latency};
+
+    // ------------------------------------------------------------ bandwidth
+    // A bucket of bytes (8 fraction bits) filled by `i_bw` each cycle. A
+    // beat goes when its cost is there; when both wait and only one fits,
+    // they take turns. The choice uses last cycle's W offer, so R does not
+    // depend on the DUT's wvalid in the same cycle.
+    var bucket: logic<32>;
+    var w_seen: logic    ;
+    var r_turn: logic    ;
+    let free  : logic     = i_bw == 0;
+    let one   : logic     = bucket >= COST;
+    let two   : logic     = bucket >= COST * 2;
+    let r_tok : logic     = free || two || (one && r_turn);
+    let w_tok : logic     = free || two || (one && !r_turn);
+
+    // ------------------------------------------------------------- channels
+    let ar_go: logic = s_axi.arvalid && m_axi.arready && !rful;
+    let aw_go: logic = s_axi.awvalid && m_axi.awready && !wful;
+    let w_go : logic = s_axi.wvalid && m_axi.wready && w_ok && w_tok;
+    let r_in : logic = m_axi.rvalid && !rq_full;
+    let b_in : logic = m_axi.bvalid && !bq_full;
+    let r_out: logic = r_due && r_tok && s_axi.rready;
+    let b_out: logic = b_due && s_axi.bready;
+    // The bucket after this cycle's beats and refill.
+    let filled: logic<32> = bucket - (if r_out ? COST : 32'd0) - (if w_go ? COST : 32'd0) + {16'h0, i_bw};
+
+    always_comb {
+        // Addresses go straight down; only a full ring holds them.
+        m_axi.awaddr   = s_axi.awaddr;
+        m_axi.awsize   = s_axi.awsize;
+        m_axi.awburst  = s_axi.awburst;
+        m_axi.awcache  = s_axi.awcache;
+        m_axi.awprot   = s_axi.awprot;
+        m_axi.awid     = s_axi.awid;
+        m_axi.awlen    = s_axi.awlen;
+        m_axi.awlock   = s_axi.awlock;
+        m_axi.awqos    = s_axi.awqos;
+        m_axi.awregion = s_axi.awregion;
+        m_axi.awuser   = s_axi.awuser;
+        m_axi.awvalid  = s_axi.awvalid && !wful;
+        s_axi.awready  = m_axi.awready && !wful;
+
+        m_axi.wdata  = s_axi.wdata;
+        m_axi.wstrb  = s_axi.wstrb;
+        m_axi.wlast  = s_axi.wlast;
+        m_axi.wuser  = s_axi.wuser;
+        m_axi.wvalid = s_axi.wvalid && w_ok && w_tok;
+        s_axi.wready = m_axi.wready && w_ok && w_tok;
+
+        m_axi.araddr   = s_axi.araddr;
+        m_axi.arsize   = s_axi.arsize;
+        m_axi.arburst  = s_axi.arburst;
+        m_axi.arcache  = s_axi.arcache;
+        m_axi.arprot   = s_axi.arprot;
+        m_axi.arid     = s_axi.arid;
+        m_axi.arlen    = s_axi.arlen;
+        m_axi.arlock   = s_axi.arlock;
+        m_axi.arqos    = s_axi.arqos;
+        m_axi.arregion = s_axi.arregion;
+        m_axi.aruser   = s_axi.aruser;
+        m_axi.arvalid  = s_axi.arvalid && !rful;
+        s_axi.arready  = m_axi.arready && !rful;
+
+        // Responses come back into the FIFOs and leave when due.
+        m_axi.rready = !rq_full;
+        rq_push      = r_in;
+        rq_in        = {if r_hit ? rt[r_at] : now, m_axi.ruser, m_axi.rlast, m_axi.rid, m_axi.rresp, m_axi.rdata};
+        rq_pop       = r_out;
+        s_axi.rvalid = r_due && r_tok;
+        s_axi.rdata  = rq_out[DW - 1:0];
+        s_axi.rresp  = rq_out[DW + 1:DW];
+        s_axi.rid    = rq_out[DW + 2 + IDW - 1:DW + 2];
+        s_axi.rlast  = rq_out[DW + 2 + IDW];
+        s_axi.ruser  = rq_out[DW + 3 + IDW + RUW - 1:DW + 3 + IDW];
+
+        m_axi.bready = !bq_full;
+        bq_push      = b_in;
+        bq_in        = {if b_hit ? wt[b_at] : now, m_axi.buser, m_axi.bid, m_axi.bresp};
+        bq_pop       = b_out;
+        s_axi.bvalid = b_due;
+        s_axi.bresp  = bq_out[1:0];
+        s_axi.bid    = bq_out[2 + IDW - 1:2];
+        s_axi.buser  = bq_out[2 + IDW + BUW - 1:2 + IDW];
+    }
+
+    always_ff {
+        if_reset {
+            now        = 0;
+            rhd        = 0;
+            rtl        = 0;
+            whd        = 0;
+            wtl        = 0;
+            wnx        = 0;
+            bucket     = 0;
+            w_seen     = 0;
+            r_turn     = 0;
+            o_rd_beats = 0;
+            o_wr_beats = 0;
+            for i in 0..DEPTH {
+                rv[i]  = 0;
+                wv[i]  = 0;
+                wdn[i] = 0;
+            }
+        } else {
+            now = now + 1;
+
+            if ar_go {
+                rv[rtl[IW - 1:0]]  = 1;
+                rid[rtl[IW - 1:0]] = s_axi.arid;
+                rt[rtl[IW - 1:0]]  = now;
+                rtl                = rtl + 1;
+            }
+            if r_in && m_axi.rlast && r_hit {
+                rv[r_at] = 0;
+            }
+            if rhd != rtl && !rv[rhd[IW - 1:0]] {
+                rhd = rhd + 1;
+            }
+
+            if aw_go {
+                wv[wtl[IW - 1:0]]  = 1;
+                wdn[wtl[IW - 1:0]] = 0;
+                wid[wtl[IW - 1:0]] = s_axi.awid;
+                wtl                = wtl + 1;
+            }
+            if w_go && s_axi.wlast {
+                wdn[wnx[IW - 1:0]] = 1;
+                wt[wnx[IW - 1:0]]  = now;
+                wnx                = wnx + 1;
+            }
+            if b_in && b_hit {
+                wv[b_at] = 0;
+            }
+            if whd != wnx && !wv[whd[IW - 1:0]] {
+                whd = whd + 1;
+            }
+
+            if free {
+                bucket = 0;
+            } else {
+                bucket = if filled >: CAP ? CAP : filled;
+            }
+            w_seen = s_axi.wvalid && w_ok;
+            r_turn = if r_due && !w_seen ? 1 : if !r_due && w_seen ? 0 : if r_out || w_go ? !r_turn : r_turn;
+
+            if r_out {
+                o_rd_beats = o_rd_beats + 1;
+            }
+            if w_go {
+                o_wr_beats = o_wr_beats + 1;
+            }
+        }
+    }
+}

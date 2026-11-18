@@ -101,6 +101,16 @@ pub const DUT_RESET: &str = "dut_reset";
 /// changes.
 pub const DUT_RESET_STATE: &str = "dut_reset_state";
 
+/// The registers of a latency and bandwidth model (`hns::axi_model`), with
+/// their widths.
+pub const MODEL_REGISTERS: [(&str, usize, Access); 5] = [
+    ("rd_latency", 16, Access::ReadWrite),
+    ("wr_latency", 16, Access::ReadWrite),
+    ("bw", 16, Access::ReadWrite),
+    ("rd_beats", 32, Access::ReadOnly),
+    ("wr_beats", 32, Access::ReadOnly),
+];
+
 /// The seed of every stall stage. A stage reloads it while the DUT is in
 /// reset, so write it before `dut_reset` is released.
 pub const SEED_NAME: &str = "harness_seed";
@@ -1120,6 +1130,26 @@ pub fn build(
             role: Some(SEED_NAME),
         });
         offset += WORD_BITS / 8;
+    }
+
+    // The latency and bandwidth models: three knobs set at run time, and the
+    // beats that went through, to check the rate.
+    for (bundle, _) in crate::terminator::modeled_bundles(manifest, axi_mems) {
+        for (role, width, access) in MODEL_REGISTERS {
+            registers.push(Register {
+                name: format!("{bundle}_{role}"),
+                kind: Kind::Terminator,
+                offset,
+                words: 1,
+                width,
+                access,
+                bundle: Some(bundle.clone()),
+                value: None,
+                self_clearing: None,
+                role: Some(role),
+            });
+            offset += WORD_BITS / 8;
+        }
     }
 
     // The registers for the card to write host memory: only on PCIe with

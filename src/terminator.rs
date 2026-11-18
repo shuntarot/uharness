@@ -3886,6 +3886,8 @@ pub fn check_claimed(
     const TRIGGER: &str = "trigger";
     const TIMEOUT: &str = "timeout";
     const STALL: &str = "stall";
+    const MODEL: &str = "model";
+    const MODEL_DEPTH: &str = "model_depth";
 
     for binding in bindings {
         let name = binding.bundle.as_str();
@@ -3950,7 +3952,7 @@ pub fn check_claimed(
                     .iter()
                     .any(|p| p.bundle == name && p.xfer.is_none()),
                 "an AXI4 memory port",
-                &[DEPTH, APERTURE, DUT_BASE, STALL][..],
+                &[DEPTH, APERTURE, DUT_BASE, STALL, MODEL, MODEL_DEPTH][..],
             ),
             (
                 axi_mems
@@ -4011,6 +4013,8 @@ pub fn check_claimed(
             (TRIGGER, declared.trigger.is_some()),
             (TIMEOUT, declared.timeout.is_some()),
             (STALL, declared.stall.is_some()),
+            (MODEL, declared.model.is_some()),
+            (MODEL_DEPTH, declared.model_depth.is_some()),
         ] {
             if set && !takes.contains(&key) {
                 return Err(TerminatorError::KeyNotApplicable {
@@ -4018,7 +4022,7 @@ pub fn check_claimed(
                     key,
                     shape,
                     takes: if takes.is_empty() {
-                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`, `reset`, `format`, `trigger`, `timeout`, `stall`"
+                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`, `reset`, `format`, `trigger`, `timeout`, `stall`, `model`, `model_depth`"
                             .to_string()
                     } else {
                         takes
@@ -4032,6 +4036,22 @@ pub fn check_claimed(
         }
     }
     Ok(())
+}
+
+/// The AXI4 memory ports that get the latency and bandwidth model, sorted by
+/// name, with how many transfers it tracks (`model_depth`, default 32).
+pub fn modeled_bundles(manifest: &Manifest, axi_mems: &[AxiMemPlan]) -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = axi_mems
+        .iter()
+        .filter(|m| m.xfer.is_none())
+        .filter_map(|m| {
+            let declared = manifest.bundle.get(&m.bundle)?;
+            (declared.model == Some(true))
+                .then(|| (m.bundle.clone(), declared.model_depth.unwrap_or(32)))
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// The bundles that get a stall stage, sorted by name: the handshakes the
