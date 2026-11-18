@@ -2483,6 +2483,15 @@ fn core_body(
     }
     out.push('\n');
 
+    // The latency and bandwidth models: their registers.
+    for (bundle, _) in crate::terminator::modeled_bundles(&plan.loaded.manifest, &plan.axi_mems) {
+        for (role, width, _) in crate::regmap::MODEL_REGISTERS {
+            out.push_str(&format!(
+                "    var t_{bundle}_{role}: {domain}logic<{width}>;\n"
+            ));
+        }
+    }
+
     // The stall stages: their registers, and the seed they share.
     let stalled = stalled_bundles(plan);
     for bundle in &stalled {
@@ -3233,16 +3242,27 @@ fn core_body(
         "    assign t_{DUT_RESET_STATE} = dut_rst_req;\n\n"
     ));
     for (bundle, pkg) in &fenced {
-        // The stall stage comes after the fence, so the fence sees the DUT's
-        // own handshakes, and before the arbiter, so the host is never stalled.
+        // The model and the stall stage come after the fence, so the fence
+        // sees the DUT's own handshakes, and before the arbiter, so the host
+        // is never delayed. The model goes first: it sets the latency, and
+        // the stall stage then disturbs it on purpose.
         let stalled = plan.stalled(bundle);
-        let fenced_to = if stalled {
+        let modeled = plan.modeled(bundle);
+        let staged = if stalled {
             out.push_str(&format!(
                 "    inst jaxi_{bundle}: {domain}$std::axi4_if::<{pkg}>;\n"
             ));
             format!("jaxi_{bundle}")
         } else {
             format!("faxi_{bundle}")
+        };
+        let fenced_to = if modeled.is_some() {
+            out.push_str(&format!(
+                "    inst kaxi_{bundle}: {domain}$std::axi4_if::<{pkg}>;\n"
+            ));
+            format!("kaxi_{bundle}")
+        } else {
+            staged.clone()
         };
         out.push_str(&format!(
             "    inst u_fence_{bundle}: hns::axi_fence::<{pkg}> (\n"
@@ -3255,6 +3275,25 @@ fn core_body(
         out.push_str(&format!("        s_axi   : axi_{bundle},\n"));
         out.push_str(&format!("        m_axi   : {fenced_to},\n"));
         out.push_str("    );\n\n");
+        if let Some(depth) = modeled {
+            out.push_str(&format!(
+                "    inst u_model_{bundle}: hns::axi_model::<{pkg}> #(\n"
+            ));
+            out.push_str(&format!("        DEPTH : {depth},\n"));
+            // Room for every read in flight to be a burst of 8 beats, a
+            // cache line of 64 bits. More only waits longer, never drops.
+            out.push_str(&format!("        RBEATS: {},\n", depth * 8));
+            out.push_str("    ) (\n");
+            out.push_str(&format!("        i_clk       : {clk},\n"));
+            out.push_str(&format!("        i_rst       : {rst},\n"));
+            for (role, _, _) in crate::regmap::MODEL_REGISTERS {
+                let dir = if role.ends_with("beats") { "o" } else { "i" };
+                out.push_str(&format!("        {dir}_{role:<10}: t_{bundle}_{role},\n"));
+            }
+            out.push_str(&format!("        s_axi       : kaxi_{bundle},\n"));
+            out.push_str(&format!("        m_axi       : {staged},\n"));
+            out.push_str("    );\n\n");
+        }
         if stalled {
             out.push_str(&format!(
                 "    inst u_stall_{bundle}: hns::axi_stall::<{pkg}> #(\n"
@@ -8282,6 +8321,22 @@ fn tlp_counter_note(role: &str) -> &'static str {
 /// What all the TLP counts share, for regs.md.
 const TLP_COUNTER_NOTE: &str = "All `pcie_*` counts saturate, and a link reset does not clear them. A request the PCIe block refuses itself (no BAR hit, Memory Space off) never reaches them: see the function's Device Status. A read over PCIe counts itself; read over JTAG to leave them alone";
 
+/// The notes of a latency model register.
+fn model_note(role: &str) -> Option<&'static str> {
+    Some(match role {
+        "rd_latency" => {
+            "cycles from a read's address to its data; a slower memory answers when it answers. 0 adds nothing"
+        }
+        "wr_latency" => "cycles from a write's last data beat to its response. 0 adds nothing",
+        "bw" => {
+            "read and write data together, in bytes per cycle with 8 fraction bits (0x100 is one byte a cycle); 0 is no limit"
+        }
+        "rd_beats" => "read data beats handed to the DUT; wraps at 2^32",
+        "wr_beats" => "write data beats passed to the memory; wraps at 2^32",
+        _ => return None,
+    })
+}
+
 /// The notes of a `count` register. Its roles share names with the
 /// `trace` ones (`run`, `count`) but mean other things.
 fn count_note(bundle: &str, role: &str) -> Option<String> {
@@ -8324,6 +8379,12 @@ fn register_notes(plan: &Plan, register: &crate::regmap::Register) -> String {
     }
 
     let bundle = register.bundle.as_deref().unwrap_or("");
+    if plan.modeled(bundle).is_some()
+        && let Some(note) = model_note(register.role.unwrap_or(""))
+    {
+        notes.push(note.to_string());
+        return notes.join("; ");
+    }
     if plan.counts.iter().any(|c| c.bundle == bundle)
         && let Some(note) = count_note(bundle, register.role.unwrap_or(""))
     {

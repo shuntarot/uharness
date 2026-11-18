@@ -113,6 +113,15 @@ impl Plan {
         self.board.as_ref().expect("gen requires a target")
     }
 
+    /// How many transfers the latency model of this bundle tracks, if it has
+    /// one (`terminator::modeled_bundles`).
+    pub fn modeled(&self, bundle: &str) -> Option<u32> {
+        crate::terminator::modeled_bundles(&self.loaded.manifest, &self.axi_mems)
+            .into_iter()
+            .find(|(b, _)| b == bundle)
+            .map(|(_, depth)| depth)
+    }
+
     /// Whether this bundle gets a stall stage (`terminator::stalled_bundles`).
     pub fn stalled(&self, bundle: &str) -> bool {
         crate::terminator::stalled_bundles(

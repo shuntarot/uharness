@@ -92,6 +92,8 @@ data lives (`backing`); the shape of the port is read from the DUT.**
 | `format` | `"rvfi"` | `trace` only: the records are RVFI; names and widths are checked |
 | `trigger` | array of ports | `trace` only: the ports `hio trace start --when` may test, from `ports`; only these get a comparator. Default: none |
 | `halt` | a `dmi` bundle | `count` only: the Debug Module the harness asks to halt when a marked count is reached. Default: it only marks |
+| `model` | `true` / `false` | an AXI4 memory port: `true` adds the [latency and bandwidth model](#memory-latency-a-model-of-another-systems-memory). Default `false` |
+| `model_depth` | power of two, 2 to 256 | with `model`: how many reads, and writes, it tracks at once. Default 32 |
 | `stall` | `true` / `false` | a bundle with a handshake the harness answers (an AXI4 or pzcorebus memory, a transfer-level port, `host_mem`, a `host_poll_fifo` with ready): `true` adds a [stall stage](#stalls-making-the-dut-wait). Default `false` |
 | `timeout` | cycles of the bundle's clock | a slave with a handshake (AXI4, pzcorebus, APB, `dmi`): how long the window waits for an answer before it ends the access with an error. Default 10 us. Set it above the slave's own timeout when the slave answers late on purpose. Over PCIe, more than 50 us is warned about |
 
@@ -490,6 +492,40 @@ answer at varying times, so only a `bram`-backed run repeats cycle for cycle.
 The stage is off by default because it is not free: each stalled channel costs
 about 100 LUTs and 40 flip-flops (an AXI4 bundle has five channels), and puts a
 gate on its ready and valid.
+
+### Memory latency: a model of another system's memory
+
+An FPGA core runs at tens of MHz, so its DRAM answers in a few core cycles.
+To run it against the memory of a faster system, such as an ASIC's DRAM at
+its own clock, put `model = true` on an AXI4 memory port. Each read then
+answers a fixed number of cycles after its address, and each write after its
+last data beat, however fast the memory behind it is; many can be in flight
+at once, so only the latency changes, not the throughput. A limit on the data
+rate can be added too. Registers set it at run time:
+
+| register | |
+|---|---|
+| `<bundle>_rd_latency` | cycles from a read's address to its data |
+| `<bundle>_wr_latency` | cycles from a write's last data beat to its response |
+| `<bundle>_bw` | read and write data together, bytes per cycle with 8 fraction bits (`0x100` is one byte a cycle); 0 is no limit |
+| `<bundle>_rd_beats`, `<bundle>_wr_beats` | data beats that went through, to check the rate |
+
+```bash
+hio write mem_rd_latency 120
+hio write mem_wr_latency 60
+hio write mem_bw 0x1000     # 16 bytes a cycle
+```
+
+The cycles are counted at the DUT's AXI4 port: from the AR handshake to the
+first R beat, and from the last W handshake to B. The DUT's own path to that
+port is not included. A memory slower than the latency answers when it
+answers, and with nothing set, a transfer is one cycle later than without the
+model. Up to 65535 cycles can be set. `model_depth` (a
+power of two up to 256, default 32) is how many reads, and writes, it tracks
+at once; more than that holds the next address back, so it also caps the
+bandwidth at about `model_depth` transfers per latency. Without `model`
+nothing is generated. The model sits before the stall stage, so `stall` still
+disturbs the result on purpose, and the host's own accesses go around both.
 
 ### `access`: `region` or `indirect`
 

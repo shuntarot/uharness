@@ -752,6 +752,18 @@ pub struct Bundle {
     /// `count` only marks the cycles.
     #[serde(default)]
     pub halt: Option<String>,
+
+    /// Whether an AXI4 memory port gets the latency and bandwidth model
+    /// (`hns::axi_model`). Off by default. With `true` the reads, the writes
+    /// and the data rate are set at run time from registers.
+    #[serde(default)]
+    pub model: Option<bool>,
+
+    /// How many reads, and writes, the model tracks at once (`model` only):
+    /// a power of two from 2 to 256, default 32. Fewer than the DUT issues
+    /// holds its next address back.
+    #[serde(default, deserialize_with = "size::option_u32")]
+    pub model_depth: Option<u32>,
 }
 
 /// What the records of a `trace` are.
@@ -1317,6 +1329,24 @@ pub enum ManifestError {
         dmis: String,
     },
 
+    #[error("[bundle.{bundle}] sets `model_depth` without `model = true`")]
+    #[diagnostic(
+        code(harness::manifest::model_depth_without_model),
+        help(
+            "`model_depth` sizes the latency model, and there is none without `model = true`.\n\nAdd `model = true`, or remove `model_depth`."
+        )
+    )]
+    ModelDepthWithoutModel { bundle: String },
+
+    #[error("[bundle.{bundle}] model_depth = {depth} is not a power of two from 2 to 256")]
+    #[diagnostic(
+        code(harness::manifest::model_depth),
+        help(
+            "`model_depth` is how many reads, and writes, the model tracks at once. It wraps a ring, so it is a power of two, and past 256 the lookup costs too much logic.\n\nUse 32 (the default), or the next power of two above what the DUT issues at once."
+        )
+    )]
+    ModelDepth { bundle: String, depth: u32 },
+
     /// The host decodes by masking address bits, so a size that is not a power
     /// of two answers at unintended addresses too. Below 4 KiB, the IP (1 KB
     /// steps only) and the written value disagree.
@@ -1723,6 +1753,19 @@ impl Manifest {
                     }
                 }
             }
+            if let Some(depth) = bundle.model_depth {
+                if bundle.model != Some(true) {
+                    return Err(ManifestError::ModelDepthWithoutModel {
+                        bundle: name.clone(),
+                    });
+                }
+                if !(2..=256).contains(&depth) || !depth.is_power_of_two() {
+                    return Err(ManifestError::ModelDepth {
+                        bundle: name.clone(),
+                        depth,
+                    });
+                }
+            }
             // `access` only means something for a memory. On any other
             // terminator it would have no effect, so reject it.
             if bundle.access.is_some() && !bundle.backing.is_memory() {
@@ -1814,6 +1857,30 @@ mod tests {
             m.bundle["imem"].access.unwrap_or_default(),
             MemAccess::Region
         );
+    }
+
+    /// `model_depth` sizes a model that must be asked for, and wraps a ring.
+    #[test]
+    fn model_depth_needs_a_model_and_a_power_of_two() {
+        let head = "[dut]\nmodule = \"dut_top\"\n\n[bundle.mem]\nbacking = \"dram\"\n";
+        let m: Manifest =
+            toml::from_str(&format!("{head}model = true\nmodel_depth = 64\n")).unwrap();
+        m.validate().unwrap();
+        let m: Manifest = toml::from_str(&format!("{head}model_depth = 64\n")).unwrap();
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(err, ManifestError::ModelDepthWithoutModel { .. }),
+            "{err}"
+        );
+        for bad in [1, 48, 512] {
+            let m: Manifest =
+                toml::from_str(&format!("{head}model = true\nmodel_depth = {bad}\n")).unwrap();
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(err, ManifestError::ModelDepth { .. }),
+                "{bad}: {err}"
+            );
+        }
     }
 
     /// `halt` names a Debug Module for a `count`. On another backing, or

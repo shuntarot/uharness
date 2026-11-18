@@ -3554,6 +3554,67 @@ module axi_stall_wired {{
     );
 }
 
+/// The latency model holds the DUT's AXI4 answers for the cycles the
+/// registers say, and counts the beats; the data does not change. The stall
+/// stage behind it passes through at 0.
+#[test]
+fn an_axi4_master_waits_out_the_latency_model() {
+    let manifest = "[dut]\nmodule = \"dut_top\"\n\n[clock.i_clk]\nfreq_mhz = 200\n\n[bundle.run]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"i_run\"]\n\n[bundle.last]\ncontract = \"fixed_latency\"\nlatency = 0\nbacking = \"reg\"\nports = [\"o_last\"]\n\n[bundle.ddr]\nbacking = \"bram\"\ndepth = 64\nstall = true\nmodel = true\nmodel_depth = 8\nports = [\"axi\"]\n";
+
+    let dir = fixture(manifest, AXI_MASTER_DUT, "");
+    let map = offsets(dir.path());
+    let at = |name: &str| offset_of(&map, name);
+    let (base, run, last) = (region_base(&map, "ddr"), at("i_run"), at("o_last"));
+    let (rd, wr, rbeats, wbeats) = (
+        at("ddr_rd_latency"),
+        at("ddr_wr_latency"),
+        at("ddr_rd_beats"),
+        at("ddr_wr_beats"),
+    );
+
+    let tb = format!(
+        r#"
+#[test(axi_model_wired)]
+module axi_model_wired {{
+{BUS}
+    initial {{
+        start();
+
+        wr({base} + 4, 32'ha5a5_0001);
+        wr({wr}, 200);
+        wr({rd}, 300);
+        $assert(rd({rd}) == 300);
+
+        wr({run}, 1);
+        clk.next(1);
+        wr({run}, 0);
+        // The write lands at once; its answer waits 200 cycles, and the read
+        // is issued only after it.
+        clk.next(150);
+        $assert(rd({base} + 12) == 32'hbeef_0003);
+        $assert(rd({wbeats}) == 1 && rd({rbeats}) == 0);
+        clk.next(250);
+        $assert(rd({last}) == 0);
+
+        clk.next(400);
+        var seen: logic<32>;
+        seen = rd({last});
+        $display("o_last = %h, beats %0d read %0d written", seen, rd({rbeats}), rd({wbeats}));
+        $assert(seen == 32'ha5a5_0001);
+        $assert(rd({rbeats}) == 1);
+
+        $finish();
+    }}
+}}
+"#
+    );
+    write_tb(dir.path(), tb);
+    assert!(
+        veryl_test(&dir.path().join("hns")),
+        "the simulation must pass"
+    );
+}
+
 /// With `dut_base` on an AXI4 memory, the DUT uses its own addresses, and
 /// what falls outside gets DECERR instead of a wrapped address inside.
 #[test]
