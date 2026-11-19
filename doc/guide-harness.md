@@ -89,6 +89,7 @@ data lives (`backing`); the shape of the port is read from the DUT.**
 | `window_base` | byte offset in the window | a region only (`region` memory, `dram`, `slave`); default is the first free place |
 | `dut_base` | byte address | a memory; the DUT address of its first byte, default 0. A multiple of 4 KB on AXI4 |
 | `reset` | port name | `dmi` only: the Debug Module's own reset port |
+| `checkpoint` | table | `dmi` only: what `hio cpu save` and `restore` need to know about the core besides what the Debug Module says (below) |
 | `format` | `"rvfi"` | `trace` only: the records are RVFI; names and widths are checked |
 | `trigger` | array of ports | `trace` only: the ports `hio trace start --when` may test, from `ports`; only these get a comparator. Default: none |
 | `halt` | a `dmi` bundle | `count` only: the Debug Module the harness asks to halt when a marked count is reached. Default: it only marks |
@@ -449,6 +450,31 @@ reset   = "i_dm_rst"  # the Debug Module's own reset port
   halt-on-reset request in place. Without it the Debug Module is on the DUT
   reset and `hio reset` clears it. Inside the DUT, reset the core with the DUT
   reset *or* the Debug Module's `ndmreset` / hart reset.
+- `checkpoint` describes the parts of the core's state that `hio cpu save`
+  cannot learn from the Debug Module. All of it is optional:
+
+  ```toml
+  [bundle.dmi.checkpoint]
+  flush = [0xfc000073]  # writes the whole data cache back and invalidates it
+  csrs  = [0x7c0]       # CSRs of the core's own, besides the standard ones
+
+  [[bundle.dmi.checkpoint.mmio]]   # device registers, written back in order
+  name  = "mtimecmp"
+  addr  = 0x0200_4000
+  width = 64
+
+  [[bundle.dmi.checkpoint.region]] # memory inside the core, such as a DTIM
+  name = "dtim"
+  addr = 0x4000_0000
+  size = "4K"
+  ```
+
+  A core with a write-back data cache needs `flush`: instructions the program
+  buffer runs, which write the whole cache back to memory and invalidate it.
+  Without them the host reads memory the cache has not written yet.
+  `cbo.flush` does one line, which is not enough. The table goes to
+  `regs.json` but not into the map hash, so changing it needs no new
+  bitstream.
 
 ### Stalls: making the DUT wait
 

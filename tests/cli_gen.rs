@@ -1642,6 +1642,39 @@ fn a_dmi_becomes_an_apb_master_in_a_region_of_its_own() {
     assert!(squashed.contains("i_hold:1'b0,"), "{top}");
 }
 
+/// The `checkpoint` table of a `dmi` bundle reaches regs.json as the host
+/// reads it, and leaves the map hash alone: it describes the core, so a
+/// bitstream built without it still matches.
+#[test]
+fn a_dmi_checkpoint_table_reaches_regs_json() {
+    let with = format!(
+        "{DMI_HARNESS_TOML}\n[bundle.dmi.checkpoint]\nflush = [0xfc000073]\ncsrs = [0x7c0]\n\n\
+         [[bundle.dmi.checkpoint.mmio]]\nname = \"mtime\"\naddr = 0x0200bff8\nwidth = 64\n\n\
+         [[bundle.dmi.checkpoint.region]]\nname = \"dtim\"\naddr = 0x40000000\nsize = \"4K\"\n"
+    );
+    let read = |harness: &str| {
+        let dir = dmi_fixture(harness, 9, "");
+        let output = run_gen(&dir, &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = fs::read_to_string(dir.path().join("hns/regs.json")).unwrap();
+        hns_regs::RegisterMap::from_json(&text).unwrap()
+    };
+    let map = read(&with);
+    let c = &map.checkpoint["dmi"];
+    assert_eq!(c.flush, [0xfc00_0073]);
+    assert_eq!(c.csrs, [0x7c0]);
+    assert_eq!(c.mmio[0].name, "mtime");
+    assert_eq!((c.mmio[0].addr, c.mmio[0].width), (0x0200_bff8, 64));
+    assert_eq!((c.region[0].addr, c.region[0].size), (0x4000_0000, 4096));
+    assert_eq!(map.map_hash, read(DMI_HARNESS_TOML).map_hash);
+    assert!(read(DMI_HARNESS_TOML).checkpoint.is_empty());
+}
+
 /// What `dmi` refuses, each with its own code.
 #[test]
 fn a_dmi_that_is_not_a_whole_apb_slave_is_refused() {

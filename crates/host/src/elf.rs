@@ -191,6 +191,110 @@ fn symbols(r: &Reader, wide: bool) -> Result<Vec<Symbol>, String> {
     Ok(out)
 }
 
+/// Writes an ELF of `PT_LOAD` segments only, as a memory image: no
+/// sections, no symbols, no entry point.
+///
+/// The data streams to the file as it comes, so an image of gigabytes needs
+/// no buffer of that size. The program headers go after the data, which ELF
+/// allows (`e_phoff` says where), and the header is written last.
+pub struct Writer<W: std::io::Write + std::io::Seek> {
+    out: W,
+    wide: bool,
+    /// (address, file offset, length) of each segment so far.
+    segments: Vec<(u64, u64, u64)>,
+    at: u64,
+}
+
+/// `EM_RISCV`.
+const EM_RISCV: u16 = 243;
+
+impl<W: std::io::Write + std::io::Seek> Writer<W> {
+    /// Starts an image. `wide` makes it 64-bit (`ELFCLASS64`), which an
+    /// address past 4 GB needs.
+    pub fn new(mut out: W, wide: bool) -> std::io::Result<Self> {
+        let header = if wide { 64 } else { 52 };
+        out.write_all(&vec![0; header])?;
+        Ok(Writer {
+            out,
+            wide,
+            segments: Vec::new(),
+            at: header as u64,
+        })
+    }
+
+    /// Adds `bytes` at `addr`. Bytes that follow the last ones directly
+    /// extend the same segment.
+    pub fn push(&mut self, addr: u64, bytes: &[u8]) -> std::io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.out.write_all(bytes)?;
+        let len = bytes.len() as u64;
+        match self.segments.last_mut() {
+            Some((a, off, l)) if *a + *l == addr && *off + *l == self.at => *l += len,
+            _ => self.segments.push((addr, self.at, len)),
+        }
+        self.at += len;
+        Ok(())
+    }
+
+    /// Writes the program headers and the ELF header. Returns the number of
+    /// segments.
+    pub fn finish(mut self) -> std::io::Result<usize> {
+        // Program headers are aligned to the word size.
+        let align = if self.wide { 8 } else { 4 };
+        let pad = (align - self.at % align) % align;
+        self.out.write_all(&vec![0; pad as usize])?;
+        let phoff = self.at + pad;
+        let (phentsize, header) = if self.wide { (56u16, 64u16) } else { (32, 52) };
+        for &(addr, offset, len) in &self.segments {
+            let mut ph = Vec::with_capacity(phentsize as usize);
+            ph.extend_from_slice(&PT_LOAD.to_le_bytes());
+            if self.wide {
+                ph.extend_from_slice(&6u32.to_le_bytes()); // PF_R | PF_W
+                for v in [offset, addr, addr, len, len, 1] {
+                    ph.extend_from_slice(&v.to_le_bytes());
+                }
+            } else {
+                for v in [offset, addr, addr, len, len] {
+                    ph.extend_from_slice(&(v as u32).to_le_bytes());
+                }
+                ph.extend_from_slice(&6u32.to_le_bytes());
+                ph.extend_from_slice(&1u32.to_le_bytes());
+            }
+            self.out.write_all(&ph)?;
+        }
+        let phnum = u16::try_from(self.segments.len()).map_err(|_| {
+            std::io::Error::other("more than 65535 segments do not fit an ELF header")
+        })?;
+
+        let mut h = vec![0x7f, b'E', b'L', b'F', if self.wide { 2 } else { 1 }, 1, 1];
+        h.resize(16, 0);
+        // ET_EXEC, so loaders that want a program (a simulator's, QEMU's)
+        // take it. The entry point is 0: it is an image, not a program.
+        h.extend_from_slice(&2u16.to_le_bytes());
+        h.extend_from_slice(&EM_RISCV.to_le_bytes());
+        h.extend_from_slice(&1u32.to_le_bytes());
+        if self.wide {
+            for v in [0u64, phoff, 0] {
+                h.extend_from_slice(&v.to_le_bytes()); // entry, phoff, shoff
+            }
+        } else {
+            for v in [0u32, phoff as u32, 0] {
+                h.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        h.extend_from_slice(&0u32.to_le_bytes()); // flags
+        for v in [header, phentsize, phnum, 0, 0, 0] {
+            h.extend_from_slice(&v.to_le_bytes()); // ehsize .. shstrndx
+        }
+        self.out.seek(std::io::SeekFrom::Start(0))?;
+        self.out.write_all(&h)?;
+        self.out.flush()?;
+        Ok(self.segments.len())
+    }
+}
+
 fn bad(what: &str) -> String {
     format!("this ELF cannot be read: {what}")
 }
@@ -233,6 +337,36 @@ impl Reader<'_> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// What the writer makes, the reader reads back: bytes that follow on
+    /// join one segment, a gap starts another, and both classes work.
+    #[test]
+    fn a_written_image_reads_back() {
+        for wide in [false, true] {
+            let mut file = std::io::Cursor::new(Vec::new());
+            let mut w = Writer::new(&mut file, wide).unwrap();
+            w.push(0x8000_0000, &[1, 2, 3, 4]).unwrap();
+            w.push(0x8000_0004, &[5, 6]).unwrap();
+            w.push(0x8000_1000, &[7]).unwrap();
+            w.push(0x8000_2000, &[]).unwrap();
+            assert_eq!(w.finish().unwrap(), 2);
+            let elf = Elf::parse(file.get_ref()).unwrap();
+            assert_eq!(elf.wide, wide);
+            assert!(elf.symbols.is_empty());
+            let got: Vec<(u64, u64, Vec<u8>)> = elf
+                .segments
+                .into_iter()
+                .map(|s| (s.paddr, s.memsz, s.bytes))
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    (0x8000_0000, 6, vec![1, 2, 3, 4, 5, 6]),
+                    (0x8000_1000, 1, vec![7]),
+                ]
+            );
+        }
+    }
 
     /// Builds a small little-endian ELF: one `PT_LOAD` segment and a
     /// `.symtab` with the given symbols.
