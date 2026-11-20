@@ -811,6 +811,12 @@ enum CpuCmd {
         /// Costs a second pass over the ELF.
         #[arg(long)]
         verify: bool,
+        /// Fill every memory the ELF goes to with zeros first.
+        ///
+        /// DRAM holds noise after power-up. Zeroed, the pages the program
+        /// never writes stay zero, and `cpu save` leaves them out.
+        #[arg(long)]
+        zero: bool,
         #[command(flatten)]
         attach: AttachArgs,
         /// Arguments after the ELF, which are ignored.
@@ -972,6 +978,55 @@ enum CpuCmd {
         clear: bool,
         #[command(flatten)]
         hart: HartArgs,
+    },
+
+    /// Save the state of the CPU to a directory: registers, memory, devices.
+    ///
+    /// Every hart is halted and stays halted unless `--resume`. The registers
+    /// and the device registers of `checkpoint.mmio` go to `checkpoint.json`,
+    /// the harness memories to `memory.elf` (pages of zeros left out), and
+    /// each `checkpoint.region` to `<name>.bin`. A core with a write-back
+    /// cache needs `checkpoint.flush` in its `dmi` bundle, or memory is read
+    /// before the cache has written it.
+    Save {
+        /// The directory to write. It must not exist yet, or be empty.
+        dir: PathBuf,
+        /// Save only this memory, or part: `<bundle>[:<offset>:<size>]`.
+        ///
+        /// The offset is into the memory. Repeat it for several. Default:
+        /// every memory, whole. Over JTAG a whole DRAM takes long; name the
+        /// part the program uses.
+        #[arg(long, value_name = "RANGE")]
+        range: Vec<String>,
+        /// Read memory through the Debug Module's system bus instead.
+        ///
+        /// Slow, but a core that keeps the system bus coherent with its
+        /// caches gives what the program last wrote, flush or not.
+        #[arg(long)]
+        sba: bool,
+        /// Let the harts run again afterwards.
+        #[arg(long)]
+        resume: bool,
+        /// The `dmi` bundle, when the design has more than one.
+        #[arg(long, value_name = "BUNDLE")]
+        dmi: Option<String>,
+    },
+
+    /// Put back a state that `cpu save` wrote.
+    ///
+    /// Every hart is halted; the cache is flushed (`checkpoint.flush`); the
+    /// memories, the regions, the device registers and the registers are
+    /// written; the harts stay halted unless `--resume`. The checkpoint must
+    /// come from the same harness (the map hash).
+    Restore {
+        /// The directory `cpu save` wrote.
+        dir: PathBuf,
+        /// Let the harts run afterwards.
+        #[arg(long)]
+        resume: bool,
+        /// The `dmi` bundle, when the design has more than one.
+        #[arg(long, value_name = "BUNDLE")]
+        dmi: Option<String>,
     },
 
     /// Reset the hart through the Debug Module (`ndmreset`).
@@ -1336,6 +1391,9 @@ fn run_step(
         | Cmd::Serve { .. }
         | Cmd::Completions { .. } => {
             unreachable!("refused when the script was read")
+        }
+        Cmd::Cpu(ref cmd @ (CpuCmd::Save { .. } | CpuCmd::Restore { .. })) => {
+            checkpoint(cli, bus, map, cmd)
         }
         Cmd::Cpu(cmd) => cpu_debug(bus, map, &cmd, None),
         Cmd::Id => id(bus, map),
@@ -2905,6 +2963,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
             halt,
             catch,
             verify,
+            zero,
             ref attach,
             ref args,
         }) => {
@@ -2924,6 +2983,7 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
                     halt,
                     catch,
                     verify,
+                    zero,
                 },
             )?;
             exit_with(code)
@@ -2934,6 +2994,9 @@ fn run_cli(mut cli: Cli) -> Result<(), String> {
         }) => {
             let code = boot(&cli, &mut bus, &map, elf, attach, Start::Attach)?;
             exit_with(code)
+        }
+        Cmd::Cpu(ref cmd @ (CpuCmd::Save { .. } | CpuCmd::Restore { .. })) => {
+            checkpoint(&cli, &mut bus, &map, cmd)
         }
         Cmd::Cpu(ref cmd) => cpu_debug(&mut bus, &map, cmd, None),
         Cmd::DmaFire {
@@ -7724,6 +7787,7 @@ fn check_entries(
 }
 
 /// A memory bundle at its place in the DUT's address space.
+#[derive(Clone)]
 struct Span {
     bundle: String,
     /// The DUT address of entry 0 (`dut_base`, else 0).
@@ -8100,6 +8164,31 @@ fn boot_write(
     )
 }
 
+/// Fills `bytes` of zeros from `addr` into the memory `name`, by the card
+/// when the card has that memory.
+fn boot_write_one(
+    mem: &mut WindowMem,
+    card: &mut Option<(String, Mover)>,
+    name: &str,
+    addr: u64,
+    bytes: u64,
+) -> Result<(), String> {
+    // A piece at a time, so the window path holds no buffer of the whole
+    // memory.
+    const PIECE: u64 = 64 << 20;
+    let mut done = 0;
+    while done < bytes {
+        let n = (bytes - done).min(PIECE);
+        let at = addr + done;
+        match card.as_mut().filter(|(card_name, _)| card_name == name) {
+            Some(_) => boot_write(mem, card, at, Fill::Zeros(n as usize))?,
+            None => mem.write_to(Some(name), at, &vec![0; n as usize])?,
+        }
+        done += n;
+    }
+    Ok(())
+}
+
 /// The time taken and the rate, such as `0.21 s, 320.5 MB/s`.
 fn took_and_rate(bytes: u64, took: std::time::Duration) -> String {
     let secs = took.as_secs_f64();
@@ -8230,11 +8319,13 @@ fn rtt_place(elf: &hns_host::elf::Elf, attach: &AttachArgs) -> Option<(u64, Opti
 #[derive(Clone, Copy)]
 enum Start {
     /// Load the ELF and run it; with `halt`, stop at the first instruction,
-    /// and with `catch`, stop on a fault. With `verify`, read it back first.
+    /// and with `catch`, stop on a fault. With `verify`, read it back first;
+    /// with `zero`, fill the memories it goes to with zeros before.
     Load {
         halt: bool,
         catch: bool,
         verify: bool,
+        zero: bool,
     },
     /// Connect to a program that is already running.
     Attach,
@@ -8251,6 +8342,7 @@ fn boot(
     start: Start,
 ) -> Result<i32, String> {
     let verify = matches!(start, Start::Load { verify: true, .. });
+    let zero = matches!(start, Start::Load { zero: true, .. });
     let (load, halt, catch) = match start {
         Start::Load { halt, catch, .. } => (true, halt, catch),
         Start::Attach => (false, false, false),
@@ -8327,13 +8419,35 @@ fn boot(
     let mut mem = WindowMem { bus, map, spans };
     if load {
         reset(mem.bus, map, true, false)?;
+        // The memories to fill with zeros first, whole.
+        let mut cleared: Vec<(String, u64, u64)> = Vec::new();
+        if zero {
+            for (_, names, _) in &plan {
+                for name in names {
+                    if let Some(span) = mem.spans.iter().find(|s| &s.bundle == name)
+                        && !cleared.iter().any(|(n, ..)| n == name)
+                    {
+                        cleared.push((name.clone(), span.base, span.bytes));
+                    }
+                }
+            }
+        }
         let total: u64 = plan
             .iter()
             .map(|(segment, _, zeros)| segment.bytes.len() as u64 + zeros)
-            .sum();
+            .sum::<u64>()
+            + cleared.iter().map(|(_, _, bytes)| bytes).sum::<u64>();
         let started = std::time::Instant::now();
         let mut card = boot_card(cli, &mut mem, &plan, total)?;
         let result = (|| -> Result<(), String> {
+            for (name, base, bytes) in &cleared {
+                let at = std::time::Instant::now();
+                boot_write_one(&mut mem, &mut card, name, *base, *bytes)?;
+                println!(
+                    "  {base:#012x} -> {name}  {bytes} bytes of zeros ({})",
+                    took_and_rate(*bytes, at.elapsed())
+                );
+            }
             for (segment, names, zeros) in &plan {
                 let bytes = Fill::Bytes(&segment.bytes);
                 boot_write(&mut mem, &mut card, segment.paddr, bytes)?;
@@ -9093,12 +9207,24 @@ impl Prompt {
             PromptAction::Enter(level) => self.level = level,
             PromptAction::Quit => return Ok(Ran::Quit),
             PromptAction::Cpu(cmd) | PromptAction::Hio(Step::Window(Cmd::Cpu(cmd))) => {
-                cpu_debug(bus, map, &cmd, elf)?;
+                if let CpuCmd::Save { .. } | CpuCmd::Restore { .. } = cmd {
+                    checkpoint(cli, bus, map, &cmd)?;
+                } else {
+                    cpu_debug(bus, map, &cmd, elf)?;
+                }
                 return Ok(match cmd {
                     CpuCmd::Halt { .. }
                     | CpuCmd::Step { .. }
                     | CpuCmd::Reset { halt: true, .. } => Ran::Halted,
                     CpuCmd::Resume { .. } | CpuCmd::Reset { halt: false, .. } => Ran::Resumed,
+                    // Both halt every hart, and leave them so unless asked.
+                    CpuCmd::Save { resume, .. } | CpuCmd::Restore { resume, .. } => {
+                        if resume {
+                            Ran::Resumed
+                        } else {
+                            Ran::Halted
+                        }
+                    }
                     _ => Ran::Done,
                 });
             }
@@ -9840,6 +9966,11 @@ impl hns_host::dm::Dmi for WindowDmi<'_> {
 
 /// Where the Debug Module is: the region of kind `dmi`.
 fn dmi_base(map: &RegisterMap, bundle: Option<&str>) -> Result<u32, String> {
+    dmi_region(map, bundle).map(|(_, base)| base)
+}
+
+/// The `dmi` bundle and where it is in the window.
+fn dmi_region(map: &RegisterMap, bundle: Option<&str>) -> Result<(String, u32), String> {
     let found: Vec<_> = map
         .regions
         .iter()
@@ -9873,7 +10004,561 @@ fn dmi_base(map: &RegisterMap, bundle: Option<&str>) -> Result<u32, String> {
             .find(|r| r.name == name)
             .ok_or_else(|| format!("no Debug Module is called `{name}`. There is: {}.", names()))?,
     };
-    Ok(region.window_base as u32)
+    Ok((region.name.clone(), region.window_base as u32))
+}
+
+/// A part of a harness memory that `cpu save` keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SaveRange {
+    bundle: String,
+    /// The DUT address of its first byte.
+    addr: u64,
+    len: u64,
+}
+
+/// The parts of memory to save: the ones asked for (`<bundle>` or
+/// `<bundle>:<offset>:<size>`), or every memory. Without a choice, a memory
+/// the DUT only reads is left out where one it writes holds the same
+/// addresses: that one holds the program's view.
+fn save_ranges(
+    map: &RegisterMap,
+    spans: &[Span],
+    asked: &[String],
+) -> Result<Vec<SaveRange>, String> {
+    let mut out: Vec<SaveRange> = Vec::new();
+    if asked.is_empty() {
+        for s in spans {
+            let shadowed = !s.dut_writes
+                && spans.iter().any(|o| {
+                    o.dut_writes && o.base < s.base + s.bytes && s.base < o.base + o.bytes
+                });
+            if !shadowed {
+                out.push(SaveRange {
+                    bundle: s.bundle.clone(),
+                    addr: s.base,
+                    len: s.bytes,
+                });
+            }
+        }
+    }
+    for text in asked {
+        let mut parts = text.split(':');
+        let bundle = parts.next().unwrap_or_default();
+        let span = spans.iter().find(|s| s.bundle == bundle).ok_or_else(|| {
+            format!(
+                "--range {text}: there is no memory `{bundle}`. The memories are at:\n{}",
+                span_list(spans)
+            )
+        })?;
+        let (off, len) = match (parts.next(), parts.next(), parts.next()) {
+            (None, ..) => (0, span.bytes),
+            (Some(off), Some(len), None) => (parse_u64(off)?, parse_u64(len)?),
+            _ => {
+                return Err(format!(
+                    "--range {text}: write `<bundle>` or `<bundle>:<offset>:<size>`, such as \
+                     `{bundle}:0:1M`."
+                ));
+            }
+        };
+        if len == 0 || off.checked_add(len).is_none_or(|end| end > span.bytes) {
+            return Err(format!(
+                "--range {text} does not fit in `{bundle}`, which holds {:#x} bytes. Give an \
+                 offset into the memory and a size above 0 that end inside it.",
+                span.bytes
+            ));
+        }
+        let entry = mem_port(map, bundle)?.entry_bytes() as u64;
+        if off % entry != 0 || len % entry != 0 {
+            return Err(format!(
+                "--range {text}: `{bundle}` is read {entry} bytes at a time, so the offset and \
+                 the size must be multiples of {entry}."
+            ));
+        }
+        out.push(SaveRange {
+            bundle: bundle.to_string(),
+            addr: span.base + off,
+            len,
+        });
+    }
+    out.sort_by_key(|r| r.addr);
+    for pair in out.windows(2) {
+        if pair[0].addr + pair[0].len > pair[1].addr {
+            return Err(format!(
+                "`{}` and `{}` overlap at {:#x}. The saved image is by address, so one \
+                 address can be saved once: pick one of them with --range.",
+                pair[0].bundle, pair[1].bundle, pair[1].addr
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Reads a saved range a piece at a time and hands each piece to `out` with
+/// its DUT address: by the card if it has the memory, else the window.
+fn read_range(
+    cli: &Cli,
+    mem: &mut WindowMem,
+    r: &SaveRange,
+    mut out: impl FnMut(u64, &[u8]) -> Result<(), String>,
+) -> Result<&'static str, String> {
+    let span_base = mem
+        .spans
+        .iter()
+        .find(|s| s.bundle == r.bundle)
+        .map(|s| s.base)
+        .ok_or_else(|| format!("no memory named `{}`", r.bundle))?;
+    let port = mem_port(mem.map, &r.bundle)?;
+    let master = mem.bus.master();
+    let chosen = route(
+        mem.map, master, "cpu save", &r.bundle, &port, r.len, DMA_ABOVE, None,
+    )?;
+    let entry = port.entry_bytes() as u64;
+    let card = match chosen {
+        Route::Card { .. } => open_route(mem.bus, mem.map, cli, chosen)?,
+        Route::Window { .. } => None,
+    };
+    let Some(mut mover) = card else {
+        // About a megabyte a batch, in whole entries.
+        let per = (1 << 20) / entry;
+        let first = (r.addr - span_base) / entry;
+        let count = r.len / entry;
+        let mut e = 0;
+        while e < count {
+            let n = (count - e).min(per);
+            let bytes =
+                mem.read_entries(&r.bundle, (first + e) as usize, (first + e + n) as usize)?;
+            out(r.addr + e * entry, &bytes)?;
+            e += n;
+        }
+        return Ok("through the window");
+    };
+    let result = (|| -> Result<(), String> {
+        let off = r.addr - span_base;
+        let chunk = mover.chunk as u64;
+        let mut done = 0;
+        while done < r.len {
+            let n = (r.len - done).min(chunk);
+            let next = Some(done + n)
+                .filter(|&d| d < r.len && r.len - d >= n)
+                .map(|d| off + d);
+            let got = mover.fetch(mem.bus, mem.map, off + done, n as usize, next)?;
+            out(r.addr + done, got)?;
+            done += n;
+        }
+        mover.report_losses(mem.bus, mem.map)
+    })();
+    close_mover(Some(mover), mem.bus, mem.map, result)?;
+    Ok("by the card")
+}
+
+/// Bytes in a page `cpu save` leaves out of the image when it is all zero.
+const SAVE_PAGE: usize = 4096;
+
+/// `cpu save` and `cpu restore`.
+fn checkpoint(cli: &Cli, bus: &mut Bus, map: &RegisterMap, cmd: &CpuCmd) -> Result<(), String> {
+    match cmd {
+        CpuCmd::Save {
+            dir,
+            range,
+            sba,
+            resume,
+            dmi,
+        } => cpu_save(cli, bus, map, dir, range, *sba, *resume, dmi.as_deref()),
+        CpuCmd::Restore { dir, resume, dmi } => {
+            cpu_restore(cli, bus, map, dir, *resume, dmi.as_deref())
+        }
+        _ => unreachable!("only save and restore come here"),
+    }
+}
+
+fn write_error(file: &std::path::Path, err: impl std::fmt::Display) -> String {
+    format!("cannot write {}: {err}", file.display())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_save(
+    cli: &Cli,
+    bus: &mut Bus,
+    map: &RegisterMap,
+    dir: &std::path::Path,
+    asked: &[String],
+    sba: bool,
+    resume: bool,
+    dmi: Option<&str>,
+) -> Result<(), String> {
+    use hns_host::checkpoint::{self as ck, Hex};
+    use hns_host::dm::Debug;
+
+    // Everything that can be wrong is found before the board is touched.
+    let (dmi_name, base) = dmi_region(map, dmi)?;
+    let desc = map.checkpoint.get(&dmi_name).cloned().unwrap_or_default();
+    let spans = spans(map)?;
+    let ranges = save_ranges(map, &spans, asked)?;
+    if dir.exists()
+        && std::fs::read_dir(dir)
+            .map_err(|e| read_error(dir, e))?
+            .next()
+            .is_some()
+    {
+        return Err(format!(
+            "{} is not empty. Save into a new directory, so an older checkpoint is never \
+             mixed with this one.",
+            dir.display()
+        ));
+    }
+    std::fs::create_dir_all(dir).map_err(|e| write_error(dir, e))?;
+
+    let started = std::time::Instant::now();
+    let (harts, states, mmio, regions) = {
+        let mut dm = Debug::attach(WindowDmi::new(bus, map, base), 0)?;
+        let harts = dm.halt_all()?;
+        let mut states = Vec::new();
+        for hart in 0..harts {
+            dm.select(hart)?;
+            let (state, notes) = ck::save_hart(&mut dm, &desc.csrs)?;
+            for note in notes {
+                println!("note: hart {hart}: {note}");
+            }
+            println!(
+                "  hart {hart}: pc {:#x}, {} CSRs{}",
+                state.pc.0,
+                state.csr.len(),
+                if state.fpr.is_some() {
+                    ", FP registers"
+                } else {
+                    ""
+                }
+            );
+            states.push(state);
+        }
+        dm.select(0)?;
+        let mut mmio = Vec::new();
+        for m in &desc.mmio {
+            let value = dm.load(m.addr, m.width)?;
+            mmio.push(ck::MmioValue {
+                name: m.name.clone(),
+                addr: Hex(m.addr),
+                width: m.width,
+                value: Hex(value),
+            });
+        }
+        let mut regions = Vec::new();
+        for r in &desc.region {
+            let mut bytes = Vec::with_capacity(r.size as usize);
+            for at in (0..r.size).step_by(4) {
+                let word = dm.load(r.addr + at, 32)? as u32;
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            let file = dir.join(format!("{}.bin", r.name));
+            std::fs::write(&file, &bytes).map_err(|e| write_error(&file, e))?;
+            regions.push(ck::Range {
+                name: r.name.clone(),
+                addr: Hex(r.addr),
+                size: Hex(r.size),
+            });
+        }
+        if !desc.flush.is_empty() {
+            for hart in 0..harts {
+                dm.select(hart)?;
+                dm.exec(&desc.flush)
+                    .map_err(|e| format!("checkpoint.flush on hart {hart}: {e}"))?;
+            }
+            dm.select(0)?;
+        }
+        (harts, states, mmio, regions)
+    };
+    println!(
+        "{harts} hart(s) halted and saved, {} device register(s), {} region(s)",
+        mmio.len(),
+        regions.len()
+    );
+
+    let wide =
+        states.iter().any(|s| s.xlen == 64) || ranges.iter().any(|r| r.addr + r.len > 1 << 32);
+    let image = dir.join("memory.elf");
+    let file = std::fs::File::create(&image).map_err(|e| write_error(&image, e))?;
+    let mut elf = hns_host::elf::Writer::new(std::io::BufWriter::new(file), wide)
+        .map_err(|e| write_error(&image, e))?;
+    let mut kept = 0u64;
+    let mut keep = |addr: u64, bytes: &[u8]| -> Result<(), String> {
+        for (i, page) in bytes.chunks(SAVE_PAGE).enumerate() {
+            if page.iter().any(|b| *b != 0) {
+                elf.push(addr + (i * SAVE_PAGE) as u64, page)
+                    .map_err(|e| write_error(&image, e))?;
+                kept += page.len() as u64;
+            }
+        }
+        Ok(())
+    };
+    let mut memory = Vec::new();
+    for r in &ranges {
+        let at = std::time::Instant::now();
+        let how = if sba {
+            let mut sb = hns_host::dm::SystemBus::open(WindowDmi::new(bus, map, base))?;
+            let mut done = 0;
+            while done < r.len {
+                let n = (r.len - done).min(SAVE_PAGE as u64);
+                let mut buf = vec![0; n as usize];
+                hns_host::rtt::Memory::read(&mut sb, r.addr + done, &mut buf)?;
+                keep(r.addr + done, &buf)?;
+                done += n;
+            }
+            "through the system bus"
+        } else {
+            let mut mem = WindowMem {
+                bus,
+                map,
+                spans: spans.clone(),
+            };
+            read_range(cli, &mut mem, r, &mut keep)?
+        };
+        println!(
+            "  {:#012x} <- {}  {} bytes in {} ({how})",
+            r.addr,
+            r.bundle,
+            r.len,
+            took_and_rate(r.len, at.elapsed())
+        );
+        memory.push(ck::Range {
+            name: r.bundle.clone(),
+            addr: Hex(r.addr),
+            size: Hex(r.len),
+        });
+    }
+    drop(keep);
+    let segments = elf.finish().map_err(|e| write_error(&image, e))?;
+
+    let saved = ck::File {
+        format: ck::FORMAT,
+        hio: env!("HNS_VERSION").to_string(),
+        dut: map.dut.clone(),
+        map_hash: Hex(map.map_hash.into()),
+        dmi: dmi_name,
+        harts: states,
+        mmio,
+        memory,
+        region: regions,
+    };
+    let json = dir.join("checkpoint.json");
+    let text = serde_json::to_string_pretty(&saved).map_err(|e| write_error(&json, e))?;
+    std::fs::write(&json, text + "\n").map_err(|e| write_error(&json, e))?;
+    println!(
+        "saved to {} in {:.2} s: {kept} bytes of memory in {segments} segment(s), the rest zero",
+        dir.display(),
+        started.elapsed().as_secs_f64()
+    );
+    if resume {
+        let mut dm = Debug::attach(WindowDmi::new(bus, map, base), 0)?;
+        dm.resume_all(harts)?;
+        println!("resumed");
+    }
+    Ok(())
+}
+
+fn cpu_restore(
+    cli: &Cli,
+    bus: &mut Bus,
+    map: &RegisterMap,
+    dir: &std::path::Path,
+    resume: bool,
+    dmi: Option<&str>,
+) -> Result<(), String> {
+    use hns_host::checkpoint as ck;
+    use hns_host::dm::Debug;
+
+    let json = dir.join("checkpoint.json");
+    let text = std::fs::read_to_string(&json).map_err(|e| read_error(&json, e))?;
+    let saved: ck::File = serde_json::from_str(&text)
+        .map_err(|e| format!("{} cannot be read: {e}", json.display()))?;
+    if saved.format != ck::FORMAT {
+        return Err(format!(
+            "{} has format {}, and this hio reads {}. Restore it with the hio that saved it \
+             ({}).",
+            json.display(),
+            saved.format,
+            ck::FORMAT,
+            saved.hio
+        ));
+    }
+    if saved.dut != map.dut || saved.map_hash.0 != u64::from(map.map_hash) {
+        return Err(format!(
+            "the checkpoint was taken on another harness (`{}`, map hash {:#010x}); this one is \
+             `{}` ({:#010x}). Its memories and its core may differ, so it is not restored.\n\
+             Use the regs.json and the bitstream it was saved with.",
+            saved.dut, saved.map_hash.0, map.dut, map.map_hash
+        ));
+    }
+    let (dmi_name, base) = dmi_region(map, dmi.or(Some(saved.dmi.as_str())))?;
+    let desc = map.checkpoint.get(&dmi_name).cloned().unwrap_or_default();
+    let image = dir.join("memory.elf");
+    let raw = std::fs::read(&image).map_err(|e| read_error(&image, e))?;
+    let elf = hns_host::elf::Elf::parse(&raw)?;
+    drop(raw);
+    let mut regions = Vec::new();
+    for r in &saved.region {
+        let file = dir.join(format!("{}.bin", r.name));
+        let bytes = std::fs::read(&file).map_err(|e| read_error(&file, e))?;
+        if bytes.len() as u64 != r.size.0 {
+            return Err(format!(
+                "{} holds {} bytes, and checkpoint.json says {:#x}.",
+                file.display(),
+                bytes.len(),
+                r.size.0
+            ));
+        }
+        regions.push((r.addr.0, bytes));
+    }
+    let spans = spans(map)?;
+    for r in &saved.memory {
+        if !spans
+            .iter()
+            .any(|s| s.bundle == r.name && s.covers(r.addr.0, r.size.0))
+        {
+            return Err(format!(
+                "the checkpoint holds {:#x}..{:#x} of `{}`, and no such memory holds it here. \
+                 The memories are at:\n{}",
+                r.addr.0,
+                r.addr.0 + r.size.0,
+                r.name,
+                span_list(&spans)
+            ));
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let harts = {
+        let mut dm = Debug::attach(WindowDmi::new(bus, map, base), 0)?;
+        let harts = dm.halt_all()?;
+        if harts as usize != saved.harts.len() {
+            return Err(format!(
+                "the checkpoint has {} hart(s), and this Debug Module has {harts}.",
+                saved.harts.len()
+            ));
+        }
+        // The cache drops what it holds, so the memory written next is what
+        // the harts see.
+        if !desc.flush.is_empty() {
+            for hart in 0..harts {
+                dm.select(hart)?;
+                dm.exec(&desc.flush)
+                    .map_err(|e| format!("checkpoint.flush on hart {hart}: {e}"))?;
+            }
+        }
+        harts
+    };
+
+    for span in &spans {
+        if saved.memory.iter().any(|r| r.name == span.bundle) {
+            calibrated(bus, map, &span.bundle)?;
+        }
+    }
+    let mut mem = WindowMem { bus, map, spans };
+    for r in &saved.memory {
+        let at = std::time::Instant::now();
+        let (from, to) = (r.addr.0, r.addr.0 + r.size.0);
+        // In address order: the image's bytes, and zeros between them.
+        let mut pieces: Vec<(u64, Option<&[u8]>, u64)> = Vec::new();
+        let mut cursor = from;
+        let mut segments: Vec<&hns_host::elf::Segment> = elf
+            .segments
+            .iter()
+            .filter(|s| s.paddr < to && s.paddr + s.bytes.len() as u64 > from)
+            .collect();
+        segments.sort_by_key(|s| s.paddr);
+        for seg in segments {
+            let start = seg.paddr.max(from);
+            let end = (seg.paddr + seg.bytes.len() as u64).min(to);
+            if start > cursor {
+                pieces.push((cursor, None, start - cursor));
+            }
+            let bytes = &seg.bytes[(start - seg.paddr) as usize..(end - seg.paddr) as usize];
+            pieces.push((start, Some(bytes), end - start));
+            cursor = end;
+        }
+        if cursor < to {
+            pieces.push((cursor, None, to - cursor));
+        }
+        let port = mem_port(map, &r.name)?;
+        let chosen = route(
+            map,
+            mem.bus.master(),
+            "cpu restore",
+            &r.name,
+            &port,
+            r.size.0,
+            DMA_WRITE_ABOVE,
+            None,
+        )?;
+        let mut card = match chosen {
+            Route::Card { .. } => {
+                open_route(mem.bus, map, cli, chosen)?.map(|m| (r.name.clone(), m))
+            }
+            Route::Window { .. } => None,
+        };
+        const PIECE: u64 = 64 << 20;
+        let result = (|| -> Result<(), String> {
+            for (addr, bytes, len) in &pieces {
+                let mut done = 0;
+                while done < *len {
+                    let n = (len - done).min(PIECE);
+                    let fill = match bytes {
+                        Some(b) => Fill::Bytes(&b[done as usize..(done + n) as usize]),
+                        None => Fill::Zeros(n as usize),
+                    };
+                    boot_write(&mut mem, &mut card, addr + done, fill)?;
+                    done += n;
+                }
+            }
+            if let Some((_, mover)) = &mut card {
+                mover.report_losses(mem.bus, map)?;
+            }
+            Ok(())
+        })();
+        let how = if card.is_some() {
+            "by the card"
+        } else {
+            "through the window"
+        };
+        close_mover(card.map(|(_, m)| m), mem.bus, map, result)?;
+        println!(
+            "  {:#012x} -> {}  {} bytes in {} ({how})",
+            r.addr.0,
+            r.name,
+            r.size.0,
+            took_and_rate(r.size.0, at.elapsed())
+        );
+    }
+
+    let mut dm = Debug::attach(WindowDmi::new(mem.bus, map, base), 0)?;
+    for (addr, bytes) in &regions {
+        for (i, word) in bytes.chunks(4).enumerate() {
+            let mut w = [0u8; 4];
+            w[..word.len()].copy_from_slice(word);
+            dm.store(addr + 4 * i as u64, 32, u32::from_le_bytes(w).into())?;
+        }
+    }
+    for m in &saved.mmio {
+        dm.store(m.addr.0, m.width, m.value.0)?;
+    }
+    for state in &saved.harts {
+        dm.select(state.hart)?;
+        for note in ck::restore_hart(&mut dm, state)? {
+            println!("note: hart {}: {note}", state.hart);
+        }
+    }
+    dm.select(0)?;
+    println!(
+        "restored {} hart(s), {} device register(s), {} region(s) in {:.2} s",
+        saved.harts.len(),
+        saved.mmio.len(),
+        saved.region.len(),
+        started.elapsed().as_secs_f64()
+    );
+    if resume {
+        dm.resume_all(harts)?;
+        println!("resumed");
+    }
+    Ok(())
 }
 
 /// What `cpu ipc` prints about one run, without the PC.
@@ -9914,8 +10599,11 @@ fn cpu_debug(
     use hns_host::dm::{Debug, Reg, reg};
 
     let args = match cmd {
-        CpuCmd::Boot { .. } | CpuCmd::Console { .. } => {
-            unreachable!("boot and console are run elsewhere")
+        CpuCmd::Boot { .. }
+        | CpuCmd::Console { .. }
+        | CpuCmd::Save { .. }
+        | CpuCmd::Restore { .. } => {
+            unreachable!("boot, console, save and restore are run elsewhere")
         }
         CpuCmd::Info { hart }
         | CpuCmd::Dmi { hart, .. }
@@ -10211,7 +10899,12 @@ fn cpu_debug(
                 println!("{line}");
             }
         }
-        CpuCmd::Boot { .. } | CpuCmd::Console { .. } | CpuCmd::Dmi { .. } | CpuCmd::Mem { .. } => {
+        CpuCmd::Boot { .. }
+        | CpuCmd::Console { .. }
+        | CpuCmd::Save { .. }
+        | CpuCmd::Restore { .. }
+        | CpuCmd::Dmi { .. }
+        | CpuCmd::Mem { .. } => {
             unreachable!()
         }
     }

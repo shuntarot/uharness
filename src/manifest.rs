@@ -764,6 +764,62 @@ pub struct Bundle {
     /// holds its next address back.
     #[serde(default, deserialize_with = "size::option_u32")]
     pub model_depth: Option<u32>,
+
+    /// What `hio cpu save` and `restore` need to know about the core and
+    /// cannot learn from the Debug Module (`dmi` only).
+    #[serde(default)]
+    pub checkpoint: Option<Checkpoint>,
+}
+
+/// `[bundle.<dmi>.checkpoint]`: the parts of a core's state outside the
+/// Debug specification. What the spec covers (registers, the program
+/// buffer, system bus access) the host asks the Debug Module about.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Checkpoint {
+    /// Instructions that write the whole data cache back to memory and
+    /// invalidate it. The host runs them in the program buffer before it
+    /// saves memory, and before it restores memory. A core without a
+    /// write-back cache leaves it out.
+    #[serde(default)]
+    pub flush: Vec<u32>,
+
+    /// CSRs to save besides the standard ones, by number.
+    #[serde(default)]
+    pub csrs: Vec<u32>,
+
+    /// Device registers to save, such as the timer. They are written back in
+    /// this order.
+    #[serde(default)]
+    pub mmio: Vec<CheckpointMmio>,
+
+    /// Memories inside the core that the harness cannot reach, such as a
+    /// tightly coupled RAM. The host reaches them through the core.
+    #[serde(default)]
+    pub region: Vec<CheckpointRegion>,
+}
+
+/// One device register in `checkpoint.mmio`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointMmio {
+    pub name: String,
+    /// The address the core sees.
+    pub addr: u64,
+    /// 8, 16, 32 or 64 bits.
+    pub width: u32,
+}
+
+/// One memory in `checkpoint.region`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointRegion {
+    pub name: String,
+    /// The address the core sees.
+    pub addr: u64,
+    /// Bytes; `4K` and the like work.
+    #[serde(deserialize_with = "size::u64")]
+    pub size: u64,
 }
 
 /// What the records of a `trace` are.
@@ -780,6 +836,86 @@ impl TraceFormat {
             TraceFormat::Rvfi => "rvfi",
         }
     }
+}
+
+/// Checks what `hio` will do with a `checkpoint` table: the instructions go
+/// into the program buffer, the names become file names, and the accesses
+/// must be ones the core can make.
+fn check_checkpoint(bundle: &str, c: &Checkpoint) -> Result<(), ManifestError> {
+    let err = |problem: String, fix: &str| ManifestError::Checkpoint {
+        bundle: bundle.to_string(),
+        problem,
+        fix: fix.to_string(),
+    };
+    for insn in &c.flush {
+        if insn & 0b11 != 0b11 {
+            return Err(err(
+                format!("flush has {insn:#010x}, a compressed instruction"),
+                "The program buffer is filled a 32-bit word at a time. Write the 32-bit form of the instruction.",
+            ));
+        }
+    }
+    for csr in &c.csrs {
+        if *csr >= 0x1000 {
+            return Err(err(
+                format!("csrs has {csr:#x}, which is not a CSR number"),
+                "CSR numbers are 12 bits: 0x000 to 0xfff.",
+            ));
+        }
+    }
+    let mut names = std::collections::HashSet::new();
+    let names_of = c
+        .mmio
+        .iter()
+        .map(|m| ("mmio", &m.name))
+        .chain(c.region.iter().map(|r| ("region", &r.name)));
+    for (table, name) in names_of {
+        let fine = !name.is_empty()
+            && name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+        if !fine {
+            return Err(err(
+                format!("{table} has the name {name:?}"),
+                "A name becomes part of a file name in the saved checkpoint. Use letters, digits, `_` and `-`.",
+            ));
+        }
+        if !names.insert(name.as_str()) {
+            return Err(err(
+                format!("the name `{name}` is used twice"),
+                "Each mmio register and region needs a name of its own.",
+            ));
+        }
+    }
+    for m in &c.mmio {
+        if ![8, 16, 32, 64].contains(&m.width) {
+            return Err(err(
+                format!("mmio `{}` has width = {}", m.name, m.width),
+                "A register is read with one load: 8, 16, 32 or 64 bits.",
+            ));
+        }
+        if m.addr % u64::from(m.width / 8) != 0 {
+            return Err(err(
+                format!(
+                    "mmio `{}` is at {:#x}, not aligned to its {} bits",
+                    m.name, m.addr, m.width
+                ),
+                "A misaligned load may trap or split. Give the address of the register itself.",
+            ));
+        }
+    }
+    for r in &c.region {
+        if r.size == 0 || r.size % 4 != 0 || r.addr % 4 != 0 {
+            return Err(err(
+                format!(
+                    "region `{}` is {:#x} bytes at {:#x}",
+                    r.name, r.size, r.addr
+                ),
+                "A region is read a 32-bit word at a time. Give an address and a size that are multiples of 4, and a size above 0.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Sizes may also be written like `4k` or `256M`.
@@ -814,6 +950,24 @@ mod size {
         u32::try_from(value)
             .map(Some)
             .map_err(|_| serde::de::Error::custom(format!("{value} does not fit in 32 bits")))
+    }
+
+    /// Accepts an integer or a string, as `option_u32`, for a value that
+    /// must be given.
+    pub fn u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Number(u64),
+            Text(String),
+        }
+        match Either::deserialize(deserializer)? {
+            Either::Number(n) => Ok(n),
+            Either::Text(text) => parse(&text).map_err(serde::de::Error::custom),
+        }
     }
 
     pub fn bar_bytes<'de, D>(deserializer: D) -> Result<u32, D::Error>
@@ -1329,6 +1483,14 @@ pub enum ManifestError {
         dmis: String,
     },
 
+    #[error("[bundle.{bundle}.checkpoint] {problem}")]
+    #[diagnostic(code(harness::manifest::checkpoint), help("{fix}"))]
+    Checkpoint {
+        bundle: String,
+        problem: String,
+        fix: String,
+    },
+
     #[error("[bundle.{bundle}] sets `model_depth` without `model = true`")]
     #[diagnostic(
         code(harness::manifest::model_depth_without_model),
@@ -1753,6 +1915,9 @@ impl Manifest {
                     }
                 }
             }
+            if let Some(checkpoint) = &bundle.checkpoint {
+                check_checkpoint(name, checkpoint)?;
+            }
             if let Some(depth) = bundle.model_depth {
                 if bundle.model != Some(true) {
                     return Err(ManifestError::ModelDepthWithoutModel {
@@ -1879,6 +2044,56 @@ mod tests {
             assert!(
                 matches!(err, ManifestError::ModelDepth { .. }),
                 "{bad}: {err}"
+            );
+        }
+    }
+
+    /// A `checkpoint` table is checked for what `hio` will do with it:
+    /// words for the program buffer, names for files, loads the core makes.
+    #[test]
+    fn a_checkpoint_table_is_checked() {
+        let head = "[dut]\nmodule = \"dut_top\"\n\n[bundle.dmi]\nbacking = \"dmi\"\n\n\
+                    [bundle.dmi.checkpoint]\n";
+        let ok = format!(
+            "{head}flush = [0xfc000073]\n[[bundle.dmi.checkpoint.mmio]]\nname = \"mtimecmp\"\n\
+             addr = 0x02004000\nwidth = 64\n[[bundle.dmi.checkpoint.region]]\nname = \"dtim\"\n\
+             addr = 0x40000000\nsize = \"4K\"\n"
+        );
+        let m: Manifest = toml::from_str(&ok).unwrap();
+        m.validate().unwrap();
+        let c = m.bundle["dmi"].checkpoint.as_ref().unwrap();
+        assert_eq!(c.region[0].size, 4096);
+        for (bad, says) in [
+            ("flush = [0x4501]\n", "compressed"),
+            ("csrs = [0x1000]\n", "not a CSR number"),
+            (
+                "[[bundle.dmi.checkpoint.mmio]]\nname = \"a b\"\naddr = 0\nwidth = 32\n",
+                "name",
+            ),
+            (
+                "[[bundle.dmi.checkpoint.mmio]]\nname = \"t\"\naddr = 4\nwidth = 64\n",
+                "not aligned",
+            ),
+            (
+                "[[bundle.dmi.checkpoint.mmio]]\nname = \"t\"\naddr = 0\nwidth = 24\n",
+                "width = 24",
+            ),
+            (
+                "[[bundle.dmi.checkpoint.mmio]]\nname = \"t\"\naddr = 0\nwidth = 32\n\
+                 [[bundle.dmi.checkpoint.region]]\nname = \"t\"\naddr = 0\nsize = 4\n",
+                "used twice",
+            ),
+            (
+                "[[bundle.dmi.checkpoint.region]]\nname = \"r\"\naddr = 0\nsize = 6\n",
+                "multiples of 4",
+            ),
+        ] {
+            let m: Manifest = toml::from_str(&format!("{head}{bad}")).unwrap();
+            let err = m.validate().unwrap_err();
+            let text = format!("{err} {}", miette::Diagnostic::help(&err).unwrap());
+            assert!(
+                matches!(err, ManifestError::Checkpoint { .. }) && text.contains(says),
+                "{bad}: {text}"
             );
         }
     }

@@ -3888,6 +3888,7 @@ pub fn check_claimed(
     const STALL: &str = "stall";
     const MODEL: &str = "model";
     const MODEL_DEPTH: &str = "model_depth";
+    const CHECKPOINT: &str = "checkpoint";
 
     for binding in bindings {
         let name = binding.bundle.as_str();
@@ -3940,7 +3941,7 @@ pub fn check_claimed(
             (
                 apbs.iter().any(|p| p.bundle == name && p.debug_module),
                 "a `dmi`",
-                &[RESET, TIMEOUT][..],
+                &[RESET, TIMEOUT, CHECKPOINT][..],
             ),
             (
                 apbs.iter().any(|p| p.bundle == name && !p.debug_module),
@@ -4015,6 +4016,7 @@ pub fn check_claimed(
             (STALL, declared.stall.is_some()),
             (MODEL, declared.model.is_some()),
             (MODEL_DEPTH, declared.model_depth.is_some()),
+            (CHECKPOINT, declared.checkpoint.is_some()),
         ] {
             if set && !takes.contains(&key) {
                 return Err(TerminatorError::KeyNotApplicable {
@@ -4022,7 +4024,7 @@ pub fn check_claimed(
                     key,
                     shape,
                     takes: if takes.is_empty() {
-                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`, `reset`, `format`, `trigger`, `timeout`, `stall`, `model`, `model_depth`"
+                        "none of `depth`, `addressing`, `access`, `aperture`, `dut_base`, `reset`, `format`, `trigger`, `timeout`, `stall`, `model`, `model_depth`, `checkpoint`"
                             .to_string()
                     } else {
                         takes

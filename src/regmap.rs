@@ -170,6 +170,11 @@ pub struct RegisterMap {
     /// the ring with it. In the hash: the same bits mean other fields with
     /// another layout.
     pub traces: Vec<TraceLayout>,
+
+    /// The `checkpoint` table of each `dmi` bundle that has one, in bundle
+    /// order, for `hio cpu save` and `restore`. Not in the hash: it describes
+    /// the core, not the window.
+    pub checkpoints: Vec<(String, crate::manifest::Checkpoint)>,
 }
 
 /// How the bits of a trace record split into fields.
@@ -1499,6 +1504,12 @@ pub fn build(
             .map(|mem| mem.bundle.clone())
             .collect(),
         traces,
+        checkpoints: manifest
+            .bundle
+            .iter()
+            .filter(|(_, b)| b.backing == crate::manifest::Backing::Dmi)
+            .filter_map(|(name, b)| Some((name.clone(), b.checkpoint.clone()?)))
+            .collect(),
     })
 }
 

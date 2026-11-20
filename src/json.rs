@@ -572,9 +572,41 @@ pub struct RegisterMapOutput {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub traces: Vec<TraceOutput>,
 
+    /// The `checkpoint` table of each `dmi` bundle, by bundle name: what
+    /// `hio cpu save` and `restore` cannot learn from the Debug Module.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub checkpoint: std::collections::BTreeMap<String, CheckpointOutput>,
+
     /// Only for a PCIe design. The host needs it to find the card.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pcie: Option<PcieOutput>,
+}
+
+/// `[bundle.<dmi>.checkpoint]` as the host reads it.
+#[derive(Debug, Serialize)]
+pub struct CheckpointOutput {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub flush: Vec<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub csrs: Vec<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mmio: Vec<CheckpointMmioOutput>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub region: Vec<CheckpointRegionOutput>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CheckpointMmioOutput {
+    pub name: String,
+    pub addr: u64,
+    pub width: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CheckpointRegionOutput {
+    pub name: String,
+    pub addr: u64,
+    pub size: u64,
 }
 
 /// The IDs the bitstream reports, and the BAR size.
@@ -773,6 +805,37 @@ pub fn register_map(
                         nonzero_lsb: field.nonzero_lsb,
                     })
                     .collect(),
+            })
+            .collect(),
+        checkpoint: map
+            .checkpoints
+            .iter()
+            .map(|(bundle, c)| {
+                (
+                    bundle.clone(),
+                    CheckpointOutput {
+                        flush: c.flush.clone(),
+                        csrs: c.csrs.clone(),
+                        mmio: c
+                            .mmio
+                            .iter()
+                            .map(|m| CheckpointMmioOutput {
+                                name: m.name.clone(),
+                                addr: m.addr,
+                                width: m.width,
+                            })
+                            .collect(),
+                        region: c
+                            .region
+                            .iter()
+                            .map(|r| CheckpointRegionOutput {
+                                name: r.name.clone(),
+                                addr: r.addr,
+                                size: r.size,
+                            })
+                            .collect(),
+                    },
+                )
             })
             .collect(),
     }

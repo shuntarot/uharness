@@ -378,7 +378,8 @@ too; a segment with no file bytes, usually the stack, is left to the startup
 code. Over PCIe, a large ELF goes the way `load` takes it: the card writes
 the memory it reaches, and only a part of an entry at either end goes through
 the window. `--verify` reads it all back and compares it before the DUT is
-released. Up
+released. `--zero` fills every memory the ELF goes to with zeros first, so a
+later `cpu save` leaves out the pages the program never wrote. Up
 channel 0 goes to the terminal and keys go to down channel 0; Ctrl-A x
 leaves. `hio cpu console <elf>` connects without loading, so leaving and
 coming back is harmless.
@@ -587,6 +588,50 @@ inactive one takes only `dmactive` from the harness's write. Give it its own
 hart stops a few instructions after the
 mark; `minstret` says how many. `hio cpu` then works on the halted harts as
 usual.
+
+## `hio cpu save` and `restore`: keep a state, go back to it
+
+`hio cpu save <dir>` halts every hart and writes what the CPU holds:
+
+```text
+$ hio cpu save ck --range tcm --range dmem:0xf0000:64K
+  hart 0: pc 0x80000068, 101 CSRs
+1 hart(s) halted and saved, 2 device register(s), 0 region(s)
+  0x0080000000 <- tcm  65536 bytes in 0.16 s, 416.6 KB/s (through the window)
+  0x0080100000 <- dmem  65536 bytes in 0.47 s, 138.7 KB/s (through the window)
+saved to ck in 1.10 s: 77824 bytes of memory in 2 segment(s), the rest zero
+```
+
+- `checkpoint.json`: per hart the GPRs, the FPRs, the PC, the privilege
+  level, and every standard CSR the hart has (the hart is asked; one it
+  refuses is skipped); the device registers of `checkpoint.mmio`; and which
+  memory ranges were saved. Values are hex strings.
+- `memory.elf`: the harness memories as an ELF image, with all-zero pages
+  left out. A simulator's loader can read it.
+- `<name>.bin` for each `checkpoint.region`.
+
+Without `--range` every memory is saved whole: seconds for gigabytes over
+PCIe, but slow over JTAG (about 140 KB/s), so name the part the program uses
+there. DRAM holds noise after power-up, so a whole DRAM saves as a whole DRAM;
+`hio cpu boot --zero` fills the memories with zeros before loading, and then
+the pages the program never wrote are left out. The harts stay halted unless
+`--resume`. A core with a write-back data cache needs `checkpoint.flush` in
+its `dmi` bundle ([Harness.toml](guide-harness.md)); `--sba` reads memory
+through the Debug Module's system bus instead, which is slow, but sees what a
+coherent system bus sees.
+
+`hio cpu restore <dir>` halts every hart, flushes the cache, writes the
+memories (zeros where the image left pages out), the regions, the device
+registers and the registers, and leaves the harts halted unless `--resume`.
+It refuses a checkpoint from another harness (another map hash).
+
+Where the core lets the counters stop while a hart is halted
+(`dcsr.stopcount`), `mcycle` and `minstret` come back as the program left
+them; otherwise they include the debugger's own work, and `cpu save` says so. Caches, branch
+predictors and other state the program cannot see are not saved; a run that
+is measured after a restore needs a warm-up. Device state outside
+`checkpoint.mmio` (a UART's FIFO, an interrupt being claimed) is not saved
+either.
 
 ## `hio program` and `erase`
 

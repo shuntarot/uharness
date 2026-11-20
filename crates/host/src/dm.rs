@@ -219,6 +219,11 @@ const DCSR_EBREAKU: u64 = 1 << 12;
 
 /// GPR `s0`, which the program buffer uses to carry a CSR value.
 const S0: u32 = 8;
+/// GPR `s1`, which carries the data of a load or store the hart makes for
+/// the debugger (`s0` holds the address).
+const S1: u32 = 9;
+
+const MISA: u32 = 0x301;
 
 const EBREAK: u32 = 0x0010_0073;
 
@@ -231,9 +236,18 @@ const POLLS: usize = 1000;
 pub enum Reg {
     /// `x0`..`x31`.
     Gpr(u32),
+    /// `f0`..`f31`. Reaching them needs `mstatus.FS` on.
+    Fpr(u32),
     /// A CSR by number. `dpc` is the PC while halted.
     Csr(u32),
 }
+
+/// ABI names of the FPRs, in order.
+pub const FPR_NAMES: [&str; 32] = [
+    "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "fs0", "fs1", "fa0", "fa1", "fa2",
+    "fa3", "fa4", "fa5", "fa6", "fa7", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9",
+    "fs10", "fs11", "ft8", "ft9", "ft10", "ft11",
+];
 
 /// ABI names of the GPRs, in order.
 pub const GPR_NAMES: [&str; 32] = [
@@ -274,6 +288,12 @@ impl Reg {
         if let Some(n) = text.strip_prefix('x').and_then(|n| n.parse::<u32>().ok()) {
             return (n < 32).then_some(Reg::Gpr(n));
         }
+        if let Some(n) = FPR_NAMES.iter().position(|name| *name == text) {
+            return Some(Reg::Fpr(n as u32));
+        }
+        if let Some(n) = text.strip_prefix('f').and_then(|n| n.parse::<u32>().ok()) {
+            return (n < 32).then_some(Reg::Fpr(n));
+        }
         if let Some((_, csr)) = CSR_NAMES.iter().find(|(name, _)| *name == text) {
             return Some(Reg::Csr(*csr));
         }
@@ -291,6 +311,7 @@ impl Reg {
     fn regno(self) -> u32 {
         match self {
             Reg::Gpr(n) => 0x1000 + n,
+            Reg::Fpr(n) => 0x1020 + n,
             Reg::Csr(n) => n,
         }
     }
@@ -300,12 +321,22 @@ impl fmt::Display for Reg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Reg::Gpr(n) => write!(f, "{}", GPR_NAMES[*n as usize]),
+            Reg::Fpr(n) => write!(f, "{}", FPR_NAMES[*n as usize]),
             Reg::Csr(DPC) => write!(f, "pc"),
             Reg::Csr(n) => match crate::disasm::csr_name(*n) {
                 name if name.starts_with("0x") => write!(f, "csr{n:#05x}"),
                 name => write!(f, "{name}"),
             },
         }
+    }
+}
+
+/// `hawindow` with the first `harts` harts in it.
+fn mask_of(harts: u32) -> u32 {
+    if harts >= 32 {
+        u32::MAX
+    } else {
+        (1 << harts) - 1
     }
 }
 
@@ -536,6 +567,10 @@ pub struct Debug<D: Dmi> {
     /// The CSRs that the access register command refused; they go through
     /// the program buffer from then on.
     csr_by_progbuf: bool,
+    /// The same for the FPRs.
+    fpr_by_progbuf: bool,
+    /// FLEN, learnt from `misa` on the first FPR access.
+    flen: Option<u32>,
 }
 
 impl<D: Dmi> Debug<D> {
@@ -548,6 +583,8 @@ impl<D: Dmi> Debug<D> {
             progbuf_size: 0,
             impebreak: false,
             csr_by_progbuf: false,
+            fpr_by_progbuf: false,
+            flen: None,
         };
         let control = dm.read(reg::DMCONTROL)?;
         if control & DMACTIVE == 0 {
@@ -586,6 +623,30 @@ impl<D: Dmi> Debug<D> {
 
     pub fn hart(&self) -> u32 {
         self.hart
+    }
+
+    /// Selects another hart. What was learnt about the last one (XLEN, FLEN)
+    /// is learnt again: harts may differ.
+    pub fn select(&mut self, hart: u32) -> Result<(), String> {
+        self.hart = hart;
+        self.xlen = None;
+        self.flen = None;
+        self.write(reg::DMCONTROL, self.control(0))?;
+        if self.status()? & ANYNONEXISTENT != 0 {
+            return Err(format!(
+                "hart {hart} does not exist. `hio cpu info` says how many harts answer."
+            ));
+        }
+        if self.is_halted()? {
+            self.dmi.hart_runs(false)?;
+        }
+        Ok(())
+    }
+
+    /// Words in the program buffer, and whether an `ebreak` follows them
+    /// without one being written.
+    pub fn progbuf(&self) -> (u32, bool) {
+        (self.progbuf_size, self.impebreak)
     }
 
     fn read(&mut self, reg: u32) -> Result<u32, String> {
@@ -705,6 +766,48 @@ impl<D: Dmi> Debug<D> {
             );
         }
         Ok((HALTREQ | HASEL | DMACTIVE, harts))
+    }
+
+    /// Halts every hart, with one write when there are several (the hart
+    /// array window), so they stop together. Returns how many there are.
+    /// The hart selected before stays selected.
+    pub fn halt_all(&mut self) -> Result<u32, String> {
+        let harts = self.info()?.harts;
+        if harts <= 1 {
+            self.halt()?;
+            return Ok(1);
+        }
+        let (control, _) = self.halt_all_control()?;
+        self.dmi.run(&[
+            Op::Write(reg::HAWINDOWSEL, 0),
+            Op::Write(reg::HAWINDOW, mask_of(harts)),
+            Op::Write(reg::DMCONTROL, control),
+        ])?;
+        let waited = self.wait("every hart to halt", |dm| {
+            Ok(dm.read(reg::DMSTATUS)? & ALLHALTED != 0)
+        });
+        self.write(reg::DMCONTROL, self.control(0))?;
+        waited?;
+        self.dmi.hart_runs(false)?;
+        Ok(harts)
+    }
+
+    /// Lets every hart run, with one write when there are several.
+    pub fn resume_all(&mut self, harts: u32) -> Result<(), String> {
+        if harts <= 1 {
+            return self.resume();
+        }
+        self.dmi.hart_runs(true)?;
+        self.dmi.run(&[
+            Op::Write(reg::HAWINDOWSEL, 0),
+            Op::Write(reg::HAWINDOW, mask_of(harts)),
+            Op::Write(reg::DMCONTROL, self.control(RESUMEREQ | HASEL)),
+        ])?;
+        let waited = self.wait("every hart to resume", |dm| {
+            Ok(dm.read(reg::DMSTATUS)? & ALLRESUMEACK != 0)
+        });
+        self.write(reg::DMCONTROL, self.control(0))?;
+        waited
     }
 
     /// Halts the hart. Already halted is fine.
@@ -967,6 +1070,9 @@ impl<D: Dmi> Debug<D> {
     pub fn read_reg(&mut self, reg: Reg) -> Result<u64, String> {
         self.need_halted("reading a register")?;
         let xlen = self.xlen()?;
+        if let Reg::Fpr(n) = reg {
+            return self.read_fpr(n);
+        }
         if let Reg::Csr(csr) = reg
             && self.csr_by_progbuf
         {
@@ -987,6 +1093,9 @@ impl<D: Dmi> Debug<D> {
     pub fn write_reg(&mut self, reg: Reg, value: u64) -> Result<(), String> {
         self.need_halted("writing a register")?;
         let xlen = self.xlen()?;
+        if let Reg::Fpr(n) = reg {
+            return self.write_fpr(n, value);
+        }
         if let Reg::Csr(csr) = reg
             && self.csr_by_progbuf
         {
@@ -1047,6 +1156,224 @@ impl<D: Dmi> Debug<D> {
             .command(self.access(0x1000 + S0, true, true, true, xlen))
             .map_err(|e| format!("cannot write csr {csr:#05x}: {e}"));
         self.write_reg(Reg::Gpr(S0), s0)?;
+        ran
+    }
+
+    /// Reads a CSR that may not exist: `None` if the hart refuses it. The
+    /// hart must be halted.
+    ///
+    /// A refusal of the access register command alone is not taken as
+    /// "absent": the program buffer gets a try too, as for `read_reg`.
+    pub fn read_csr_if_any(&mut self, csr: u32) -> Result<Option<u64>, String> {
+        self.need_halted("reading a register")?;
+        let xlen = self.xlen()?;
+        if !self.csr_by_progbuf {
+            match self.command(self.access(csr, false, true, false, xlen)) {
+                Ok(()) => return self.read_data(xlen).map(Some),
+                Err(CmdErr::Dm(3)) => return Ok(None),
+                Err(CmdErr::Dm(2)) => {}
+                Err(e) => return Err(format!("cannot read csr {csr:#05x}: {e}")),
+            }
+        }
+        let s0 = self.read_reg(Reg::Gpr(S0))?;
+        // csrrs s0, csr, x0
+        self.load_program((csr << 20) | (0b010 << 12) | (S0 << 7) | 0x73)?;
+        let ran = self.command(self.access(0, false, false, true, xlen));
+        let value = match ran {
+            Ok(()) => {
+                // The access register command refused a CSR the program
+                // buffer reaches: all CSRs take this path from now on.
+                self.csr_by_progbuf = true;
+                Some(self.read_reg(Reg::Gpr(S0))?)
+            }
+            Err(CmdErr::Dm(3)) => None,
+            Err(e) => {
+                self.write_reg(Reg::Gpr(S0), s0)?;
+                return Err(format!("cannot read csr {csr:#05x}: {e}"));
+            }
+        };
+        self.write_reg(Reg::Gpr(S0), s0)?;
+        Ok(value)
+    }
+
+    /// FLEN, from `misa`: 64 with D, 32 with F only.
+    pub fn flen(&mut self) -> Result<u32, String> {
+        if let Some(flen) = self.flen {
+            return Ok(flen);
+        }
+        let misa = self.read_reg(Reg::Csr(MISA))?;
+        let flen = if misa & (1 << 3) != 0 {
+            64
+        } else if misa & (1 << 5) != 0 {
+            32
+        } else {
+            return Err(format!(
+                "hart {} has no floating-point registers: misa ({misa:#x}) has neither F nor D.",
+                self.hart
+            ));
+        };
+        self.flen = Some(flen);
+        Ok(flen)
+    }
+
+    fn read_fpr(&mut self, n: u32) -> Result<u64, String> {
+        let flen = self.flen()?;
+        if !self.fpr_by_progbuf {
+            match self.command(self.access(0x1020 + n, false, true, false, flen)) {
+                Ok(()) => return self.read_data(flen),
+                Err(CmdErr::Dm(2)) => self.fpr_by_progbuf = true,
+                Err(e) => return Err(format!("cannot read {}: {e}", Reg::Fpr(n))),
+            }
+        }
+        let xlen = self.xlen()?;
+        let funct = self.fmv_funct(flen, xlen)?;
+        // fmv.x.d / fmv.x.w s0, fN
+        let insn = ((0b1110000 | funct) << 25) | (n << 15) | (S0 << 7) | 0x53;
+        let s0 = self.read_reg(Reg::Gpr(S0))?;
+        self.load_program(insn)?;
+        let ran = self
+            .command(self.access(0, false, false, true, xlen))
+            .map_err(|e| format!("cannot read {}: {e}", Reg::Fpr(n)));
+        let value = match ran {
+            Ok(()) => self.read_reg(Reg::Gpr(S0)),
+            Err(e) => Err(e),
+        };
+        self.write_reg(Reg::Gpr(S0), s0)?;
+        value
+    }
+
+    fn write_fpr(&mut self, n: u32, value: u64) -> Result<(), String> {
+        let flen = self.flen()?;
+        if !self.fpr_by_progbuf {
+            self.write_data(flen, value)?;
+            match self.command(self.access(0x1020 + n, true, true, false, flen)) {
+                Ok(()) => return Ok(()),
+                Err(CmdErr::Dm(2)) => self.fpr_by_progbuf = true,
+                Err(e) => return Err(format!("cannot write {}: {e}", Reg::Fpr(n))),
+            }
+        }
+        let xlen = self.xlen()?;
+        let funct = self.fmv_funct(flen, xlen)?;
+        // fmv.d.x / fmv.w.x fN, s0
+        let insn = ((0b1111000 | funct) << 25) | (S0 << 15) | (n << 7) | 0x53;
+        let s0 = self.read_reg(Reg::Gpr(S0))?;
+        self.load_program(insn)?;
+        self.write_data(xlen, value)?;
+        let ran = self
+            .command(self.access(0x1000 + S0, true, true, true, xlen))
+            .map_err(|e| format!("cannot write {}: {e}", Reg::Fpr(n)));
+        self.write_reg(Reg::Gpr(S0), s0)?;
+        ran
+    }
+
+    /// The `fmt` field of `fmv` between an FPR and `s0`: 1 for D, 0 for F.
+    /// A 64-bit FPR does not fit a 32-bit GPR.
+    fn fmv_funct(&self, flen: u32, xlen: u32) -> Result<u32, String> {
+        match (flen, xlen) {
+            (64, 64) => Ok(1),
+            (32, _) => Ok(0),
+            _ => Err(
+                "the Debug Module does not reach the 64-bit FPRs of this 32-bit hart: the \
+                 access register command refuses them, and `fmv` cannot carry 64 bits \
+                 through a 32-bit register."
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Runs `insns` in the program buffer. The hart must be halted.
+    ///
+    /// They must fit, with an `ebreak` after them unless the Debug Module
+    /// adds one. They may use no GPR the caller needs.
+    pub fn exec(&mut self, insns: &[u32]) -> Result<(), String> {
+        self.need_halted("running instructions")?;
+        let xlen = self.xlen()?;
+        let room = self.progbuf_size as usize;
+        let fits = insns.len() < room || (insns.len() == room && self.impebreak);
+        if !fits {
+            return Err(format!(
+                "{} instructions do not fit the program buffer: it has {room} words{}.",
+                insns.len(),
+                if self.impebreak {
+                    ""
+                } else {
+                    ", and one goes to the `ebreak` after them"
+                }
+            ));
+        }
+        let mut ops: Vec<Op> = insns
+            .iter()
+            .enumerate()
+            .map(|(i, &insn)| Op::Write(reg::PROGBUF0 + i as u32, insn))
+            .collect();
+        if insns.len() < room {
+            ops.push(Op::Write(reg::PROGBUF0 + insns.len() as u32, EBREAK));
+        }
+        self.dmi.run(&ops)?;
+        self.command(self.access(0, false, false, true, xlen))
+            .map_err(|e| format!("the program buffer did not run: {e}"))
+    }
+
+    /// Loads `width` bits (8, 16, 32 or 64) at `addr` as the hart sees it,
+    /// with a load the hart runs in the program buffer. The hart must be
+    /// halted. `s0` and `s1` carry the address and the value and are put
+    /// back. A 64-bit load on a 32-bit hart is two loads, low word first.
+    pub fn load(&mut self, addr: u64, width: u32) -> Result<u64, String> {
+        let xlen = self.xlen()?;
+        if width == 64 && xlen == 32 {
+            let lo = self.load(addr, 32)?;
+            let hi = self.load(addr + 4, 32)?;
+            return Ok(lo | (hi << 32));
+        }
+        // lbu / lhu / lw / ld (lwu on RV64 for 32 bits)
+        let funct3 = match (width, xlen) {
+            (8, _) => 0b100,
+            (16, _) => 0b101,
+            (32, 32) => 0b010,
+            (32, _) => 0b110,
+            (64, _) => 0b011,
+            _ => return Err(format!("a load of {width} bits is not one the hart makes")),
+        };
+        let insn = (S0 << 15) | (funct3 << 12) | (S1 << 7) | 0x03;
+        let saved = (self.read_reg(Reg::Gpr(S0))?, self.read_reg(Reg::Gpr(S1))?);
+        self.load_program(insn)?;
+        self.write_data(xlen, addr)?;
+        let ran = self
+            .command(self.access(0x1000 + S0, true, true, true, xlen))
+            .map_err(|e| format!("the hart cannot load at {addr:#x}: {e}"));
+        let value = match ran {
+            Ok(()) => self.read_reg(Reg::Gpr(S1)),
+            Err(e) => Err(e),
+        };
+        self.write_reg(Reg::Gpr(S0), saved.0)?;
+        self.write_reg(Reg::Gpr(S1), saved.1)?;
+        value
+    }
+
+    /// Stores `width` bits of `value` at `addr`, as `load` loads.
+    pub fn store(&mut self, addr: u64, width: u32, value: u64) -> Result<(), String> {
+        let xlen = self.xlen()?;
+        if width == 64 && xlen == 32 {
+            self.store(addr, 32, value & 0xffff_ffff)?;
+            return self.store(addr + 4, 32, value >> 32);
+        }
+        let funct3 = match width {
+            8 => 0b000,
+            16 => 0b001,
+            32 => 0b010,
+            64 => 0b011,
+            _ => return Err(format!("a store of {width} bits is not one the hart makes")),
+        };
+        let insn = (S1 << 20) | (S0 << 15) | (funct3 << 12) | 0x23;
+        let saved = (self.read_reg(Reg::Gpr(S0))?, self.read_reg(Reg::Gpr(S1))?);
+        self.write_reg(Reg::Gpr(S0), addr)?;
+        self.load_program(insn)?;
+        self.write_data(xlen, value)?;
+        let ran = self
+            .command(self.access(0x1000 + S1, true, true, true, xlen))
+            .map_err(|e| format!("the hart cannot store at {addr:#x}: {e}"));
+        self.write_reg(Reg::Gpr(S0), saved.0)?;
+        self.write_reg(Reg::Gpr(S1), saved.1)?;
         ran
     }
 
@@ -1679,6 +2006,17 @@ mod tests {
         resuming: u32,
         /// An abstract command that never finishes.
         stuck: bool,
+        /// CSRs not in `csr` trap, as on a hart that lacks them. Otherwise
+        /// they read as 0.
+        strict_csrs: bool,
+        /// An FPU: `f0`..`f31` (through the program buffer only, as on
+        /// Rocket) and a writable `mstatus.FS`.
+        fpu: bool,
+        fpr: [u64; 32],
+        /// Bytes the hart loads and stores.
+        mem: std::collections::HashMap<u64, u8>,
+        /// Fence instructions run (`fence.i`, `sfence.vma`).
+        fences: Vec<u32>,
     }
 
     impl Model {
@@ -1703,7 +2041,53 @@ mod tests {
             let csr = insn >> 20;
             let rd = (insn >> 7) & 0x1f;
             let rs1 = (insn >> 15) & 0x1f;
-            match (insn >> 12) & 0x7 {
+            let funct3 = (insn >> 12) & 0x7;
+            if insn == 0x0000_100f || insn == 0x1200_0073 {
+                self.fences.push(insn);
+                return;
+            }
+            if insn & 0x7f == 0x73
+                && (funct3 == 0b010 || funct3 == 0b001)
+                && self.strict_csrs
+                && ![DPC, TDATA1, TDATA2, TSELECT, TINFO].contains(&csr)
+                && !self.csr.contains_key(&csr)
+            {
+                self.cmderr = 3;
+                return;
+            }
+            if insn & 0x7f == 0x53 {
+                // fmv.x.{w,d} rd, fN / fmv.{w,d}.x fN, rs1
+                if !self.fpu {
+                    self.cmderr = 3;
+                    return;
+                }
+                let rs2 = rs1;
+                match insn >> 25 {
+                    0b1110000 | 0b1110001 => self.gpr[rd as usize] = self.fpr[rs2 as usize],
+                    0b1111000 | 0b1111001 => self.fpr[rd as usize] = self.gpr[rs1 as usize],
+                    _ => self.cmderr = 3,
+                }
+                return;
+            }
+            if insn & 0x7f == 0x03 {
+                let addr = self.gpr[rs1 as usize];
+                let bytes = 1u64 << (funct3 & 0b11);
+                let v = (0..bytes).fold(0u64, |v, i| {
+                    v | (u64::from(*self.mem.get(&(addr + i)).unwrap_or(&0)) << (8 * i))
+                });
+                self.gpr[rd as usize] = v;
+                return;
+            }
+            if insn & 0x7f == 0x23 {
+                let addr = self.gpr[rs1 as usize];
+                let rs2 = (insn >> 20) & 0x1f;
+                let v = self.gpr[rs2 as usize];
+                for i in 0..1u64 << funct3 {
+                    self.mem.insert(addr + i, (v >> (8 * i)) as u8);
+                }
+                return;
+            }
+            match funct3 {
                 // csrrs rd, csr, x0
                 0b010 if insn & 0x7f == 0x73 => {
                     let sel = (self.csr[&TSELECT] as usize).min(3);
@@ -1732,6 +2116,9 @@ mod tests {
                     } else if csr == TSELECT {
                         // Three triggers.
                         self.csr.insert(TSELECT, v.min(3));
+                    } else if csr == 0x300 && !self.fpu {
+                        // FS is fixed at Off without an FPU.
+                        self.csr.insert(csr, v & !(0b11 << 13));
                     } else {
                         self.csr.insert(csr, v);
                     }
@@ -1979,6 +2366,138 @@ mod tests {
         // The first CSR access found out; later ones go straight to the
         // program buffer.
         assert_eq!(m.refused_csr, 1);
+    }
+
+    /// A 64-bit hart with an FPU and S-mode, and only the CSRs it is given.
+    fn full_hart() -> Model {
+        let mut m = Model::new(64);
+        m.strict_csrs = true;
+        m.fpu = true;
+        // RV64 with D, F and S.
+        m.csr
+            .insert(MISA, (2 << 62) | (1 << 3) | (1 << 5) | (1 << 8) | (1 << 18));
+        m.csr.insert(DCSR, (4 << 28) | 1);
+        for (n, v) in [
+            (0x300, 0xa_0000_0080u64),      // mstatus, FS off
+            (0x003, 0x21),                  // fcsr
+            (0x305, 0x8000_0100),           // mtvec
+            (0x341, 0x8000_0200),           // mepc
+            (0x180, 0x8000_0000_0008_0000), // satp
+            (0xb00, 123_456),               // mcycle
+            (0x3b0, 0x2000_0000),           // pmpaddr0
+            (0x3a0, 0x0f),                  // pmpcfg0
+        ] {
+            m.csr.insert(n, v);
+        }
+        for n in 1..32 {
+            m.gpr[n] = 0x1000 + n as u64;
+            m.fpr[n] = 0x4000_0000_0000_0000 | n as u64;
+        }
+        m.pc = 0x8000_1234;
+        m
+    }
+
+    /// Everything saved comes back after the hart is scrambled, and only
+    /// the CSRs the hart has are kept.
+    #[test]
+    fn a_hart_saved_and_restored_comes_back_whole() {
+        let mut m = full_hart();
+        let state = {
+            let mut dm = Debug::attach(&mut m, 0).unwrap();
+            dm.halt().unwrap();
+            let (state, notes) = crate::checkpoint::save_hart(&mut dm, &[0x7c0]).unwrap();
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert!(notes[0].contains("0x7c0"), "{notes:?}");
+            state
+        };
+        assert_eq!(state.pc.0, 0x8000_1234);
+        assert_eq!(state.prv, 1);
+        assert_eq!(state.fpr.as_ref().unwrap().flen, 64);
+        let mut kept: Vec<u64> = state.csr.iter().map(|c| c.number.0).collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            [0x003, 0x180, 0x300, 0x305, 0x341, 0x3a0, 0x3b0, 0xb00]
+        );
+        // Saving left the FPU as the program had it.
+        assert_eq!(m.csr[&0x300], 0xa_0000_0080);
+        // The counters stop while halted.
+        assert_ne!(m.csr[&DCSR] & (1 << 10), 0);
+
+        let want = (m.gpr, m.fpr, m.csr.clone(), m.pc);
+        m.gpr = [0; 32];
+        m.fpr = [0; 32];
+        m.pc = 0;
+        for v in m.csr.values_mut() {
+            *v = 0;
+        }
+        m.csr.insert(MISA, want.2[&MISA]);
+        m.csr.insert(DCSR, (4 << 28) | (3 << 6) | 3);
+        {
+            let mut dm = Debug::attach(&mut m, 0).unwrap();
+            let notes = crate::checkpoint::restore_hart(&mut dm, &state).unwrap();
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+        assert_eq!(m.gpr, want.0);
+        assert_eq!(m.fpr, want.1);
+        assert_eq!(m.pc, want.3);
+        for n in [0x003, 0x180, 0x300, 0x305, 0x341, 0x3a0, 0x3b0, 0xb00] {
+            assert_eq!(m.csr[&n], want.2[&n], "csr {n:#x}");
+        }
+        assert_eq!(m.csr[&DCSR] & 3, 1);
+        assert_eq!(m.fences, [0x1200_0073, 0x0000_100f]);
+    }
+
+    #[test]
+    fn a_hart_without_an_fpu_keeps_no_fp_registers() {
+        let mut m = Model::new(32);
+        m.strict_csrs = true;
+        m.csr.insert(0x300, 0x1800);
+        let mut dm = Debug::attach(&mut m, 0).unwrap();
+        dm.halt().unwrap();
+        let (state, notes) = crate::checkpoint::save_hart(&mut dm, &[]).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(state.fpr, None);
+        assert_eq!(state.xlen, 32);
+        let json = serde_json::to_string(&state).unwrap();
+        let back: crate::checkpoint::HartState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, state);
+    }
+
+    /// Loads and stores the hart makes keep `s0` and `s1`, and a 64-bit
+    /// access on a 32-bit hart is two.
+    #[test]
+    fn the_hart_loads_and_stores_for_the_debugger() {
+        let mut m = Model::new(32);
+        m.gpr[8] = 0x88;
+        m.gpr[9] = 0x99;
+        {
+            let mut dm = Debug::attach(&mut m, 0).unwrap();
+            dm.halt().unwrap();
+            dm.store(0x200_4000, 64, 0x1122_3344_5566_7788).unwrap();
+            dm.store(0x200_4010, 8, 0xab).unwrap();
+            assert_eq!(dm.load(0x200_4000, 64).unwrap(), 0x1122_3344_5566_7788);
+            assert_eq!(dm.load(0x200_4004, 32).unwrap(), 0x1122_3344);
+            assert_eq!(dm.load(0x200_4002, 16).unwrap(), 0x5566);
+            assert_eq!(dm.load(0x200_4010, 8).unwrap(), 0xab);
+        }
+        assert_eq!(m.mem[&0x200_4000], 0x88);
+        assert_eq!(m.mem[&0x200_4007], 0x11);
+        assert_eq!((m.gpr[8], m.gpr[9]), (0x88, 0x99));
+    }
+
+    #[test]
+    fn instructions_run_only_if_they_fit_the_program_buffer() {
+        let mut m = Model::new(32);
+        {
+            let mut dm = Debug::attach(&mut m, 0).unwrap();
+            dm.halt().unwrap();
+            // Two words, and the module adds the ebreak.
+            dm.exec(&[0x0000_100f, 0x1200_0073]).unwrap();
+            let err = dm.exec(&[0x13, 0x13, 0x13]).unwrap_err();
+            assert!(err.contains("do not fit"), "{err}");
+        }
+        assert_eq!(m.fences, [0x0000_100f, 0x1200_0073]);
     }
 
     #[test]

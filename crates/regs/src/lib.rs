@@ -140,12 +140,52 @@ pub struct RegisterMap {
     #[serde(default)]
     pub traces: Vec<Trace>,
 
+    /// What `hio cpu save` and `restore` need to know about a core besides
+    /// what its Debug Module says, by `dmi` bundle. Empty when no bundle has
+    /// a `checkpoint` table, and in older `regs.json`.
+    #[serde(default)]
+    pub checkpoint: BTreeMap<String, Checkpoint>,
+
     /// Present only for a PCIe design; the host needs it to find the card.
     ///
     /// Absent means the design has no PCIe port. On a JTAG design, it would
     /// make the host search for a device that is not there.
     #[serde(default)]
     pub pcie: Option<Pcie>,
+}
+
+/// `[bundle.<dmi>.checkpoint]`: the parts of a core's state outside the
+/// Debug specification.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct Checkpoint {
+    /// Instructions that write the whole data cache back and invalidate it,
+    /// run in the program buffer.
+    #[serde(default)]
+    pub flush: Vec<u32>,
+    /// CSRs to save besides the standard ones.
+    #[serde(default)]
+    pub csrs: Vec<u32>,
+    /// Device registers, written back in this order.
+    #[serde(default)]
+    pub mmio: Vec<CheckpointMmio>,
+    /// Memories inside the core, reached through the core.
+    #[serde(default)]
+    pub region: Vec<CheckpointRegion>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CheckpointMmio {
+    pub name: String,
+    pub addr: u64,
+    /// 8, 16, 32 or 64.
+    pub width: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CheckpointRegion {
+    pub name: String,
+    pub addr: u64,
+    pub size: u64,
 }
 
 /// The IDs the bitstream presents, and the BAR size.
