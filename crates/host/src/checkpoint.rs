@@ -13,7 +13,8 @@ use crate::dm::{Debug, Dmi, Reg};
 pub const FORMAT: u32 = 1;
 
 /// A number written as a hex string, so a 64-bit value with the top bit set
-/// survives JSON readers that take numbers as doubles.
+/// survives JSON readers that take numbers as doubles. A plain JSON number
+/// is read too, as `map_hash` in regs.json is one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hex(pub u64);
 
@@ -25,7 +26,16 @@ impl Serialize for Hex {
 
 impl<'de> Deserialize<'de> for Hex {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(d)?;
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Number(u64),
+            Text(String),
+        }
+        let text = match Either::deserialize(d)? {
+            Either::Number(n) => return Ok(Hex(n)),
+            Either::Text(t) => t,
+        };
         let digits = text
             .strip_prefix("0x")
             .ok_or_else(|| serde::de::Error::custom(format!("{text:?} is not 0x and hex")))?;
@@ -36,17 +46,25 @@ impl<'de> Deserialize<'de> for Hex {
 }
 
 /// `checkpoint.json`: everything but the memory images.
+///
+/// `hio cpu save` writes every field. A file made elsewhere (from a
+/// simulator, say) may leave out what it does not know, and `restore` leaves
+/// that part of the target as it is: a hart not listed, a register or CSR
+/// not given, a memory not in `memory`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct File {
     pub format: u32,
     /// The `hio` that wrote it.
+    #[serde(default)]
     pub hio: String,
     /// The DUT and the map hash of the harness it came from. A restore onto
     /// another harness is refused: the memories and the core may differ.
     pub dut: String,
     pub map_hash: Hex,
     /// The `dmi` bundle.
+    #[serde(default)]
     pub dmi: String,
+    #[serde(default)]
     pub harts: Vec<HartState>,
     /// Device registers (`checkpoint.mmio`), in the order they are written.
     #[serde(default)]
@@ -83,15 +101,19 @@ pub struct HartState {
     pub hart: u32,
     pub xlen: u32,
     /// `dpc`: where the hart goes on.
-    pub pc: Hex,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pc: Option<Hex>,
     /// `dcsr.prv`: 0 U, 1 S, 3 M.
-    pub prv: u32,
-    /// `x0`..`x31` (`x0` is always 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prv: Option<u32>,
+    /// `x0`..`x31` (`x0` is always 0): all 32, or none.
+    #[serde(default)]
     pub gpr: Vec<Hex>,
     /// FLEN and `f0`..`f31`, if the hart has an FPU.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fpr: Option<Fprs>,
     /// The CSRs the hart has, in the order they are written back.
+    #[serde(default)]
     pub csr: Vec<Csr>,
 }
 
@@ -105,6 +127,7 @@ pub struct Fprs {
 pub struct Csr {
     /// The number, which is what counts. The name is for a person.
     pub number: Hex,
+    #[serde(default)]
     pub name: String,
     pub value: Hex,
 }
@@ -234,8 +257,8 @@ pub fn save_hart<D: Dmi>(
         HartState {
             hart: dm.hart(),
             xlen,
-            pc: Hex(pc),
-            prv: (dcsr & PRV) as u32,
+            pc: Some(Hex(pc)),
+            prv: Some((dcsr & PRV) as u32),
             gpr,
             fpr,
             csr,
@@ -259,12 +282,11 @@ pub fn restore_hart<D: Dmi>(dm: &mut Debug<D>, state: &HartState) -> Result<Vec<
             state.xlen
         ));
     }
-    let mstatus = state
-        .csr
-        .iter()
-        .find(|c| c.number.0 == u64::from(MSTATUS))
-        .map(|c| c.value.0)
-        .ok_or("the checkpoint has no mstatus")?;
+    check_hart(state)?;
+    let mstatus = match state.csr.iter().find(|c| c.number.0 == u64::from(MSTATUS)) {
+        Some(c) => c.value.0,
+        None => dm.read_reg(Reg::Csr(MSTATUS))?,
+    };
     let dcsr = dm.read_reg(Reg::Csr(DCSR))?;
     dm.write_reg(Reg::Csr(DCSR), dcsr | STOPCOUNT)?;
 
@@ -287,7 +309,7 @@ pub fn restore_hart<D: Dmi>(dm: &mut Debug<D>, state: &HartState) -> Result<Vec<
     {
         let number = c.number.0 as u32;
         if let Err(e) = dm.write_reg(Reg::Csr(number), c.value.0) {
-            notes.push(format!("{} was not written back: {e}", c.name));
+            notes.push(format!("{} was not written back: {e}", Reg::Csr(number)));
         }
     }
     let has = |n: u32| state.csr.iter().any(|c| c.number.0 == u64::from(n));
@@ -304,8 +326,54 @@ pub fn restore_hart<D: Dmi>(dm: &mut Debug<D>, state: &HartState) -> Result<Vec<
     for (n, v) in state.gpr.iter().enumerate().skip(1) {
         dm.write_reg(Reg::Gpr(n as u32), v.0)?;
     }
-    dm.write_reg(Reg::Csr(DPC), state.pc.0)?;
-    let dcsr = dm.read_reg(Reg::Csr(DCSR))?;
-    dm.write_reg(Reg::Csr(DCSR), (dcsr & !PRV) | (u64::from(state.prv) & PRV))?;
+    if let Some(pc) = state.pc {
+        dm.write_reg(Reg::Csr(DPC), pc.0)?;
+    }
+    if let Some(prv) = state.prv {
+        let dcsr = dm.read_reg(Reg::Csr(DCSR))?;
+        dm.write_reg(Reg::Csr(DCSR), (dcsr & !PRV) | u64::from(prv))?;
+    }
     Ok(notes)
+}
+
+/// Refuses a hart state that cannot be meant: one made by hand or by
+/// another tool may be wrong in ways `hio cpu save` never is.
+pub fn check_hart(state: &HartState) -> Result<(), String> {
+    let hart = state.hart;
+    if state.xlen != 32 && state.xlen != 64 {
+        return Err(format!(
+            "hart {hart}: xlen is {}; it is 32 or 64.",
+            state.xlen
+        ));
+    }
+    if !state.gpr.is_empty() && state.gpr.len() != 32 {
+        return Err(format!(
+            "hart {hart}: gpr has {} values; give all 32 (x0 to x31), or leave it out.",
+            state.gpr.len()
+        ));
+    }
+    if let Some(prv) = state.prv
+        && ![0, 1, 3].contains(&prv)
+    {
+        return Err(format!(
+            "hart {hart}: prv is {prv}; it is 0 (U), 1 (S) or 3 (M)."
+        ));
+    }
+    if let Some(fpr) = &state.fpr
+        && fpr.regs.len() != 32
+    {
+        return Err(format!(
+            "hart {hart}: fpr.regs has {} values; give all 32 (f0 to f31).",
+            fpr.regs.len()
+        ));
+    }
+    for c in &state.csr {
+        if c.number.0 >= 0x1000 {
+            return Err(format!(
+                "hart {hart}: csr {:#x} is not a CSR number (0 to 0xfff).",
+                c.number.0
+            ));
+        }
+    }
+    Ok(())
 }

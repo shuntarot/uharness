@@ -2410,8 +2410,8 @@ mod tests {
             assert!(notes[0].contains("0x7c0"), "{notes:?}");
             state
         };
-        assert_eq!(state.pc.0, 0x8000_1234);
-        assert_eq!(state.prv, 1);
+        assert_eq!(state.pc, Some(crate::checkpoint::Hex(0x8000_1234)));
+        assert_eq!(state.prv, Some(1));
         assert_eq!(state.fpr.as_ref().unwrap().flen, 64);
         let mut kept: Vec<u64> = state.csr.iter().map(|c| c.number.0).collect();
         kept.sort();
@@ -2446,6 +2446,55 @@ mod tests {
         }
         assert_eq!(m.csr[&DCSR] & 3, 1);
         assert_eq!(m.fences, [0x1200_0073, 0x0000_100f]);
+    }
+
+    /// A state made elsewhere may give only part of the hart; the rest is
+    /// left as it is.
+    #[test]
+    fn a_partial_state_changes_only_what_it_gives() {
+        let mut m = full_hart();
+        let state: crate::checkpoint::HartState = serde_json::from_str(
+            r#"{"hart": 0, "xlen": 64, "pc": "0x80002000",
+                "csr": [{"number": 833, "value": "0x55"}]}"#,
+        )
+        .unwrap();
+        let before = (m.gpr, m.fpr, m.csr.clone());
+        {
+            let mut dm = Debug::attach(&mut m, 0).unwrap();
+            dm.halt().unwrap();
+            let notes = crate::checkpoint::restore_hart(&mut dm, &state).unwrap();
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+        assert_eq!(m.pc, 0x8000_2000);
+        assert_eq!(m.csr[&0x341], 0x55);
+        assert_eq!(m.gpr, before.0);
+        assert_eq!(m.fpr, before.1);
+        for (n, v) in &before.2 {
+            if *n != 0x341 && *n != DCSR {
+                assert_eq!(m.csr[n], *v, "csr {n:#x}");
+            }
+        }
+        assert_eq!(m.csr[&DCSR] & 3, before.2[&DCSR] & 3);
+    }
+
+    #[test]
+    fn a_state_that_cannot_be_meant_is_refused() {
+        for (json, says) in [
+            (
+                r#"{"hart": 0, "xlen": 64, "gpr": ["0x0", "0x1"]}"#,
+                "all 32",
+            ),
+            (r#"{"hart": 0, "xlen": 48}"#, "32 or 64"),
+            (r#"{"hart": 0, "xlen": 64, "prv": 2}"#, "1 (S)"),
+            (
+                r#"{"hart": 0, "xlen": 64, "csr": [{"number": "0x1000", "value": "0x0"}]}"#,
+                "0xfff",
+            ),
+        ] {
+            let state: crate::checkpoint::HartState = serde_json::from_str(json).unwrap();
+            let e = crate::checkpoint::check_hart(&state).unwrap_err();
+            assert!(e.contains(says), "{json}: {e}");
+        }
     }
 
     #[test]
