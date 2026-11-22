@@ -5,7 +5,7 @@
 //! only; both 32-bit and 64-bit.
 
 /// A parsed ELF.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Elf {
     /// 64-bit (`ELFCLASS64`). Pointers on the target are this wide.
     pub wide: bool,

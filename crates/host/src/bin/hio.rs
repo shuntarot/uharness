@@ -10221,7 +10221,7 @@ fn cpu_save(
             }
             println!(
                 "  hart {hart}: pc {:#x}, {} CSRs{}",
-                state.pc.0,
+                state.pc.map_or(0, |pc| pc.0),
                 state.csr.len(),
                 if state.fpr.is_some() {
                     ", FP registers"
@@ -10388,12 +10388,28 @@ fn cpu_restore(
             saved.dut, saved.map_hash.0, map.dut, map.map_hash
         ));
     }
-    let (dmi_name, base) = dmi_region(map, dmi.or(Some(saved.dmi.as_str())))?;
+    let saved_dmi = (!saved.dmi.is_empty()).then_some(saved.dmi.as_str());
+    let (dmi_name, base) = dmi_region(map, dmi.or(saved_dmi))?;
     let desc = map.checkpoint.get(&dmi_name).cloned().unwrap_or_default();
-    let image = dir.join("memory.elf");
-    let raw = std::fs::read(&image).map_err(|e| read_error(&image, e))?;
-    let elf = hns_host::elf::Elf::parse(&raw)?;
-    drop(raw);
+    let mut listed = std::collections::BTreeSet::new();
+    for state in &saved.harts {
+        ck::check_hart(state).map_err(|e| format!("{}: {e}", json.display()))?;
+        if !listed.insert(state.hart) {
+            return Err(format!(
+                "{}: hart {} is given twice.",
+                json.display(),
+                state.hart
+            ));
+        }
+    }
+    // Without memory ranges there is no image to read.
+    let elf = if saved.memory.is_empty() {
+        hns_host::elf::Elf::default()
+    } else {
+        let image = dir.join("memory.elf");
+        let raw = std::fs::read(&image).map_err(|e| read_error(&image, e))?;
+        hns_host::elf::Elf::parse(&raw)?
+    };
     let mut regions = Vec::new();
     for r in &saved.region {
         let file = dir.join(format!("{}.bin", r.name));
@@ -10429,10 +10445,10 @@ fn cpu_restore(
     let harts = {
         let mut dm = Debug::attach(WindowDmi::new(bus, map, base), 0)?;
         let harts = dm.halt_all()?;
-        if harts as usize != saved.harts.len() {
+        if let Some(state) = saved.harts.iter().find(|s| s.hart >= harts) {
             return Err(format!(
-                "the checkpoint has {} hart(s), and this Debug Module has {harts}.",
-                saved.harts.len()
+                "the checkpoint has hart {}, and this Debug Module has {harts} hart(s).",
+                state.hart
             ));
         }
         // The cache drops what it holds, so the memory written next is what

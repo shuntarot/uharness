@@ -257,7 +257,7 @@ harness adds it up in 64 bits, with the cycles, while the DUT is out of
 reset. It marks the first cycle the count reaches each of two values, so the
 cycles between two instruction counts are exact. With `halt`, it can also
 write `dmcontrol` of that Debug Module itself in that cycle; the hart stops a
-few instructions later. [`hio count`](guide-hio.md#hio-count-count-instructions-and-mark-two-counts)
+few instructions later. [`hio count`](guide-cpu.md#hio-count-count-instructions-and-mark-two-counts)
 drives it.
 
 ```toml

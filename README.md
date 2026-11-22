@@ -99,6 +99,7 @@ cargo uninstall harness hns-host
 Needs `veryl` on `PATH` (the version pinned in `Cargo.toml`), and Vivado for
 synthesis. Details: [doc/guide-harness.md](doc/guide-harness.md) for the
 manifest and generation, [doc/guide-hio.md](doc/guide-hio.md) for `hio`,
+[doc/guide-cpu.md](doc/guide-cpu.md) for running and debugging a CPU,
 [doc/hns2.md](doc/hns2.md) for the protocol of `hio serve` and the
 simulation.
 
